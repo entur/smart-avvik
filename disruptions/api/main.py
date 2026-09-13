@@ -1705,6 +1705,10 @@ def _registration_store() -> varsel_state.RegistrationStore:
         raise RuntimeError(
             f"VARSEL_STATE_BACKEND is {backend!r}; it must be one of {_VARSEL_STATE_BACKENDS}"
         )
+    # The togvarsel round markers follow the registrations rather than choosing a home of their
+    # own: a rollback to the blob-reading binary has to find them where that binary looks. Set
+    # before either branch returns, so moving the backend moves them with it.
+    varsel_state.configure_rounds(in_store=backend == "store")
     if backend == "gcs":
         return varsel_state.BlobRegistrations(
             max_devices=varsel._MAX_DEVICES, max_journeys=varsel._MAX_JOURNEYS

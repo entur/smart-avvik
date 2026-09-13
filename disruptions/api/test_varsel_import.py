@@ -429,17 +429,40 @@ def test_a_traveller_who_erased_everything_is_absent_from_the_next_export(_mp):
 
 
 def test_the_export_carries_through_the_keys_the_store_has_no_home_for(_mp):
-    """The togvarsel round markers and anything else the blob carries.
+    """A key written by a future build must survive THIS one rewriting the artefact.
 
-    They are off the protocol and the store holds none of them, so an export that rebuilt the
-    document from the store alone would silently delete them from the only place they exist -- and
-    the deletion would be invisible until a rush round re-fired after a restart.
+    The store holds no `some_future_key` and never will, so an export that rebuilt the document
+    from the store alone would delete it from the only place it exists -- and a rollback-and-forward
+    would then find that feature's state gone, invisibly.
     """
     store, _client = _imported(_mp)
     varsel_state.export_store_to_blob(store, now=NOW)
     written = json.loads(varsel_state.read_blob_text() or "{}")
-    assert written["togvarsel_rounds"] == {"2026-09-30": {"0630": {"level": "yellow", "pushed": True}}}
     assert written["some_future_key"] == {"kept": True}
+
+
+def test_the_export_writes_the_live_round_markers_rather_than_the_blobs_stale_copy(_mp):
+    """The markers have their own home in the store now, so the blob's copy is an OUTPUT.
+
+    Carrying the existing object's copy through instead would fossilise it: the artefact would keep
+    saying a round had fired on the day of the cutover, forever, and a rollback would read that as
+    the current day's dedup. An empty map overwriting a stale one is likewise correct rather than a
+    loss -- a marker is keyed by Oslo date, and one filed under any other date already reads as
+    absent.
+    """
+    store, _client = _imported(_mp)
+    stale = {"2026-09-30": {"0630": {"level": "yellow", "pushed": True}}}
+    assert json.loads(varsel_state.read_blob_text() or "{}")["togvarsel_rounds"] == stale
+
+    varsel_state.store_rounds("2026-10-01", {"1400": {"level": "red", "pushed": True}})
+    varsel_state.export_store_to_blob(store, now=NOW)
+    written = json.loads(varsel_state.read_blob_text() or "{}")
+    assert written["togvarsel_rounds"] == {"2026-10-01": {"1400": {"level": "red", "pushed": True}}}
+
+    varsel_state._togvarsel_rounds.clear()
+    varsel_state.export_store_to_blob(store, now=NOW)
+    written = json.loads(varsel_state.read_blob_text() or "{}")
+    assert written["togvarsel_rounds"] == {}, "a stale marker is not worth preserving"
 
 
 def test_the_export_never_writes_the_blob_backends_empty_state_over_the_artefact(_mp):

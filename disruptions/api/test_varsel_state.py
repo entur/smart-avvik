@@ -51,6 +51,9 @@ def _reset() -> varsel_state.BlobRegistrations:
         varsel_state._daily_pushes.clear()
         varsel_state._togvarsel_rounds.clear()
         varsel_state._state_extra.clear()
+    # The markers' durable home is module state, so a suite that moved it has to move it back or
+    # the next test writes a Firestore document from a blob-backend check.
+    varsel_state.configure_rounds(in_store=False)
     return varsel_state.BlobRegistrations(max_devices=MAX_DEVICES, max_journeys=MAX_JOURNEYS)
 
 
@@ -512,8 +515,11 @@ def test_the_round_markers_keep_exactly_one_date_and_are_handed_out_detached(_mp
 
 
 def test_the_markers_are_deliberately_off_the_registration_protocol(_mp):
-    """A rush round marker is not a registration. On the protocol, the store backend would have to
-    grow a `togvarsel_rounds` document to satisfy an interface nothing would read it through."""
+    """A rush round marker is not a registration, so it does not belong on a seam whose every
+    method is a question about one — `erase_device`, `create_journey`, `mark_notified`. It IS
+    durable under both backends (the store keeps one document for it), and that is the distinction
+    this pins: off the protocol never meant off disk. On the protocol, both implementations would
+    carry a method neither of them answers as a registration question."""
     declared = set(vars(varsel_state.RegistrationStore))
     assert not {n for n in declared if "round" in n}, "a round marker reached the registration seam"
 
@@ -906,6 +912,109 @@ def test_a_journey_list_renews_at_most_once_a_week_however_often_the_page_polls(
     assert len(client.transactions) - settled == 4, "three registrations and one device document"
     store.device_journeys(DEVICE)
     assert len(client.transactions) - settled == 4, "the renewal repeated on the very next read"
+
+
+# ---------------------------------------------------------------- togvarsel round markers
+def test_the_round_markers_are_written_to_one_store_document_nested_by_area(_mp):
+    """Under the store backend a marker write must NOT go through `save_state()`.
+
+    That is the trap, and it is invisible: `save_state` serializes the blob GLOBALS, which under
+    this backend are empty because every mutator writes Firestore instead — so a marker write
+    through it would replace the export's rollback artefact with an empty registration set. The
+    assertion that nothing touched the blob is therefore the point of this test, not a detail of it.
+
+    The body is nested by AREA with one area in it. Rushvarsel is one rush geography today and is
+    planned to become several; nested from the start, that split is a data change here.
+    """
+    _reset()
+    _mp.setattr(varsel_state, "_rounds_in_store", False)
+    varsel_state.configure_rounds(in_store=True)
+    written: list[dict] = []
+    saved: list[int] = []
+    _mp.setattr(notification_store, "write_rounds", lambda data, **kw: written.append(dict(data)))
+    _mp.setattr(varsel_state, "save_state", lambda: (saved.append(1), True)[1])
+
+    varsel_state.store_rounds("2026-09-14", {"0630": {"level": "yellow", "pushed": True}})
+    assert varsel_state.save_rounds() is True
+    assert written == [
+        {
+            "date": "2026-09-14",
+            "areas": {varsel_state.ROUND_AREA: {"0630": {"level": "yellow", "pushed": True}}},
+        }
+    ]
+    assert not saved, "a marker write reached the state blob, which under `store` is empty"
+
+
+def test_the_round_markers_load_back_from_the_store_and_ignore_another_areas_key(_mp):
+    """A build that knows one area reads its own key and leaves the rest alone — which is what
+    makes a rollback ACROSS the rush-area split safe, rather than one that merges a neighbouring
+    area's rounds into this one's dedup."""
+    _reset()
+    _mp.setattr(varsel_state, "_rounds_in_store", False)
+    varsel_state.configure_rounds(in_store=True)
+    body = {
+        "date": "2026-09-14",
+        "areas": {
+            varsel_state.ROUND_AREA: {"0630": {"level": "red", "pushed": True}},
+            "somewhere-else": {"0630": {"level": "green", "pushed": False}},
+        },
+    }
+    _mp.setattr(notification_store, "read_rounds", lambda: dict(body))
+
+    varsel_state.load_rounds()
+    assert varsel_state.rounds_for("2026-09-14") == {"0630": {"level": "red", "pushed": True}}
+    assert varsel_state.rounds_for("2026-09-13") == {}, "only the stored date"
+    assert varsel_state.all_rounds() == {"2026-09-14": {"0630": {"level": "red", "pushed": True}}}
+
+
+def test_the_round_markers_go_through_the_blob_when_the_backend_is_gcs(_mp):
+    """The default and what every deployment did before the store backend existed: the markers are
+    one key of the state object and `save_state()` writes them with the rest of it. The store must
+    not be reached at all — including on load, where the blob's own `load_state` has applied them."""
+    _reset()
+    # Poisoned first, so the assertions below actually depend on `configure_rounds` doing
+    # something: started from the module default they would pass with the call deleted.
+    _mp.setattr(varsel_state, "_rounds_in_store", True)
+    varsel_state.configure_rounds(in_store=False)
+    calls: list[int] = []
+    _mp.setattr(varsel_state, "save_state", lambda: (calls.append(1), True)[1])
+
+    def _refuse(*_a, **_k):
+        raise AssertionError("the store was touched under the blob backend")
+
+    _mp.setattr(notification_store, "write_rounds", _refuse)
+    _mp.setattr(notification_store, "read_rounds", _refuse)
+
+    varsel_state.store_rounds("2026-09-14", {"0630": {"level": "yellow", "pushed": True}})
+    assert varsel_state.save_rounds() is True
+    varsel_state.load_rounds()
+    assert calls == [1]
+    assert varsel_state._togvarsel_rounds == {
+        "2026-09-14": {"0630": {"level": "yellow", "pushed": True}}
+    }
+
+
+def test_a_round_marker_store_failure_is_logged_rather_than_raised(_mp):
+    """Best-effort on both backends. A raise on the write would reach `togvarsel_notify`'s round
+    loop and cost the round its decision; a raise on the read would fail the lifespan for a feature
+    that is off in every environment. What an empty map costs is that rounds still inside their
+    timeliness window are decided again — the crash window that module already documents."""
+    _reset()
+    _mp.setattr(varsel_state, "_rounds_in_store", False)
+    varsel_state.configure_rounds(in_store=True)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("firestore is having a moment")
+
+    _mp.setattr(notification_store, "write_rounds", _boom)
+    _mp.setattr(notification_store, "read_rounds", _boom)
+
+    varsel_state.store_rounds("2026-09-14", {"0630": {"level": "yellow", "pushed": True}})
+    assert varsel_state.save_rounds() is False, "a failed write must SAY so"
+    assert varsel_state.rounds_for("2026-09-14") == {"0630": {"level": "yellow", "pushed": True}}, (
+        "the in-memory markers still dedup this process"
+    )
+    varsel_state.load_rounds()  # must not raise
 
 
 class _MonkeyPatch:

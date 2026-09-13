@@ -1631,6 +1631,33 @@ def test_the_store_is_configured_before_the_registration_backend_resolves():
     )
 
 
+def test_the_round_markers_home_is_named_before_either_backend_branch_returns():
+    """A second startup ORDER in the same function, and its failure is silent rather than loud.
+
+    `varsel_state.configure_rounds` says where the togvarsel round markers are made durable, and
+    the markers must follow the REGISTRATIONS: a rollback to the blob-reading binary has to find
+    them where that binary looks. `_registration_store` has two returns, one per backend, so the
+    call belongs above both -- moved inside the `store` branch it still reads correctly and leaves
+    every `gcs` deployment on whatever the module default happens to be, which today is the right
+    answer and after one edit to that default is not.
+
+    Off the source for the test above's reason, and pinned at all because nothing fails when it is
+    wrong: the markers simply go to a home the next binary does not read.
+    """
+    source = (HERE / "main.py").read_text()
+    resolver = source.index("def _registration_store(")
+    body = source[resolver : source.index("\ndef ", resolver + 1)]
+    named = body.index("varsel_state.configure_rounds(")
+    first_branch = body.index('if backend == "gcs":')
+    assert named < first_branch, (
+        "main names the round markers' home inside a backend branch, so the other backend's "
+        "deployments keep whatever the module default is"
+    )
+    assert 'in_store=backend == "store"' in body, (
+        "the markers must follow the registration backend, not a flag of their own"
+    )
+
+
 def test_the_tool_sets_quotas_and_create_client_takes_them_for_a_new_account():
     store = _install()
     try:

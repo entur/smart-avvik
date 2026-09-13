@@ -1501,7 +1501,12 @@ def test_store_togvarsel_rounds_prunes_to_the_given_date_saves_and_copies():
     saves = []
     with varsel._state_lock:
         saved_raw = varsel._serialize_state()
-    save_state, varsel._save_state = varsel._save_state, lambda: saves.append(1)
+    # `varsel_state.save_state` and NOT `varsel._save_state`: the markers persist through
+    # `varsel_state.save_rounds`, which is the blob's own writer under this backend and one
+    # Firestore document under the store. Patching the caller's helper would count nothing and
+    # still write the blob — the totality argument `save_state`'s own docstring makes.
+    save_state = varsel.varsel_state.save_state
+    varsel.varsel_state.save_state = lambda: bool(saves.append(1)) or True
     try:
         varsel.store_togvarsel_rounds("2026-08-30", {"1400": {"level": "red", "pushed": True}})
         varsel.store_togvarsel_rounds("2026-08-31", {"0630": {"level": "yellow", "pushed": True}})
@@ -1514,7 +1519,7 @@ def test_store_togvarsel_rounds_prunes_to_the_given_date_saves_and_copies():
         got["0630"]["pushed"] = False
         assert varsel.togvarsel_rounds_for("2026-08-31")["0630"]["pushed"] is True
     finally:
-        varsel._save_state = save_state
+        varsel.varsel_state.save_state = save_state
         varsel._apply_state(saved_raw)
 
 
