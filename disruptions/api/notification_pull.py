@@ -100,15 +100,23 @@ _OSLO = ZoneInfo("Europe/Oslo")
 #: and is deliberately no longer tied to it: that one bounds a Firestore lookup and this one bounds
 #: INTERPRETER TIME, which is the binding resource here and is shared with the poller (KTD17).
 #:
-#: **What this ceiling is worth depends on the hit rate, and the two halves are published
-#: separately** in the operations document's capacity table. A HIT is assembly only. A MISS is one
-#: matcher run on the request pool -- pruned per place pair since U2, with no Journey Planner
-#: lookup on this phase -- and 50 per second of misses is the case that does not fit in one
-#: interpreter: at U2's measured per-definition cost a sustained miss rate well under 50/s is what
-#: the process can serve beside the pass. Warming (:func:`warm_figures`) is what turns a REGISTERED
-#: definition's reads into hits for the whole cycle; a favourite nobody registered is a miss on the
-#: first read of each cycle however high this number is. Raising it past what the measured per-miss
-#: time supports does not buy throughput -- it buys a queue in front of one GIL.
+#: **What this ceiling is worth depends on the hit rate, and both halves are published** in the
+#: operations document's capacity table. A HIT is assembly only. A MISS is one matcher run on the
+#: request pool -- pruned per place pair since U2, with no Journey Planner lookup on this phase.
+#:
+#: **Measured 2026-09-13** (`bench_matcher.py --pull-read`, 20 000 definitions): a miss **0.32 ms**,
+#: a hit **0.017 ms**, and ~**3 000 misses per second** sustainable beside the pass. So 50/s fits
+#: with about sixty times the headroom even if EVERY read misses -- and it is U2's index that did
+#: that, not warming: the same miss measured 15 ms p50 in dev on 2026-09-10, which is where the old
+#: 300/min came from. Warming (:func:`warm_figures`) turns a REGISTERED definition's reads into
+#: hits for the whole cycle; a favourite nobody registered is still a miss on the first read of
+#: each cycle, however high this number is.
+#:
+#: What is still owed is the same question asked of a real process -- 50 rps against dev during
+#: pass 1a -- because the figures above are one process over a synthetic cache and say nothing
+#: about anyio or the event loop. Until then read this as a bound on ABUSE: raising it past what
+#: the measured per-miss time supports would not buy throughput, it would buy a queue in front of
+#: one GIL.
 MAX_PER_MIN = 3_000
 #: Reads per minute per canonical stop pair. What a favourites panel polling every minute on a phone
 #: needs is one; thirty is room for a client's whole fleet behind one NAT without being room for
