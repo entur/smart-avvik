@@ -198,6 +198,10 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
             {decision.n_devices && decision.n_devices > 1
               ? ` · ${decision.n_devices} enheter`
               : ''}
+            {/* The client side, beside the browser count and never folded into it: the two count
+                different recipients, and one is not a share of the other. Shown only when there is
+                one, so the ordinary /varsel card is unchanged. */}
+            {decision.n_subscriptions ? ` · ${decision.n_subscriptions} klientabonnement` : ''}
           </SubParagraph>
         </div>
       ) : null}

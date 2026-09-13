@@ -57,6 +57,8 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- The same population filter meldinger_decisions.sql applies; see its note.
+    AND (@channel  IS NULL OR channel  = @channel)
     -- The SIRI-SX population filter is applied after aggregation below so a matching subject keeps
     -- all cycles contributing to its whole-subject figures.
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))

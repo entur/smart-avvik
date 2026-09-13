@@ -79,9 +79,15 @@ export interface Decision {
    *  filters (threshold, not-yet-departed, one_alert_per_train, the `_notified` dedup), not a
    *  re-derivation — so it is strictly narrower than `ever_alerted`. */
   pushed_any: boolean | null;
-  /** How many registrations shared this journey DEFINITION. The dedup key is per journey_id, so
-   *  one card stands for this many real pushes rather than one. */
+  /** How many /varsel registrations shared this journey DEFINITION — the BROWSER side only. The
+   *  dedup key is per journey_id, so one card stands for this many real pushes rather than one. */
   n_devices: number | null;
+  /** 'browser' | 'webhook' | 'both'. Null for decisions taken before webhook routes were recorded
+   *  (2026-09-13), which is its own answer and not 'browser'. */
+  channel: string | null;
+  /** Webhook subscriptions on this definition. A count and nothing more — the decision log carries
+   *  no client, subscription or destination identity. */
+  n_subscriptions: number | null;
   /** How many OTHER situations about this same registration and train delivered a push. Non-zero
    *  beside `pushed_any: false` is one_alert_per_train's collapse — the traveller was told, under
    *  another situation number. Non-zero beside `pushed_any: true` is the open `_notified` gap. */
@@ -303,6 +309,10 @@ export interface FilterOptions extends WindowFields {
   lines: string[];
   from_places: PlaceOption[];
   to_places: PlaceOption[];
+  /** 'browser' | 'webhook' | 'both'. A FIXED vocabulary, unlike every list around it: three values
+   *  is already a bounded cache key, and a channel absent from the window is a true answer rather
+   *  than an option to hide — so this one never goes stale and is never reconciled. */
+  channels: string[];
   /** The SIRI-SX options for the window, MOST COMMON FIRST and capped at 30 by the server. Render
    *  in the given order — it is the answer to "which disruption texts dominated this window", and
    *  sorting alphabetically would throw that away while looking deliberate.
@@ -348,6 +358,10 @@ export interface Filters {
   fromPlace?: string;
   /** StopPlace ref the registration alights at. */
   toPlace?: string;
+  /** Which channel watched the definition: 'browser', 'webhook' or 'both'. A POPULATION filter, so
+   *  it reaches the summary too, and it must reach /messages as well — that query repeats this
+   *  one's predicate verbatim, and a filter on one and not the other misaligns the two lists. */
+  channel?: string;
   /** One exact SIRI-SX summary. Values come from fetchFilterOptions, which is also the server's
    *  allow-list — and a truncated one, so a selection is cleared when the window moves off it. */
   sxSummary?: string;
@@ -390,6 +404,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.line) params.set('line', filters.line);
   if (filters.fromPlace) params.set('from_place', filters.fromPlace);
   if (filters.toPlace) params.set('to_place', filters.toPlace);
+  if (filters.channel) params.set('channel', filters.channel);
   if (filters.sxSummary) params.set('sx_summary', filters.sxSummary);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
@@ -421,7 +436,7 @@ export function fetchSummary(filters: Filters): Promise<Summary> {
   // whose registered journeys — so its rates describe the same slice the list beside it shows. The
   // verdict/alerted/resolved ones narrow by OUTCOME and deliberately do not: filtering to hits
   // would make precision read 100 %. The API refuses them here for the same reason.
-  const { day, fromTime, toTime, operator, line, fromPlace, toPlace, sxSummary } = filters;
+  const { day, fromTime, toTime, operator, line, fromPlace, toPlace, sxSummary, channel } = filters;
   return get(
     `/meldinger-api/summary?${query({
       day,
@@ -432,6 +447,7 @@ export function fetchSummary(filters: Filters): Promise<Summary> {
       fromPlace,
       toPlace,
       sxSummary,
+      channel,
     })}`,
   );
 }

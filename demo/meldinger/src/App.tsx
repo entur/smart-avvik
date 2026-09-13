@@ -60,7 +60,16 @@ const NO_OPTIONS: FilterOptions = {
   lines: [],
   from_places: [],
   to_places: [],
+  channels: [],
   sx_summaries: [],
+};
+
+/** The Norwegian label per channel value. The server publishes VALUES and never labels, like every
+ *  other vocabulary here: a label edit must not become a filter value the allow-list rejects. */
+const CHANNEL_LABELS: Record<string, string> = {
+  browser: 'Appen',
+  webhook: 'Klient',
+  both: 'Begge',
 };
 
 /** How far back the day picker will go — the API's own lookback bound (historikk._MAX_WINDOW_DAYS).
@@ -102,6 +111,10 @@ export default function App() {
   // no ref behind it, which is why the server allow-lists it against a capped vocabulary rather than
   // accepting whatever arrives.
   const [sxSummary, setSxSummary] = useState('');
+  // Not reconciled against the window, unlike the four above: the vocabulary is a fixed
+  // three-value set the server always accepts, so an empty result for «Klient» is the true
+  // answer (no client route in this window) rather than a stale selection to clear.
+  const [channel, setChannel] = useState('');
 
   const [decisions, setDecisions] = useState<Decision[]>([]);
   const [summary, setSummary] = useState<Summary | null>(null);
@@ -233,6 +246,7 @@ export default function App() {
       fromPlace: fromPlace || undefined,
       toPlace: toPlace || undefined,
       sxSummary: sxSummary || undefined,
+      channel: channel || undefined,
       verdict: utfall || undefined,
       alertedOnly,
       pushedOnly,
@@ -322,6 +336,7 @@ export default function App() {
     fromPlace,
     toPlace,
     sxSummary,
+    channel,
     utfall,
     resolvedOnly,
     alertedOnly,
@@ -470,6 +485,22 @@ export default function App() {
             {options.to_places.map((pl) => (
               <option key={pl.ref} value={pl.ref}>
                 {pl.name ?? pl.ref}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Which channel the journey was watched on. A definition both channels share is ONE
+            decision — one match, one wording, one verdict — so «Begge» is a property of the subject
+            rather than a second card. Decisions taken before 2026-09-13 carry no channel and drop
+            out of any selection here; «Alle» is what shows them. */}
+        <label className="tb-select">
+          <span>Kanal</span>
+          <select value={channel} onChange={(e) => setChannel(e.target.value)}>
+            <option value="">Alle</option>
+            {options.channels.map((c) => (
+              <option key={c} value={c}>
+                {CHANNEL_LABELS[c] ?? c}
               </option>
             ))}
           </select>

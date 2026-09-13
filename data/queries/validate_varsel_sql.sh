@@ -43,6 +43,9 @@ DECISION_PARAMS=(
   --parameter=from_date:DATE:2026-07-01 --parameter=to_date:DATE:2026-07-31
   --parameter=operator:STRING:VYG --parameter=verdict:STRING:hit
   --parameter=line:STRING:R11
+  # The channel discriminator (U16). NULL means every channel, so a NULL here would dry-run the
+  # unfiltered arm only; a value exercises the predicate AND type-checks the column.
+  --parameter=channel:STRING:both
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
   --parameter=alerted_only:BOOL:false --parameter=resolved_only:BOOL:false
   --parameter=sx_only:BOOL:false --parameter=limit:INT64:200
@@ -50,6 +53,7 @@ DECISION_PARAMS=(
 SUMMARY_PARAMS=(
   --parameter=from_date:DATE:2026-07-01 --parameter=to_date:DATE:2026-07-31
   --parameter=operator:STRING:VYG --parameter=line:STRING:R11
+  --parameter=channel:STRING:both
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
 )
 
@@ -138,8 +142,8 @@ check "historikk_stop_places.sql"   "$API/historikk_stop_places.sql" \
 # against `departure_time`, not `decided_at`, so @day and @from_ts/@to_ts are predicates on two
 # DIFFERENT columns and neither can be derived from the other.
 #
-# The same "keep these in step" warning applies, and harder: these files carry FOURTEEN parameters
-# against /historikk's eleven, and one omitted here makes bq refuse to parse the query at all, so the
+# The same "keep these in step" warning applies, and harder: these files carry FIFTEEN parameters
+# against /historikk's twelve, and one omitted here makes bq refuse to parse the query at all, so the
 # check reports FAILED and the file goes UNVALIDATED. test_meldinger.py greps this script for
 # every @param each file uses, which is the cheap half of the guard; the dry run below is the half
 # that actually type-checks them.
@@ -164,6 +168,7 @@ MELDINGER_DECISION_PARAMS=(
   # API expands it to every stored summary it stands for -- the no-SX placeholder alone has two
   # wordings. Allow-listed against meldinger_filters.sql's top-30 array before it reaches BigQuery.
   '--parameter=sx_summaries:ARRAY<STRING>:[]'
+  --parameter=channel:STRING:both
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
   --parameter=alerted_only:BOOL:false --parameter=pushed_only:BOOL:false
   --parameter=resolved_only:BOOL:false
@@ -181,6 +186,7 @@ check "meldinger_messages.sql"      "$API/meldinger_messages.sql" \
 check "meldinger_summary.sql"       "$API/meldinger_summary.sql" \
   "${MELDINGER_PARAMS[@]}" \
   --parameter=operator:STRING:VYG --parameter=line:STRING:R11 \
+  --parameter=channel:STRING:both \
   '--parameter=sx_summaries:ARRAY<STRING>:[]' \
   '--parameter=from_place_refs:ARRAY<STRING>:[]' '--parameter=to_place_refs:ARRAY<STRING>:[]'
 # The vocabulary AND the API's allow-list, so a fault here 400s every filtered request rather than
