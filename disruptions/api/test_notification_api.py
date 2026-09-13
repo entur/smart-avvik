@@ -353,7 +353,7 @@ def _sortable(value: Any) -> Any:
     return datetime.min.replace(tzinfo=UTC)
 
 
-def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeFirestore:
+def _install(*, pepper: str | None = PEPPER) -> _FakeFirestore:
     """Point both modules at in-memory state, running every real body they own."""
     global _fake, _auth_docs
     client = _FakeFirestore()
@@ -446,7 +446,6 @@ def _install(*, pepper: str | None = PEPPER, connectivity: Any = None) -> _FakeF
         store=notification_store,
         auth=notification_auth,
         canonicalize=lambda ref: FROM if ref == COLLAPSED else ref,
-        connectivity=connectivity if connectivity is not None else (lambda a, b: (True, True)),
         deliver=_deliver,
     )
     return client
@@ -645,10 +644,23 @@ def test_an_unknown_or_foreign_destination_is_one_answer():
 # ---- Scenario 2 / AE13: servability ------------------------------------------------------------
 
 
-def test_an_unservable_pair_is_stored_and_carries_the_caveat():
-    """AE13's first half. Never refused: weekend-only and seasonal routes are why that would be
-    wrong, and an unregisterable journey is worse than a registered one carrying a caveat."""
-    _install(connectivity=lambda a, b: (False, True))
+def test_a_create_asks_nothing_and_answers_that_it_has_not_established_servability():
+    """AE13's first half, and the whole of U10's step 3.
+
+    A create and a replace used to ask /varsel's 20-second BigQuery question in a second
+    transaction after the write. On a channel whose purpose is onboarding an existing commuter base
+    that put a BigQuery job on the registration path: a client may issue
+    `notification_auth.PER_CLIENT_PER_MIN` (120) writes a minute, every one drawing on a shared
+    per-minute ceiling, and the degradation past it was silent -- `None` reads as "could not
+    establish", so the caveat simply did not appear.
+
+    `servable: null` is what the contract already defines as "not established", and it must never
+    render as an all-clear. `notification_servability.recheck` answers it from one job per cycle.
+
+    Never refused either way: weekend-only and seasonal routes are why refusing would be wrong, and
+    an unregisterable journey is worse than a registered one carrying a caveat.
+    """
+    _install()
     bearer = _provision()
     try:
         response = _client().post(
@@ -656,101 +668,55 @@ def test_an_unservable_pair_is_stored_and_carries_the_caveat():
         )
         assert response.status_code == 201, response.text
         payload = response.json()
-        assert payload["servable"] is False
-        assert payload["servable_checked_at"] is not None
-    finally:
-        _uninstall()
-
-
-def test_a_provider_timeout_stores_no_caveat_rather_than_a_false_one():
-    """AE13's second half. `None` means "could not be established" and must never read as an
-    all-clear -- nor as "no trips run", which storing False would have said."""
-    _install(connectivity=lambda a, b: None)
-    bearer = _provision()
-    try:
-        payload = _client().post(
-            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
-        ).json()
         assert payload["servable"] is None
         assert payload["servable_checked_at"] is None
     finally:
         _uninstall()
 
 
-def test_a_raising_connectivity_provider_never_fails_the_registration():
-    _install(connectivity=lambda a, b: (_ for _ in ()).throw(RuntimeError("bigquery down")))
-    bearer = _provision()
-    try:
-        response = _client().post(
-            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
-        )
-        assert response.status_code == 201
-        assert response.json()["servable"] is None
-    finally:
-        _uninstall()
+def test_a_replace_also_answers_null_rather_than_carrying_the_old_verdict_forward():
+    """R6: a stale answer must never read as an all-clear, so an amendment retires it.
 
-
-def test_a_changed_route_retires_the_old_servability_answer():
-    """R6: a stale answer must never read as an all-clear, so an amendment re-asks."""
-    answers = iter([(True, True), (False, False)])
-    _install(connectivity=lambda a, b: next(answers))
+    The store already retires both fields on a replace; what changed in U10 is that nothing
+    re-establishes them on the request path, so the response says "not established" until the
+    sweep's next cycle rather than either stalling on BigQuery or carrying a verdict about the
+    route the client has just stopped watching.
+    """
+    _install()
     bearer = _provision()
     try:
         client = _client()
         first = client.post(
             "/notification-api/v1/subscriptions", json=_body(), headers=_headers(bearer)
         ).json()
-        assert first["servable"] is True
+        assert first["servable"] is None
         second = client.post(
             "/notification-api/v1/subscriptions",
             json=_body(to_stop="NSR:StopPlace:591"),
             headers=_headers(bearer),
         ).json()
-        assert second["servable"] is False
+        assert second["servable"] is None
+        assert second["servable_checked_at"] is None
         assert second["version"] == 2
     finally:
         _uninstall()
 
 
-def test_a_verdict_that_arrives_after_a_replace_is_discarded_not_stamped():
-    """The route the question was asked about is not always the route the answer lands on.
-
-    The check takes up to `main._CONNECTIVITY_TIMEOUT_S` (20 s) while a replace is one request, so
-    they interleave -- and this path used to write whatever came back onto whatever the record now
-    was, freshly timestamped. A client would then be told their NEW route has no direct service,
-    with `servable_checked_at` a second old, which is the pair R6 publishes so a caveat's age can be
-    judged. Simulated by replacing from inside the seam, which is the one place the interleaving is
-    reproducible without threads.
-
-    The registration itself is never failed for it: a discarded verdict is `servable: null`, exactly
-    as a provider timeout is, and `notification_servability.recheck` picks a never-established record up
-    on its own cadence.
+def test_no_write_path_reaches_a_connectivity_seam_at_all():
+    """The falsification of the two above, and it is a property of the MODULE rather than of one
+    route: a seam re-introduced for some third write path would put a BigQuery job back on the
+    registration path with nothing here to notice.
     """
-    state: dict[str, Any] = {}
-
-    def replace_then_answer(_from: str, _to: str) -> tuple[bool, bool]:
-        # The client's concurrent replace, landing while "our" question is in flight.
-        if state.get("done") is None:
-            state["done"] = True
-            _client().post(
-                "/notification-api/v1/subscriptions",
-                json=_body(to_stop="NSR:StopPlace:591"),
-                headers=_headers(state["bearer"]),
-            )
-        return (False, False)
-
-    _install(connectivity=replace_then_answer)
-    state["bearer"] = _provision()
-    try:
-        payload = _client().post(
-            "/notification-api/v1/subscriptions", json=_body(), headers=_headers(state["bearer"])
-        ).json()
-        assert payload["servable"] is None, (
-            "a verdict about the pre-replace route must not be stamped onto the current one"
-        )
-        assert payload["servable_checked_at"] is None
-    finally:
-        _uninstall()
+    source = pathlib.Path(notification_api.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    used = {
+        node.attr if isinstance(node, ast.Attribute) else node.id
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Attribute, ast.Name))
+    }
+    used |= {node.arg for node in ast.walk(tree) if isinstance(node, ast.keyword) and node.arg}
+    reintroduced = used & {"_connectivity", "connectivity", "_record_servability"}
+    assert not reintroduced, reintroduced
 
 
 # ---- Scenario 3: retry, conflict, tombstone ----------------------------------------------------

@@ -371,13 +371,24 @@ places today?", from `/varsel`'s own connectivity check.
 
 - **A pair no direct trip serves is stored, never refused.** Weekend-only and seasonal routes are why
   a refusal would be wrong.
-- **`null` means the answer could not be established** — an outage, a timeout, the connectivity
-  endpoint's own rate limit. It is never an all-clear, and it is never written as `false`.
-- The answer is retired and re-asked when you amend the definition.
+- **`null` means the answer could not be established** — it has not been asked yet, or an outage or a
+  timeout prevented an answer. It is never an all-clear, and it is never written as `false`.
+- The answer is retired when you amend the definition, and established again on the next sweep.
 
-**It is re-asked, and the cadence is `/varsel`'s own: every six hours per record.** A weekend-only
-ferry registered on a Friday evening, a seasonal route registered out of season and a pair whose
-timetable had not been published yet all answer "no direct service" at registration and start running
+**A create or a replace answers `servable: null`, always.** It used to ask at registration time, and
+does not since 2026-09-13: the question is a BigQuery job, this API exists to onboard an existing
+commuter base, and a job per write made the registration path as slow and as expensive as the
+question. **A background sweep establishes it instead**, so plan for the field to be `null` on the
+response to every write and to become `true`/`false` within the hour. If your UI renders the caveat,
+render nothing at all for `null` — the same rule as before, now reached more often.
+
+How long "within the hour" is, concretely: the sweep runs once per poller cycle (~5 minutes) and
+writes at most 2 000 records per cycle, so a fresh bulk load of 100 000 subscriptions settles over
+roughly 50 cycles — about four hours — and anything smaller settles on the next cycle or two.
+
+**It is then re-asked, and the cadence is `/varsel`'s own: every six hours per record.** A
+weekend-only ferry registered on a Friday evening, a seasonal route registered out of season and a
+pair whose timetable had not been published yet all answer "no direct service" and start running
 later, so the caveat clears by itself. Three properties of that sweep are worth knowing:
 
 - **Only `false` and `null` are re-asked.** A `true` is never re-checked, deliberately: the harm is
@@ -391,9 +402,9 @@ later, so the caveat clears by itself. Three properties of that sweep are worth 
 
 **One window where it does not run**, and it is worth knowing during onboarding: the sweep is gated
 on the same flag as delivery, so until the webhook channel is enabled in that environment nothing
-refreshes a caveat. Re-`POST`ing the *identical* definition does not re-ask either — that path is a
-liveness touch, and only a **changed** definition re-asks. So in that window you are looking at the
-create-time answer, with `servable_checked_at` telling you how old it is.
+establishes or refreshes a caveat and every record reads `servable: null`. Re-`POST`ing the
+*identical* definition does not ask either — that path is a liveness touch, and it leaves an
+established answer alone rather than retiring it.
 
 Related: `/varsel` rewrites stored registrations onto canonical stop refs when the stop registry
 rebuilds, and that rewrite reaches its own state blob and **not** Firestore. Your refs are

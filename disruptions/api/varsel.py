@@ -419,7 +419,7 @@ class ConnectivityProvider(Protocol):
     outage, a timeout, the rate limit. None is not "no service".
 
     ``path`` names whose per-minute budget the question spends. The provider owns the vocabulary and
-    the ceilings (`main._CONNECTIVITY_NOTIFICATION_API_PATH` and its neighbours); this module only forwards
+    the ceilings (`main._CONNECTIVITY_POLLER_PATH` and its neighbours); this module only forwards
     the tag it was handed, so an unrecognised one is charged the public budget rather than minting a
     new one. It is keyword-only and defaulted so a caller that does not care — and every existing
     one — is unchanged.
@@ -428,6 +428,28 @@ class ConnectivityProvider(Protocol):
     def __call__(
         self, from_refs: Sequence[str], to_refs: Sequence[str], *, path: str = ...
     ) -> tuple[bool, bool] | None: ...
+
+
+class BatchConnectivityProvider(Protocol):
+    """The same question about MANY stop pairs, in one job (U10).
+
+    Answers are POSITIONAL -- one per input pair, in order -- which is what lets the caller pair
+    each verdict with its own record without this module knowing what a pair is for. A provider
+    that answered a different number of them would stamp routes with other routes' answers, so
+    every caller checks the length rather than trusting it.
+
+    ``None`` in any position is "could not be established" and is never "no service", exactly as on
+    the single-pair form.
+
+    **It takes no ``path``**, unlike the single-pair form. Both of its callers are poller sweeps, so
+    whose budget they spend is a property of the wiring rather than of the call, and `main.lifespan`
+    binds it once. A per-call tag would be a vocabulary this module does not own, forwarded by two
+    functions that have no reason to disagree about it.
+    """
+
+    def __call__(
+        self, pairs: Sequence[tuple[Sequence[str], Sequence[str]]]
+    ) -> Sequence[tuple[bool, bool] | None]: ...
 
 
 @dataclass(frozen=True)
@@ -512,6 +534,7 @@ class WebhookRecipientProvider(Protocol):
 _impact_provider: ImpactProvider | None = None
 _stops_provider: Callable[[], list[dict]] | None = None
 _connectivity_provider: ConnectivityProvider | None = None
+_connectivity_batch_provider: BatchConnectivityProvider | None = None
 _togvarsel_notify_provider: Callable[[], bool] | None = None
 # The webhook channel's two seams, both defaulting to "no webhook recipients" so an un-wired
 # deployment -- which is every deployment until the store lands -- behaves byte for byte as it did
@@ -549,6 +572,7 @@ def configure(
     impact_provider: ImpactProvider,
     stops_provider: Callable[[], list[dict]],
     connectivity_provider: ConnectivityProvider | None = None,
+    connectivity_batch_provider: BatchConnectivityProvider | None = None,
     togvarsel_notify_provider: Callable[[], bool] | None = None,
     webhook_enabled: Callable[[], bool] | None = None,
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
@@ -558,7 +582,10 @@ def configure(
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
     `connectivity_provider` is optional: without it, registrations are simply not checked, which is
-    what every deploy did before the check existed. `togvarsel_notify_provider` is main's
+    what every deploy did before the check existed. `connectivity_batch_provider` is the same
+    question asked about many stop pairs at once, and the sweeps use only that one -- absent, they
+    establish nothing rather than falling back to a loop, because a loop is precisely the cost U10
+    removed and a silent fallback to it would read in the logs as a healthy pass. `togvarsel_notify_provider` is main's
     TOGVARSEL_NOTIFY_ENABLED read, surfaced through /config so the PWA can announce the rush
     forecasts only where they are actually delivered; absent reads as off.
 
@@ -582,10 +609,12 @@ def configure(
     :data:`_HEARTBEAT_EVERY`.
     """
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
+    global _connectivity_batch_provider
     global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     _connectivity_provider = connectivity_provider
+    _connectivity_batch_provider = connectivity_batch_provider
     _togvarsel_notify_provider = togvarsel_notify_provider
     _webhook_enabled = webhook_enabled
     _webhook_provider = webhook_recipients_provider
@@ -961,6 +990,22 @@ def _service_warning(rec: dict) -> str | None:
 # start running later the same day (a weekend-only ferry registered on a Friday evening), and until
 # the verdict is refreshed the card carries a warning that has stopped being true.
 _SERVICE_RECHECK = timedelta(hours=6)
+#: How many flagged journeys one cycle may re-check, and therefore how many stop pairs the one
+#: connectivity job may be asked about. `notification_servability._MAX_WRITES_PER_CYCLE`'s number and
+#: its reason: at the measured ~296 s cycle period it carries ~145 000 permanently-flagged
+#: registrations at the six-hourly cadence above, which is above the population this is sized for.
+#: Before U10 there was no bound at all -- one BigQuery job per flagged journey, serially, on the
+#: ingestion thread -- which was invisible at a pilot's few hundred and is a stalled cycle at a
+#: hundred thousand.
+_MAX_SERVICE_RECHECKS_PER_CYCLE = 2000
+#: The seam's own ceiling on one question (`main._CONNECTIVITY_TIMEOUT_S`), restated because this
+#: module may not import `main` and pinned equal by `test_poller_refresh`.
+_WORST_CASE_SERVICE_CHECK_S = 20.0
+#: The step's clock, RESERVED rather than measured -- `_WriteBudget`'s shape one function over -- so
+#: it bounds when the step ENDS and not when its question starts. One question at the worst case
+#: plus the state save that follows it; there is no per-record store write here, because these
+#: records live in this process's own state blob.
+_SERVICE_RECHECK_DEADLINE_S = 30.0
 
 
 def _service_check_due(rec: dict, now: datetime) -> bool:
@@ -996,55 +1041,175 @@ def _service_verdict(
         return _connectivity_provider(place_refs(from_stop), place_refs(to_stop), path=path)
     except Exception:
         # Same rule as the provider's own failure path: an unanswerable question never blocks a
-        # registration, and never becomes a warning either.
+        # registration, and never becomes a warning either. The pair rides as a digest and never as
+        # two refs (U10): these two ARE a registered traveller's own journey, and this record is
+        # the last of the four carriers that put one in Cloud Logging.
         logger.warning(
-            "Planned-service check raised for %s -> %s; registering without it",
-            from_stop,
-            to_stop,
+            "Planned-service check raised for pair %s; registering without it",
+            alternatives.pair_digest(from_stop, to_stop),
             exc_info=True,
-            extra={"fields": {"event": "varsel_service_check", "result": "error"}},
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "error",
+                    "pair_digest": alternatives.pair_digest(from_stop, to_stop),
+                }
+            },
         )
         return None
+
+
+def _service_verdicts(pairs: Sequence[tuple[str, str]]) -> list[tuple[bool, bool] | None]:
+    """One question about many stop pairs, each expanded to every ref of both places.
+
+    The batch form of :func:`_service_verdict` and the seam both servability sweeps run on, so the
+    caveat a traveller is shown at registration and the answer a sweep stores six hours later stay
+    the same question. Answers are positional; a provider that answers a different number of them
+    discards the whole batch rather than pairing verdicts with the wrong routes.
+
+    Whose per-minute budget the job spends is bound into the provider at wiring time -- see
+    :class:`BatchConnectivityProvider`.
+    """
+    if _connectivity_batch_provider is None:
+        return [None] * len(pairs)
+    expanded = [(place_refs(from_stop), place_refs(to_stop)) for from_stop, to_stop in pairs]
+    try:
+        answers = list(_connectivity_batch_provider(expanded))
+    except Exception:
+        logger.warning(
+            "Planned-service check raised for %d stop pair(s); every stored answer stands",
+            len(pairs),
+            exc_info=True,
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "error",
+                    "asked": len(pairs),
+                }
+            },
+        )
+        return [None] * len(pairs)
+    if len(answers) != len(pairs):
+        logger.warning(
+            "The planned-service provider answered %d of %d stop pairs; the batch is discarded",
+            len(answers),
+            len(pairs),
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "misaligned",
+                    "asked": len(pairs),
+                    "answers": len(answers),
+                }
+            },
+        )
+        return [None] * len(pairs)
+    return answers
 
 
 def recheck_service() -> None:
     """Re-ask about journeys flagged as having no direct service, and clear the ones that now do.
 
-    Called from the poller's refresh cycle. Bounded by design: only flagged journeys are re-asked, and
-    each at most once per :data:`_SERVICE_RECHECK`, so this costs nothing on a healthy list.
+    Called from the poller's refresh cycle. Bounded by design: only flagged journeys are re-asked,
+    and each at most once per :data:`_SERVICE_RECHECK`, so this costs nothing on a healthy list.
+
+    **One question per cycle since U10, not one per journey.** It used to issue a serial BigQuery
+    job per flagged journey on the ingestion thread, with no per-cycle bound at all: invisible at a
+    pilot's few hundred registrations and a stalled cycle at a hundred thousand. The distinct stop
+    pairs are derived from the journeys this cycle will actually answer for and put to one job
+    (`_service_verdicts`), and each answer fans back out to every journey on that pair -- so a
+    corridor with five hundred registrations is one place in one query.
+
+    The bound is on JOURNEYS (:data:`_MAX_SERVICE_RECHECKS_PER_CYCLE`), spent oldest-check-first
+    with a missing stamp counting as the oldest there is. Deriving the pairs from the whole due set
+    instead would spend an answer on journeys this cycle is not going to stamp, which leaves them
+    due anyway.
     """
     now = datetime.now(UTC)
+    started = monotonic()
     with _state_lock:
         due = [
-            (jid, rec["from_stop"], rec["to_stop"])
+            (jid, rec["from_stop"], rec["to_stop"], rec.get("service_checked_ts") or "")
             for jid, rec in _journeys.items()
             if rec.get("no_direct_service") and _service_check_due(rec, now)
         ]
     if not due:
         return
+    # ISO-8601 sorts chronologically as a string, and an absent stamp is the empty string, which
+    # sorts before every timestamp -- so "oldest first, never-checked first" is one key.
+    due.sort(key=lambda entry: entry[3])
+    admitted = due[:_MAX_SERVICE_RECHECKS_PER_CYCLE]
+    capped = len(due) - len(admitted)
+    if monotonic() + _WORST_CASE_SERVICE_CHECK_S > started + _SERVICE_RECHECK_DEADLINE_S:
+        # RESERVED, not measured: a question that cannot finish inside the budget must not start,
+        # or the step ends one whole worst case past it with the poller's cycle behind it.
+        logger.warning(
+            "The planned-service re-check had no room to ask this cycle; %d journey(s) stay due",
+            len(due),
+            extra={
+                "fields": {"event": "varsel_service_check", "result": "deadline", "due": len(due)}
+            },
+        )
+        return
+    pairs = list(dict.fromkeys((from_stop, to_stop) for _jid, from_stop, to_stop, _ts in admitted))
+    verdicts = {
+        pair: answer
+        for pair, answer in zip(pairs, _service_verdicts(pairs), strict=True)
+        if answer is not None
+    }
     cleared = 0
-    for jid, from_stop, to_stop in due:
-        verdict = _service_verdict(from_stop, to_stop)
-        if verdict is None:
-            continue
-        with _state_lock:
+    stamped = 0
+    with _state_lock:
+        for jid, from_stop, to_stop, _ts in admitted:
+            verdict = verdicts.get((from_stop, to_stop))
+            if verdict is None:
+                continue  # nothing established: the stored value AND its stamp are left alone
             rec = _journeys.get(jid)
             if rec is None:  # deleted while we were asking
                 continue
             rec["service_checked_ts"] = _now_iso()
+            stamped += 1
             if verdict[0]:
                 rec.pop("no_direct_service", None)
                 rec.pop("service_reverse_only", None)
                 cleared += 1
             else:
                 rec["service_reverse_only"] = verdict[1]
-    if cleared:
-        with _state_lock:
+        if stamped:
+            # ONE save for the whole sweep, inside the lock that made the edits. It used to save
+            # only when something cleared, which left every stamp of an unchanged `false` in memory
+            # until some other writer happened to persist -- so a restart re-asked them all.
             _save_state()
+    fields = {
+        "event": "varsel_service_check",
+        "result": "capped" if capped else "swept",
+        "due": len(due),
+        "asked": len(pairs),
+        "established": len(verdicts),
+        "cleared": cleared,
+        "stamped": stamped,
+        "capped": capped,
+        "ms": int((monotonic() - started) * 1000),
+    }
+    if capped:
+        logger.warning(
+            "The planned-service re-check hit its per-cycle bound: %d of %d due journeys answered",
+            stamped,
+            len(due),
+            extra={"fields": fields},
+        )
+    elif cleared:
         logger.info(
             "Planned service appeared for %d journey(s); warning cleared",
             cleared,
-            extra={"fields": {"event": "varsel_service_check", "result": "cleared"}},
+            extra={"fields": fields},
+        )
+    else:
+        logger.debug(
+            "Planned-service re-check: %d of %d due journeys answered",
+            stamped,
+            len(due),
+            extra={"fields": fields},
         )
 
 

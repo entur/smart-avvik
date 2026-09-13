@@ -799,6 +799,38 @@ _FETCH_CEILINGS: dict[str, int] = {
 _WAITING_PATHS = frozenset({_POLLER_PATH, _PULL_PATH})
 _budget_lock = threading.Lock()
 _fetch_calls: dict[str, list[datetime]] = {path: [] for path in _FETCH_CEILINGS}
+#: Refusals counted per path, so a bound that binds is ONE record rather than one per refused
+#: lookup (U10). The poller asks up to `impact._MAX_ALTERNATIVE_LOOKUPS` times per definition per
+#: cycle, so at a hundred thousand definitions a morning where the budget binds would be hundreds of
+#: thousands of WARNING lines a cycle -- and a warning at that volume is how a real warning stops
+#: being read. The first refusal after a quiet window is still reported AT ONCE, because the
+#: interesting moment is when the bound starts binding; the rest are counted and carried into one
+#: summary per `_REFUSAL_SUMMARY_WINDOW`.
+#:
+#: It needs no stale sweep, unlike every budget in `varsel`: it holds one counter per path (three of
+#: them, for the life of the process) and a leaked one costs a log line's accuracy rather than an
+#: alert. The suites reset it for determinism, not for correctness.
+_REFUSAL_SUMMARY_WINDOW = timedelta(minutes=1)
+_refusals: dict[str, dict[str, Any]] = {}
+
+
+def _count_refusal(path: str, now: datetime) -> dict[str, Any] | None:
+    """Count one refused lookup; answer a summary when one is due, else ``None``.
+
+    The caller holds :data:`_budget_lock` and logs OUTSIDE it -- this module already documents one
+    lock order (`_KeyedTTLCache`'s, then this one) and a logging call made under a lock is a third
+    party's code running inside it.
+    """
+    state = _refusals.get(path)
+    if state is None:
+        _refusals[path] = {"since": now, "refused": 0}
+        return {"refused": 1, "window_s": 0.0}
+    state["refused"] += 1
+    if now - state["since"] < _REFUSAL_SUMMARY_WINDOW:
+        return None
+    summary = {"refused": state["refused"], "window_s": (now - state["since"]).total_seconds()}
+    _refusals[path] = {"since": now, "refused": 0}
+    return summary
 
 
 def _reserve_fetch(path: str, now: datetime) -> bool:
@@ -814,26 +846,34 @@ def _reserve_fetch(path: str, now: datetime) -> bool:
     An unknown `path` raises: see :data:`_FETCH_CEILINGS`.
     """
     ceiling = _FETCH_CEILINGS[path]
+    summary: dict[str, Any] | None = None
     with _budget_lock:
         calls = _fetch_calls.setdefault(path, [])
         calls[:] = [t for t in calls if now - t < _RATE_WINDOW]
-        if len(calls) >= ceiling:
-            logger.warning(
-                "Journey Planner lookups rate-limited on the %s path (%d/min); offering no "
-                "alternative",
-                path,
-                ceiling,
-                extra={
-                    "fields": {
-                        "event": "alternatives_error",
-                        "reason": "rate_limited",
-                        "path": path,
-                    }
-                },
-            )
-            return False
-        calls.append(now)
-        return True
+        admitted = len(calls) < ceiling
+        if admitted:
+            calls.append(now)
+        else:
+            summary = _count_refusal(path, now)
+    if summary is not None:
+        logger.warning(
+            "Journey Planner lookups rate-limited on the %s path (%d/min); %d refused in the last "
+            "%.0f s, each offering no alternative",
+            path,
+            ceiling,
+            summary["refused"],
+            summary["window_s"],
+            extra={
+                "fields": {
+                    "event": "alternatives_error",
+                    "reason": "rate_limited",
+                    "path": path,
+                    "refused": summary["refused"],
+                    "window_s": summary["window_s"],
+                }
+            },
+        )
+    return admitted
 
 
 def pair_digest(from_stop: str, to_stop: str) -> str:

@@ -38,26 +38,44 @@ all-clear. And re-asking every servable subscription is the expensive direction 
 subscriptions) BigQuery questions per interval against O(the unservable ones), which at a pilot's
 volume is the difference between nothing and the ceiling below binding every cycle.
 
+**ONE QUESTION PER CYCLE SINCE U10, and the bound moved with it.** Until then the pass asked the
+seam once per subscription, which made a BigQuery job the unit of work: four per cycle was the
+ceiling, four per ~296 s cycle is ~1 200 records a day, and a population meant to reach 100 000
+would never have finished a first pass. The seam now takes every pending stop pair at once
+(`varsel._service_verdicts` -> `main._varsel_connectivity_batch`), so the question costs one job
+however many records are waiting -- and the pass is bounded by what it WRITES instead.
+
 **Bounded, in numbers, because each bound protects a different resource.**
 
-* :data:`_MAX_CHECKS_PER_CYCLE` (4) bounds the BigQuery spend and this pass's share of the seam's
-  per-minute limit -- since 2026-09-09 the Webhook channel's own
-  (`main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`, 15), not the public unauthenticated endpoint's, so a
-  sweep cannot cost a real traveller their registration's no-direct-service caveat. It is the bound
-  that binds in ordinary operation.
-* :data:`_DEADLINE_S` (30 s) bounds the poller. It RESERVES the worst case
+* :data:`_MAX_WRITES_PER_CYCLE` (2 000) bounds the store. It bounds the question too, since the
+  pairs asked about are derived from the admitted subscriptions and never from the whole due set --
+  asking about a pair whose subscriptions will not be written this cycle would spend the answer on
+  nothing and leave them due anyway. It is spent in :func:`_priority` order, so a caveat a client is
+  being shown right now goes first.
+* :data:`_WRITE_WORKERS` (32) is that bound divided by the time it may take: 2 000 transactions at
+  the ~250 ms round trip U9 measured is ~16 s at this width, and a 500 ms one still fits inside
+  :data:`_WRITE_WAIT_S`. One transaction at a time is ~4 writes a second however many are waiting,
+  which is U9's arithmetic one module over -- a bound of 2 000 and a serial writer would simply
+  mean the deadline binding every cycle.
+* :data:`_WRITE_WAIT_S` (30 s) bounds the COLLECTION of those writes, and it has to: a transactional
+  commit carries no client-side deadline, so an unbounded wait on a hung one would hold the poller's
+  thread. Stragglers are abandoned and counted; an abandoned write that later commits is a stamped
+  record, and one that never commits leaves its subscription due for the next cycle.
+* :data:`_DEADLINE_S` (55 s) bounds the phase. It RESERVES the worst case
   (:data:`_WORST_CASE_CHECK_S`, the seam's own 20 s timeout) rather than measuring elapsed time --
-  ``varsel._WriteBudget``'s shape -- so it bounds when the step ENDS and not when its last question
-  starts. One hung question therefore costs 20 s and never 4 x 20 s. It reserves the QUESTION and
-  not the store write that follows it, so the step ends within ``_DEADLINE_S`` **plus one
-  ``set_servability``**; that constant's own comment carries the arithmetic and the reason the
-  residual is left rather than reserved.
+  ``varsel._WriteBudget``'s shape -- so it bounds when the step ENDS and not when its question
+  starts. Unlike the per-record version this no longer leaves the store write outside the ceiling:
+  the writes have their own bounded wait, so the phase's worst case is the sum of the two plus the
+  load, which is what this number is.
 * The store read is one page of at most ``notification_store.MAX_SUBSCRIPTIONS_PER_CYCLE`` documents,
   R21's existing ceiling and the same query the notification pass already runs once per cycle. It
   needs no new composite index, which is the second reason to reuse it: a query ordering on
   ``servable_checked_at`` would have to reason about Firestore excluding documents that lack the
   field and sorting null below every timestamp, and the emulator tracks no composite indexes, so
   neither the emulator suite nor a dry run could catch getting that wrong.
+
+The phase does not beat ``/health``'s heartbeat and does not need to: its whole ceiling is 55 s
+against a 600 s staleness rule, where U9's emit pass needed one at 110 s.
 
 When a bound binds it is LOGGED, once per cycle, under ``result`` values of the existing
 ``notification_servability`` event -- a ceiling nobody can see binding is not a ceiling anybody can
@@ -70,13 +88,16 @@ whose check keeps failing stays at the head of the due queue and is re-asked on 
 the ceiling. That is ``varsel.recheck_service``'s behaviour exactly, and the seam's own 10-minute
 answer cache does not soften it (only established verdicts are cached). The ceiling is what bounds
 it; nothing here retires such a record, because retiring it would be a give-up rule that silently
-converts a long outage into a permanent non-answer.
+converts a long outage into a permanent non-answer. It costs one place in a job that is issued
+anyway, rather than one job of four, which is what makes it cheap enough to leave alone.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 
@@ -98,52 +119,81 @@ _RECHECK_INTERVAL = timedelta(hours=6)
 #: being a ceiling the first time a question ran long.
 _WORST_CASE_CHECK_S = 20.0
 
-#: At most this many questions per cycle. Four is sized off the cadence rather than picked: at the
-#: measured ~296 s cycle period a subscription needs four checks a day to hold rule 2's six-hour
-#: interval, so four per cycle carries ~290 permanently-unservable subscriptions at full cadence --
-#: two orders of magnitude above a pilot, and still only four BigQuery questions of the client
-#: channel's own 15/min share of a limit this module does not own.
-_MAX_CHECKS_PER_CYCLE = 4
+#: At most this many records are written per cycle, and therefore at most this many stop pairs are
+#: asked about. 2 000 at the measured ~296 s cycle period is ~580 000 records a day at full cadence,
+#: against rule 2's requirement of four checks a day per record -- so it carries ~145 000
+#: permanently-unservable subscriptions, which is above the population this unit sizes for. It
+#: replaced `_MAX_CHECKS_PER_CYCLE` (4) in U10, when the BigQuery question stopped being per record.
+#:
+#: It is also the bound on ONE JOB's pairs: `main._CONNECTIVITY_MAX_PAIRS_PER_JOB` is the same
+#: number from the other side, and `test_poller_refresh` pins this one at or under it, or the
+#: overflow would be answered as unknown by a job this pass had already decided to spend.
+#:
+#: **What a full cycle costs the mirror, stated rather than discovered.** `_servability_body` is in
+#: `notification_store.MIRROR_STAMPING_BODIES` -- it must be, or the mirror's copy of `servable`
+#: never moves, the record reads as due on the next cycle and the bound is spent re-asking the same
+#: pairs forever. So 2 000 writes here are 2 000 documents the NEXT `notification_mirror` phase
+#: re-reads, which is deliberate and is against the read-once-ever economy U6 was built for. At the
+#: full bound on every cycle that is ~580 000 extra document reads a day, on the order of $0.35;
+#: a `synced` count spiking to 2 000 on that phase is this pass working as designed, not a churn
+#: problem. It is self-limiting in practice, because a record stamped now is not due for six hours.
+_MAX_WRITES_PER_CYCLE = 2000
+
+#: How many of those writes are in flight at once. Derived, not picked: `notification_store`'s
+#: transactions are ~250 ms of round trip (U9's measurement, same store and same client), so 2 000
+#: of them at this width is ~16 s and at 500 ms each is ~31 s -- the first inside `_WRITE_WAIT_S`
+#: and the second only just outside it, which is the margin this number buys. Serial, the pass
+#: would write ~4 records a second and the bound above would be decoration.
+_WRITE_WORKERS = 32
+
+#: The bounded collection of the write pass. A transactional COMMIT carries no client-side deadline
+#: -- `notification_store` plumbs one into every read, a transaction's reads included, and there is
+#: nowhere to put one on the commit -- so waiting on all of them would park the poller's thread on a
+#: hung store. Stragglers are abandoned and counted; an abandoned write that later commits is a
+#: stamped record and one that never commits leaves its subscription due, so the residual is a
+#: thread and never a wrong answer.
+_WRITE_WAIT_S = 30.0
 
 #: The step's clock, reserved rather than measured, and running from before the store read so what
-#: it bounds is the PHASE and not the loop. It has to exceed `_WORST_CASE_CHECK_S` by enough to
-#: admit a normal run: at 30 s a question may START while under 10 s have elapsed, which fits
-#: `_MAX_CHECKS_PER_CYCLE` questions at the ~2 s a healthy one takes and lets a single hung one end
-#: the step at 20 s. Set equal to the worst case and the count ceiling would be decoration --
-#: exactly one question could ever start.
+#: it bounds is the PHASE and not the loop. The sum of what the phase may spend: one question at
+#: `_WORST_CASE_CHECK_S` (20 s), one write pass at `_WRITE_WAIT_S` (30 s), and ~5 s for the load and
+#: the coordinator between them.
 #:
-#: **What it does NOT reserve, stated rather than implied: the store write that follows an admitted
-#: question.** So the true ceiling is this number plus one `set_servability`, whose own worst case is
-#: five contended transaction attempts at `notification_store._CALL_DEADLINE_S` each with commits that
-#: carry no deadline at all -- unbounded in principle, and only an outer bounded wait on a worker
-#: thread could fix that (`notification_events._EMIT_WAIT_S`'s shape, and its residual is a leaked
-#: thread). Reserving a guessed write cost instead would push this to ~50 s to keep the same start
-#: window, and would still not be a ceiling. This step is a maintenance chore on a ~296 s cycle with
-#: ~230 s of headroom, so the proportionate answer is the honest number rather than a bigger one
-#: that is equally residual.
-_DEADLINE_S = 30.0
+#: **It no longer leaves the store write outside the ceiling.** Until U10 this was 30 s and bounded
+#: the QUESTIONS only, so the true worst case was that number plus one `set_servability` -- five
+#: contended transaction attempts at `notification_store._CALL_DEADLINE_S` each, with commits that
+#: carry no deadline at all, and therefore unbounded in principle. The writes have their own bounded
+#: wait now, so this number is the phase's ceiling rather than most of it.
+_DEADLINE_S = 55.0
 
 # ---- The connectivity seam ---------------------------------------------------------------------
 #
-# `varsel._service_verdict`, injected exactly as it is into `notification_api`: it expands both stop refs
-# to every ref of their place (`varsel.place_refs`) and already fails open to None, which is what
-# keeps "we could not establish it" from ever reading as "no trips run". Injected rather than
-# imported so this module can be exercised without varsel's module state, and so an unwired
-# deployment is a cheap early return instead of a store read.
-ConnectivityProvider = Callable[[str, str], "tuple[bool, bool] | None"]
+# `varsel._service_verdicts`: it expands both stop refs of every pair to every ref of their place
+# (`varsel.place_refs`) and already fails open to None, which is what keeps "we could not establish
+# it" from ever reading as "no trips run". Injected rather than imported so this module can be
+# exercised without varsel's module state, and so an unwired deployment is a cheap early return
+# instead of a store read.
+#
+# **It takes PAIRS and answers positionally** (U10). The single-pair shape it replaced made a
+# BigQuery job the unit of work; the parameter is named `verdicts` rather than kept as
+# `connectivity` so a deployment still wiring the old callable fails loudly at `main.lifespan`
+# instead of handing a list of pairs to something expecting two stop refs.
+BatchConnectivityProvider = Callable[
+    [Sequence["tuple[str, str]"]], "Sequence[tuple[bool, bool] | None]"
+]
 
-_connectivity: ConnectivityProvider | None = None
+_verdicts: BatchConnectivityProvider | None = None
 
 
-def configure(*, connectivity: ConnectivityProvider | None = None) -> None:
+def configure(*, verdicts: BatchConnectivityProvider | None = None) -> None:
     """Wire the seam. Called once from ``main.lifespan``."""
-    global _connectivity
-    _connectivity = connectivity
+    global _verdicts
+    _verdicts = verdicts
 
 
 def reset_for_tests() -> None:
-    global _connectivity
-    _connectivity = None
+    global _verdicts
+    _verdicts = None
 
 
 # ---- Which subscriptions are due ---------------------------------------------------------------
@@ -194,39 +244,98 @@ def due_subscriptions(
 # ---- The pass ----------------------------------------------------------------------------------
 
 
-def _ask(subscription: notification_store.Subscription) -> tuple[bool, bool] | None:
-    """One question through the seam. Never raises: an unanswerable question is not an answer."""
-    provider = _connectivity
+class _Counts:
+    """The write pass's tally, written by its workers as they go.
+
+    `notification_events._Counts`' shape and for its reason: a still-running worker's completed work
+    must not be discarded when the bounded wait expires, which is exactly when the numbers are worth
+    having. A plain dict is a lost update at thirty-two threads.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts: dict[str, int] = {}
+
+    def add(self, key: str, n: int = 1) -> int:
+        """Increment, and answer what the value was BEFORE this call."""
+        with self._lock:
+            before = self._counts.get(key, 0)
+            self._counts[key] = before + n
+            return before
+
+    def get(self, key: str) -> int:
+        with self._lock:
+            return self._counts.get(key, 0)
+
+
+def _ask(pairs: Sequence[tuple[str, str]]) -> list[tuple[bool, bool] | None]:
+    """One question about every pair, through the seam. Never raises.
+
+    An unanswerable question is not an answer, so every failure -- the seam being unwired, a raise,
+    a short or long answer list -- is ``None`` for every pair it touched, and rule 1 then leaves
+    each record's stored value and stamp exactly as they were.
+
+    The length check is not defensive decoration: the answers are POSITIONAL, so a provider that
+    returned a different number of them would silently pair each verdict with the wrong stop pair
+    and stamp routes with other routes' answers.
+    """
+    provider = _verdicts
     if provider is None:  # narrowed for the type checker; recheck() already returned
-        return None
+        return [None] * len(pairs)
     try:
-        return provider(subscription.from_stop, subscription.to_stop)
+        answers = list(provider(pairs))
     except Exception:
         logger.warning(
-            "Client servability re-check raised; the stored answer and its stamp stand",
+            "Client servability re-check raised; every stored answer and stamp stands",
             exc_info=True,
             extra={
                 "fields": {
                     "event": "notification_servability",
                     "result": "error",
-                    "client_id": subscription.client_id,
-                    "subscription_id": subscription.subscription_id,
+                    "pairs": len(pairs),
                 }
             },
         )
-        return None
+        return [None] * len(pairs)
+    if len(answers) != len(pairs):
+        logger.warning(
+            "The connectivity seam answered %d of %d stop pairs; the whole batch is discarded "
+            "rather than paired up by position",
+            len(answers),
+            len(pairs),
+            extra={
+                "fields": {
+                    "event": "notification_servability",
+                    "result": "misaligned",
+                    "pairs": len(pairs),
+                    "answers": len(answers),
+                }
+            },
+        )
+        return [None] * len(pairs)
+    return answers
 
 
-def _record(subscription: notification_store.Subscription, servable: bool) -> bool:
-    """Write an ESTABLISHED answer. ``True`` when it landed.
+def _record(
+    subscription: notification_store.Subscription, servable: bool, counts: _Counts
+) -> None:
+    """Write one ESTABLISHED answer, on a worker thread. Never raises.
 
     Guarded per record rather than per pass (R20): a subscription deleted between the read and the
     write is an ordinary outcome, and one failing write must not cost the pass the records behind
-    it.
+    it -- which at thirty-two threads means it must not reach the pool either.
 
     The version is the one the QUESTION was asked about -- the answer is about a ROUTE, and a
-    replace during a 20 s check would otherwise stamp the new route with the old route's verdict,
-    freshly timestamped. Same guard `notification_api._record_servability` uses, for the same race.
+    replace during the check would otherwise stamp the new route with the old route's verdict,
+    freshly timestamped. Enforced INSIDE `set_servability`'s transaction, which is why this pass
+    writes through it one record at a time rather than as a Firestore `WriteBatch`: a batch's only
+    preconditions are `exists` and `last_update_time`, neither of which can say "and the route has
+    not changed", and `last_update_time` read off the mirror is as old as the last sync -- so the
+    busiest subscriptions, the ones a delivery has written since, would fail it forever.
+
+    **Outcomes are COUNTED, not logged one by one.** Two thousand records a cycle is two thousand
+    lines, and the one line worth having -- the traceback of an unexpected failure -- is written
+    once per pass by the worker that saw the first one.
     """
     try:
         notification_store.set_servability(
@@ -234,52 +343,32 @@ def _record(subscription: notification_store.Subscription, servable: bool) -> bo
             servable=servable,
             expected_version=subscription.version,
         )
-        return True
     except notification_store.NotFound:
         # Deleted or tombstoned while we were asking. `set_servability` reads before it writes, so
         # nothing was resurrected; there is simply nothing left to stamp.
-        logger.debug(
-            "Webhook subscription vanished during its servability re-check; skipping it",
-            extra={
-                "fields": {
-                    "event": "notification_servability",
-                    "result": "vanished",
-                    "client_id": subscription.client_id,
-                    "subscription_id": subscription.subscription_id,
-                }
-            },
-        )
-        return False
+        counts.add("vanished")
     except notification_store.Conflict:
         # Replaced while we were asking. The newer definition retired the answer and its stamp on
         # purpose; a due record with nothing established is picked up on the next cadence, so this
         # needs no repair -- only a name, so the counter does not read it as a write failure.
-        logger.debug(
-            "A webhook subscription was replaced during its servability re-check; verdict dropped",
-            extra={
-                "fields": {
-                    "event": "notification_servability",
-                    "result": "superseded",
-                    "client_id": subscription.client_id,
-                    "subscription_id": subscription.subscription_id,
-                }
-            },
-        )
-        return False
+        counts.add("superseded")
     except Exception:
-        logger.warning(
-            "Client servability write failed; the record keeps its previous caveat",
-            exc_info=True,
-            extra={
-                "fields": {
-                    "event": "notification_servability",
-                    "result": "write_failed",
-                    "client_id": subscription.client_id,
-                    "subscription_id": subscription.subscription_id,
-                }
-            },
-        )
-        return False
+        if counts.add("write_failed") == 0:
+            logger.warning(
+                "Client servability write failed; the record keeps its previous caveat. Further "
+                "failures this cycle are counted rather than logged",
+                exc_info=True,
+                extra={
+                    "fields": {
+                        "event": "notification_servability",
+                        "result": "write_failed",
+                        "client_id": subscription.client_id,
+                        "subscription_id": subscription.subscription_id,
+                    }
+                },
+            )
+    else:
+        counts.add("cleared" if servable else "unservable")
 
 
 #: How old the notification pass's read of `subscriptions` may be for this re-check to reuse it
@@ -342,9 +431,9 @@ def recheck(*, now: datetime | None = None) -> None:
     the same reason every ``notification_store`` entry point's is: staleness is the whole rule here, and
     a suite that could not pin the clock could only assert it by sleeping.
     """
-    if _connectivity is None:
+    if _verdicts is None:
         # No seam wired: nothing could be established anyway, so this must not spend a store read
-        # to discover that. Same shape as `notification_api._record_servability`'s own first line.
+        # to discover that.
         return
     # The clock starts BEFORE the load, not at the first question. The load is a Firestore stream
     # and part of what the phase spends, so a deadline measured from after it would bound the loop
@@ -367,43 +456,73 @@ def recheck(*, now: datetime | None = None) -> None:
 def _sweep(
     due: Sequence[notification_store.Subscription], *, truncated: bool, started: float
 ) -> None:
+    """One question about every pending pair, then the answers written across a bounded pool."""
     deadline = started + _DEADLINE_S
-    checked = cleared = still_unservable = 0
-    bound: str | None = None
-    for subscription in due:
-        if checked >= _MAX_CHECKS_PER_CYCLE:
-            bound = "capped"
-            break
-        if monotonic() + _WORST_CASE_CHECK_S > deadline:
-            # RESERVED, not measured, so this bounds when the pass ENDS rather than when its last
-            # question starts. What it reserves is the SEAM's worst case and not the write that
-            # follows it -- see `_DEADLINE_S` for the residual that leaves and why it is not
-            # reserved too.
-            bound = "deadline"
-            break
-        checked += 1
-        verdict = _ask(subscription)
-        if verdict is None:
-            continue  # rule 1: the stored value and its stamp are left exactly as they were
-        # Only the forward direction decides the caveat. `verdict[1]` is the reverse-service
-        # reading /varsel words a likely from/to swap from, and the client record has nowhere to
-        # carry it: `set_servability` takes one tri-state, and inventing a second field here would
-        # publish a hint U4 never contracted.
-        servable = bool(verdict[0])
-        if not _record(subscription, servable):
-            continue
-        if servable:
-            cleared += 1
-        else:
-            still_unservable += 1
+    # The bound is on SUBSCRIPTIONS and the pairs are derived from the admitted ones, never from
+    # the whole due set: a pair whose subscriptions will not be written this cycle would spend an
+    # answer on nothing and stay due regardless. `due` is already in `_priority` order, so what the
+    # bound spends itself on is the caveats a client is being shown right now, oldest answer first.
+    admitted = list(due[:_MAX_WRITES_PER_CYCLE])
+    capped = len(due) - len(admitted)
+    # Deduped and in first-seen order: two subscriptions on one corridor are one question, and the
+    # answer fans back out to both.
+    pairs = list(dict.fromkeys((s.from_stop, s.to_stop) for s in admitted))
+    counts = _Counts()
+    answers: list[tuple[bool, bool] | None] = []
+    out_of_time = monotonic() + _WORST_CASE_CHECK_S > deadline
+    if not out_of_time:
+        # RESERVED, not measured, so this bounds when the pass ENDS rather than when its question
+        # starts. What it reserves is the SEAM's worst case; the writes below have their own.
+        answers = _ask(pairs)
+    # Only the forward direction decides the caveat. `answer[1]` is the reverse-service reading
+    # /varsel words a likely from/to swap from, and the client record has nowhere to carry it:
+    # `set_servability` takes one tri-state, and inventing a second field here would publish a hint
+    # U4 never contracted.
+    verdicts = {pair: answer for pair, answer in zip(pairs, answers) if answer is not None}
+    established = [
+        (subscription, bool(verdicts[(subscription.from_stop, subscription.to_stop)][0]))
+        for subscription in admitted
+        if (subscription.from_stop, subscription.to_stop) in verdicts
+    ]
+    if established:
+        pool = ThreadPoolExecutor(max_workers=_WRITE_WORKERS, thread_name_prefix="servability")
+        try:
+            futures = [
+                pool.submit(_record, subscription, servable, counts)
+                for subscription, servable in established
+            ]
+            # Bounded by whichever of the two ceilings comes first, and bounded at all because a
+            # transactional commit carries no client-side deadline. Stragglers are abandoned: the
+            # record they were writing stays due, which is the same state it was already in.
+            until = min(monotonic() + _WRITE_WAIT_S, deadline)
+            _, unfinished = wait(futures, timeout=max(0.0, until - monotonic()))
+            counts.add("abandoned", len(unfinished))
+        finally:
+            pool.shutdown(wait=False)
+    abandoned = counts.get("abandoned")
+    cleared = counts.get("cleared")
+    if out_of_time:
+        bound: str | None = "deadline"
+    elif abandoned:
+        bound = "abandoned"
+    elif capped:
+        bound = "capped"
+    else:
+        bound = None
     ms = int((monotonic() - started) * 1000)
     fields = {
         "event": "notification_servability",
         "result": bound or "swept",
         "due": len(due),
-        "checked": checked,
+        "asked": len(pairs),
+        "established": len(verdicts),
         "cleared": cleared,
-        "unservable": still_unservable,
+        "unservable": counts.get("unservable"),
+        "vanished": counts.get("vanished"),
+        "superseded": counts.get("superseded"),
+        "write_failed": counts.get("write_failed"),
+        "abandoned": abandoned,
+        "capped": capped,
         # R21's ceiling bound the page this pass read, so the due set may be incomplete. The
         # notification pass warns about it once a cycle already (`notification_store.recipient_documents`),
         # so this only carries the flag rather than repeating the warning.
@@ -412,9 +531,9 @@ def _sweep(
     }
     if bound is not None:
         logger.warning(
-            "Client servability re-check hit its %s bound: %d of %d due checked in %d ms",
+            "Client servability re-check hit its %s bound: %d of %d due records written in %d ms",
             bound,
-            checked,
+            cleared + counts.get("unservable"),
             len(due),
             ms,
             extra={"fields": fields},
@@ -427,8 +546,8 @@ def _sweep(
         )
     else:
         logger.debug(
-            "Client servability re-check: %d of %d due checked in %d ms",
-            checked,
+            "Client servability re-check: %d of %d due records written in %d ms",
+            cleared + counts.get("unservable"),
             len(due),
             ms,
             extra={"fields": fields},
