@@ -1270,8 +1270,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   cutover later the same day, and `varsel_state` is the only writer of the channel), which is what
   made it a free choice rather than a migration. **What it
   still costs is a privacy-text change, not a silent one: «Reiser du har registrert lagres til du
-  sletter dem» is false for a traveller who abandons the app for 180 days**, so U14 owes T5 a
-  clause and a `CONSENT_TEXT_VERSION` bump. Two call sites had to learn the channel with it —
+  sletter dem» is false for a traveller who abandons the app for 180 days.** T5's «Hvor lenge» is
+  rewritten and `CONSENT_TEXT_VERSION` is `2026-09-13.1` (#189, held open to merge WITH prd's
+  cutover). The version moved although T1-T3 did not, because `personvern-page.tsx` renders «Sist
+  oppdatert» from it — a T5-only edit that changes what we DO must bump it or the page dates the
+  new text to the day the old one was written. The published wording is «rundt et halvt år» rather
+  than «180 dager» because the anchor is refreshed at most weekly, so real deletion lands 173-180
+  days after the last visit and a stated 180 would be a promise beaten by up to a week;
+  `test_personvern_texts.py` fails if the constant leaves 180. Two call sites had to learn the channel with it —
   `_replace_body` and `_touch_body` both called `_horizons` with its `webhook` default, unreachable
   while no web_push document existed and the primary path now.
   Two traps this had to not fall into, both of them silent. `device_id` shares `destination_id`'s

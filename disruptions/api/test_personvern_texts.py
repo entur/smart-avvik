@@ -520,6 +520,56 @@ def test_production_pins_posthog_to_the_eu_ingestion_host():
     )
 
 
+NOTIFICATION_STORE_PY = _REPO / "disruptions" / "api" / "notification_store.py"
+
+
+def test_the_published_retention_text_matches_the_horizon_the_store_enforces():
+    """The one published sentence that a code constant can falsify without anybody noticing.
+
+    «Reiser du har registrert lagres til du sletter dem» was true of the GCS blob, which expired
+    nothing, and became false the day `/varsel`'s registrations moved into Firestore under a
+    storage-limitation rule. The text now says they age out after roughly half a year of not being
+    used; if `WEB_PUSH_INACTIVITY_DAYS` is ever moved far from 180, «rundt et halvt år» stops
+    describing what we do and the page misstates a retention period under art. 13(2)(a).
+
+    The constant is read out of the SOURCE rather than imported, so this suite keeps needing
+    nothing but the standard library -- and the horizon is pinned by VALUE rather than merely
+    "mentioned", because a guard that only checks the name is green for any number at all.
+    """
+    source = PERSONVERN_TS.read_text()
+    marker = "title: 'Hvor lenge',"
+    assert marker in source, (
+        "the «Hvor lenge» section moved or was renamed, so this guard cannot see the retention "
+        "text at all -- fix the marker rather than deleting the check"
+    )
+    body = source.split(marker, 1)[1].split("\n  },", 1)[0]
+    assert "body:" in body and len(body) > 200, "the retention section's body did not extract"
+
+    horizon = re.search(
+        r"^WEB_PUSH_INACTIVITY_DAYS = (\d+)$", NOTIFICATION_STORE_PY.read_text(), re.MULTILINE
+    )
+    assert horizon is not None, "WEB_PUSH_INACTIVITY_DAYS is no longer a plain literal"
+    assert horizon.group(1) == "180", (
+        f"WEB_PUSH_INACTIVITY_DAYS is {horizon.group(1)}, not 180. The published privacy page says "
+        "registrations age out after «rundt et halvt år» of disuse; moving the horizon means "
+        "rewriting that sentence and bumping CONSENT_TEXT_VERSION with it, because the page's "
+        "«Sist oppdatert» is rendered from that version"
+    )
+    assert "halvt år" in body, (
+        "the retention section no longer states a period of disuse after which registrations are "
+        "deleted -- art. 13(2)(a) requires it, and the store enforces it whether or not we say so"
+    )
+    assert "åpner Avviksvarsel" in body, (
+        "the retention section must say what RESETS the period. The anchor is renewed by the "
+        "journey list, i.e. by opening the app; a traveller who only receives pushes renews "
+        "nothing, so «you keep them by using it» is the actionable half of the disclosure"
+    )
+    assert "sammen med reisene dine" in body, (
+        "the varselabonnement expires with the journeys it belongs to (`renew_device` rides on the "
+        "same activity event), and the section used to name «Skru av» and «Slett alt» alone"
+    )
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

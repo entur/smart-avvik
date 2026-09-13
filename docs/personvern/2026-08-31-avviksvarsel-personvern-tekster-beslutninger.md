@@ -68,6 +68,52 @@ tilbakemeldinger lagres i inntil 45 dager (den ene verifiserte lagringstiden i k
 art. 5 nr. 1 bokstav e (lagringsbegrensning): ubegrenset lagring av et pendlemønster er teksten nå
 ærlig om, men ærlighet er ikke det samme som lovlighet.
 
+**Oppdatering 2026-09-13 — sletterutinen finnes nå, og teksten er endret med den.** Det utsatte
+arbeidet over er gjort, men ikke som et eget tiltak: `/varsel`s registreringer er flyttet fra
+GCS-bloben til Firestore (U12–U14 i 100k-planen), og i Firestore har hver registrering en
+lagringsbegrensning. Den var først forankret i opprettelsestidspunktet — 180 dager fra registrering,
+uansett bruk — og det var feil vei: ingenting kunne nullstille klokken, så en pendler som åpnet
+appen hver morgen mistet reisen på dag 181, uten varsel. Produkteier avgjorde 13. september at
+fristen skal løpe fra **sist gang den reisende var her**
+(`notification_store.WEB_PUSH_INACTIVITY_DAYS`, 180 dager fra `last_seen_at`). Det er også den eneste
+formen som svarer på art. 5 nr. 1 bokstav e: lagringsbegrensning handler om å fjerne det ingen
+bruker, ikke om å fjerne det som er gammelt.
+
+Fristen nullstilles av **reiselisten**, altså av at appen åpnes — ikke av at et varsel kommer fram,
+og ikke av at varsler skrus på. Det er et bevisst valg: 79 av 186 registrerte reiser i prd ligger på
+enheter som aldri har skrudd på varsler, og en forankring i enhetsoppdateringen ville latt nettopp
+den gruppen falle ut mens de brukte siden daglig. Ankeret skrives på nytt høyst én gang i uken
+(`WEB_PUSH_RENEW_AFTER_DAYS`), så reell sletting inntreffer 173–180 dager etter siste besøk. Derfor
+sier teksten **«rundt et halvt år»** og ikke «180 dager»: et oppgitt tall vi underskrider med opptil
+en uke ville vært et løfte vi bryter, i den retningen som er verst.
+
+Tre konsekvenser som hører til beslutningen:
+
+- **«Reiser du har registrert lagres til du sletter dem» var sant om bloben og er ikke sant lenger.**
+  Setningen står fortsatt først i avsnittet «Hvor lenge», men er nå kvalifisert. Det er ikke en
+  presisering av en gammel tekst — det er en endring i hva vi faktisk gjør, og den er den eneste
+  grunnen til at teksten måtte skrives om.
+- **`CONSENT_TEXT_VERSION` er hevet til `2026-09-13.1`** selv om T5 formelt ikke er en
+  samtykketekst. Grunnen er mekanisk: personvernsidens «Sist oppdatert» rendres fra nettopp den
+  versjonen (`consentTextDate()`), så en T5-endring uten heving ville datert den nye teksten til
+  dagen den gamle ble skrevet. Registreringstekstene T1–T3 er uendret.
+- **Varselabonnementet utløper sammen med reisene.** Enhetsdokumentets frist fornyes av samme
+  hendelse (`renew_device`), så «en enhet og registreringene dens forsvinner samtidig» er nå sant —
+  og avsnittet sier det, der det før bare nevnte «Skru av» og «Slett alt».
+
+**De som allerede har registrert seg, ble møtt av den gamle teksten.** Reiser registrert før denne
+endringen bærer `consent_text_version = 2026-09-02.1` og ble registrert under et løfte om lagring
+til brukeren selv sletter. De omfattes nå av fristen. I praksis er det ingen å varsle: både dev og
+prd har bare teamets egne registreringer (samme forutsetning som `/historikk` og `/meldinger` hviler
+på), og fristen er et halvt år unna. **Tas `/varsel` noen gang i bruk av publikum, gjelder ikke den
+forutsetningen lenger**, og da må en endring av lagringstiden varsles til dem det gjelder før den
+trer i kraft — ikke bare skrives inn på siden.
+
+Teksten og koden er bundet sammen av en test
+(`test_personvern_texts.py::test_the_published_retention_text_matches_the_horizon_the_store_enforces`):
+flyttes `WEB_PUSH_INACTIVITY_DAYS` bort fra 180, faller den, med beskjed om at setningen og
+versjonen må følge med.
+
 ### Google og EU — bekreftet, og testsikret
 
 To påstander i T5 ble bekreftet av produkteier og står i teksten:
