@@ -73,8 +73,8 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   delay_p90_min         INT64     OPTIONS(description="Bad-case (p90) departure delay (min)."),
   alert_threshold       FLOAT64   OPTIONS(description="The operator's threshold applied to impact_probability here."),
   alertworthy           BOOL      OPTIONS(description="Whether the score crossed the threshold."),
-  pushed                BOOL      OPTIONS(description="Whether a Web Push was delivered for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation. In practice the two agreed, because match_journey keeps only the worst alert per situation across every window and a cycle therefore held one departure per situation; the key was fixed before either channel's `pushed` was read as ground truth per train (KTD4)."),
-  n_devices             INT64     OPTIONS(description="How many registrations share this journey definition."),
+  pushed                BOOL      OPTIONS(description="Whether a notification was ISSUED for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written: a Web Push the push service accepted, or, since 2026-09-13 (KTD4), a webhook event this cycle MINTED. The mint and not the delivery: a delivered mark lags the mint by up to two cycles, so a subject retired in between would read as never notified. Read `channel` beside it -- a 'both' row can say pushed with no Web Push behind it. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation."),
+  n_devices             INT64     OPTIONS(description="How many /varsel registrations share this journey definition -- the BROWSER side only, and it stays that way now that webhook routes are recorded too (2026-09-13, KTD4). A webhook-only row therefore reads 0 here beside a non-zero n_subscriptions, and neither column counts the other's recipients."),
 
   -- What had actually been OBSERVED on the line when we decided (as opposed to predicted). The
   -- system prompt tells the model to quote this with its timestamp, so it is the factual claim a
@@ -139,7 +139,16 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- is whichever one went out, and these two are what it was chosen between -- so the two can be
   -- read against each other on the traffic of the environment that actually pushes.
   message_llm           STRING    OPTIONS(description="The wording the model wrote for this decision, whether or not it was the one sent. NULL means no model wording exists for this row — below the alert gate, push off, generation off, capped, retries exhausted, refused, ungrounded (message_status says which) — OR the row predates this column, which message_deterministic is what distinguishes. 'Written but withheld by policy' is exactly message_source='deterministic' AND message_llm IS NOT NULL. Caveat when message_status='ok_cached': this text was written from an EARLIER cycle's message_input while message_deterministic beside it is THIS cycle's, so any same-input comparison of the two must filter on message_status='ok'."),
-  message_deterministic STRING    OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and at deploy time every existing row is the latter. NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does.")
+  message_deterministic STRING    OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and at deploy time every existing row is the latter. NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does."),
+  -- The webhook channel, recorded here for the first time (U16, 2026-09-13). KTD10 kept client
+  -- routes out of this table until /historikk and /meldinger were behind authentication; they are
+  -- (Entur SSO, 2026-09-10), and at a hundred thousand commuters "unscored" would have been the
+  -- whole product. What did NOT move is the grain: a row is still one journey DEFINITION's view of
+  -- one situation on one train, and a definition is a route, a window and a weekday set. No
+  -- subscription id, client id, destination or external reference is recorded here or anywhere
+  -- downstream of it -- test_notification_contract greps this file for exactly those.
+  channel               STRING    OPTIONS(description="Which channel(s) watched this journey definition when the row was written: 'browser' (a /varsel registration), 'webhook' (a client subscription only) or 'both'. Added 2026-09-13 (KTD4) -- webhook routes were not recorded at all before it, so NULL means the row predates the column, never 'no channel'. It is aggregated onto the subject and is NOT in varsel_decision_groups' GROUP BY: a definition both channels share is ONE subject with one matching decision, which is the premise of the shared match and the shared wording. Three things follow. `pushed` means a notification was ISSUED on any channel, so a 'both' row can say pushed with no Web Push behind it. `n_devices` stays browser-only and `n_subscriptions` counts the client side, so neither is a count of the other's recipients. And the two LLM delivery switches are separate, so where a rollout has them disagreeing, `message` on a 'both' row is the browser's wording and the client received the other one."),
+  n_subscriptions       INT64     OPTIONS(description="How many live webhook subscriptions shared this journey definition when the row was written -- the client side's count, beside n_devices' browser side. 0 on a browser-only row; NULL means the row predates the column (2026-09-13). No client identity is recorded anywhere in this table (KTD10): the grain is the journey DEFINITION, which is a route and a window and names nobody.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
@@ -221,7 +230,9 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS alt_jkey           STRING    OPTIONS(description="Journey ref of the offered journey's boarding call, minus its codespace (dated for rail, plain ServiceJourney for bus). NULL exactly when alt_scored is FALSE."),
   ADD COLUMN IF NOT EXISTS alt_stop_order     INT64     OPTIONS(description="Position of that boarding call along the offered journey (1 = origin). Completes the join key with alt_operator, alt_jkey and DATE(alt_departure_time, 'Europe/Oslo'). NULL exactly when alt_scored is FALSE."),
   ADD COLUMN IF NOT EXISTS message_llm        STRING    OPTIONS(description="The wording the model wrote for this decision, whether or not it was the one sent. NULL means no model wording exists for this row — below the alert gate, push off, generation off, capped, retries exhausted, refused, ungrounded (message_status says which) — OR the row predates this column, which message_deterministic is what distinguishes. 'Written but withheld by policy' is exactly message_source='deterministic' AND message_llm IS NOT NULL. Caveat when message_status='ok_cached': this text was written from an EARLIER cycle's message_input while message_deterministic beside it is THIS cycle's, so any same-input comparison of the two must filter on message_status='ok'."),
-  ADD COLUMN IF NOT EXISTS message_deterministic STRING OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and at deploy time every existing row is the latter. NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does.");
+  ADD COLUMN IF NOT EXISTS message_deterministic STRING OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and at deploy time every existing row is the latter. NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does."),
+  ADD COLUMN IF NOT EXISTS channel            STRING    OPTIONS(description="Which channel(s) watched this journey definition when the row was written: 'browser' (a /varsel registration), 'webhook' (a client subscription only) or 'both'. Added 2026-09-13 (KTD4) -- webhook routes were not recorded at all before it, so NULL means the row predates the column, never 'no channel'. It is aggregated onto the subject and is NOT in varsel_decision_groups' GROUP BY: a definition both channels share is ONE subject with one matching decision, which is the premise of the shared match and the shared wording. Three things follow. `pushed` means a notification was ISSUED on any channel, so a 'both' row can say pushed with no Web Push behind it. `n_devices` stays browser-only and `n_subscriptions` counts the client side, so neither is a count of the other's recipients. And the two LLM delivery switches are separate, so where a rollout has them disagreeing, `message` on a 'both' row is the browser's wording and the client received the other one."),
+  ADD COLUMN IF NOT EXISTS n_subscriptions    INT64     OPTIONS(description="How many live webhook subscriptions shared this journey definition when the row was written -- the client side's count, beside n_devices' browser side. 0 on a browser-only row; NULL means the row predates the column (2026-09-13). No client identity is recorded anywhere in this table (KTD10): the grain is the journey DEFINITION, which is a route and a window and names nobody.");
 
 
 
@@ -258,7 +269,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   final_delay_p50_min    INT64,
   final_delay_p90_min    INT64,
   alert_threshold        FLOAT64,
-  pushed_any             BOOL    OPTIONS(description="Whether a Web Push was actually delivered for this decision."),
+  pushed_any             BOOL    OPTIONS(description="Whether a notification was ISSUED on any channel for this decision: a Web Push the push service accepted, or a webhook event that was minted (2026-09-13, KTD4). Web Push alone before that date. Read `channel` beside it -- a 'both' subject can say TRUE with no Web Push behind it."),
   n_devices              INT64,
   message                STRING  OPTIONS(description="The wording the traveller was actually PUSHED for this decision, copied from varsel_decision_groups; when none was ever pushed (pushed_any = FALSE) it is the last wording produced instead, which is what /historikk marks 'ikke levert'. Deliberately not 'the last text produced', which it was until 2026-08-21: a wording is cached only while the situation stays above the alert gate (varsel._reconcile_caches), so a subject that eased off records the template on every later cycle and the card quoted text the traveller never received -- 41 % of dev's alerted subjects when it was measured, a tenth of them under the wrong writer's name."),
   message_source         STRING  OPTIONS(description="Which wording was SENT: 'llm' or 'deterministic'. Since 2026-08-07 'deterministic' covers two unlike states — no model wording existed, and one existed and was withheld by policy (prd's setting). This table cannot separate them: varsel_decisions.message_llm is what does, and it is not copied here."),
@@ -272,7 +283,14 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   -- Otherwise a fresh environment and an upgraded one hold the same columns in different orders,
   -- and anything positional -- label_varsel_decisions.sql's INSERT was exactly that until it grew
   -- an explicit column list -- writes each environment's data into a different column.
-  et_cancelled           BOOL    OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment.")
+  et_cancelled           BOOL    OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment."),
+  -- The webhook channel's two columns, frozen onto the verdict exactly as n_devices is (U16,
+  -- 2026-09-13). Adding them is what forces the scheduled query to be re-registered in BOTH
+  -- environments in the same operation as this DDL -- the transfer config holds a COPY of the SQL
+  -- and its INSERT names its columns, so the old text inserts one column short and the nightly job
+  -- fails outright until it is updated.
+  channel                STRING  OPTIONS(description="Which channel(s) watched this journey definition, aggregated over the subject's rows: 'browser', 'webhook' or 'both' -- 'both' when any row said so, or when browser rows and webhook rows both occur. NOT part of the grain (KTD4): a definition both channels share is one subject with one verdict. NULL = every row predates the column (2026-09-13)."),
+  n_subscriptions        INT64   OPTIONS(description="The highest webhook-subscription count any of this subject's rows carried, frozen here like n_devices beside it. 0 on a browser-only subject; NULL = the rows predate the column.")
 )
 PARTITION BY call_date
 CLUSTER BY operator, verdict
@@ -284,7 +302,9 @@ OPTIONS(description="Avviksvarsel alert decisions joined to realized SIRI-ET out
 -- Here the symptom would be the nightly job failing outright rather than dropping rows, since its
 -- INSERT names the column.
 ALTER TABLE `disruptions.varsel_decision_outcomes`
-  ADD COLUMN IF NOT EXISTS et_cancelled BOOL OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment.");
+  ADD COLUMN IF NOT EXISTS et_cancelled BOOL OPTIONS(description="ET had already declared this boarding call cancelled at the point this verdict judges (the first alerting cycle if we alerted, any cycle if we did not): we RELAYED a known fact rather than predicting one. Segment on it, do not filter: service quality includes these and should, model skill excludes them as gimmes. NULL = the decision predates the column and belongs to neither segment."),
+  ADD COLUMN IF NOT EXISTS channel         STRING OPTIONS(description="Which channel(s) watched this journey definition, aggregated over the subject's rows: 'browser', 'webhook' or 'both' -- 'both' when any row said so, or when browser rows and webhook rows both occur. NOT part of the grain (KTD4): a definition both channels share is one subject with one verdict. NULL = every row predates the column (2026-09-13)."),
+  ADD COLUMN IF NOT EXISTS n_subscriptions INT64  OPTIONS(description="The highest webhook-subscription count any of this subject's rows carried, frozen here like n_devices beside it. 0 on a browser-only subject; NULL = the rows predate the column.");
 
 
 -- One row per decision SUBJECT: a journey definition's view of one situation on one train.
@@ -403,6 +423,24 @@ SELECT
   MAX(impact_probability)    AS max_impact_probability,
   LOGICAL_OR(pushed)         AS pushed_any,
   MAX(n_devices)             AS n_devices,
+  -- The channel, AGGREGATED onto the subject and deliberately not in the GROUP BY below (KTD4).
+  -- Grouping on it would split a definition both channels share into two subjects -- two verdicts,
+  -- two cards, two rows in every rate -- when what happened is one match, one wording and one
+  -- decision. So it is a property of the subject, and 'both' is what a subject that was ever
+  -- shared reads: either a single row already said so, or the subject has browser rows and webhook
+  -- rows from different cycles (a client subscribed to a corridor a traveller was already
+  -- watching, or a registration lapsed under a client's).
+  --
+  -- NULL survives as its own answer, the n_unsegmented rule one column over: every row written
+  -- before 2026-09-13 carries no channel, and reading those as 'browser' would be a guess that
+  -- happens to be right today and would silently mislabel any environment backfilled later.
+  CASE
+    WHEN LOGICAL_OR(channel = 'both')
+      OR (LOGICAL_OR(channel = 'browser') AND LOGICAL_OR(channel = 'webhook')) THEN 'both'
+    WHEN LOGICAL_OR(channel = 'webhook') THEN 'webhook'
+    WHEN LOGICAL_OR(channel = 'browser') THEN 'browser'
+  END                        AS channel,
+  MAX(n_subscriptions)       AS n_subscriptions,
   ANY_VALUE(alert_threshold) AS alert_threshold,
   -- "Final" = the last cycle that scored it: the closest look we got before departure.
   ARRAY_AGG(impact_probability ORDER BY decided_at DESC LIMIT 1)[OFFSET(0)] AS final_impact_probability,
@@ -482,8 +520,8 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- fresh environment gets its text from the CREATE bodies above and only an EXISTING table needs
 -- carrying. Statements here whose text has demonstrably reached both dev and prd are dead weight
 -- and can be pruned; until someone verifies that, the split is what keeps the cost bounded. That
--- verification was finally done on 2026-09-12 and took the block from eight statements to four --
--- see the note below.
+-- verification was done on 2026-09-12 (eight statements to four) and again on 2026-09-13, when
+-- U16 needed two of the slots back -- see the note below.
 -- ==============================================================================================
 
 -- Descriptions for columns that ALREADY exist.
@@ -494,8 +532,8 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- dev's `impact_probability` still carried its pre-et_cancelled text hours after the deploy that
 -- reworded it, and `et_cancelled` itself was frozen with the description it was born with. The
 -- file and the table then disagree, and the table is what anyone reads in the console or in
--- `bq show --schema` -- which for THESE three columns is the difference between segmenting the
--- precision figure and quoting it whole.
+-- `bq show --schema` -- which for the columns below is the difference between reading `pushed`
+-- as a Web Push and reading it as a notification on either channel.
 --
 -- SET OPTIONS is idempotent and free (metadata only, no rewrite), so it runs at every startup like
 -- the block above. One statement per column: BigQuery allows a single ALTER COLUMN action per
@@ -506,7 +544,7 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- would drop exactly the statements that have not reached an environment yet while re-applying ones
 -- that already landed -- silent and perfectly counterproductive. Newest-first means a truncated run
 -- loses only re-applications. The block stood at 7 statements against that cap of 5, i.e. it could
--- not complete at all; after the 2026-09-12 prune it is 4 on varsel_decisions and 1 on the outcomes
+-- not complete at all; after the 2026-09-13 prune it is 3 on varsel_decisions and 1 on the outcomes
 -- table, which is inside the cap on both. Prune again before adding a fifth to either.
 --
 -- The real fix is to prune: a statement here exists solely to carry reworded text to a table that
@@ -514,21 +552,20 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- its descriptions from the CREATE body). Verify with `bq show --schema` in both projects, then
 -- delete rather than letting the block grow past the cap again.
 
--- PRUNED on 2026-09-12, all eight statements that stood here (U4 step 5).
+-- PRUNED TWICE: eight statements on 2026-09-12 (U4 step 5) and four more on 2026-09-13 (U16).
 --
--- Verified rather than assumed, which is what the paragraph above asks for: `bq show --schema` in
--- BOTH ent-kixavvik-dev and ent-kixavvik-prd returned, for every one of the eight columns
--- (varsel_decisions: message_status, message_source, et_cancelled, impact_probability,
--- cancel_probability, has_alternative, alt_minutes_saved; varsel_decision_outcomes: message), text
--- byte-identical to the statement carrying it — and the CREATE / ADD COLUMN body above carries the
--- same text for each, so a fresh environment is covered too. They were dead weight.
+-- Verified rather than assumed both times, which is what the paragraph above asks for. The second
+-- prune compared each statement's text against `bq show --schema` in BOTH ent-kixavvik-dev and
+-- ent-kixavvik-prd programmatically, byte for byte: varsel_decisions' alt_status, decided_at and
+-- pushed and varsel_decision_outcomes' n_decisions were identical in both projects, so all four
+-- were carrying text that had already arrived. ent-kixavvik-tst holds no such table at all, so a
+-- statement here can only ever serve dev and prd. The first prune's eight were varsel_decisions'
+-- message_status, message_source, et_cancelled, impact_probability, cancel_probability,
+-- has_alternative and alt_minutes_saved plus varsel_decision_outcomes' message.
 --
--- That matters beyond tidiness: the block stood at 7 statements against a cap of 5 per 10 s per
--- table, so it could not complete in one job at all and every startup spent three of them failing.
--- What follows is what is actually owed to an existing table today: FOUR on varsel_decisions (the
--- retention statement plus three descriptions; alt_status joined them in the U4 review) and ONE on
--- varsel_decision_outcomes, both inside the cap -- varsel_decisions now with ONE slot left. Prune
--- again before adding a fifth.
+-- What that buys is the room this unit needs: `pushed` and `n_devices` are reworded below because
+-- KTD4 changes what they MEAN, and without the prune the block would stand at six against a cap of
+-- five and complete for nobody.
 
 -- Retention (U4, 2026-09-12). Carries the CREATE body's partition_expiration_days to the tables
 -- that already exist — the whole point of this block, and the one statement here that is not a
@@ -537,24 +574,26 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- limit must never make `ensure_table` report "not ready": that is the 2026-08-07 mode, where the
 -- decision log records nothing at all. A retention rule that lands one poller tick late costs
 -- nothing. IT DELETES DATA once it lands: partitions older than a year go, and are gone.
+--
+-- Kept rather than pruned although it HAS landed in both projects (31 536 000 000 ms in each,
+-- checked 2026-09-13): it is not a description, so a fresh environment reads it from the CREATE
+-- body and an environment restored from a backup taken before U4 would not. One slot against that
+-- is worth paying.
 ALTER TABLE `disruptions.varsel_decisions`
   SET OPTIONS(partition_expiration_days=365);
 
--- The columns the thinning rule (KTD15, 2026-09-12) changed the READING of. None of them changed
--- type or value; what changed is what a row's presence, and a count of rows, now means. THREE of
--- them are here plus the retention statement above, so this table stands at FOUR of BigQuery's five
--- metadata updates per 10 s. That is inside the cap with one slot left: prune before adding a
--- fifth, and prune rather than assume -- verify with `bq show --schema` in BOTH projects first.
+-- The two columns KTD4 changed the MEANING of (U16, 2026-09-13). Neither changed type; what
+-- changed is that `pushed` now answers for two channels and `n_devices` answers for one of them.
+-- Both are read by somebody looking at the schema in the console to decide what a rate is over, so
+-- a table still saying "Web Push" while the column counts minted webhook events is the 2026-08-05
+-- failure shape: the file and the table disagree and the table is what gets read.
 ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN alt_status SET OPTIONS(description="What became of the alternative-journey lookup: offered | none_found | suppressed (the selection ran and kept the traveller on their own train) | not_worth_lookup (no lookup was issued — the impact gate, or a reading taken from a non-canonical stop ref). Reserved but not yet written, because impact.for_trip does not record them and they are indistinguishable from 'no lookup' downstream: beyond_horizon | error. Recorded on every WRITTEN decision: until 2026-09-12 that was every decision, sub-threshold included; since the thinning rule (varsel._thinning_reason) it is every decision the log KEEPS. Thinning is blind to this column, so it drops the flat middle of standing sub-threshold subjects and the survivors over-represent transitions, peaks and pushes — NO offer rate over it is comparable across that date. It also gives the 2026-08-06 selection change a denominator, that change moving the numerator sharply. NULL = written before the column.");
+  ALTER COLUMN pushed SET OPTIONS(description="Whether a notification was ISSUED for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written: a Web Push the push service accepted, or, since 2026-09-13 (KTD4), a webhook event this cycle MINTED. The mint and not the delivery: a delivered mark lags the mint by up to two cycles, so a subject retired in between would read as never notified. Read `channel` beside it -- a 'both' row can say pushed with no Web Push behind it. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation.");
 
 ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN decided_at SET OPTIONS(description="When this match was evaluated (UTC). NOT every cycle since 2026-09-12: a standing subject nothing has changed about is written at most once per quarter hour (varsel._thinning_reason), plus every cycle a figure is computed from -- first sighting, each alert-worthy/sub-threshold transition, each new maximum impact probability, each push, and a closing row carrying the subject's LAST observation, dated at the cycle it describes. So consecutive rows for one subject can be minutes or a quarter hour apart, and the gap is not a gap in the matching. Before that date every cycle wrote, which is why no per-cycle rate may be computed across it.");
-
-ALTER TABLE `disruptions.varsel_decisions`
-  ALTER COLUMN pushed SET OPTIONS(description="Whether a Web Push was delivered for THIS decision -- this journey definition, this situation, this departure -- in the cycle the row was written. Read rows before 2026-09-12 with care: the delivery loop marked pushes per (definition, situation) while rows are per (definition, situation, departure), so a push about one train could mark another departure under the same situation. In practice the two agreed, because match_journey keeps only the worst alert per situation across every window and a cycle therefore held one departure per situation; the key was fixed before either channel's `pushed` was read as ground truth per train (KTD4).");
+  ALTER COLUMN n_devices SET OPTIONS(description="How many /varsel registrations share this journey definition -- the BROWSER side only, and it stays that way now that webhook routes are recorded too (2026-09-13, KTD4). A webhook-only row therefore reads 0 here beside a non-zero n_subscriptions, and neither column counts the other's recipients.");
 
 -- The outcomes table's own budget: BigQuery's 5-updates-per-10s cap is PER TABLE, and this is the
 -- only statement against this one.
 ALTER TABLE `disruptions.varsel_decision_outcomes`
-  ALTER COLUMN n_decisions SET OPTIONS(description="How many ROWS the decision log holds for this journey x situation x departure -- not how many refresh cycles scored it, and the two stopped being the same thing on 2026-09-12. A standing subject nothing has changed about is now written at most once per quarter hour (varsel._thinning_reason); every row the figures beside this are computed from is still written, which is why first_alert_at, max_impact_probability, the final_* block and the quoted wording are unchanged. Compute no per-cycle rate across that date.");
+  ALTER COLUMN pushed_any SET OPTIONS(description="Whether a notification was ISSUED on any channel for this decision: a Web Push the push service accepted, or a webhook event that was minted (2026-09-13, KTD4). Web Push alone before that date. Read `channel` beside it -- a 'both' subject can say TRUE with no Web Push behind it.");

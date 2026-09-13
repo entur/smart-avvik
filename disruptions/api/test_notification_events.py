@@ -396,6 +396,14 @@ def _observed(subjects: list[notification_events.WebhookSubject]) -> list[Any]:
             body=group[0].body,
             payload=group[0].payload,
             expected_departure_time=group[0].expected_departure_time,
+            # U16's seam, in `varsel._decision_key`'s shape: (journey definition, situation,
+            # departure). One per observation however many recipients it has, which is the property
+            # `test_the_mints_are_also_reported_at_the_decision_logs_grain` is about.
+            decision_key=(
+                "jkey|from|to|window",
+                group[0].situations[0] if group[0].situations else "",
+                group[0].departure_time.isoformat() if group[0].departure_time else "",
+            ),
         )
         for group in grouped.values()
     ]
@@ -1467,6 +1475,44 @@ def test_a_superseding_mint_gives_its_pending_slot_back():
             assert len(pending) == 2, f"one replacement and one new train; got {pending}"
         finally:
             notification_store._count_destination_deliveries = real  # type: ignore[assignment]
+    finally:
+        _uninstall()
+
+
+def test_the_mints_are_also_reported_at_the_decision_logs_grain_deduplicated():
+    """U16 reads `minted_decisions`, and the two grains are not interchangeable.
+
+    An alert id is per (subscription, train): a corridor with five hundred subscriptions watching
+    one disrupted departure mints five hundred of them. A decision row is per (definition,
+    situation, departure) — ONE, whatever the corridor's population — so the second list has to be
+    deduplicated at the source rather than by whoever reads it, or the mint write would be
+    O(subscriptions) on exactly the shape U9 emptied of per-recipient work.
+
+    The key is carried on the observation rather than derived, because neither grain converts to
+    the other: an alert id embeds a subscription and a decision key embeds a situation.
+    """
+    client = _install()
+    try:
+        _live(client)
+        _live(client, subscription_id="sub-0002")
+        # Two subscriptions on the SAME train: one observation, two recipients, two alert ids.
+        shared = [_subject(), _subject(subscription_id="sub-0002")]
+        # A second DEPARTURE under the same situation, which is what a decision key tells apart:
+        # one situation reaches 12 h from its onset and names several trains.
+        other = _subject(
+            journey_ref="DatedServiceJourney:9999",
+            departure_time=NOW + timedelta(minutes=40),
+        )
+        report = _emit(shared + [other], now=NOW, workers=1)
+
+        assert report.created == 3, report
+        assert len(report.minted) == 3, "three (subscription, train) subjects were minted"
+        assert len(report.minted_decisions) == 2, (
+            f"but only two decision subjects: {report.minted_decisions}"
+        )
+        assert len({k[2] for k in report.minted_decisions}) == 2, (
+            "and they are told apart by the train, which is what the decision key carries"
+        )
     finally:
         _uninstall()
 
