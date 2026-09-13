@@ -1768,6 +1768,22 @@ async def lifespan(app: FastAPI):
         # pairs rather than with registrations.
         stop_ref_index=_impact_stop_ref_index,
     )
+    # BEFORE `varsel.configure`, whose `registrations=` argument resolves the backend and, under
+    # `VARSEL_STATE_BACKEND=store`, immediately reads this store: the `browser` account, and then
+    # U14's cutover import. `notification_store.enabled()` is `a client was injected, or a database
+    # id was named`, and the database id is named HERE -- so with the block below `varsel.configure`
+    # the store backend refused to start with "set NOTIFICATION_FIRESTORE_DATABASE", naming the one
+    # variable the deployment had plainly set. It would have failed the lifespan, and therefore the
+    # release, on the cutover deploy and nowhere before it.
+    notification_store.configure(
+        database=os.environ.get("NOTIFICATION_FIRESTORE_DATABASE", "").strip() or None,
+        # One span per Firestore call, carrying its own interpreter cost (KTD2 sizes the widened
+        # emit pass in interpreter ms per transaction). Injected for `varsel`'s reason: the store
+        # must import neither this module nor `tracing_setup`.
+        span=tracing_setup.span,
+    )
+    notification_auth.configure()
+
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
@@ -1834,19 +1850,10 @@ async def lifespan(app: FastAPI):
     # so it serves 503 -- honest, and cheap: nothing here builds a Firestore client until a request
     # arrives, so an unconfigured environment pays no import and needs no credential.
     #
-    # ONE client for the whole channel: `notification_store.configure` is the only place that names the
-    # database, and `notification_auth` reads through `notification_store.firestore_client()` -- so there is one gRPC
-    # channel and one connection pool in a process whose poller already shares the thread. The
-    # `notification_auth.configure()` call still earns its place: it resets that module's in-process
-    # limiter ledgers, which must not survive a restart-in-place.
-    notification_store.configure(
-        database=os.environ.get("NOTIFICATION_FIRESTORE_DATABASE", "").strip() or None,
-        # One span per Firestore call, carrying its own interpreter cost (KTD2 sizes the widened
-        # emit pass in interpreter ms per transaction). Injected for `varsel`'s reason: the store
-        # must import neither this module nor `tracing_setup`.
-        span=tracing_setup.span,
-    )
-    notification_auth.configure()
+    # ONE client for the whole channel: `notification_store.configure` -- above, beside the
+    # registration backend it has to precede -- is the only place that names the database, and
+    # `notification_auth` reads through `notification_store.firestore_client()`, so there is one
+    # gRPC channel and one connection pool in a process whose poller already shares the thread.
     notification_api.configure(
         store=notification_store,
         auth=notification_auth,
