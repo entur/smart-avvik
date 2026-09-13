@@ -1893,6 +1893,14 @@ async def lifespan(app: FastAPI):
         # tell a pass that got slow from a poller that is wedged. Injected as a callable for the
         # same reason as `span`: `varsel` imports neither this module nor the tracing wiring.
         beat=_beat,
+        # The journey-alerts read's warm seam (U15), the one wire that runs from the pass INTO the
+        # read. Pass 1a publishes its own match as this cycle's figures for every registered
+        # definition, so a favourite that is also a registration is a figures hit for whoever asks,
+        # for the whole cycle, at no matcher cost. Wired from here because this module is the only
+        # one allowed to know both: `notification_pull` imports `varsel`, so `varsel` may not
+        # import it back. Order does not matter -- `warm_figures` reads the generation through the
+        # provider below at CALL time, and the first pass cannot run before the lifespan yields.
+        figures_warmer=notification_pull.warm_figures,
     )
     # The journey-keyed public read's one seam (2026-09-10): when the per-call prediction cache
     # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.

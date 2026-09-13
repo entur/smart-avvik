@@ -95,12 +95,21 @@ logger = logging.getLogger(__name__)
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
-#: Reads per minute across every caller. The same number as `notification_auth.
-#: GLOBAL_PRELOOKUP_PER_MIN`, chosen for the same reason: it is what the process comfortably serves
-#: from in-memory caches, and a read that misses its figures cache costs one matcher run on the
-#: request pool -- milliseconds against the poller's in-process snapshot, with no Journey Planner
-#: lookup on this phase.
-MAX_PER_MIN = 300
+#: Reads per minute across every caller. Raised 300 -> 3 000 by U15 (2026-09-13), which is R6's
+#: 50 per second stated per minute. It was `notification_auth.GLOBAL_PRELOOKUP_PER_MIN`'s number
+#: and is deliberately no longer tied to it: that one bounds a Firestore lookup and this one bounds
+#: INTERPRETER TIME, which is the binding resource here and is shared with the poller (KTD17).
+#:
+#: **What this ceiling is worth depends on the hit rate, and the two halves are published
+#: separately** in the operations document's capacity table. A HIT is assembly only. A MISS is one
+#: matcher run on the request pool -- pruned per place pair since U2, with no Journey Planner
+#: lookup on this phase -- and 50 per second of misses is the case that does not fit in one
+#: interpreter: at U2's measured per-definition cost a sustained miss rate well under 50/s is what
+#: the process can serve beside the pass. Warming (:func:`warm_figures`) is what turns a REGISTERED
+#: definition's reads into hits for the whole cycle; a favourite nobody registered is a miss on the
+#: first read of each cycle however high this number is. Raising it past what the measured per-miss
+#: time supports does not buy throughput -- it buys a queue in front of one GIL.
+MAX_PER_MIN = 3_000
 #: Reads per minute per canonical stop pair. What a favourites panel polling every minute on a phone
 #: needs is one; thirty is room for a client's whole fleet behind one NAT without being room for
 #: a burst that minted three hundred definitions on one corridor.
@@ -117,9 +126,21 @@ MAX_WAIT_S = 20
 #: handful; the cap is what stops a caller turning one read into the whole cycle's worth of trains.
 DEFAULT_LIMIT = 10
 MAX_LIMIT = 20
-#: Figures cached per poller cycle. One entry per definition read this cycle; at ~300 reads a
-#: minute and a ~5 min cycle the working set is well under this, and an entry is a few KB.
-FIGURES_CACHE_MAX = 512
+#: Figures cached per poller cycle. One entry per definition READ this cycle plus one per
+#: definition the pass WARMED (:func:`warm_figures`), which is what raised it 512 -> 20 000 in U15:
+#: at 512 the warm pass would evict its own oldest entries before a single read arrived, and the
+#: registered definitions that survived would be whichever the pass happened to match last.
+#:
+#: The bound is memory, not correctness -- eviction costs a matcher run, never a wrong answer. An
+#: entry is one `_Figures` per definition, and almost every one of them is EMPTY: an ordinary
+#: evening cycle has 0-1 alert-worthy trains across ~85 matched definitions, so the cost is the
+#: dict slot. What is not free is the bad-morning shape, where ~13 % of definitions are
+#: alert-worthy and each such entry holds `Alert` copies; that figure is in the operations
+#: document's capacity table beside the mirror's, measured the same way.
+#:
+#: Past this many registered definitions the warm pass evicts insertion-oldest and the read falls
+#: back to computing, which is the documented degradation rather than a failure.
+FIGURES_CACHE_MAX = 20_000
 #: Trains worded per read, spent soonest-first (KTD7). Four is a panel's worth and one Vertex call
 #: each; the rest carry the template under `not_worded`. That verdict is POSITIONAL -- derived at
 #: read time from the entry's place in the definition's own soonest-first order, never written to
@@ -448,19 +469,33 @@ def _cache_key(journey_key: str, refreshed_at: datetime, now: datetime) -> tuple
     return (journey_key, refreshed_at, now.astimezone(_OSLO).date().isoformat())
 
 
-def _cached_figures(key: tuple, refreshed_at: datetime) -> _Figures | None:
+def _enter_generation(refreshed_at: datetime) -> bool:
+    """Make `refreshed_at` the live generation if it is newer, and answer whether it IS the live
+    one. Caller holds :data:`_figures_lock`.
+
+    Extracted from :func:`_cached_figures` in U15, for a reason that is silent if it is missed:
+    :func:`_remember_figures` refuses to store under a generation marker that does not match, and
+    the marker was only ever SET here, by a read. The warm pass runs BEFORE any read of a fresh
+    process, so without this being reachable from the warm path every warmed figure would be
+    discarded on the way in and every read would still miss -- a warm pass that spends the pass's
+    time and buys nothing, with no error anywhere.
+
+    False means an OLDER load: a caller that read `refreshed_at` just before the poller moved. It
+    misses, and `_remember_figures` refuses its result; it must not wipe the newer generation's
+    entries and regress the marker, which would cost one extra matcher run per such straddle.
+    """
     global _figures_generation
+    if _figures_generation is None or refreshed_at > _figures_generation:
+        # A NEWER load: every entry of the older generation goes at once (KTD3).
+        _figures.clear()
+        _figures_generation = refreshed_at
+        return True
+    return refreshed_at == _figures_generation
+
+
+def _cached_figures(key: tuple, refreshed_at: datetime) -> _Figures | None:
     with _figures_lock:
-        if _figures_generation is None or refreshed_at > _figures_generation:
-            # A NEWER load: every entry of the older generation goes at once (KTD3).
-            _figures.clear()
-            _figures_generation = refreshed_at
-            return None
-        if refreshed_at != _figures_generation:
-            # An OLDER load -- a caller that read `refreshed_at` just before the poller moved. It
-            # misses, and `_remember_figures` refuses its result; it must not wipe the newer
-            # generation's entries and regress the marker, which would cost one extra matcher run
-            # per such straddle.
+        if not _enter_generation(refreshed_at):
             return None
         hit = _figures.get(key)
         if hit is not None:
@@ -534,7 +569,24 @@ def _compute_figures(definition: dict, now: datetime, *, journey_key: str) -> _F
     outcome go with it, so a train that re-crosses the gate is re-worded rather than served the
     text written for its earlier reading.
     """
-    alerts = varsel.match_journey(definition, now)
+    return _figures_from_alerts(definition, varsel.match_journey(definition, now), now, journey_key=journey_key)
+
+
+def _figures_from_alerts(
+    definition: dict, alerts: list[varsel.Alert], now: datetime, *, journey_key: str
+) -> _Figures:
+    """The selection and the per-train build, over alerts SOMEBODY ELSE ran the matcher for.
+
+    One builder for the read's miss and for the pass's warm (:func:`warm_figures`), because two
+    would be two definitions of what an entry is -- and the first field one of them gained would
+    make a warmed definition's answer differ from the same definition's answer on a cold cycle,
+    which no test that stubs the matcher can see.
+
+    The pass's alerts are `with_alternative=True` and the read's are not. That difference is
+    deliberately NOT normalised here: an entry carries the winner, and every reader of an entry
+    goes through :func:`_enriched`, which decides the alternative from the caches and silences the
+    one fallback that could otherwise read the pass's (see its docstring).
+    """
     contributing: dict[tuple, list[varsel.Alert]] = {}
     for alert in alerts:
         train = varsel._train_key(alert)
@@ -574,6 +626,39 @@ def _compute_figures(definition: dict, now: datetime, *, journey_key: str) -> _F
         )
     _forget_unlisted(journey_key, (definition["from_stop"], definition["to_stop"]), entries)
     return _Figures(entries=tuple(entries))
+
+
+def warm_figures(journey_key: str, definition: dict, alerts: list[varsel.Alert], now: datetime) -> None:
+    """Publish the pass's own match as this cycle's figures for one registered definition (U15).
+
+    Wired by `main` into `varsel.configure(figures_warmer=...)` and called from pass 1a, which is
+    the only place the alerts already exist. It is an INJECTED callable rather than an import
+    because `varsel` may not depend on this module -- a plan stop condition, pinned both ways by
+    `test_varsel_api.test_the_pull_read_is_the_dependent_side`.
+
+    What it buys is bounded and worth stating plainly: a favourite that IS a registered definition
+    is a figures hit for the whole cycle, for every caller, at no matcher cost. A favourite nobody
+    registered is untouched by this -- the app's favourites are mostly not registrations -- so the
+    warm pass raises the hit rate rather than removing the miss, and `MAX_PER_MIN` is sized against
+    the miss that remains.
+
+    Three properties it must keep. It reads `_refreshed_at_provider` ITSELF rather than taking the
+    generation from the pass: `main._rebuild_all` swaps the prediction cache and calls
+    `check_and_notify` on the one poller thread, so the value is stable across the pass, and taking
+    it here keeps the seam's signature free of this module's vocabulary. It SKIPS a key already
+    cached this generation, because a read that beat the pass to it already computed the same
+    figures and already applied the forget rule, and a second application is not free. And it
+    raises nothing that matters: the caller wraps it, but the cheaper guarantee is that everything
+    here is either a dict operation or the same build a read does.
+    """
+    provider = _refreshed_at_provider
+    refreshed_at = provider() if provider is not None else None
+    if refreshed_at is None:
+        return
+    key = _cache_key(journey_key, refreshed_at, now)
+    if _cached_figures(key, refreshed_at) is not None:
+        return
+    _remember_figures(key, refreshed_at, _figures_from_alerts(definition, alerts, now, journey_key=journey_key))
 
 
 def _message_input(definition: dict, alert: varsel.Alert, now: datetime) -> dict:
@@ -641,6 +726,21 @@ _alternative_outcomes: OrderedDict[tuple, tuple[float, _AlternativeRecord]] = Or
 _wording_inflight: dict[tuple, threading.Event] = {}
 #: journey_key -> the train keys its figures listed at the last compute, for the third forget rule.
 _listed_trains: OrderedDict[str, frozenset] = OrderedDict()
+#: (pair, train key) -> the `_wordings` keys written for that train. The third forget rule pops by
+#: TRAIN, and `_wordings` is keyed by KTD9's wording key, which does not begin with one -- so
+#: without this the rule is a scan of the whole wording cache. That was affordable while it ran on
+#: a read MISS, a handful a minute; U15 runs it once per registered definition per cycle, and at
+#: `WORDING_CACHE_MAX` entries a scan is ~1 ms, so a few thousand of them are seconds of the one
+#: interpreter the pass needs (KTD17).
+#:
+#: DERIVED and self-healing, deliberately not a mirror of the cache: an entry left behind by LRU
+#: eviction or by expiry is harmless, because the rule pops keys OUT of `_wordings` and popping an
+#: absent key is a no-op. That is what keeps maintenance to two sites -- written beside the
+#: wording, dropped with the train -- rather than the four a mirror would need, each of them a
+#: silent leak if missed. It is bounded by REBUILDING from `_wordings` rather than by evicting:
+#: evicting the index alone would retire the forget rule for whichever train went, which is a wrong
+#: answer, while a rebuild is one pass over a bounded cache once per `WORDING_CACHE_MAX` writes.
+_wording_keys_by_train: dict[tuple, set[tuple]] = {}
 
 # ---- The enrichment pool (KTD5) ----------------------------------------------------------------
 
@@ -702,9 +802,26 @@ def _remember(cache: OrderedDict, key: tuple, record, ttl_s: float, epoch: int) 
         cache[key] = (monotonic() + ttl_s, record)
 
 
+def _rebuild_wording_index() -> None:
+    """Rebuild :data:`_wording_keys_by_train` from `_wordings`, dropping what eviction and expiry
+    left behind. Caller holds :data:`_enrichment_lock`."""
+    _wording_keys_by_train.clear()
+    for cached_key, (_, cached) in _wordings.items():
+        _wording_keys_by_train.setdefault((cached_key[0], cached.train_key), set()).add(cached_key)
+
+
 def _remember_wording(key: tuple, record: _WordingRecord, epoch: int) -> None:
     ttl = WORDING_TTL_S if record.status in _TERMINAL_WORDING else FAILURE_TTL_S
     _remember(_wordings, key, record, ttl, epoch)
+    with _enrichment_lock:
+        # After the store and under the same condition it applied: a write refused for a stale
+        # epoch, or one the LRU bound evicted on the way in, must not leave the index naming a key
+        # the cache does not hold -- harmless for the forget rule, which pops, but it would grow.
+        if epoch != _epoch or key not in _wordings:
+            return
+        _wording_keys_by_train.setdefault((key[0], record.train_key), set()).add(key)
+        if len(_wording_keys_by_train) > WORDING_CACHE_MAX:
+            _rebuild_wording_index()
 
 
 def _remember_alternative(key: tuple, record: _AlternativeRecord, epoch: int) -> None:
@@ -739,8 +856,8 @@ def _forget_unlisted(journey_key: str, pair: tuple[str, str], entries: list[_Ent
             return
         for train_key in gone:
             _alternative_outcomes.pop(_alternative_key(pair, train_key), None)
-        for key in [k for k, (_, rec) in _wordings.items() if k[0] == pair and rec.train_key in gone]:
-            _wordings.pop(key, None)
+            for wording_key in _wording_keys_by_train.pop((pair, train_key), ()):
+                _wordings.pop(wording_key, None)
 
 
 @dataclass(frozen=True)
@@ -767,8 +884,27 @@ class _EntryState:
 
 def _enriched(winner: varsel.Alert, alt) -> varsel.Alert:
     """The winner with the alternative ON THE ALERT, which is where both the message-input builder
-    and `varsel._webhook_payload` read it (2026-08-05)."""
-    return winner.model_copy(update={"alternative_journey": alt})
+    and `varsel._webhook_payload` read it (2026-08-05) -- and with the RESPONSE copy's own
+    alternative cleared, which is the other half of that same rule.
+
+    `llm_message.build_message_input` reads `alert.alternative_journey` **or**, failing that,
+    `impact.alternative_journey` -- the worst train's answer, kept as a fallback for callers that
+    have only the response. On this path the Alert's field is authoritative by construction: it is
+    what the caches said about THIS train, and `None` means no alternative was established for it.
+
+    Left alone the fallback would reach past that. Every alert the poller's pass produces carries a
+    response-level alternative (`with_alternative=True`), and since U15 a registered definition's
+    figures are WARMED from exactly those alerts -- so a warmed winner would put an
+    `alternativ_reise` into the message input that the same definition's answer on a cold cycle
+    does not have, moving the wording key and the payload with it, in production and never in a
+    suite that stubs the matcher. A no-op for a winner this module computed itself, which is every
+    winner before U15, and the copy is only made when there is something to clear.
+    """
+    impact = winner.impact
+    update: dict = {"alternative_journey": alt}
+    if impact is not None and getattr(impact, "alternative_journey", None) is not None:
+        update["impact"] = impact.model_copy(update={"alternative_journey": None})
+    return winner.model_copy(update=update)
 
 
 def _entry_state(
@@ -1184,13 +1320,51 @@ async def _await_task(future: Future, wait: int) -> None:
 # ---- Assembly ----------------------------------------------------------------------------------
 
 
-def _coverage(definition: dict) -> CoverageOut:
+_coverage_lock = threading.Lock()
+#: The stop places today's timetable holds, and the stop-cache LIST the set was built from. Built
+#: once per stop-cache refresh rather than per request (U15): the set is over the poller's whole
+#: stop cache, and at `MAX_PER_MIN` that is thousands of rebuilds a minute of a list that changes
+#: at most daily. `None` means the provider is unwired or answered nothing, which is the fail-open
+#: reading -- the same one this had before there was a memo -- and is deliberately distinct from an
+#: empty set.
+#:
+#: **Keyed on the ROWS and not on the prediction-cache generation**, which is what U15's plan
+#: proposed. Coverage is a function of the STOP cache, and the two are refreshed on different TTLs:
+#: keyed on the generation the set would rebuild every cycle for a list that had not moved, AND
+#: still report a newly-served stop place as absent until the next cycle. Identity does strictly
+#: less work and is strictly fresher.
+#:
+#: The rows are held by a STRONG reference so `is` is sound -- an id compared against a freed
+#: object's is a wrong answer, not a miss. `main._varsel_stops` returns the cache list itself and
+#: `refresh_varsel_stops` REBINDS it rather than mutating in place, which is what makes identity
+#: mean "the same refresh"; a provider that rebuilt the list per call would simply always miss.
+_coverage_present: frozenset | None = None
+_coverage_rows: list | None = None
+
+
+def _present_stop_places() -> frozenset | None:
+    """The memo. The BUILD is outside the lock on purpose: two callers racing a refresh build the
+    same set twice and the second overwrites the first with an equal value, which is cheaper than
+    holding a module lock across a pass over the whole stop cache while `MAX_PER_MIN` requests
+    queue behind it."""
+    global _coverage_present, _coverage_rows
     rows = _stop_rows()
-    if not rows:
+    with _coverage_lock:
+        if rows is _coverage_rows:
+            return _coverage_present
+    present = frozenset(row.get("stop_place") for row in rows) if rows else None
+    with _coverage_lock:
+        _coverage_present = present
+        _coverage_rows = rows
+    return present
+
+
+def _coverage(definition: dict) -> CoverageOut:
+    present = _present_stop_places()
+    if present is None:
         return CoverageOut(
             operators=list(SERVED_OPERATORS), from_stop_in_timetable_today=True, to_stop_in_timetable_today=True
         )
-    present = {row.get("stop_place") for row in rows}
 
     def known(ref: str) -> bool:
         return any(r in present for r in varsel.place_refs(ref))
@@ -1469,7 +1643,7 @@ def reset_state() -> None:
     task still running from the previous test unable to write into this one's caches (KTD5); the
     executor is replaced so its queue is dropped with it.
     """
-    global _figures_generation, _executor, _epoch, _waiters
+    global _figures_generation, _executor, _epoch, _waiters, _coverage_present, _coverage_rows
     with _limiter_lock:
         _global_bucket.clear()
         _pair_buckets.clear()
@@ -1477,6 +1651,9 @@ def reset_state() -> None:
         _figures.clear()
         _figures_inflight.clear()
         _figures_generation = None
+    with _coverage_lock:
+        _coverage_present = None
+        _coverage_rows = None
     with _tasks_lock:
         _epoch += 1
         old = _executor
@@ -1486,6 +1663,7 @@ def reset_state() -> None:
     old.shutdown(wait=False, cancel_futures=True)
     with _enrichment_lock:
         _wordings.clear()
+        _wording_keys_by_train.clear()
         _alternative_outcomes.clear()
         _wording_inflight.clear()
         _listed_trains.clear()
