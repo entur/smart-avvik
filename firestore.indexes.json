@@ -99,6 +99,28 @@
           "order": "DESCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "client_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "channel",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "device_id",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "created_at",
+          "order": "ASCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": [
@@ -130,6 +152,41 @@
     {
       "collectionGroup": "subscriptions",
       "fieldPath": "daily_reservations",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "notified",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "pushed_trains",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "subscriptions",
+      "fieldPath": "daily_pushes",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "devices",
+      "fieldPath": "endpoint",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "devices",
+      "fieldPath": "p256dh",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "devices",
+      "fieldPath": "auth",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "devices",
+      "fieldPath": "tombstone",
       "indexes": []
     }
   ]
