@@ -117,6 +117,25 @@ MIRROR_AGE = Gauge(
     "day, so a sync broken for longer than that loses the removal for good. Absent until the first "
     "sync completes, which is the restart window and not a fault.",
 )
+WORKER_LAST_TICK = Gauge(
+    "kix_worker_last_tick_timestamp_seconds",
+    "Epoch seconds of the webhook delivery worker's most recent round, set on EVERY iteration "
+    "including the ones that found nothing to deliver (U11). This is the worker's liveness series "
+    "and the counterpart to kix_poller_last_tick_timestamp_seconds: alert on `time() - value`, "
+    "which must stay small on a quiet night too. Absent from the API pods entirely -- the series "
+    "exists only where the worker runs -- so an alert must count NO DATA as firing, or a worker "
+    "whose Deployment was scaled to zero reads as healthy.",
+)
+DELIVERY_BACKLOG_AGE = Gauge(
+    "kix_delivery_backlog_age_seconds",
+    "Seconds since the oldest DELIVERABLE pending webhook delivery was minted, as of the worker's "
+    "last round (U11). Deliverable is the operative word: rows a lease holds, rows inside U7's "
+    "durable backoff, and rows past a destination's per-cycle ceiling or the scan bound are not in "
+    "it -- so one unwell endpoint cannot drive this, and what it answers is whether the queue is "
+    "draining. Read it beside webhook_delivery_round's `throttled` and `truncated`. Zero means "
+    "nothing was ready. An event is valid for an hour, so a value approaching 3600 means the "
+    "backlog is expiring undelivered rather than merely lagging.",
+)
 LABELLING_LAST_SUCCESS = Gauge(
     "kix_labelling_last_success_timestamp_seconds",
     "Epoch seconds when the varsel-label-daily outcome labelling was last observed fresh (set by "

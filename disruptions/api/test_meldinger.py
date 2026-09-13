@@ -1291,16 +1291,27 @@ def test_rolling_budgets_release_calls_at_each_window_boundary():
     assert meldinger._Budget().reserve(1, now + meldinger._DAY_WINDOW_S) is None
 
 
+#: The API release's values files, and NOT the worker's (U11). `helm/kix-avvik/env/` holds two
+#: releases' files since the delivery worker got its own — the chart renders one Deployment per
+#: release, so a second workload is a second release — and the worker asks no model and serves no
+#: replay, so demanding these two values of it would be demanding configuration for surfaces that
+#: are not in that process at all. A prefix filter rather than a name list: a fourth environment
+#: must still be caught by both tests below, which is the whole point of globbing.
+def _api_values_files() -> list[Path]:
+    env = Path(__file__).parents[2] / "helm/kix-avvik/env"
+    files = [p for p in sorted(env.glob("values-kub-ent-*.yaml"))]
+    assert len(files) >= 3, f"the API values glob matched only {files}; it has stopped matching"
+    return files
+
+
 def test_every_helm_environment_and_the_base_pin_gemini():
     root = Path(__file__).parents[2] / "helm/kix-avvik"
-    values = [root / "values.yaml", *sorted((root / "env").glob("*.yaml"))]
-    for path in values:
+    for path in [root / "values.yaml", *_api_values_files()]:
         assert "VARSEL_LLM_PROVIDER: gemini" in path.read_text(), path
 
 
 def test_every_helm_environment_extends_the_replay_deadline():
-    env = Path(__file__).parents[2] / "helm/kix-avvik/env"
-    for path in sorted(env.glob("*.yaml")):
+    for path in _api_values_files():
         assert 'MELDINGER_REQUEST_DEADLINE_S: "60"' in path.read_text(), path
 
 

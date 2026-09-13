@@ -90,6 +90,81 @@ _WORKERS = 4
 #: the query's `limit` and this budget's count cannot disagree.
 _MAX_ATTEMPTS_PER_CYCLE = notification_store.MAX_DELIVERY_ATTEMPTS_PER_CYCLE
 
+#: The window `deliveries_per_minute` is named after, and it is named after it since U11 rather than
+#: only nearly.
+#:
+#: The ceiling is applied inside `pending_deliveries`' READ, and that used to be enough: the poller
+#: read once per cycle and a cycle is ~296 s, so 50 per read was about ten a minute -- comfortably
+#: under a name that promises fifty. The worker loops with NO sleep while a round found work, and a
+#: round of fifty at 0.4 s four-wide is about five seconds, so the same ceiling applied per read
+#: would be six hundred a minute at one receiver: twelve times the published number, and the first
+#: thing it would produce is the receiver's own 429 and U7's backoff, i.e. a self-inflicted outage
+#: that looks like a misbehaving client.
+#:
+#: So the attempts are tallied per destination in a rolling minute and subtracted from the ceiling
+#: before the read admits a row. Two properties worth stating rather than discovering. It is a
+#: no-op for a poller-only deployment -- a cycle is longer than the window, so the tally is always
+#: empty by the next read -- which is what makes this safe to ship ahead of the worker. And it is
+#: PER PROCESS, so N replicas are N times the rate, exactly as the per-destination ceiling has
+#: always been per read; the operations document's drain formula multiplies by replicas for the
+#: same reason.
+_DESTINATION_WINDOW_S = 60.0
+_destination_attempts: dict[str, list[float]] = {}
+_destination_lock = threading.Lock()
+
+
+def _spent_this_minute(destination_id: str) -> int:
+    """How many attempts this destination has been offered inside the rolling window.
+
+    Reads and prunes under the lock: the read path is the coordinator and the charge path is the
+    coordinator too, but `reset_destination_window` is reachable from a suite on another thread and
+    a dict mutated during iteration is the one failure that would show up as a KeyError in a pass
+    that must not raise.
+    """
+    cutoff = monotonic() - _DESTINATION_WINDOW_S
+    with _destination_lock:
+        marks = [mark for mark in _destination_attempts.get(destination_id, ()) if mark > cutoff]
+        if marks:
+            _destination_attempts[destination_id] = marks
+        else:
+            _destination_attempts.pop(destination_id, None)
+        return len(marks)
+
+
+def _charge_destinations(deliveries: Sequence[notification_store.Delivery]) -> None:
+    """Charge one unit per destination per delivery this pass is about to attempt.
+
+    Charged on what the READ ADMITTED rather than on what was actually POSTed, which over-counts by
+    whatever the pass then skips (a destination paused mid-pass, a sibling attempt's failure taking
+    the rest out). Deliberate: over-counting slows the next read against a destination that is
+    already unwell, and the alternative -- charging on the terminal write -- would let a whole pass's
+    worth of attempts leave before any of them were counted, which is exactly the burst this exists
+    to stop.
+    """
+    now = monotonic()
+    cutoff = now - _DESTINATION_WINDOW_S
+    with _destination_lock:
+        # Prune the WHOLE ledger here, not only the destinations this pass touched: `_spent_this_
+        # minute` prunes a destination it is asked about, and a destination whose deliveries all
+        # finished is never asked about again -- so without this its marks would sit here for the
+        # life of the process. Once per pass over a map the size of the client's destination list.
+        for destination_id in list(_destination_attempts):
+            marks = [mark for mark in _destination_attempts[destination_id] if mark > cutoff]
+            if marks:
+                _destination_attempts[destination_id] = marks
+            else:
+                del _destination_attempts[destination_id]
+        for delivery in deliveries:
+            _destination_attempts.setdefault(delivery.destination_id, []).append(now)
+
+
+def reset_destination_window() -> None:
+    """Forget every tally. For suites only -- a module ledger that survives between tests is the
+    leaked-budget failure this repo has had twice, and it reads exactly like a real refusal.
+    """
+    with _destination_lock:
+        _destination_attempts.clear()
+
 
 def _worst_case_s(timeout_s: float, store_call_s: float) -> float:
     """The whole attempt's worst case: the outbound call plus the three store calls around it."""
@@ -180,11 +255,16 @@ class DeliveryReport:
     not_deliverable: int = 0
     paused: int = 0
     #: Attempts whose lease had lapsed and been re-claimed by the time the terminal write arrived
-    #: (U8). Unreachable while there is one writer, and its own counter rather than folded into
-    #: `already_resolved` because it means the opposite: the delivery is not finished, it is in
-    #: somebody else's hands.
+    #: (U8). Its own counter rather than folded into `already_resolved` because it means the
+    #: opposite: the delivery is not finished, it is in somebody else's hands.
+    #:
+    #: **Reachable since U11** -- it was not while delivery had one writer. A non-zero count during
+    #: the rollout window, when the poller and the worker both deliver, is the lease doing its job.
+    #: A steady one afterwards means attempts are outliving their 20 s lease, i.e. the store or the
+    #: receiver is slower than `DELIVERY_LEASE_S`'s arithmetic assumes.
     lease_lost: int = 0
-    #: Claims refused because another worker already held the delivery. Also unreachable today.
+    #: Claims refused because another worker already held the delivery. Reachable since U11 too, and
+    #: the cheaper of the two: nothing was attempted, so the delivery is simply somebody else's.
     leased: int = 0
     #: Attempts not made because the destination is inside U7's durable backoff. Its own counter and
     #: not folded into `skipped`, because the two are different operator answers: `skipped` is "a
@@ -194,6 +274,17 @@ class DeliveryReport:
     skipped: int = 0
     skipped_destinations: int = 0
     store_errors: int = 0
+    #: Seconds since the OLDEST deliverable record in this pass was minted (U11) -- the series the
+    #: worker's backlog alert selects on, and 0.0 when nothing was ready.
+    #:
+    #: It measures the oldest DELIVERABLE row, not the oldest row in the collection: `ready`
+    #: excludes what a lease holds, what U7's durable backoff is waiting on, and everything past the
+    #: per-destination ceiling or the scan bound. So a single hung destination cannot drive it,
+    #: which is the point -- what it answers is "is the queue draining", and `throttled` and
+    #: `truncated` beside it answer "is a destination unwell". A delivery minted before U11 carries
+    #: no `created_at` and contributes nothing, so the gauge climbs from zero on the deploy that
+    #: introduces it instead of reporting the whole backlog as infinitely old.
+    backlog_age_s: float = 0.0
     truncated: bool = False
     throttled: tuple[str, ...] = ()
     timed_out: bool = False
@@ -870,6 +961,10 @@ def deliver_pending(
             per_destination_limit=lambda client_id: notification_auth.quotas_for(
                 client_id
             ).deliveries_per_minute,
+            # What makes that ceiling per MINUTE rather than per read (U11). See
+            # `_DESTINATION_WINDOW_S`: with the worker looping continuously, a per-read ceiling is
+            # twelve times the number the quota is named after.
+            per_destination_spent=_spent_this_minute,
             now=instant,
         )
     except Exception:
@@ -879,6 +974,8 @@ def deliver_pending(
             extra={"fields": {"event": "webhook_delivery", "result": "pending_error"}},
         )
         return DeliveryReport(store_errors=1, ms=int((monotonic() - started) * 1000))
+
+    _charge_destinations(pending.ready)
 
     # THE STALE SWEEP IS A POOL TOO, and it was not until 2026-09-09. It is a loop of store WRITES
     # on the poller's thread, which is the one class of call this module's docstring says has no
@@ -950,8 +1047,10 @@ def deliver_pending(
             pool.shutdown(wait=False)
 
     ms = int((monotonic() - started) * 1000)
+    minted = [d.created_at for d in pending.ready if d.created_at is not None]
     report = DeliveryReport(
         ready=len(pending.ready),
+        backlog_age_s=max(0.0, (instant - min(minted)).total_seconds()) if minted else 0.0,
         sent=counts.get("sent"),
         already_resolved=counts.get("already_resolved"),
         superseded=counts.get("superseded"),
@@ -988,6 +1087,7 @@ def deliver_pending(
                 "event": "webhook_delivery_round",
                 "result": "timeout" if timed_out else "ok",
                 "ready": report.ready,
+                "backlog_age_s": int(report.backlog_age_s),
                 "sent": report.sent,
                 # Beside `sent` rather than added into it: U8 publishes this record as operational
                 # telemetry, so "we delivered N notifications" has to mean that.

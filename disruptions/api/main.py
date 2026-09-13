@@ -1519,10 +1519,17 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                     )
             except Exception:
                 logger.exception("Notification event emission failed")
-            try:
-                webhook_delivery.deliver_pending()
-            except Exception:
-                logger.exception("Webhook delivery failed")
+            # U11: delivery moves to `webhook_worker`, its own Deployment from this same image, and
+            # this flag is how a deployment says so. Read INSIDE the phase rather than beside the
+            # `webhook_channel` check above, because the two answer different questions and folding
+            # them would make "the channel is on" imply "this process delivers" — which is exactly
+            # what stops being true here. The phase stays, carrying the emit pass; its `ms` drops by
+            # the delivery ceiling, which is what a reader comparing cycles across the flag will see.
+            if not delivery_worker_enabled():
+                try:
+                    webhook_delivery.deliver_pending()
+                except Exception:
+                    logger.exception("Webhook delivery failed")
     # R6's freshness half, and AE13's second clause: webhook subscriptions carrying a stale "no
     # direct service" caveat -- or one that was never established -- are re-asked, and the caveat is
     # dropped from any pair a later timetable does connect. `varsel.recheck_service` above does
@@ -1603,6 +1610,31 @@ def _notification_webhooks_enabled() -> bool:
     which is what makes "the flag is unset, so no notification state was read" a property of the pass.
     """
     return os.environ.get("NOTIFICATION_WEBHOOKS_ENABLED", "").strip().lower() in llm_message._TRUTHY
+
+
+def delivery_worker_enabled() -> bool:
+    """Is webhook delivery somebody else's job? From NOTIFICATION_DELIVERY_WORKER_ENABLED (U11).
+
+    The same allow-list convention as every other flag here — only true/1/yes/on enable, and the
+    code default for an UNSET value is off — but read in the OPPOSITE direction: on means this
+    process does LESS. `webhook_worker` is its own Deployment from the same image and delivers
+    unconditionally, so the only thing that has to move is whether the poller also does.
+
+    **Off is the safe default and that is the whole point of the flag's polarity.** A deployment
+    with no worker keeps delivering exactly as it did; a worker release that fails to become Ready
+    leaves the poller still delivering, because turning this on is a separate change made after the
+    worker is up. The window where both deliver is deliberate rather than tolerated: two readers
+    each apply the per-destination ceiling to their own read, so a destination can briefly see twice
+    its `deliveries_per_minute`, and U8's lease is what stops a traveller being notified twice.
+
+    Emit and servability are NOT gated by it. Emit is KTD6's one writer of a subject's phase and
+    revision, which stays in this process; servability is a BigQuery question this process already
+    has the client for. What moves is the POST and the terminal write beside it.
+    """
+    return (
+        os.environ.get("NOTIFICATION_DELIVERY_WORKER_ENABLED", "").strip().lower()
+        in llm_message._TRUTHY
+    )
 
 
 @asynccontextmanager

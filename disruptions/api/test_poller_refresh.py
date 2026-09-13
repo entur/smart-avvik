@@ -16,6 +16,7 @@ checks for why the properties worth pinning are the exception-handling ones, not
 Run: uv run --with fastapi --with httpx --with pydantic python test_poller_refresh.py
 """
 
+import textwrap
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
@@ -472,6 +473,55 @@ def test_the_notification_webhooks_flag_is_an_allow_list_with_unset_off():
         ):
             os.environ["NOTIFICATION_WEBHOOKS_ENABLED"] = value
             assert main._notification_webhooks_enabled() is want, value
+
+
+def test_the_delivery_worker_flag_is_an_allow_list_with_unset_off():
+    """U11, and its polarity is the interesting half. Same parse as every other flag here -- only
+    true/1/yes/on enable, a typo reads as off -- but read in the opposite direction: on means this
+    process does LESS. So "off" is a deployment that keeps delivering exactly as it did, which is
+    what makes a worker release that never becomes Ready cost nothing.
+    """
+    import os
+
+    with _env(NOTIFICATION_DELIVERY_WORKER_ENABLED=None):
+        assert main.delivery_worker_enabled() is False, "unset must be off, i.e. the poller delivers"
+        for value, want in (
+            ("true", True), ("1", True), ("yes", True), ("on", True), ("TRUE", True),
+            (" true ", True), ("false", False), ("", False), ("off", False), ("disabled", False),
+            ("0", False),
+        ):
+            os.environ["NOTIFICATION_DELIVERY_WORKER_ENABLED"] = value
+            assert main.delivery_worker_enabled() is want, value
+
+
+def test_the_flag_moves_delivery_and_leaves_emit_and_servability_where_they_are():
+    """What U11 moves is the POST and the terminal write beside it, and nothing else.
+
+    Emit stays because it is KTD6's one writer of a subject's phase and revision; servability stays
+    because it is a BigQuery question this process already holds the client for, and because the
+    worker has no BigQuery client at all. Asserted off the source rather than by running a cycle:
+    the branch is one `if` inside a phase whose other steps need the whole rebuild around them, and
+    a behavioural test would have to build that to observe one call site.
+    """
+    import ast
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    tree = ast.parse(textwrap.dedent(source))
+    guarded = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "delivery_worker_enabled" in ast.dump(node.test)
+        and "deliver_pending" in ast.dump(node)
+    ]
+    assert len(guarded) == 1, "delivery is gated exactly once"
+    # It is a NOT: the flag says somebody else delivers, so this process skips.
+    assert isinstance(guarded[0].test, ast.UnaryOp) and isinstance(guarded[0].test.op, ast.Not)
+    # And nothing else in the cycle is behind it -- emit and the servability sweep included.
+    body = ast.dump(ast.Module(body=guarded[0].body, type_ignores=[]))
+    for stays in ("notification_events", "notification_servability", "sync_mirrors"):
+        assert stays not in body, f"{stays} must not move with delivery"
 
 
 def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerting_step():

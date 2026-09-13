@@ -1052,6 +1052,88 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   the `ARRAY<STRUCT<... ARRAY<STRING> ...>>` shape, so the file is in `validate_varsel_sql.sh` — but
   a dry run does not evaluate parameters, so it proves the shape and the column types and nothing
   about the join.
+  **Delivery left the poller and became its own workload** (U11, 2026-09-13, KTD18). It was a step
+  of `main._rebuild_all`'s `notification_webhooks` phase, which put it behind ~30 s of BigQuery on a
+  loop whose period is how often SIRI-SX moves — ~296 s — while a pending event is valid for an
+  hour: at a few hundred subscriptions fine, at a hundred thousand a backlog that cannot drain in
+  the ~20 s the phase allows it, expiring undelivered while the poller scans ET partitions.
+  `disruptions/api/webhook_worker.py` is a `python -m` entrypoint that loops `deliver_pending`,
+  sleeps three seconds on an empty queue and **not at all** when a round found work (the read is
+  bounded per round, so sleeping would cap the drain at one page per sleep). It fails **loudly at
+  startup** on a missing database or signing root — exit non-zero, so `helm --wait` rolls the
+  release back — and **never at runtime**: a store error sleeps twenty seconds and the loop
+  continues, because a worker that exits on a Firestore blip is a CrashLoopBackOff whose backoff is
+  the outage. Its `/health` is `main`'s staleness rule (`HEALTH_STALE_AFTER_S`, the same variable)
+  on port **8081**, minus the dead-thread branch it cannot need — the loop IS the main thread.
+  SIGTERM sets an Event read BETWEEN rounds, never inside one, and
+  `terminationGracePeriodSeconds` is 75 s so a round finishes; below that, SIGKILL lands mid-round
+  and U8's lease is what makes it safe (the claims return when the lease lapses, at the cost of a
+  re-send).
+  **The common chart renders exactly ONE Deployment per release** — `containers` is a list of
+  containers in one POD, and the changelog's "multiple deployments" is the `releaseName` override —
+  so this is a second RELEASE, `kix-avvik-worker`, of the same chart and the same image, with
+  `helm/kix-avvik/env/worker-values-kub-ent-{dev,tst,prd}.yaml` and its own `cd.yml` job. Checked
+  against the vendored chart before designing around it, and the same read answered two smaller
+  questions: the chart creates **no ServiceAccount at all** (the platform provisions `application`
+  in the namespace), so there is no second SA and `.entur/application.yaml` is untouched; and every
+  probe port derives from `service.internalPort`, so setting that to 8081 **with the Service off**
+  is what puts the probes on the worker's own port. tst's file sets `deployment.enabled: false` and
+  renders no workload at all — that project holds neither notification secret and the worker refuses
+  to start without the signing root, so a file rendering a guaranteed CrashLoopBackOff would make
+  every tst dispatch red for a feature tst does not have. The worker's secret group is
+  `WEBHOOK_SIGNING_ROOT` **alone**: delivery signs but never verifies a credential, so it gets no
+  pepper, no VAPID keys and no SSO secret. `helm lint` cannot see any of that — every override that
+  makes this file a worker's is NEGATIVE, and a negative that stops holding renders valid YAML —
+  so `helm/kix-avvik/test/worker_render.sh` renders all three environments, asserts both directions
+  and gates the image build; it FAILS rather than skips when helm is absent.
+  **Which process delivers is `NOTIFICATION_DELIVERY_WORKER_ENABLED`, read by `main` and in the
+  OPPOSITE direction to every other flag here**: on means this process does less, so unset — the
+  code default — keeps the poller delivering. That polarity is the rollout. The worker release lands
+  first with the poller still delivering; **both deliver for a window**, which is deliberate (U8's
+  lease arbitrates, and `leased`/`lease_lost` on `webhook_delivery_round` become reachable for the
+  first time — seeing them is the evidence the lease works, and what it costs is that each reader
+  applies the per-destination ceiling to its own read, so a destination can briefly see twice its
+  `deliveries_per_minute`); only then does a values-only deploy turn the poller's half off. The
+  other order leaves NOBODY delivering if the worker never becomes Ready, because gha-helm's
+  rollback reaches only the release it deployed. **Emit and the servability sweep do not move**:
+  emit is KTD6's one writer of a subject's phase and revision, and the sweep is a BigQuery question
+  the worker has no client for.
+  **KTD6's "one writer" has to be read more precisely from here on**: one writer of a subject's
+  PHASE and REVISION, still this process, with delivery-side fields written elsewhere. The U6 note
+  to re-check the `_sent_body` mirror exemption at U11 was acted on and it **stands** —
+  `delivered_revision`, `delivered_at` and `pending_delivery_id` are none of them in the standing
+  set or in `SUBJECT_MIRRORING_BODIES`, so the `SubjectMirror` is not made stale by a write it
+  cannot see; a field moved into the standing set later would break that, which is what
+  `SUBJECT_WRITERS_OUTSIDE_THE_MIRROR` is pinned for. The pending-event ledger's figure goes stale
+  **HIGH** inside a pass for the same reason (the worker resolves deliveries this process does not
+  hear about), so it refuses earlier than it needs to — the conservative direction; what would break
+  its exactness is a second EMITTER.
+  **`deliveries_per_minute` means per minute since U11, and it did not quite before.** The
+  per-destination ceiling is applied inside `pending_deliveries`' read; under the poller that was
+  once per ~296 s cycle, so 50 per read was about ten a minute — under the name, which is why
+  nothing said otherwise. The worker's rounds are continuous while there is work, so the same
+  ceiling per read would be ~600/min at one receiver: twelve times the published number, whose
+  first visible effect would be the receiver's own 429 and U7's backoff, i.e. a self-inflicted
+  outage that reads as a misbehaving client. `webhook_delivery` keeps a rolling per-destination
+  minute tally (`_DESTINATION_WINDOW_S`) and subtracts it from the ceiling before the read admits a
+  row. Charged on what the read ADMITTED, not on what was POSTed — over-counting by whatever the
+  pass then skips, which is the safe direction. It is a no-op for a poller-only deployment (a cycle
+  is longer than the window), and it is PER PROCESS, so N replicas are N times the rate exactly as
+  the drain formula's `× replicas` says. Like every module budget here it joins the suite's reset
+  (`webhook_delivery.reset_destination_window`), or a leaked tally reads exactly like a real
+  refusal.
+  Two new series: `kix_worker_last_tick_timestamp_seconds` (liveness, set on every round including
+  the empty ones, **absent from the API pods** — so an alert on it must count no data as firing, or
+  a worker scaled to zero reads as healthy) and `kix_delivery_backlog_age_seconds` (how long ago the
+  oldest **deliverable** pending delivery was minted; a leased row, a backed-off row and a row past
+  a destination's ceiling are all absent from it, so one unwell receiver cannot drive it). The age
+  comes off `created_at`, which `_mint` already wrote and nothing read back; a delivery minted
+  before U11 carries none and contributes nothing, so the gauge climbs from zero rather than
+  reporting the whole backlog as infinitely old on the deploy that introduces it. The drain formula,
+  the rollback and how to scale replicas are in the operations document's "The delivery worker"
+  section; scaling is `deployment.forceReplicas` **by hand**, because the `kix_*` series are in
+  Thanos rather than in Google Managed Prometheus and common's HPA on custom metrics cannot see
+  them.
   **Six never-queried fields are exempt from Firestore's automatic single-field indexes** — `payload`
   and `situations` on `events`, `situations` on `deliveries`, and `delivered`, `daily_deliveries`
   and `daily_reservations` on `subscriptions`. Every field is indexed ascending and descending
@@ -1225,7 +1307,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **What a reader sees in the logs**: `varsel_webhook_load`, `notification_store_load`, `notification_emit`,
   `webhook_delivery_round`, `webhook_delivery`, `notification_quota`,
   `notification_subscription`, `notification_cleanup`, `notification_auth`, `notification_admin`, `notification_test_event`,
-  `notification_servability`, `notification_alert_state`, `webhook_delivery_refused`,
+  `notification_servability`, `notification_alert_state`, `webhook_delivery_refused`, `webhook_worker`,
   `webhook_delivery_response_truncated`, `notification_auth_config` / `webhook_signing_config`,
   `notification_wording`, and `poller_phase` with `phase="notification_webhooks"` **or
   `"notification_servability"`** — two phases, not one. `docs/operations/notification-webhooks.md` carries
