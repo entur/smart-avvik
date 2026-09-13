@@ -770,6 +770,10 @@ def _install_fetch(fake):
     alternatives._fetch_trip_patterns = fake
     alternatives._cache = _KeyedTTLCache(alternatives._TTL, alternatives._FAILURE_COOLDOWN)
     alternatives._fetch_calls = {path: [] for path in alternatives._FETCH_CEILINGS}
+    # The refusal tally is module state like the ledger beside it: left behind, a later test's
+    # first refusal lands inside an earlier test's summary window and is counted instead of logged
+    # -- which reads as "the ceiling stopped binding".
+    alternatives._refusals = {}
     return original
 
 
@@ -1275,6 +1279,43 @@ def test_a_successful_fetch_is_logged_with_a_digest_not_the_stop_refs():
     finally:
         alternatives.logger.removeHandler(handler)
         alternatives._fetch_trip_patterns = original
+
+
+def test_a_bound_that_keeps_binding_is_one_record_and_not_one_per_refusal():
+    """U10. The poller asks up to `impact._MAX_ALTERNATIVE_LOOKUPS` times per definition per cycle,
+    so at a hundred thousand definitions a morning where this budget binds was hundreds of thousands
+    of WARNING lines a cycle -- and a warning at that volume is how a real warning stops being read.
+
+    The FIRST refusal after a quiet window is still reported at once, because the interesting moment
+    is when the bound starts binding. The rest are counted and carried into one summary per window,
+    which is what makes the record answer "how often" rather than only "it happened".
+
+    Driven through the reservation itself rather than through `fetch_candidates`: what is under test
+    is the tally, and going through the cache would make the check about cache keys.
+    """
+    handler = _capture_logs()
+    alternatives._fetch_calls = {path: [] for path in alternatives._FETCH_CEILINGS}
+    alternatives._refusals = {}
+    try:
+        # A full minute already spent on this path.
+        alternatives._fetch_calls["request"] = [CAND_NOW] * alternatives._FETCH_MAX_PER_MIN
+        for _ in range(50):
+            assert alternatives._reserve_fetch("request", CAND_NOW) is False
+        refusals = [r for r in handler.records if _fields(r).get("reason") == "rate_limited"]
+        assert len(refusals) == 1, f"one record for fifty refusals, not fifty: {len(refusals)}"
+        assert _fields(refusals[0])["refused"] == 1, _fields(refusals[0])
+        # ...and the window rolling carries the count the quiet refusals were hiding.
+        later = CAND_NOW + alternatives._REFUSAL_SUMMARY_WINDOW + timedelta(seconds=1)
+        alternatives._fetch_calls["request"] = [later] * alternatives._FETCH_MAX_PER_MIN
+        assert alternatives._reserve_fetch("request", later) is False
+        rolled = [r for r in handler.records if _fields(r).get("reason") == "rate_limited"]
+        assert len(rolled) == 2, len(rolled)
+        assert _fields(rolled[1])["refused"] == 50, _fields(rolled[1])
+        assert _fields(rolled[1])["window_s"] >= 60
+    finally:
+        alternatives.logger.removeHandler(handler)
+        alternatives._fetch_calls = {path: [] for path in alternatives._FETCH_CEILINGS}
+        alternatives._refusals = {}
 
 
 def test_no_log_record_from_this_module_carries_a_raw_stop_ref():

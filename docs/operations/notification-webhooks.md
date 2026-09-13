@@ -457,7 +457,7 @@ silently.
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `overlap_refused`, `retryable`, `failed`, `ceiling_error`, `run_clear_error`, `subject_error`, `subjects_skipped`, `unroutable`, `build_error`), and on the one summary record per cycle: `created`, `withdrawn`, `unchanged`, `counting`, `obsolete`, `nothing_standing`, `unidentified`, `quota`, `capped`, `retryable`, `failed`, `abandoned`, `overlap_refused`, `run_cleared`, `run_stale`, `run_clear_capped`, `run_clear_error`, `n` (the (recipient, train) observations offered), `trains` (what the fan-out was over — `n` over `trains` is the corridor's sharing factor), `ms` |
 | `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
-| `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
+| `webhook_delivery` | one delivery FAULT — never a per-attempt outcome, which is what `webhook_delivery_round` carries for the whole pass | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
@@ -856,9 +856,9 @@ Three things about a row here, each of which a reader would otherwise have to gu
 
 **A row is only comparable to a row with the same tags.** *Mode* is how the subscriptions were
 created — `store` writes the documents through `notification_store`'s own builder (byte-identical to
-what the API writes, but without the create path's in-transaction count, its log line or its inline
-servability ask), `api` goes through `POST /subscriptions` and cannot exceed the create path's own
-ceilings, and `bench` created none at all: `scripts/bench_matcher.py` seeds registrations straight
+what the API writes, but without the create path's aggregation or its log line — the inline
+servability ask that used to be the third difference is gone as of U10), `api` goes through
+`POST /subscriptions` and cannot exceed the create path's own ceilings, and `bench` created none at all: `scripts/bench_matcher.py` seeds registrations straight
 into `varsel`'s in-process store and runs one `check_and_notify` over a synthetic cache, with no
 cluster, no Firestore and no BigQuery. *Shape* is which peak the run measured: the late-evening cache
 maximum, or a bad morning. A `bench` row's evening is **synthetic** — the generator's ~930 trips and
@@ -887,9 +887,9 @@ script can scrape them; they are for rules and dashboards, and the log records a
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 4 000 | bench | evening (syn) | plan | — | — | — | — | **0.604** | — | — | 41 687 rows. The pair term: +5 092 pairs over the row above costs +1.07 s, ~0.21 ms per pair |
 | 2026-09-12 | U1–U4 | 0 | 10 000 | 7 092 | bench | evening (syn) | prd | — | — | — | — | **0.649** | — | — | 39 098 rows. prd's 1.41 definitions per pair — the honest floor on what the memo can buy |
 
-**What U7, U8 and U9 owe this table, named rather than left to be noticed.** Every unit from U7 on
-has shipped its bounds as arithmetic over constants, and none of the three has a measured row here
-yet. Specifically owed, all against dev with the harness above:
+**What U7 to U10 owe this table, named rather than left to be noticed.** Every unit from U7 on has
+shipped its bounds as arithmetic over constants, and none of the four has a measured row here yet.
+Specifically owed, all against dev with the harness above:
 
 | Owed measurement | Which unit's claim it settles |
 |---|---|
@@ -899,6 +899,8 @@ yet. Specifically owed, all against dev with the harness above:
 | **Write amplification with and without the field exemptions** | U9 step 4's six exemptions. Index entries per document written, before and after — the only figure that says what they bought |
 | **The create ceiling's aggregation cost** at a realistic subscription count | U7's `count()` (verified against dev at 18 documents, which proves correctness and not cost) |
 | **A cycle's `capped` / `abandoned` at 100 000 subscriptions** | Whether emit's share is already exceeded, which is U11's first trigger |
+| **The servability phase's job and write times** at ~8 000 pending pairs | U10's two halves: one BigQuery job under 5 s and 2 000 transactions under 15 s across `_WRITE_WORKERS` (32). A run that cannot reach the second moves the width or the bound, not the deadline |
+| **Log lines per cycle, by event**, at 100 000 definitions | What the aggregation of U10 step 5 actually bought, and the one number that says whether `alternatives_fetch` is the next line to aggregate: it is one INFO per lookup INCLUDING cache hits, and the poller asks up to `impact._MAX_ALTERNATIVE_LOOKUPS` (3) times per definition per cycle. Refusals are already one record per path per minute; the cache-hit record is deliberately left alone until this measurement exists, because demoting it would make the cache hit rate it was added for unmeasurable |
 
 Recorded as owed rather than estimated: a number in this table is a measurement, and the units above
 shipped with their reasoning published and their measurement outstanding.
