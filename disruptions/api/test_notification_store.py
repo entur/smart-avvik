@@ -59,9 +59,11 @@ def _uncommented(text: str, marker: str = "#") -> str:
     """The code half of a commented file, for the checks that must NOT match a comment.
 
     Every header in `terraform/firestore.tf` explains what it deliberately does not do -- it names
-    `google-beta`, `index_config {}`, `google_project_iam_member` and `roles/datastore.user` in
-    order to refuse them -- so a negative grep over the raw text matches the explanation and passes
-    (or fails) for the wrong reason. Same rule `test_rushhistorikk` applies to its SQL greps.
+    `google-beta`, `google_project_iam_member` and `roles/datastore.user` in order to refuse them,
+    and since U9 it names `index_config {}` twice, once to refuse it on the TTL field and once to
+    require it on the six exemptions -- so a negative grep over the raw text matches the
+    explanation and passes (or fails) for the wrong reason. Same rule `test_rushhistorikk` applies
+    to its SQL greps.
     """
     return "\n".join(
         line for line in text.splitlines() if not line.strip().startswith(marker)
@@ -1819,15 +1821,74 @@ def test_every_collection_group_has_exactly_one_ttl_field():
     assert notification_store.TTL_FIELD == "expires_at"
     assert f'field      = "{notification_store.TTL_FIELD}"' in FIRESTORE_TF
     assert FIRESTORE_TF_CODE.count("ttl_config {}") == 1  # one resource, for_each over four groups
-    # An empty index_config block DISABLES indexing on the field; deliberately not used.
-    assert "index_config {}" not in FIRESTORE_TF_CODE
-
-
-def test_field_overrides_stay_empty_so_ttl_has_one_source_of_truth():
-    assert INDEXES.get("fieldOverrides") == [], (
-        "the CLI format can express a TTL, but Terraform owns them here -- two writable sources "
-        "for a retention setting is how one of them quietly goes stale"
+    # An empty `index_config` block DISABLES indexing on the field, which is right for the six
+    # exemptions below and wrong for `expires_at` -- the poller's per-cycle read orders by it. The
+    # TTL resource must therefore OMIT the block, and the count is what says only the exemption
+    # resource carries one.
+    ttl_resource = FIRESTORE_TF_CODE.split('resource "google_firestore_field" "notification_ttl"', 1)[1]
+    ttl_resource = ttl_resource.split("\nresource ", 1)[0]
+    assert "index_config" not in ttl_resource, (
+        "the TTL field must keep Firestore's automatic single-field indexes: an empty "
+        "`index_config {}` disables them, and the poller's per-cycle read orders by `expires_at`"
     )
+    assert FIRESTORE_TF_CODE.count("index_config {}") == 1  # the exemption resource, for_each
+
+
+def test_every_exempted_field_is_named_by_no_query_and_declared_in_both_places():
+    """U9 step 4. An exemption is silent in both directions, so it is pinned in both.
+
+    Firestore indexes every field of every document automatically -- ascending and descending, and
+    every element of an array separately -- so each index below was paid for on every write by a
+    query that does not exist. What makes the removal safe is the SPEC TABLE: a field no query
+    filters or orders on cannot lose anything by not being indexed, and that is checked here
+    against `QUERY_SPECS` rather than by reading the module.
+
+    The failure the other way is worse and is why this is bidirectional: exempting a field a query
+    DOES name makes the query return nothing at all, with no error -- `retry_not_before` is the
+    live example, a range filter in `pending_deliveries`, and `expires_at` is the TTL field on all
+    four collections.
+    """
+    block = FIRESTORE_TF.split("firestore_index_exemptions = [", 1)[1].split("]", 1)[0]
+    declared = {
+        (line.split('collection = "', 1)[1].split('"', 1)[0],
+         line.split('field = "', 1)[1].split('"', 1)[0])
+        for line in block.splitlines()
+        if "collection = " in line and "field = " in line
+    }
+    assert declared, "the exemption list is empty; this check has stopped checking anything"
+
+    mirrored = {
+        (entry["collectionGroup"], entry["fieldPath"])
+        for entry in INDEXES.get("fieldOverrides", [])
+    }
+    assert declared == mirrored, (
+        f"Terraform exempts {sorted(declared)} and firestore.indexes.json {sorted(mirrored)}. The "
+        "two must agree: the JSON is what the emulator and a `firebase deploy` read, Terraform is "
+        "what applies, and a plan-time drift check that reads one of them is worth nothing."
+    )
+    for entry in INDEXES["fieldOverrides"]:
+        assert set(entry) == {"collectionGroup", "fieldPath", "indexes"}
+        assert entry["indexes"] == [], "an exemption is an EMPTY index list, not a missing key"
+
+    queried = {
+        (spec.collection, field)
+        for spec in notification_store.QUERY_SPECS
+        for field in (
+            *spec.equality,
+            *(path for path, _ in spec.inequality),
+            *(path for path, _ in spec.order_by),
+        )
+    }
+    collisions = declared & queried
+    assert not collisions, (
+        f"{sorted(collisions)} is both exempted from indexing and named by a query spec. The query "
+        "would return NOTHING, with no error and nothing in the logs."
+    )
+    for collection in notification_store.COLLECTIONS:
+        assert (collection, notification_store.TTL_FIELD) not in declared, (
+            f"{collection}.{notification_store.TTL_FIELD} is the TTL field; exempting it stops "
+            "expired documents being found at all"
+        )
 
 
 def test_every_filter_goes_through_the_query_helper():
