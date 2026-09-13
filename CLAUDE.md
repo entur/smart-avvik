@@ -1116,8 +1116,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   first visible effect would be the receiver's own 429 and U7's backoff, i.e. a self-inflicted
   outage that reads as a misbehaving client. `webhook_delivery` keeps a rolling per-destination
   minute tally (`_DESTINATION_WINDOW_S`) and subtracts it from the ceiling before the read admits a
-  row. Charged on what the read ADMITTED, not on what was POSTed — over-counting by whatever the
-  pass then skips, which is the safe direction. It is a no-op for a poller-only deployment (a cycle
+  row. Charged on the page the pass is ABOUT TO ATTEMPT, after the stale sweep — a sweep that hits
+  its bounded wait empties the shard list and nothing is dialled, so a charge beside the read would
+  spend a destination's whole minute for zero POSTs and keep refusing it for a minute after the
+  store recovered. It still over-counts by whatever the pass skips mid-flight, which is the safe
+  direction. It is a no-op for a poller-only deployment (a cycle
   is longer than the window), and it is PER PROCESS, so N replicas are N times the rate exactly as
   the drain formula's `× replicas` says. Like every module budget here it joins the suite's reset
   (`webhook_delivery.reset_destination_window`), or a leaked tally reads exactly like a real

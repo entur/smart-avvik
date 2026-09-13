@@ -161,6 +161,14 @@ def _charge_destinations(deliveries: Sequence[notification_store.Delivery]) -> N
 def reset_destination_window() -> None:
     """Forget every tally. For suites only -- a module ledger that survives between tests is the
     leaked-budget failure this repo has had twice, and it reads exactly like a real refusal.
+
+    **Deliberately NOT in `varsel.check_and_notify`'s stale sweep**, which is where this repo's rule
+    puts every other module budget. The rule exists because a half-spent budget that outlives its
+    pass reads exactly like the give-up bug; this ledger cannot get into that state, because
+    `_charge_destinations` prunes the WHOLE map on every pass rather than only the destinations it
+    touched, so a stale entry has a sixty-second life by construction. Sweeping it would also be
+    wrong rather than merely redundant: the sweep runs per cycle and the window is per minute, so a
+    sweep would reset the very allowance this is counting.
     """
     with _destination_lock:
         _destination_attempts.clear()
@@ -975,8 +983,6 @@ def deliver_pending(
         )
         return DeliveryReport(store_errors=1, ms=int((monotonic() - started) * 1000))
 
-    _charge_destinations(pending.ready)
-
     # THE STALE SWEEP IS A POOL TOO, and it was not until 2026-09-09. It is a loop of store WRITES
     # on the poller's thread, which is the one class of call this module's docstring says has no
     # ceiling of its own -- and it ran BEFORE the delivery pool existed, so the
@@ -1016,6 +1022,12 @@ def deliver_pending(
         [] if timed_out else _shard_by_subscription(pending.ready)
     )
     if shards:
+        # Charged HERE and not beside the read, because between the two the stale sweep can set
+        # `timed_out` and empty `shards`: the store is hung, nothing will be attempted, and a page
+        # charged anyway would refuse that destination its whole minute for zero POSTs -- then keep
+        # refusing it for a minute after the store recovered. The mechanism exists to stop a
+        # self-inflicted outage and that placement would have produced one.
+        _charge_destinations(pending.ready)
         pool = ThreadPoolExecutor(
             max_workers=min(workers, len(shards)), thread_name_prefix="client-deliver"
         )
