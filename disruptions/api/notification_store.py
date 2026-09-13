@@ -152,9 +152,12 @@ MAX_SUBSCRIPTION_LIST_SCAN = 10_000
 MIRROR_FIELD = "mirror_updated_at"
 # Pending events per destination. Enforced with a bounded count BEFORE the emit transaction rather
 # than inside it, which is exact rather than best-effort for one reason that is nameable instead of
-# hoped for: the emit path has exactly one writer (KTD6 -- one poller thread, no route invokes the
+# hoped for: the EMIT path has exactly one writer (KTD6 -- one poller thread, no route invokes the
 # pass, one replica under the Recreate strategy), so nothing can create a pending event between the
-# count and the commit.
+# count and the commit. Emit, precisely: U11 moved DELIVERY to its own Deployment, and the ledger's
+# figure then goes stale HIGH inside a pass -- the worker resolves pending deliveries this process
+# does not hear about -- so it refuses earlier than it needs to, which is the conservative
+# direction. What would break the exactness is a second EMITTER, which is why there is not one.
 MAX_PENDING_EVENTS_PER_DESTINATION = 500
 # Delivery attempts per cycle, in total and per destination. The per-destination one is what stops a
 # single backlogged client spending the whole pass; the total is what bounds the query.
@@ -2295,10 +2298,14 @@ class SubscriptionMirror:
 # watermark because clients write subscriptions through the API at any time. Subject documents have
 # exactly one writer -- KTD6's single writer: one poller thread, no route invokes the pass, one
 # replica under Recreate -- so every change to a subject passes through this process, and applying
-# it in memory is both cheaper and stronger than re-reading it. That property is worth re-checking
-# rather than assuming when U11 moves delivery to its own Deployment: what the worker writes is
-# `delivered_revision` and `pending_delivery_id` on the subject, and neither is in the standing set,
-# which carries the phase and the below-threshold run only.
+# it in memory is both cheaper and stronger than re-reading it. **Re-checked at U11, and it holds
+# -- with the sentence narrowed.** Delivery now runs in `webhook_worker`, so what a second process
+# writes to a subject is `delivered_revision`, `delivered_at` and `pending_delivery_id`; none of the
+# three is in the standing set, which carries the phase and the below-threshold run only, and
+# `_sent_body` is the declared exemption from `SUBJECT_MIRRORING_BODIES`. So KTD6 reads, from U11
+# on, as ONE WRITER OF A SUBJECT'S PHASE AND REVISION -- still this process, still the emit pass --
+# rather than one writer of the document. A field moved into the standing set later would break
+# that, which is what `SUBJECT_WRITERS_OUTSIDE_THE_MIRROR` is pinned for.
 
 
 @dataclass(frozen=True, slots=True)
@@ -3984,10 +3991,11 @@ def _claim_body(
     read outside one: a body may run more than once, and a token minted inside would differ between
     attempts, so the retry would write a lease its own caller cannot later prove it holds.
 
-    **The lease is what makes a second worker safe** (KTD14). Until U11 there is exactly one --
-    ``claimed_at`` was written and read by nothing -- so this is unreachable in production today and
-    is pinned against the fake anyway: a check that arrives with the second replica arrives after the
-    duplicate notifications it exists to prevent.
+    **The lease is what makes a second worker safe** (KTD14), and since U11 there is one:
+    ``webhook_worker`` drains the same queue from its own Deployment, so this branch is live rather
+    than a promise. It was unreachable before -- ``claimed_at`` was written and read by nothing --
+    which is exactly why it was built and pinned against the fake first: a check that arrives with
+    the second process arrives after the duplicate notifications it exists to prevent.
     """
     delivery = _doc(_read(transaction, refs.delivery(delivery_id)))
     if not delivery or delivery.get("state") != "pending" or not _not_expired(delivery, now):
@@ -4130,8 +4138,9 @@ class DeliveryOutcome:
     #: The delivery is still ``pending`` but is held by a DIFFERENT claim than the one this write
     #: belongs to, so nothing was written (U8). A third outcome rather than a flavour of
     #: ``already_resolved``: the delivery is not resolved, it is somebody else's, and the caller
-    #: must not count it as a send or a failure. Unreachable while there is one writer; it is what
-    #: makes a second replica safe rather than what reports on one.
+    #: must not count it as a send or a failure. Reachable since U11 put a second process on the
+    #: same queue; before that it was what MADE a second process safe rather than what reports on
+    #: one.
     lease_lost: bool = False
 
 

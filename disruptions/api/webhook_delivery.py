@@ -180,11 +180,16 @@ class DeliveryReport:
     not_deliverable: int = 0
     paused: int = 0
     #: Attempts whose lease had lapsed and been re-claimed by the time the terminal write arrived
-    #: (U8). Unreachable while there is one writer, and its own counter rather than folded into
-    #: `already_resolved` because it means the opposite: the delivery is not finished, it is in
-    #: somebody else's hands.
+    #: (U8). Its own counter rather than folded into `already_resolved` because it means the
+    #: opposite: the delivery is not finished, it is in somebody else's hands.
+    #:
+    #: **Reachable since U11** -- it was not while delivery had one writer. A non-zero count during
+    #: the rollout window, when the poller and the worker both deliver, is the lease doing its job.
+    #: A steady one afterwards means attempts are outliving their 20 s lease, i.e. the store or the
+    #: receiver is slower than `DELIVERY_LEASE_S`'s arithmetic assumes.
     lease_lost: int = 0
-    #: Claims refused because another worker already held the delivery. Also unreachable today.
+    #: Claims refused because another worker already held the delivery. Reachable since U11 too, and
+    #: the cheaper of the two: nothing was attempted, so the delivery is simply somebody else's.
     leased: int = 0
     #: Attempts not made because the destination is inside U7's durable backoff. Its own counter and
     #: not folded into `skipped`, because the two are different operator answers: `skipped` is "a

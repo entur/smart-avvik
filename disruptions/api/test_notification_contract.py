@@ -73,6 +73,14 @@ NOTIFICATION_MODULES = (
     # The journey-keyed public read (2026-09-10). Public and unauthenticated, so R11's log claim
     # binds it harder than the rest: every field it logs is walked here.
     "notification_pull.py",
+    # R6's freshness half. It was outside this tuple until U11, which means its own
+    # `notification_servability` event was never checked against the operations document by the
+    # test whose whole job is that -- the gap was invisible because the event happens to be
+    # documented. A module added to the channel and not added here is the shape of that miss.
+    "notification_servability.py",
+    # The delivery worker (U11). Its own process, so its records are the ones an operator reads
+    # when the question is "is anything being delivered at all".
+    "webhook_worker.py",
 )
 
 MODULES_BY_NAME = {
