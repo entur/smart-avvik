@@ -113,6 +113,7 @@ WITH scanned AS (
     summary AS cycle_summary, description, line, mode, stop_place, from_stop, to_stop, departure_time,
     decided_at, alertworthy, et_cancelled, impact_probability, cancel_probability,
     delay_p50_min, delay_p90_min, alert_threshold, pushed, n_devices, prompt_version,
+    channel, n_subscriptions,
     -- Why no push went out is a question this page will provoke on every silent card, and this is
     -- the only column that separates "this deployment does not push at all" from "we chose not to".
     message_status = 'push_disabled' AS push_off,
@@ -130,6 +131,11 @@ WITH scanned AS (
     AND departure_time >= @from_ts AND departure_time < @to_ts
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- The channel this definition was watched on (U16, KTD4). A POPULATION filter, so it reaches
+    -- meldinger_summary.sql and meldinger_messages.sql in the same shape. A named channel excludes
+    -- rows whose own channel is NULL -- written before 2026-09-13 -- rather than folding them into
+    -- 'browser', which is the n_unsegmented third-bucket rule one page over.
+    AND (@channel  IS NULL OR channel  = @channel)
     -- ONE chosen SIRI-SX option is applied after subject aggregation below. It is expanded to EVERY
     -- stored summary it stands for -- the same shape as the place refs below, and for the same
     -- reason: an option can cover more than one stored value.
@@ -200,6 +206,17 @@ subjects AS (
     MAX(impact_probability)                 AS max_impact_probability,
     ANY_VALUE(alert_threshold)              AS alert_threshold,
     MAX(n_devices)                          AS n_devices,
+    -- The client side's count and the channel, aggregated exactly as varsel_decision_groups does
+    -- it: the highest count any row carried, and 'both' where either a row said so or the subject
+    -- has rows of each kind. Not in the GROUP BY -- a definition both channels share is ONE
+    -- subject with one wording, which is the premise this page is built on.
+    MAX(n_subscriptions)                    AS n_subscriptions,
+    CASE
+      WHEN LOGICAL_OR(channel = 'both')
+        OR (LOGICAL_OR(channel = 'browser') AND LOGICAL_OR(channel = 'webhook')) THEN 'both'
+      WHEN LOGICAL_OR(channel = 'webhook') THEN 'webhook'
+      WHEN LOGICAL_OR(channel = 'browser') THEN 'browser'
+    END                                     AS channel,
     -- `pushed` is written as a real bool on every row (decisions.py builds it with bool()), so this
     -- is never NULL in practice; COALESCE anyway, because the states below branch on it and a NULL
     -- would fall to the ELSE and report a delivered push as "never sent".
@@ -310,7 +327,7 @@ SELECT
   -- UNION. Taking it from the outcomes row where one exists is what keeps a card's tag agreeing with
   -- the segment /summary counted it in; that file reads the same column.
   COALESCE(o.et_cancelled, s.et_cancelled_derived) AS et_cancelled,
-  s.pushed_any, s.n_devices, s.other_pushed_on_train,
+  s.pushed_any, s.n_devices, s.channel, s.n_subscriptions, s.other_pushed_on_train,
 
   -- ---- the replay, projected -------------------------------------------------------------------
   s.replay.would_send_at,
