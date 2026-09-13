@@ -39,11 +39,12 @@ exactly one suppression decision per event and replay it verbatim; they do not m
 exactly-once, and deliberately so. See [What the packages guarantee](#what-the-packages-guarantee).
 
 **Nothing here is a claim about alert quality**, and nothing anywhere is a claim about any operator
-but **Vy rail**. `/historikk` scores `/varsel`'s decision logic on the journey definitions a browser
-registration also holds; a webhook-only route produces no decision row at all and is therefore
-**unscored, deliberately** — and so is any definition read through [`GET /journey-alerts`](#the-journey-keyed-read)
-that nobody registered. `../operations/notification-webhooks.md` states the five limitations that
-follow (KTD12) and the enablement condition they impose.
+but **Vy rail**. `/historikk` and `/meldinger` score `/varsel`'s decision logic, and **since
+2026-09-13 they cover a webhook-only route too**: every journey definition the poller matches is
+written, with a `channel` discriminator saying which side was watching. What is still **unscored,
+deliberately**, is a definition read through [`GET /journey-alerts`](#the-journey-keyed-read) that
+nobody registered. `../operations/notification-webhooks.md` states the five limitations that follow
+(KTD12) — the fourth of them now closed — and the enablement condition they impose.
 
 ---
 
@@ -949,8 +950,11 @@ if you never re-issue, is the document's own 7-day retention plus that lag, so u
    does, on `notification_admin`.
 
 **The seven-day event retention is shorter than the ten-day window the nightly outcome-labelling job
-uses**, so retrospectively scoring client alerts is foreclosed by this choice. That is a published
-contract, so lengthening it later is a contract change rather than a tuning edit.
+uses, and since 2026-09-13 that forecloses nothing.** Your alerts are scored at journey-DEFINITION
+grain in the decision log, which reads no event and holds no client identity — so the labelling
+window is bounded by that table's own year-long retention rather than by this one. What the seven
+days do foreclose is scoring an **event** retrospectively, and nothing does. It is a published
+contract either way, so lengthening it later is a contract change rather than a tuning edit.
 
 ---
 
@@ -976,8 +980,10 @@ Ukur cancellation feed; the companion BFF integration and native enrollment work
 surface a commuter registers a journey on**, and the subscription shape assumes it captures origin,
 destination, weekdays and hours as `/varsel`'s does; notifications tied to a specific ticket rather
 than a registered journey; publishing the helper packages to a registry; a delivery-status API or
-dashboard for clients; scored outcomes for webhook-only route definitions **and for definitions read
-through `GET /journey-alerts`**; destination-ownership verification; additional languages;
+dashboard for clients; scored outcomes **for definitions read through `GET /journey-alerts`** that
+nobody registered (a webhook-only route IS scored since 2026-09-13, on `/historikk` and
+`/meldinger`, which are Entur-internal surfaces rather than anything this API exposes);
+destination-ownership verification; additional languages;
 self-service onboarding; new model or operator coverage.
 
 And for the public read specifically: a favourite **departure** (a line at a stop) and a favourite
