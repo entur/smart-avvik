@@ -1462,6 +1462,252 @@ def test_a_raising_wording_writer_is_one_entrys_transient_error_and_is_retried_a
     assert r.headers["Cache-Control"] == "public, max-age=60"
 
 
+# ---- The pass's warm (U15) ---------------------------------------------------------------------
+#
+# Two of U15's stated scenarios need no test of their own and are named here so nobody adds a slow
+# duplicate: "the 3 001st request in a minute is refused" and "the 20 001st definition evicts the
+# oldest figure" are `test_the_global_ceiling_refuses...` and `test_the_figures_cache_is_bounded`
+# above, both of which set the constant small and so assert the RULE rather than the number. The
+# number itself is pinned against the published-numbers table by `test_notification_contract`.
+
+
+@contextmanager
+def _warming():
+    """Wire the pass's warm seam, as `main.lifespan` does, and put it back.
+
+    Off in every other test in this suite and in `test_varsel_api`, which is the point: absent, pass
+    1a must be byte-for-byte the pass that ran before U15, and 250-odd checks either side of this
+    one assert that by never noticing it exists.
+    """
+    stashed = varsel._figures_warmer
+    varsel._figures_warmer = notification_pull.warm_figures
+    try:
+        yield
+    finally:
+        varsel._figures_warmer = stashed
+
+
+def test_the_pass_warms_a_registered_definition_and_the_read_then_computes_nothing(monkeypatch):
+    """U15's first scenario: after pass 1a a read naming the registration's five fields is a
+    figures HIT, for the whole cycle and for every caller.
+
+    Falsified by making the matcher RAISE before the read rather than by counting calls: a read
+    that still answers, with the trains the pass found, cannot have run it. The same read without
+    the seam wired is the control, and it 503s -- which is what makes the assertion about warming
+    and not about some other cache.
+    """
+    _reset()
+    dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
+    snapshot = {"S1": _train(dep, p_cancel=0.82, p_impact_dep=0.9)}
+    _use_snapshot(snapshot)
+    _register_here(monkeypatch)
+
+    with _warming():
+        varsel.check_and_notify(snapshot)
+
+    def _refuse(*a, **kw):
+        raise AssertionError("the read ran the matcher for a definition the pass warmed")
+
+    monkeypatch.setattr(varsel, "match_journey", _refuse)
+    r = _get(**REGISTERED, wait=0)
+    assert r.status_code == 200, r.text
+    assert r.json()["n_alerts"] == 1, r.json()
+
+    # The control, and the falsification: a definition the pass did NOT warm still computes, so the
+    # stubbed matcher is reached and the read fails the way it should.
+    assert _get(begin="05:00", end="06:00", wait=0).status_code == 503
+
+
+def test_a_warm_on_a_fresh_process_establishes_the_generation_it_stores_under():
+    """`_remember_figures` refuses a store whose generation marker does not match, and the marker
+    was only ever SET by a read (`_cached_figures`). The pass warms BEFORE any read of a fresh
+    process, so without `_enter_generation` on the warm path every warmed figure is discarded on
+    the way in, every read still misses, and nothing anywhere says so -- a warm pass that spends
+    the pass's time and buys nothing.
+
+    Falsify by dropping the `_enter_generation` call from `warm_figures`: `_figures` stays empty.
+    """
+    _reset()
+    assert notification_pull._figures_generation is None, "control: nothing has read yet"
+    now = notification_pull._now()
+    definition = notification_pull._definition(NSR_A, NSR_B, None, None, None, now)
+    notification_pull.warm_figures(varsel.journey_key(definition), definition, [], now)
+    assert notification_pull._figures_generation == LOADED_AT
+    assert len(notification_pull._figures) == 1, notification_pull._figures
+
+
+def test_a_warm_leaves_a_figure_a_read_already_computed_alone():
+    """A read that beat the pass to the key already built the same figures AND already applied the
+    third forget rule; applying it twice is not free, and re-storing buys nothing."""
+    _reset()
+    _get(wait=0)
+    before = dict(notification_pull._figures)
+    assert len(before) == 1
+    now = notification_pull._now()
+    definition = notification_pull._definition(NSR_A, NSR_B, None, None, None, now)
+    notification_pull.warm_figures(varsel.journey_key(definition), definition, [], now)
+    after = dict(notification_pull._figures)
+    assert list(after) == list(before)
+    assert all(after[k] is before[k] for k in before), "the read's own figures object still stands"
+
+
+def test_a_warm_that_raises_costs_a_cache_entry_and_never_the_journeys_alerts(monkeypatch):
+    """The warm sits in its OWN try inside pass 1a, outside the matcher's. The matcher's answers an
+    exception with empty alerts for that journey -- right for a match that failed, catastrophic for
+    a warm that did, because it would drop a registered traveller's alerts for the whole cycle to
+    save a cache entry. The read is a READER of the pass, never a step of it.
+    """
+    _reset()
+    dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
+    snapshot = {"S1": _train(dep, p_cancel=0.82, p_impact_dep=0.9)}
+    _use_snapshot(snapshot)
+    pushed = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: pushed.append(payload) or "sent")
+    _register(DEVICE, from_stop=NSR_A, from_name="Asker stasjon", to_stop=NSR_B, to_name="Oslo S", **REGISTERED)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("the read's cache is not the pass's problem")
+
+    stashed = varsel._figures_warmer
+    varsel._figures_warmer = _boom
+    try:
+        varsel.check_and_notify(snapshot)
+    finally:
+        varsel._figures_warmer = stashed
+    assert pushed, "the traveller was still pushed for the train the pass matched"
+    assert not notification_pull._figures, "and nothing was cached, which is the whole cost"
+
+
+def test_an_alternative_the_pass_found_never_reaches_a_read_that_established_none():
+    """The one field that makes a WARMED answer differ from a cold one, and it is invisible to any
+    test that stubs the matcher.
+
+    `llm_message.build_message_input` reads `alert.alternative_journey` **or**, failing that,
+    `impact.alternative_journey` -- the worst train's answer, kept as a fallback for callers that
+    hold only the response. Every alert the poller's pass produces carries the second
+    (`with_alternative=True`), and U15 warms a registered definition's figures from exactly those
+    alerts. Left alone, such a winner would put an `alternativ_reise` into the message input -- and
+    so into the wording key and the payload -- that the same definition's answer on a cold cycle
+    does not have. `_enriched` clears it, which is a no-op for every winner this module computed
+    itself.
+
+    Falsify by dropping the `impact` half of `_enriched`'s update: `alternativ_reise` appears.
+    """
+    _reset()
+    now = notification_pull._now()
+    definition = notification_pull._definition(NSR_A, NSR_B, None, None, None, now)
+    dep = now.astimezone(_OSLO) + timedelta(hours=2)
+    _use_snapshot({"S1": _train(dep, p_cancel=0.82, p_impact_dep=0.9)})
+    figures = notification_pull._compute_figures(definition, now, journey_key="k")
+    winner = figures.entries[0].winner
+    assert winner.impact is not None and winner.alternative_journey is None, "control: a cold winner"
+    # BOTH halves of the control. If a cold match could attach a response-level alternative -- from
+    # `alternatives._cache`'s TTL'd answer for a pair the poller looked up minutes ago -- then reads
+    # were already serving `alternativ_reise` through the fallback before U15, and `_enriched`'s
+    # clear would be a behaviour change on the existing path rather than a no-op on it. It cannot:
+    # `_compute_figures` calls `match_journey` without `with_alternative`, so no lookup is consulted.
+    assert winner.impact.alternative_journey is None, (
+        "a cold read's winner must carry no response-level alternative either, or clearing it in "
+        "`_enriched` changes what every pre-U15 read served"
+    )
+
+    journey = varsel.AlternativeJourney(
+        legs=[], departure_time=dep + timedelta(minutes=20), arrival_time=dep + timedelta(minutes=70),
+        minutes_saved=-30, arrives_before_original=False, at_risk=False, scored=False,
+    )
+    # A winner as pass 1a produces one: the response copy carries the alternative, the alert itself
+    # does not, because the cache had nothing to say about THIS train.
+    as_the_pass_has_it = winner.model_copy(
+        update={"impact": winner.impact.model_copy(update={"alternative_journey": journey})}
+    )
+    assert notification_pull._message_input(definition, as_the_pass_has_it, now).get("alternativ_reise"), (
+        "control: the fallback is real -- an un-enriched winner carries it into the message input"
+    )
+    enriched = notification_pull._enriched(as_the_pass_has_it, None)
+    assert "alternativ_reise" not in notification_pull._message_input(definition, enriched, now)
+    assert notification_pull._enriched(as_the_pass_has_it, journey).alternative_journey is journey
+
+
+def test_the_forget_rule_drops_a_trains_wording_by_train_and_not_by_scanning():
+    """The third forget rule pops by TRAIN; `_wordings` is keyed by KTD9's wording key, which does
+    not begin with one. The scan that answered it was affordable on a read miss and is not once U15
+    runs it per registered definition per cycle, so the index answers it instead.
+
+    Both directions: the gone train's wording goes, and a live train's on the same pair stays --
+    the second is what an index that drops too much would fail.
+    """
+    _reset()
+    pair = (NSR_A, NSR_B)
+    keys = {}
+    for name, train in (("gone", ("VYG", "t1", 1)), ("stays", ("VYG", "t2", 1))):
+        keys[name] = (pair, name)
+        notification_pull._remember_wording(
+            keys[name], notification_pull._WordingRecord("tekst", "ok", train), notification_pull._epoch
+        )
+        notification_pull._listed_trains.setdefault("k", frozenset())
+    assert set(notification_pull._wording_keys_by_train) == {(pair, ("VYG", "t1", 1)), (pair, ("VYG", "t2", 1))}
+
+    # "k" listed both trains last time and lists only the second now.
+    notification_pull._listed_trains["k"] = frozenset({("VYG", "t1", 1), ("VYG", "t2", 1)})
+    entry = notification_pull._Entry(
+        winner=None, contributing=(), train=None, train_key=("VYG", "t2", 1),
+        expected_departure=notification_pull._now(), situations=(),
+    )
+    notification_pull._forget_unlisted("k", pair, [entry])
+    assert keys["gone"] not in notification_pull._wordings, "the train that left lost its wording"
+    assert keys["stays"] in notification_pull._wordings, "and the one still listed kept its own"
+    assert (pair, ("VYG", "t1", 1)) not in notification_pull._wording_keys_by_train
+
+
+def test_the_wording_index_is_rebuilt_rather_than_evicted_when_it_outgrows_the_cache():
+    """Evicting the index alone would retire the forget rule for whichever train went, which is a
+    wrong answer rather than a miss. A rebuild drops exactly what eviction and expiry left behind,
+    and costs one pass over a bounded cache once per `WORDING_CACHE_MAX` writes."""
+    _reset()
+    stashed = notification_pull.WORDING_CACHE_MAX
+    notification_pull.WORDING_CACHE_MAX = 3
+    try:
+        for n in range(6):
+            notification_pull._remember_wording(
+                ((NSR_A, NSR_B), n), notification_pull._WordingRecord("t", "ok", ("VYG", f"t{n}", 1)),
+                notification_pull._epoch,
+            )
+        assert len(notification_pull._wordings) <= 3
+        # Every index entry names a key the cache still holds, and every held key is indexed.
+        indexed = {k for keys in notification_pull._wording_keys_by_train.values() for k in keys}
+        assert indexed == set(notification_pull._wordings), (indexed, set(notification_pull._wordings))
+    finally:
+        notification_pull.WORDING_CACHE_MAX = stashed
+
+
+def test_the_coverage_set_is_built_once_per_stop_cache_refresh_and_not_per_request():
+    """U15's third constant-sized cost. The set is over the poller's WHOLE stop cache, and at
+    `MAX_PER_MIN` that is thousands of rebuilds a minute of a list that changes at most daily.
+
+    Keyed on the ROWS rather than on the prediction-cache generation, which U15's plan proposed:
+    coverage is a function of the stop cache, and the two refresh on different TTLs -- keyed on the
+    generation the set would rebuild every cycle for a list that had not moved AND still report a
+    newly-served stop place as absent until the next cycle. `test_coverage_names_the_served_
+    operators_and_reads_the_stop_cache_over_every_ref` is what pins the freshness half: it swaps
+    the provider between reads inside one generation and the answer follows.
+    """
+    _reset()
+    builds = []
+    stashed = varsel._stops_provider
+    rows = list(PULL_STOPS)
+    try:
+        varsel._stops_provider = lambda: (builds.append(1), rows)[1]
+        _get(wait=0)
+        _get(wait=0)
+        assert len(builds) == 2, "the provider is still consulted per request -- that part is O(1)"
+        assert notification_pull._coverage_rows is rows
+        present = notification_pull._coverage_present
+        _get(wait=0)
+        assert notification_pull._coverage_present is present, "and the SET was not rebuilt"
+    finally:
+        varsel._stops_provider = stashed
+
+
 def _run():
     """Mirrors `test_varsel_api`'s runner: a test naming `monkeypatch` gets the shim, undone after."""
     import inspect
