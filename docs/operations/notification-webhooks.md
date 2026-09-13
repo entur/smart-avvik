@@ -929,6 +929,26 @@ contract document says so in its own words; this is the operating half of the sa
    oldest created on 2026-07-08 — so under the retired creation-anchored rule the first expiries
    would have fallen on 2027-01-04 whatever the import did.
 
+   **What a clean cutover looked like, measured on dev 2026-09-13.** `varsel_state_backend`
+   `result: "store"`, then `varsel_state_import` `result: "imported"` with `devices: 4`,
+   `journeys: 14`, `devices_synthesised: 0`, `marks: 0`, `stray_marks: 0`, `problems: []` in
+   **2.6 s** — the dev blob's exact contents, 18 documents. The mirror re-seeded from 18 to 32 (its
+   18 webhook subscriptions plus the 14 browser ones) with `overtaken: 0` over one page; the pass
+   wrote 62 decision rows, so the matcher was scoring store-backed registrations; the
+   `kix.varsel_state` blob-load line stopped entirely, which is `load()` being a no-op under this
+   backend; and the pod logged no error. The next restart reported `result: "skipped"` in **24 ms**,
+   which is the marker being read before the blob is opened — that pair, `imported` once and
+   `skipped` after, is the check that the one-shot held.
+
+   The first export ran on that pod's first cycle: 4 devices, 14 journeys, 7 226 bytes, 500 ms, as
+   the cycle's last phase. Diffed against a copy of the pre-cutover blob it round-tripped
+   completely — same ids, same field names, round markers carried through — with two differences
+   and neither is the export's: `service_checked_ts` moved forward on six journeys (the poller's
+   own servability sweep), and a device's `subscription` lost a null `expirationTime`, which the
+   store never held and nothing reads. **Take that copy before the first export**, since it is what
+   makes this diff possible at all: `gcloud storage cp gs://<bucket>/varsel_state.json
+   gs://<bucket>/varsel_state.pre-export-<date>.json`.
+
    **What prd still needs, beyond repeating dev's steps.** A `create-browser-account` in prd with
    the same two ceilings, and the export running there for at least one interval before anybody
    relies on a rollback. And the **privacy texts**, which dev deliberately went without: T5's
