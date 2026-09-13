@@ -765,9 +765,9 @@ _CONNECTIVITY_MAX_PER_MIN = 30
 #
 # 15, half the traveller's rather than equal to it, and the asymmetry is the point: a client's
 # onboarding is a batch that may legitimately take longer, a traveller is waiting on a page. 15/min
-# is 900 jobs an hour against a pilot measured in tens, and the sweep contributes at most
-# `notification_servability._MAX_CHECKS_PER_CYCLE` (4) per ~296 s cycle. The worst-case BigQuery draw
-# from this seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
+# is 900 jobs an hour against a pilot measured in tens, and since U10 the sweep contributes exactly
+# ONE job per ~296 s cycle however many records are pending. The worst-case BigQuery draw from this
+# seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
 _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN = 15
 _CONNECTIVITY_REQUEST_PATH = "request"
 _CONNECTIVITY_NOTIFICATION_API_PATH = "notification_api"
@@ -1633,6 +1633,10 @@ async def lifespan(app: FastAPI):
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
         connectivity_provider=_varsel_connectivity,
+        # The same question about many stop pairs at once, which is what the servability sweeps
+        # run on: one BigQuery job answers every pending pair (U10), where one job per pair bounded
+        # the sweep to four records a cycle.
+        connectivity_batch_provider=_varsel_connectivity_batch,
         # /config tells the PWA whether rush-forecast pushes are delivered HERE, so the page's
         # notice can never promise a push class this environment's gate withholds.
         togvarsel_notify_provider=_togvarsel_notify_enabled,
@@ -1713,12 +1717,18 @@ async def lifespan(app: FastAPI):
         canonicalize=varsel.canonical_stop,
         connectivity=notification_api_connectivity,
     )
-    # The poller-side half of the same question (R6, AE13's second clause). The SAME seam object as
-    # the line above, deliberately: a subscription's caveat and its re-check have to be the answer
-    # one function gives, or the create-time verdict and the refresh could disagree about a pair
-    # while both looked right. Unwired, `notification_servability.recheck()` returns before it reads the
-    # store, so nothing here is a cost in a deployment that never sets the seam.
-    notification_servability.configure(connectivity=notification_api_connectivity)
+    # The poller-side half of the same question (R6, AE13's second clause). The BATCH form of the
+    # seam above since U10, and `varsel._service_verdicts` reaches the same
+    # `_varsel_connectivity_batch` a create-time check does -- a subscription's caveat and its
+    # re-check have to be the answer one function gives, or the create-time verdict and the refresh
+    # could disagree about a pair while both looked right. Unwired, `notification_servability.recheck()`
+    # returns before it reads the store, so nothing here is a cost in a deployment that never sets
+    # the seam.
+    notification_servability.configure(
+        verdicts=functools.partial(
+            varsel._service_verdicts, path=_CONNECTIVITY_NOTIFICATION_API_PATH
+        )
+    )
     # The alert-decision log. ensure_table() is a CREATE TABLE IF NOT EXISTS, run here rather than
     # by a provisioning script because prd is an isolated project fed by free copies that nobody
     # runs build scripts against — without this the table would simply be missing there. Its own

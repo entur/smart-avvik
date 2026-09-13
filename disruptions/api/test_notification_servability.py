@@ -14,9 +14,11 @@ silently skips every test below it while still printing a passing count.
 
 from __future__ import annotations
 
+import ast
 import inspect
 import logging
 import pathlib
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -153,6 +155,8 @@ def _run(
     verdicts: Any = (True, False),
     now: datetime = NOW,
     monotonic: Any = None,
+    max_writes: int | None = None,
+    write_wait: float | None = None,
 ) -> list[dict]:
     """Run one pass with `store` installed and a seam that answers `verdicts`.
 
@@ -161,21 +165,32 @@ def _run(
     """
     asked: list[tuple[str, str]] = []
 
-    def seam(from_stop: str, to_stop: str):
-        asked.append((from_stop, to_stop))
-        return verdicts(from_stop, to_stop) if callable(verdicts) else verdicts
+    def seam(pairs):
+        # ONE call per pass since U10, however many pairs are pending, and the answers are
+        # POSITIONAL. `asked` still collects pairs, so every assertion below about "what was asked"
+        # is unchanged in meaning: it is the distinct stop pairs, not the subscriptions.
+        asked.extend(pairs)
+        return [verdicts(f, t) if callable(verdicts) else verdicts for f, t in pairs]
 
     mark = len(_SINK.records)
     before = (
         notification_store.subscription_mirror,
         notification_store.set_servability,
         notification_servability.monotonic,
+        notification_servability._MAX_WRITES_PER_CYCLE,
+        notification_servability._WRITE_WAIT_S,
     )
     notification_store.subscription_mirror = lambda: store  # type: ignore[assignment]
-    notification_store.set_servability = store.set_servability  # type: ignore[assignment]
+    # Read through the store object on every call, so a test that swaps its own writer in after
+    # construction is still the one the pass reaches.
+    notification_store.set_servability = lambda *a, **k: store.set_servability(*a, **k)  # type: ignore[assignment]
     if monotonic is not None:
         notification_servability.monotonic = monotonic
-    notification_servability.configure(connectivity=seam)
+    if max_writes is not None:
+        notification_servability._MAX_WRITES_PER_CYCLE = max_writes
+    if write_wait is not None:
+        notification_servability._WRITE_WAIT_S = write_wait
+    notification_servability.configure(verdicts=seam)
     try:
         notification_servability.recheck(now=now)
     finally:
@@ -183,6 +198,8 @@ def _run(
             notification_store.subscription_mirror,
             notification_store.set_servability,
             notification_servability.monotonic,
+            notification_servability._MAX_WRITES_PER_CYCLE,
+            notification_servability._WRITE_WAIT_S,
         ) = before
         notification_servability.reset_for_tests()
     store.asked = asked  # type: ignore[attr-defined]
@@ -214,7 +231,7 @@ def test_the_re_check_reuses_the_notification_passs_read_and_reads_for_itself_wh
     notification_store.subscription_mirror = lambda: store  # type: ignore[assignment]
     notification_store.set_servability = store.set_servability  # type: ignore[assignment]
     notification_store.configure(clock=lambda: NOW)
-    notification_servability.configure(connectivity=lambda _f, _t: (True, False))
+    notification_servability.configure(verdicts=lambda pairs: [(True, False)] * len(pairs))
     try:
         notification_store.recipient_documents()
         assert store.loads == 1
@@ -259,7 +276,10 @@ def test_none_is_never_passed_to_the_store():
     however the control flow is later rearranged."""
     assert "servable=None" not in MODULE_SOURCE
     body = inspect.getsource(notification_servability._sweep)
-    assert "if verdict is None:" in body and "continue" in body
+    # The batch form states it as a filter rather than a `continue`: a pair with no established
+    # answer never reaches `established`, so no subscription on it is ever handed to a worker.
+    assert "if answer is not None" in body
+    assert "servable=servable" in inspect.getsource(notification_servability._record)
 
 
 def test_the_create_path_states_the_same_rule():
@@ -335,7 +355,7 @@ def test_service_that_appeared_clears_the_caveat():
     fields = _run(store, verdicts=(True, True))
     assert store.writes == [("s1", True)]
     summary = [f for f in fields if f["result"] == "swept"]
-    assert summary and summary[0]["cleared"] == 1 and summary[0]["checked"] == 1
+    assert summary and summary[0]["cleared"] == 1 and summary[0]["asked"] == 1
 
 
 def test_an_unchanged_answer_still_moves_the_stamp():
@@ -367,15 +387,15 @@ def test_a_subscription_deleted_while_we_were_asking_is_skipped_not_resurrected(
         write_errors={"s1": notification_store.NotFound("no such subscription")},
     )
     fields = _run(store, verdicts=(True, True))
-    assert [w[0] for w in store.writes] == ["s1", "s2"], "the second record is still processed"
+    assert sorted(w[0] for w in store.writes) == ["s1", "s2"], "the second record is still processed"
     summary = [f for f in fields if f["result"] == "swept"]
     assert summary and summary[0]["cleared"] == 1, "a vanished record is not a cleared one"
     # An ORDINARY outcome, named as itself and not as a failed write: `set_servability` reads before
-    # it writes, so a tombstone refusing the stamp is the store working. Logged below WARNING for
-    # the reason every standing warning in this repo is argued down -- one on a routine deletion is
-    # how a real one stops being read.
-    assert "vanished" in store.levels and "write_failed" not in store.levels, store.levels
-    assert store.levels["vanished"] < logging.WARNING
+    # it writes, so a tombstone refusing the stamp is the store working. COUNTED rather than logged
+    # since U10 -- two thousand records a cycle is two thousand lines, and the pass writes no
+    # warning at all for this one, which is how a real warning stays readable.
+    assert summary[0]["vanished"] == 1 and summary[0]["write_failed"] == 0, summary
+    assert "write_failed" not in store.levels, store.levels
 
 
 def test_a_route_replaced_mid_check_is_superseded_rather_than_stamped():
@@ -395,13 +415,13 @@ def test_a_route_replaced_mid_check_is_superseded_rather_than_stamped():
         write_errors={"s1": notification_store.Conflict("version is 2, not 1")},
     )
     fields = _run(store, verdicts=(True, True))
-    assert [w[0] for w in store.writes] == ["s1", "s2"], "the second record is still processed"
+    assert sorted(w[0] for w in store.writes) == ["s1", "s2"], "the second record is still processed"
     # The version travels with the question, so the store can refuse a writer that is behind.
-    assert store.versions == [("s1", 1), ("s2", 1)], store.versions
+    assert sorted(store.versions) == [("s1", 1), ("s2", 1)], store.versions
     summary = [f for f in fields if f["result"] == "swept"]
     assert summary and summary[0]["cleared"] == 1, "a superseded record is not a cleared one"
-    assert "superseded" in store.levels and "write_failed" not in store.levels, store.levels
-    assert store.levels["superseded"] < logging.WARNING
+    assert summary[0]["superseded"] == 1 and summary[0]["write_failed"] == 0, summary
+    assert "write_failed" not in store.levels, store.levels
 
 
 def test_one_failing_write_does_not_end_the_sweep():
@@ -410,8 +430,10 @@ def test_one_failing_write_does_not_end_the_sweep():
         write_errors={"s1": RuntimeError("firestore is unhappy")},
     )
     fields = _run(store, verdicts=(True, True))
-    assert [w[0] for w in store.writes] == ["s1", "s2"]
+    assert sorted(w[0] for w in store.writes) == ["s1", "s2"]
     assert any(f["result"] == "write_failed" for f in fields)
+    summary = [f for f in fields if f["result"] == "swept"]
+    assert summary and summary[0]["write_failed"] == 1 and summary[0]["cleared"] == 1, summary
 
 
 def test_an_unreadable_store_leaves_every_caveat_standing():
@@ -437,15 +459,45 @@ def test_no_seam_means_no_store_read():
 # ---- The bounds ---------------------------------------------------------------------------------
 
 
-def test_the_ceiling_binds_and_says_so():
-    """A ceiling nobody can see binding is not a ceiling anybody can size."""
-    n = notification_servability._MAX_CHECKS_PER_CYCLE + 6
-    store = _Store([_sub(f"s{i}", checked_at=None) for i in range(n)])
-    fields = _run(store, verdicts=(False, False))
-    assert len(store.asked) == notification_servability._MAX_CHECKS_PER_CYCLE
+def test_the_ceiling_binds_on_WRITES_and_says_so():
+    """A ceiling nobody can see binding is not a ceiling anybody can size.
+
+    It bounds the STORE since U10 -- the BigQuery question is one job however many pairs are
+    pending, so bounding questions would bound nothing -- and it is patched down here because the
+    real number is two thousand and the check is about the policy.
+    """
+    bound = 3
+    n = bound + 6
+    store = _Store([_sub(f"s{i}", checked_at=None, to_stop=f"NSR:StopPlace:{i}") for i in range(n)])
+    fields = _run(store, verdicts=(False, False), max_writes=bound)
+    assert len(store.writes) == bound
     capped = [f for f in fields if f["result"] == "capped"]
-    assert capped and capped[0]["due"] == n
-    assert capped[0]["checked"] == notification_servability._MAX_CHECKS_PER_CYCLE
+    assert capped and capped[0]["due"] == n and capped[0]["capped"] == n - bound
+
+
+def test_a_pair_no_admitted_subscription_carries_is_never_asked_about():
+    """The pairs are derived from the ADMITTED subscriptions, not from the whole due set.
+
+    Asking about a pair whose records will not be written this cycle spends an answer on nothing:
+    the ceiling stops before them, they stay due, and the next cycle asks again anyway.
+    """
+    bound = 2
+    store = _Store([_sub(f"s{i}", checked_at=None, to_stop=f"NSR:StopPlace:{i}") for i in range(5)])
+    _run(store, verdicts=(False, False), max_writes=bound)
+    assert len(store.asked) == bound, store.asked
+
+
+def test_two_subscriptions_on_one_corridor_are_one_question(monkeypatch=None):
+    """A pair is asked about once and the answer fans back out to every record on it.
+
+    This is what makes the bound above a bound on RECORDS rather than on jobs: a hundred thousand
+    commuters on one corridor are one place in one query.
+    """
+    del monkeypatch
+    store = _Store([_sub("s1", checked_at=None), _sub("s2", checked_at=None)])
+    _run(store, verdicts=(True, False))
+    assert store.asked == [("NSR:StopPlace:337", "NSR:StopPlace:418")], store.asked
+    assert sorted(store.writes) == [("s1", True), ("s2", True)]
 
 
 def test_the_ceiling_is_spent_on_the_caveat_carrying_ones_oldest_first():
@@ -462,33 +514,28 @@ def test_the_ceiling_is_spent_on_the_caveat_carrying_ones_oldest_first():
     assert order == ["false-old", "false-recent", "null-never", "null-recent"]
 
 
-def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time():
-    """A ceiling on when the step ENDS, not on when its last question starts.
+def test_the_deadline_reserves_the_question_rather_than_measuring_elapsed_time():
+    """A ceiling on when the step ENDS, not on when its question starts.
 
-    The clock is driven rather than slept on. Each question costs half the seam's worst case, so a
-    measured-elapsed check would keep starting questions until the deadline had passed and the pass
-    would end one whole worst case beyond it.
+    The clock is driven rather than slept on: the load is made to consume all but a moment of the
+    budget, so the reservation refuses to start a question that could not finish inside it. A
+    measured-elapsed check would start it anyway and the phase would end one whole worst case past
+    the deadline -- with the poller's cycle behind it.
     """
     clock = {"t": 0.0}
-    step = notification_servability._WORST_CASE_CHECK_S / 2
+    store = _Store([_sub(f"s{i}", checked_at=None) for i in range(3)])
+    original = store.recipients
 
-    def fake_monotonic() -> float:
-        return clock["t"]
+    def slow_load(*args: Any, **kwargs: Any):
+        clock["t"] += notification_servability._DEADLINE_S - 1.0
+        return original(*args, **kwargs)
 
-    def slow(*_a: Any):
-        clock["t"] += step
-        return (False, False)
-
-    store = _Store([_sub(f"s{i}", checked_at=None) for i in range(20)])
-    fields = _run(store, verdicts=slow, monotonic=fake_monotonic)
-    assert clock["t"] <= notification_servability._DEADLINE_S, (
-        "the pass must END inside the deadline, not merely stop starting questions at it"
-    )
-    bound = [f for f in fields if f["result"] in {"capped", "deadline"}]
-    assert bound, fields
-    # With a worst case of 20 s reserved against a 30 s deadline, questions may start only while
-    # under 10 s have elapsed, so the deadline is what binds here rather than the count ceiling.
-    assert bound[0]["result"] == "deadline", bound
+    store.recipients = slow_load  # type: ignore[assignment]
+    fields = _run(store, verdicts=(False, False), monotonic=lambda: clock["t"])
+    assert store.asked == [], "no question may start that cannot finish inside the deadline"
+    assert store.writes == []
+    assert [f["result"] for f in fields] == ["deadline"], fields
+    assert clock["t"] <= notification_servability._DEADLINE_S
 
 
 def test_the_clock_starts_before_the_store_read():
@@ -502,30 +549,101 @@ def test_the_clock_starts_before_the_store_read():
     assert body.index("started = monotonic()") < body.index("_load(")
 
 
-def test_the_deadline_does_not_claim_to_reserve_the_write():
-    """The ceiling is `_DEADLINE_S` plus one `set_servability`, and the module says so.
+def test_the_write_pass_is_collected_under_a_bound_and_stragglers_are_counted():
+    """A transactional COMMIT carries no client-side deadline, so an unbounded wait here would park
+    the poller's thread on a hung store -- which is the one failure this phase must not cause.
 
-    `notification_store._run_transaction` retries a contended body five times at
-    `notification_store._CALL_DEADLINE_S` per read, and the commit carries no deadline at all -- so the
-    write tail cannot be reserved into a true ceiling from here, only bounded by an outer wait this
-    step does not run. What the comment must not do is state a ceiling the code does not hold.
+    The abandoned write is not lost work and not a wrong answer: its record simply stays due, which
+    is the state it was already in, and the next cycle picks it up.
     """
-    reservation = inspect.getsource(notification_servability._sweep)
-    assert "monotonic() + _WORST_CASE_CHECK_S > deadline" in reservation
-    assert "_WORST_CASE_WRITE" not in MODULE_SOURCE, (
-        "if a write allowance is ever reserved, the docstring's residual has to go with it"
+    release = threading.Event()
+    store = _Store([_sub("slow", checked_at=None), _sub("quick", checked_at=None, to_stop="NSR:StopPlace:9")])
+    original = store.set_servability
+
+    def blocking(subscription_id: str, **kwargs: Any):
+        if subscription_id == "slow":
+            release.wait(5)
+        return original(subscription_id, **kwargs)
+
+    store.set_servability = blocking  # type: ignore[assignment]
+    try:
+        fields = _run(store, verdicts=(True, True), write_wait=0.05)
+    finally:
+        release.set()
+    summary = [f for f in fields if f["result"] == "abandoned"]
+    assert summary and summary[0]["abandoned"] == 1, fields
+    assert summary[0]["cleared"] == 1, "the record that did finish is still counted"
+
+
+def test_the_writes_of_one_pass_overlap_rather_than_queueing():
+    """U9's arithmetic one module over: one transaction at a time is ~4 writes a second however
+    many are waiting, so a bound of two thousand with a serial writer is decoration.
+
+    A barrier is the falsification: it can only be crossed if the writes are genuinely concurrent,
+    and a serial pass deadlocks on it rather than merely running slowly.
+    """
+    width = 8
+    barrier = threading.Barrier(width, timeout=5)
+    store = _Store(
+        [_sub(f"s{i}", checked_at=None, to_stop=f"NSR:StopPlace:{i}") for i in range(width)]
+    )
+    original = store.set_servability
+
+    def synchronised(subscription_id: str, **kwargs: Any):
+        barrier.wait()
+        return original(subscription_id, **kwargs)
+
+    store.set_servability = synchronised  # type: ignore[assignment]
+    fields = _run(store, verdicts=(True, True))
+    summary = [f for f in fields if f["result"] == "swept"]
+    assert summary and summary[0]["cleared"] == width, fields
+
+
+def test_the_write_bound_is_expressed_as_a_transaction_and_not_as_a_firestore_batch():
+    """The answer is about a ROUTE, and only the version compare says so.
+
+    A Firestore `WriteBatch` has exactly two preconditions, `exists` and `last_update_time`, and
+    neither can express "and the route has not changed". `last_update_time` read off the mirror is
+    as old as the last sync, and `_sent_body` deliberately does not stamp -- so the subscriptions a
+    delivery has written since would fail the precondition every cycle, forever. The version travels
+    with the question instead, which is what `set_servability` already enforces inside a
+    transaction.
+    """
+    # Over the PARSED module, not over its text: the prose above explains why a batch is refused,
+    # so a grep would match the argument for the rule as though it were the rule being broken --
+    # and a guard that cannot tell those apart is one nobody can write a comment near.
+    forbidden = {"WriteBatch", "BulkWriter", "batch", "bulk_writer", "last_update_time"}
+    used = set()
+    for node in ast.walk(ast.parse(MODULE_SOURCE)):
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            used.add(node.attr)
+        elif isinstance(node, ast.keyword) and node.arg:
+            used.add(node.arg)
+    assert not (used & forbidden), used & forbidden
+    assert "expected_version=subscription.version" in inspect.getsource(
+        notification_servability._record
     )
 
 
 def test_the_bounds_are_sized_against_each_other_and_against_the_cadence():
-    assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (
-        "a deadline at the worst case admits exactly one question, making the count a decoration"
-    )
-    # Four questions a day hold the six-hour interval for one subscription, so the per-cycle
-    # ceiling times a day of ~296 s cycles is the population this pass can carry at full cadence.
-    per_day = notification_servability._MAX_CHECKS_PER_CYCLE * (24 * 3600 / 296)
+    assert notification_servability._DEADLINE_S > (
+        notification_servability._WORST_CASE_CHECK_S + notification_servability._WRITE_WAIT_S
+    ), "the phase ceiling must cover the question AND the write pass it no longer leaves outside it"
+    # Four checks a day hold the six-hour interval for one record, so the per-cycle write ceiling
+    # times a day of ~296 s cycles is the population this pass can carry at full cadence.
+    per_day = notification_servability._MAX_WRITES_PER_CYCLE * (24 * 3600 / 296)
     carried = per_day / (timedelta(days=1) / notification_servability._RECHECK_INTERVAL)
-    assert carried > 100, carried
+    assert carried > 100_000, carried
+    # Serial, the write bound would be unreachable: the pool is what makes it a bound rather than
+    # an aspiration.
+    serial_seconds = notification_servability._MAX_WRITES_PER_CYCLE * 0.25
+    assert serial_seconds > notification_servability._WRITE_WAIT_S
+    assert (
+        serial_seconds / notification_servability._WRITE_WORKERS
+        <= notification_servability._WRITE_WAIT_S
+    )
 
 
 # ---- Quiet on a healthy list, and R16 -----------------------------------------------------------
@@ -590,9 +708,17 @@ def test_no_log_record_carries_a_route_a_window_or_prose():
             "client_id",
             "subscription_id",
             "due",
-            "checked",
+            "asked",
+            "answers",
+            "pairs",
+            "established",
             "cleared",
             "unservable",
+            "vanished",
+            "superseded",
+            "write_failed",
+            "abandoned",
+            "capped",
             "truncated",
             "ms",
         }, record
