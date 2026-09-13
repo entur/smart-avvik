@@ -3802,6 +3802,41 @@ def _webhook_observations(
     return observations
 
 
+@dataclass(frozen=True)
+class _ClientWording:
+    """What the CLIENT channel told one decision subject about one train, as the log stores it.
+
+    Four fields rather than the (text, source) pair this started as, and the two that were added
+    are the ones a COPIED row gets wrong. :func:`record_minted_decisions` builds its row from the
+    thinning ledger's copy, and on a thinned cycle that copy came through :func:`decisions.rescored`
+    — which refreshes the prediction figures and carries `message_input`, `message_deterministic`
+    and `message_status` from the last row actually WRITTEN, up to
+    :data:`_DECISION_THINNING_INTERVAL_S` ago. The browser channel never meets that, because
+    `pushed` is one of the thinning rule's keep-reasons and so a pushed row is always a fresh
+    :func:`decisions.build_row`; a mint is not in `pushed_keys` and therefore lands on whatever row
+    the rule left behind. `/meldinger` replays the FIRST pushed row's `message_input` and stamps its
+    `decided_at` as `would_send_at`, so the copy would have it replaying a quarter-hour-old document
+    beside this cycle's figures — systematically, for every client subject, on the page this channel
+    is being scored by.
+
+    `message_input` is the DICT, not the serialized form: the mint is a small set (lifecycle
+    transitions only) while an observation is produced for every alert-worthy train on every
+    definition with a client on it, so the JSON and the template body are rendered by the reader
+    for the subjects that actually minted rather than here for all of them.
+    """
+
+    #: The text the client's event carried, without the route line the body leads with.
+    message: str
+    #: 'llm' or 'deterministic' — which of the two wordings that text is.
+    source: str
+    #: The model's wording where one was read from the cache, else None. Never a browser-gate
+    #: read: `_webhook_wording` answers None when THIS channel's flag is off, which is the
+    #: "written but withheld" state and not an absence.
+    llm: str | None
+    #: The document this cycle would word from — the same object `_record_decisions` stores.
+    message_input: dict | None
+
+
 def _observations_for_key(
     out: list[notification_events.WebhookObservation],
     key: str,
@@ -3811,17 +3846,18 @@ def _observations_for_key(
     match_targets: dict[str, dict],
     message_inputs: dict[tuple[str, str, str], dict | None],
     webhook_llm: bool,
-    wordings: dict[tuple[str, str, str], tuple[str, str]] | None = None,
+    wordings: dict[tuple[str, str, str], _ClientWording] | None = None,
 ) -> int:
     """One journey definition's observations, appended to `out`. Returns the unroutable count.
 
     Split out so the per-definition guard in :func:`_webhook_observations` has something to wrap.
 
-    `wordings` collects (message, message_source) per decision subject for U16: what the CLIENT was
+    `wordings` collects a :class:`_ClientWording` per decision subject for U16: what the CLIENT was
     told about this train, as the decision log stores a wording — the text alone, without the route
-    line the event body leads with. It is filled here because this is where the choice between the
-    model's text and the template is actually made; recovering it from the body afterwards would
-    mean stripping a line by convention, and recomputing it would be a second copy of that choice.
+    line the event body leads with — beside the document it was worded from. It is filled here
+    because this is where the choice between the model's text and the template is actually made;
+    recovering it from the body afterwards would mean stripping a line by convention, and
+    recomputing it would be a second copy of that choice.
     """
     unroutable = 0
     alerts = alerts_by_key.get(key) or []
@@ -3907,8 +3943,11 @@ def _observations_for_key(
                 confirmed=False,
             )
             if wordings is not None:
-                wordings[decision_key] = (
-                    (cached, "llm") if cached else (_deterministic_body(message_input), "deterministic")
+                wordings[decision_key] = _ClientWording(
+                    message=cached if cached else _deterministic_body(message_input),
+                    source="llm" if cached else "deterministic",
+                    llm=cached,
+                    message_input=message_input,
                 )
         else:
             title, body = _webhook_withdrawal_wording(message_input, from_name, to_name)
@@ -3916,7 +3955,12 @@ def _observations_for_key(
                 # A retraction has no model behind it by construction (`_webhook_withdrawal_wording`
                 # explains why there is no wording to retract WITH), so the source is the template
                 # whatever the flag says.
-                wordings[decision_key] = (_WEBHOOK_WITHDRAWAL_DETAIL, "deterministic")
+                wordings[decision_key] = _ClientWording(
+                    message=_WEBHOOK_WITHDRAWAL_DETAIL,
+                    source="deterministic",
+                    llm=None,
+                    message_input=message_input,
+                )
         payload = _webhook_payload(
             winner,
             contributing.get(train, [winner]),
@@ -3996,15 +4040,15 @@ class PassOutcome:
     """
 
     webhook_observations: tuple[notification_events.WebhookObservation, ...] = ()
-    #: What the CLIENT channel would tell each decision subject, as the log stores a wording: the
-    #: text alone, no route line, beside 'llm' or 'deterministic'. Read by
-    #: :func:`record_minted_decisions` after the emit step says which subjects were actually
-    #: notified — so this is a pass-local lookup rather than a claim that anything was sent.
+    #: What the CLIENT channel would tell each decision subject, as the log stores a wording: see
+    #: :class:`_ClientWording`. Read by :func:`record_minted_decisions` after the emit step says
+    #: which subjects were actually notified — so this is a pass-local lookup rather than a claim
+    #: that anything was sent.
     #:
     #: A mapping rather than a field on the observation because the reader is keyed the other way
     #: round: emit reports decision keys, and walking every observation to find one would make the
     #: mint write O(observations x mints) on exactly the corridor U9 emptied of per-recipient work.
-    webhook_wordings: Mapping[tuple[str, str, str], tuple[str, str]] = field(default_factory=dict)
+    webhook_wordings: Mapping[tuple[str, str, str], _ClientWording] = field(default_factory=dict)
 
 
 def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, str, str]]) -> int:
@@ -4021,9 +4065,22 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
 
     So: one extra row per newly-notified subject, written here, in the same phase as the emit that
     produced it. It is a COPY of the ledger's own row — the one `_record_decisions` either wrote or
-    restated minutes ago — with `pushed` flipped and the client's wording in `message`. Copying
-    rather than rebuilding is the point: a second builder would be a second definition of what a
-    decision row is, and it would drift the first time `build_row` gained a field.
+    restated minutes ago — with `pushed` flipped and the client's five wording columns restated from
+    this cycle. Copying the rest rather than rebuilding it is the point: a second builder would be a
+    second definition of what a decision row is, and it would drift the first time `build_row`
+    gained a field.
+
+    **The five that are restated are restated because the copy would be STALE, not merely
+    approximate.** On a thinned cycle the ledger's row came through `decisions.rescored`, which
+    refreshes the prediction figures and carries the message columns from the last row actually
+    written — so `message_input` can be up to `_DECISION_THINNING_INTERVAL_S` old beside figures
+    that are not. `/meldinger` replays the first pushed row's `message_input` and stamps that row's
+    `decided_at` as `would_send_at`, so a copied input would have the page replaying a
+    quarter-hour-old document under this cycle's timestamp. The browser channel cannot meet this at
+    all: `pushed` is one of the thinning rule's keep-reasons, so a pushed row there is always a
+    fresh `build_row`. A mint is deliberately NOT in `pushed_keys` — that is what stops a subject
+    holding two PUSHED rows at one instant — so it lands on whatever row the rule left behind, and
+    restating is what makes `decided_at`, the figures and the input describe one cycle.
 
     **What it costs, stated where it is paid.**
 
@@ -4037,6 +4094,14 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
       transition and the next cycle sees an unchanged phase. That is exactly the browser channel's
       existing hole — `pushed_keys` is pass-local and a short write commits no ledger entry — so
       this adds no new class of loss, and `decisions.record` logs the short write either way.
+    * `llm_provider`, `llm_model` and — where the rule below leaves it — `message_status` are
+      CARRIED, so they describe the browser pass's last write for this definition rather than the
+      client's wording. The one that could mislead is `message_status`, because `ok` claims a
+      same-input pair (`message_wording_comparison.sql` filters on exactly that) and the row's
+      `message_llm` is by construction from a different cycle's input than the `message_input` now
+      beside it. So the rule is one line and covers every branch: a row that carries a model wording
+      reads `ok_cached`, which is precisely what that value already documents — «message_llm from an
+      EARLIER cycle's input, message_deterministic from this one».
     * A WITHDRAWAL mints too, and it marks a row whose `alertworthy` is false. That combination
       cannot arise on the browser channel and it is not an error: a retraction is a notification the
       client received, and a withdrawal can only exist where something was standing, so the
@@ -4064,10 +4129,12 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
         for key in minted:
             entry = entries.get(key)
             if entry is None or entry.get("row") is None:
-                # The subject retired between the match and the mint (its situation ended, or the
-                # train stopped being catchable), so the sweep has already popped it and written its
-                # closing row. Counted rather than warned per subject: at this population a per-row
-                # line is a log nobody reads.
+                # Two causes and one treatment. The subject retired between the match and the mint
+                # (its situation ended, or the train stopped being catchable), so the sweep has
+                # already popped it and written its closing row — or its very first row was lost to
+                # a short write, which commits no ledger entry, so there has never been a row to
+                # copy. Counted rather than warned per subject: at this population a per-row line is
+                # a log nobody reads.
                 missing += 1
                 continue
             if entry["row"].get("pushed"):
@@ -4077,21 +4144,51 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
                 # ambiguous. The browser wording is the one the page then quotes; `channel` says a
                 # client was there too.
                 continue
-            message, source = outcome.webhook_wordings.get(key, (None, "deterministic"))
-            row = {
-                **entry["row"],
-                "pushed": True,
-                "message": message if message is not None else entry["row"].get("message"),
-                "message_source": source,
-            }
+            row = {**entry["row"], "pushed": True}
+            wording = outcome.webhook_wordings.get(key)
+            if wording is not None:
+                try:
+                    deterministic = _deterministic_body(wording.message_input or {})
+                except Exception:
+                    # Guarded per subject, `_record_decisions`' own rule one function along: one
+                    # awkward payload costs that subject's mark, never the pass's. The outer
+                    # `except` would cost every mint on the cycle.
+                    logger.warning(
+                        "Could not word the client's template for %s; its mark is skipped",
+                        key[0],
+                        exc_info=True,
+                        extra={"fields": {"event": "varsel_decision_write",
+                                          "result": "mint_no_wording"}},
+                    )
+                    continue
+                row.update({
+                    "message": wording.message,
+                    "message_source": wording.source,
+                    # NOT `wording.llm` alone. `_webhook_wording` answers None when THIS channel's
+                    # flag is off while a model wording sits in the cache, which is the documented
+                    # "written but withheld" state (`message_source='deterministic'` AND
+                    # `message_llm IS NOT NULL`) — and blanking it would delete that population
+                    # from the client's half of the log. So the cached text wins where there is
+                    # one, and the pass's own answer stands where there is not.
+                    "message_llm": wording.llm or entry["row"].get("message_llm"),
+                    "message_deterministic": deterministic,
+                    "message_input": _message_input_json(wording.message_input),
+                })
+                if row.get("message_llm") and row.get("message_status") == "ok":
+                    # See the docstring's cost list: `ok` claims the row's two wordings were
+                    # written from the `message_input` beside them, and this row's input is this
+                    # cycle's while its `message_llm` is not. `ok_cached` is the value that already
+                    # says exactly that, so the demotion states the truth rather than inventing a
+                    # status for the client channel.
+                    row["message_status"] = "ok_cached"
             rows.append(row)
             stamped.append((key, row))
         if not rows:
             if missing:
                 logger.info(
-                    "%d minted subject(s) had already retired; their closing rows stand",
+                    "%d minted subject(s) had no row to mark (retired, or never written)",
                     missing,
-                    extra={"fields": {"event": "varsel_decision_write", "result": "mint_retired",
+                    extra={"fields": {"event": "varsel_decision_write", "result": "mint_no_row",
                                       "n": missing}},
                 )
             return 0

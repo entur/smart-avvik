@@ -5036,6 +5036,75 @@ def test_a_minted_client_notification_marks_its_subject_pushed_on_the_same_cycle
     )
 
 
+# Still alert-worthy and no new maximum — only the cancellation figure has eased, which is what
+# keeps the subject THINNED on the second cycle (`_thinning_reason` reads `alertworthy` and
+# `impact_probability`, neither of which moves here) while its message input genuinely changes.
+SNAPSHOT_LESS_LIKELY_CANCELLED = {
+    "S1": [
+        FakeCall("t1", "A", 1, DEP, p_cancel=0.55, p_impact_dep=0.9),
+        FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+}
+
+
+def test_a_mint_on_a_thinned_cycle_records_that_cycles_input_not_the_ledgers(monkeypatch):
+    """The mint row is a copy, and the five wording columns are the ones a copy gets WRONG.
+
+    KTD15 thins a standing subject to one row per 15 min, and between writes the ledger's row is
+    re-stated through `decisions.rescored` — which refreshes the prediction figures and carries
+    `message_input`, `message_deterministic` and `message_status` from the last row actually
+    written. The browser channel never meets that: `pushed` is one of the rule's keep-reasons, so a
+    pushed row there is always a fresh `build_row`. A mint is deliberately not in `pushed_keys`, so
+    it lands on whatever the rule left behind — and `/meldinger` replays the FIRST pushed row's
+    `message_input` and stamps that row's `decided_at` as `would_send_at`. Copied, the page would
+    word "what we would send now" from a quarter-hour-old document under this cycle's timestamp,
+    beside figures that are not, for every client subject on the page this channel is scored by.
+
+    Driven at the DEFAULT thinning interval, since the whole defect is a cycle the rule skipped.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == 1, f"control: the first cycle writes the subject's first row: {log.rows}"
+    first = log.rows[0]
+    assert first["message_status"] == "ok", (
+        "control: the first row is a fresh write with a wording of its own -- the status the "
+        f"demotion below has something to demote: {first['message_status']}"
+    )
+
+    _use_snapshot(SNAPSHOT_LESS_LIKELY_CANCELLED)
+    outcome = varsel.check_and_notify(SNAPSHOT_LESS_LIKELY_CANCELLED)
+    assert len(log.rows) == 1, (
+        f"control: the second cycle is THINNED -- no row, which is what makes this the case: {log.rows}"
+    )
+
+    key = next(o.decision_key for o in outcome.webhook_observations if o.decision_key)
+    assert varsel.record_minted_decisions(outcome, [key]) == 1
+
+    mint = log.rows[-1]
+    assert mint["pushed"] is True
+    assert mint["cancel_probability"] != first["cancel_probability"], (
+        "control: the two cycles genuinely differ, or nothing below can fail"
+    )
+    assert mint["message_input"] != first["message_input"], (
+        "the replayed document is THIS cycle's, not the one the ledger was carrying"
+    )
+    assert json.loads(mint["message_input"]) == json.loads(
+        varsel._message_input_json(outcome.webhook_wordings[key].message_input)
+    ), "and it is the very document the client's wording was written from"
+    assert mint["message_deterministic"] == varsel._deterministic_body(
+        outcome.webhook_wordings[key].message_input
+    ), "the template beside it is worded from the same input, so the pair stays same-input"
+    assert mint["message_llm"] and mint["message_status"] == "ok_cached", (
+        "a carried model wording was written from an earlier cycle's input than the one now beside "
+        f"it, which is exactly what `ok_cached` says: {mint['message_status']}"
+    )
+
+
 def test_a_mint_for_a_subject_the_browser_already_pushed_writes_no_second_row(monkeypatch):
     """One PUSHED row per subject per cycle, which is what keeps the view's wording pick decidable.
 
@@ -5080,6 +5149,10 @@ def test_a_mint_for_a_subject_that_already_retired_leaves_its_closing_row_alone(
     Writing one anyway would need a second builder, and rebuilding a row from an alert the pass no
     longer holds is how a decision row stops describing a decision. The closing row the sweep
     already wrote is the subject's last look and stands; the mint is counted, not warned per row.
+
+    The counter is `mint_no_row` rather than `mint_retired` because retirement is only one of its
+    two causes: a subject whose very first row was lost to a short write commits no ledger entry
+    either, and has never had a row to mark.
     """
     _reset_state()
     log = _use_decision_log(monkeypatch)
@@ -5094,9 +5167,9 @@ def test_a_mint_for_a_subject_that_already_retired_leaves_its_closing_row_alone(
         assert varsel.record_minted_decisions(outcome, [("gone", "S1", "")]) == 0
     assert len(log.rows) == before, "nothing is invented for a subject that is over"
     written = _events(records, "varsel_decision_write")
-    assert [r["result"] for r in written] == ["mint_retired"], (
-        "a retired subject is an expected, counted outcome -- not an exception the guard swallows, "
-        f"which is what this distinguishes: {written}"
+    assert [r["result"] for r in written] == ["mint_no_row"], (
+        "a subject with no row is an expected, counted outcome -- not an exception the guard "
+        f"swallows, which is what this distinguishes: {written}"
     )
 
 
