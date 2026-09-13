@@ -1108,6 +1108,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **HIGH** inside a pass for the same reason (the worker resolves deliveries this process does not
   hear about), so it refuses earlier than it needs to — the conservative direction; what would break
   its exactness is a second EMITTER.
+  **`deliveries_per_minute` means per minute since U11, and it did not quite before.** The
+  per-destination ceiling is applied inside `pending_deliveries`' read; under the poller that was
+  once per ~296 s cycle, so 50 per read was about ten a minute — under the name, which is why
+  nothing said otherwise. The worker's rounds are continuous while there is work, so the same
+  ceiling per read would be ~600/min at one receiver: twelve times the published number, whose
+  first visible effect would be the receiver's own 429 and U7's backoff, i.e. a self-inflicted
+  outage that reads as a misbehaving client. `webhook_delivery` keeps a rolling per-destination
+  minute tally (`_DESTINATION_WINDOW_S`) and subtracts it from the ceiling before the read admits a
+  row. Charged on what the read ADMITTED, not on what was POSTed — over-counting by whatever the
+  pass then skips, which is the safe direction. It is a no-op for a poller-only deployment (a cycle
+  is longer than the window), and it is PER PROCESS, so N replicas are N times the rate exactly as
+  the drain formula's `× replicas` says. Like every module budget here it joins the suite's reset
+  (`webhook_delivery.reset_destination_window`), or a leaked tally reads exactly like a real
+  refusal.
   Two new series: `kix_worker_last_tick_timestamp_seconds` (liveness, set on every round including
   the empty ones, **absent from the API pods** — so an alert on it must count no data as firing, or
   a worker scaled to zero reads as healthy) and `kix_delivery_backlog_age_seconds` (how long ago the

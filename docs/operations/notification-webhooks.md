@@ -561,7 +561,7 @@ Every bound is a number:
 | delivery step deadline / bounded wait | 20 s / 20 s |
 | emit step deadline / bounded wait | 6 s / 8 s |
 | per Firestore call | 4 s, under `varsel`'s 5 s wait |
-| attempts per cycle, total / per destination | 200 / **the client's `deliveries_per_minute`**, default 50 |
+| attempts per cycle, total / per destination | 200 / **the client's `deliveries_per_minute`**, default 50 — and since U11 that second number is genuinely **per minute**, not per read: a rolling per-destination minute tally (`webhook_delivery._DESTINATION_WINDOW_S`) is subtracted from the ceiling before the read admits a row. It changes nothing for a poller-only deployment, whose reads are ~296 s apart, and everything for the worker, whose rounds are continuous while there is work — at 50 per read and ~5 s per round that would be ~600/min at one receiver, twelve times the published number, whose first visible effect would be the receiver's own 429 and U7's backoff |
 
 **A claim takes a 20 s lease on the delivery** (U8, KTD14), and the arithmetic is the whole of the
 number: after `_claim_body` commits, one attempt still reads the event (one Firestore call at 4 s),
@@ -861,8 +861,18 @@ deliveries through a tunnelled receiver; the first draft guessed 0.15 s) and `t_
 receiver's own latency. At 0.2 s POST and 0.2 s store, 20 000 deliveries on one replica is
 20 000 × 0.4 ÷ 4 ≈ **33 minutes** — inside an event's one-hour validity, and only just, which is why
 the formula multiplies by `replicas`. A 2 s receiver is 20 000 × 2.2 ÷ 4 ≈ 3 hours on one replica and
-needs six. Note `deliveries_per_minute` is a per-destination ceiling applied per READ, so it is per
-replica too — the formula's `× replicas` is honest about that rather than hiding it.
+needs six. Note `deliveries_per_minute` is applied per destination and per PROCESS, so it is per
+replica — the formula's `× replicas` is honest about that rather than hiding it.
+
+**`deliveries_per_minute` means per minute, and it did not quite before U11.** The ceiling is
+applied inside the read. Under the poller that was once per ~296 s cycle, so 50 per read was about
+ten a minute — under the name, which is why nothing said otherwise. The worker's rounds are
+continuous while there is work, so the same ceiling per read would be ~600/min at one receiver.
+`webhook_delivery` therefore keeps a rolling per-destination minute tally and subtracts it from the
+ceiling before the read admits a row; the tally is charged on what the read ADMITTED rather than on
+what was POSTed, which over-counts by whatever the pass then skips — the safe direction, since what
+it slows is the next read against a destination that is already unwell. It is **per process**, so N
+replicas are N times the rate, which is the same thing the drain formula's `× replicas` says.
 
 **Scaling is `deployment.forceReplicas` in `helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml`.**
 By hand and not by HPA: the `kix_*` series live in Thanos rather than in Google Managed Prometheus,

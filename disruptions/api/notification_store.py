@@ -3787,6 +3787,7 @@ def pending_deliveries(
     *,
     limit: int = MAX_DELIVERY_ATTEMPTS_PER_CYCLE,
     per_destination_limit: Callable[[str], int] | None = None,
+    per_destination_spent: Callable[[str], int] | None = None,
     now: datetime | None = None,
 ) -> PendingDeliveries:
     """What to attempt this cycle, soonest-departure-first.
@@ -3882,6 +3883,13 @@ def pending_deliveries(
             if len(ready) >= ceiling:
                 break
             spent = per_destination.get(delivery.destination_id, 0)
+            # `per_destination_spent` is what a destination has ALREADY been offered inside the
+            # caller's own window (U11). Without it the ceiling is per READ, which under a worker
+            # that loops continuously is many times per minute -- see
+            # `webhook_delivery._DESTINATION_WINDOW_S`. Resolved by the caller for
+            # `per_destination_limit`'s reason: the clock and the ledger are not this module's.
+            if per_destination_spent is not None:
+                spent += per_destination_spent(delivery.destination_id)
             if spent >= _destination_ceiling(delivery.client_id):
                 throttled.add(delivery.destination_id)
                 continue

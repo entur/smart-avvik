@@ -230,12 +230,16 @@ def _install_stop(stop: threading.Event) -> None:
     """
 
     def _handle(signum: int, _frame: object) -> None:
+        # SET FIRST, log second. A handler runs on the main thread between bytecodes, so it can
+        # interrupt anything -- including a `logging` call already holding the handler lock. The
+        # stdlib's locks are reentrant and this is safe in practice; the ordering is what makes it
+        # safe by construction, because the state change cannot be lost to a slow stream.
+        stop.set()
         logger.info(
             "Signal %d received; the worker stops after the round in flight",
             signum,
             extra={"fields": {"event": "webhook_worker", "result": "stopping", "signal": signum}},
         )
-        stop.set()
 
     signal.signal(signal.SIGTERM, _handle)
     signal.signal(signal.SIGINT, _handle)
