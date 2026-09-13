@@ -721,11 +721,12 @@ def test_a_push_that_cannot_name_its_train_charges_the_day_and_marks_no_train(_m
     assert stored["daily_pushes"], "the day's count was not charged"
     assert store.push_ledger("j1").sent_today == 1
 
-    blob = varsel_state.BlobRegistrations(max_devices=MAX_DEVICES, max_journeys=MAX_JOURNEYS)
+    blob = _reset()  # clears the module state this half writes, and `_reset()` again below
     blob.create_journey("j1", _journey())
     blob.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
     assert blob.push_ledger("j1").pushed_trains == frozenset(), "the two backends disagree"
     assert blob.push_ledger("j1").sent_today == 1
+    _reset()  # the blob's state is MODULE state; left behind it reaches whatever runs next
 
 
 def test_a_mark_for_a_journey_erased_mid_push_is_dropped_rather_than_raised(_mp):
