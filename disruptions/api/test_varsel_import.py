@@ -1,4 +1,4 @@
-"""Checks for U14's cutover import — the one-shot that moves the GCS blob into the store.
+"""Checks for U14's cutover: the one-shot import into the store, and the export back out of it.
 
 Hermetic and standalone: the blob is a temp file, the store is `test_notification_store`'s fake
 client running the REAL transaction bodies, and nothing here touches GCS, Firestore or the network.
@@ -141,8 +141,12 @@ def _store(_mp: Any, now: datetime = NOW) -> tuple[varsel_state.StoreRegistratio
             if path.startswith(f"{notification_store.DEVICES}/")
         ]
         client.page("device_journeys", notification_store.SUBSCRIPTIONS, subscriptions)
+        # The export's own read, which has no filters at all: it pages the whole collection and
+        # picks the client and the channel in Python, so the fixture stages every subscription.
+        client.page("mirror_seed", notification_store.SUBSCRIPTIONS, subscriptions)
         client.page("subscription_count", notification_store.SUBSCRIPTIONS, subscriptions)
         client.page("device_count", notification_store.DEVICES, devices)
+        client.page("device_listing", notification_store.DEVICES, devices)
         return staged(name, **kwargs)
 
     notification_store._query = _restaging_query  # type: ignore[assignment]
@@ -365,6 +369,95 @@ def test_an_import_that_lost_a_mark_refuses_too(_mp):
         assert "marks" in str(exc)
     else:
         raise AssertionError("an import that lost the push marks must refuse to serve")
+
+
+# ---- The rollback artefact ---------------------------------------------------------------------
+
+
+def _imported(_mp: Any) -> tuple[Any, Any]:
+    _write_blob()
+    store, client = _store(_mp)
+    varsel_state.import_blob_into_store(store, now=NOW)
+    return store, client
+
+
+def test_the_export_writes_a_blob_the_blob_backend_can_read_straight_back(_mp):
+    """Round trip: import, export, load the export with the blob backend, compare.
+
+    The artefact is only worth having if a rollback can USE it, and a rollback is
+    `VARSEL_STATE_BACKEND` back to `gcs` -- which is `apply_state` over whatever the blob holds. So
+    the check is not "the file has the right keys" but "the other backend reads the same
+    registrations out of it".
+    """
+    store, _client = _imported(_mp)
+    report = varsel_state.export_store_to_blob(store, now=NOW)
+    assert report.journeys == 3 and report.devices == 2 and report.tombstones == 1
+    assert report.marks == 4 and report.bytes_written > 0
+
+    varsel_state.apply_state(varsel_state.read_blob_text() or "{}")
+    assert set(varsel_state._journeys) == {"j-1", "j-2", "j-3"}
+    assert set(varsel_state._devices) == {DEV_A, DEV_B}, "a tombstoned device is not a record"
+    assert set(varsel_state._device_tombstones) == {DEV_GONE}
+    assert varsel_state._device_tombstones[DEV_GONE]["reason"] == "turned_off"
+    assert varsel_state._device_tombstones[DEV_GONE]["journeys"] == 1
+    # The four live marks; the stray one the import dropped does not come back.
+    assert varsel_state._notified == {
+        "j-1|ENT:SituationNumber:1",
+        "j-1|ENT:SituationNumber:2",
+        "j-2|ENT:SituationNumber:3",
+        "j-3|KIX:ETCancellation:abc",
+    }
+    assert varsel_state._journeys["j-1"]["created_ts"] == SIGNUP.isoformat()
+
+
+def test_a_traveller_who_erased_everything_is_absent_from_the_next_export(_mp):
+    """The property the export exists for, and the only one whose absence is a privacy defect.
+
+    The import creates and never deletes, so the blob still holds every registration it started
+    with -- including those of somebody who has since pressed «Slett alt». Roll back without an
+    export and they are all back. The read behind the export applies liveness, so a tombstoned
+    registration is ABSENT rather than written as deleted.
+    """
+    store, _client = _imported(_mp)
+    store.erase_device(DEV_A)
+    varsel_state.export_store_to_blob(store, now=NOW)
+
+    varsel_state.apply_state(varsel_state.read_blob_text() or "{}")
+    assert set(varsel_state._journeys) == {"j-3"}, "an erased traveller's journeys were exported"
+    assert DEV_A not in varsel_state._devices
+    assert not [m for m in varsel_state._notified if m.startswith("j-1|")]
+
+
+def test_the_export_carries_through_the_keys_the_store_has_no_home_for(_mp):
+    """The togvarsel round markers and anything else the blob carries.
+
+    They are off the protocol and the store holds none of them, so an export that rebuilt the
+    document from the store alone would silently delete them from the only place they exist -- and
+    the deletion would be invisible until a rush round re-fired after a restart.
+    """
+    store, _client = _imported(_mp)
+    varsel_state.export_store_to_blob(store, now=NOW)
+    written = json.loads(varsel_state.read_blob_text() or "{}")
+    assert written["togvarsel_rounds"] == {"2026-09-30": {"0630": {"level": "yellow", "pushed": True}}}
+    assert written["some_future_key"] == {"kept": True}
+
+
+def test_the_export_never_writes_the_blob_backends_empty_state_over_the_artefact(_mp):
+    """`save_state` serialises the blob backend's own module dicts, which are EMPTY under the store.
+
+    So the one thing an export must not do is go through it. Asserted by driving the export with
+    the module dicts deliberately full of something else: what lands in the blob is the store's
+    registrations, never theirs.
+    """
+    store, _client = _imported(_mp)
+    with varsel_state.lock:
+        varsel_state._journeys.clear()
+        varsel_state._journeys["ghost"] = _journey(DEV_B)
+        varsel_state._devices.clear()
+    varsel_state.export_store_to_blob(store, now=NOW)
+    written = json.loads(varsel_state.read_blob_text() or "{}")
+    assert "ghost" not in written["journeys"]
+    assert set(written["journeys"]) == {"j-1", "j-2", "j-3"}
 
 
 class _MonkeyPatch:

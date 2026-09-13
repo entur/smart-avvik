@@ -856,6 +856,24 @@ contract document says so in its own words; this is the operating half of the sa
    this process makes is applied to it from the commit's own result — see the `SUBSCRIPTION_MIRRORING_BODIES`
    note, which supersedes what U12 recorded about reading the push marks.
 
+   **The blob becomes the rollback artefact, and the export is what keeps it one.** Under the
+   store backend `save()` is a no-op, so without an export the blob freezes at the cutover — and
+   since the import creates and never deletes, it still holds the journeys of anybody who has
+   pressed «Slett alt» since. Rolling back then resurrects them. `varsel_state_export` runs as the
+   LAST phase of the poller's cycle, at most every six hours, and rewrites the blob from the store:
+   the read applies liveness, so a tombstoned registration is absent from the artefact rather than
+   written as deleted. **Six hours is therefore the rollback loss window**, and it is the number to
+   quote when somebody asks how stale a rollback would be.
+
+   On the poller's tick rather than as a CronJob: a second workload would have to resolve the
+   bucket name and the database again, per environment, from values this process already holds —
+   and the bucket is the first thing that would drift, since dev's and prd's names differ. The
+   export writes the blob backend's own five keys through `_journey_record` and `_device_record`,
+   so the artefact is something `apply_state` loads rather than something a reader has to convert,
+   and it carries the togvarsel round markers and any unknown keys through from whatever the blob
+   already held — the store has no home for those, so rebuilding the document from it alone would
+   delete them from the only place they exist.
+
    **What to watch after the cutover.** `varsel_state_import` on startup — `result` is `imported`
    once and `skipped` at every restart after it, and a second `imported` in the same environment
    means somebody deleted the marker; `varsel_state_backend` with `result: "store"` on startup,
