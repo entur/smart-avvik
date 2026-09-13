@@ -1194,6 +1194,35 @@ contract document says so in its own words; this is the operating half of the sa
    questions, item 4). Dev's `kix-smoke` has 18 subscriptions and will write them from the first
    cycle after the deploy.
 
+9. **The decision log's own READERS — the next thing on this list to bind, and it binds long
+   before the serving path does.** Measured against prd on 2026-09-13, after the thinning rule had
+   been live for a day: the log runs **153.7 rows per definition per day** post-thinning, which is
+   the ~152 KTD15's 2.63x ratio predicts. At 515 B per scanned row, `/historikk`'s 14-day default
+   reaches `historikk._MAX_BYTES_BILLED` (2 GiB) at about **1 700 definitions**; its 180-day
+   maximum, which scans 182 partitions, at about **150** — prd's registration count today, held off
+   only by a log that does not reach back that far yet. `/historikk`'s summary survives to ~5 800
+   and `/meldinger`'s one-day window to ~5 700.
+
+   So at the 35 000–80 000 definitions this plan sizes for, a 14-day request wants **41–94 GiB, 20
+   to 47 times the cap** — the pages stop answering at roughly 2 % of the population the push and
+   pull paths are built for. No thinning interval closes it: KTD15 measured 3.76x at 30 minutes and
+   4.96x at 60 against 15 minutes' 2.63x, so an hour buys ~3 200 definitions, and holding 35 000
+   inside 2 GiB needs about one row per definition every three hours. That is the deferred per-day
+   summary table, and these are the numbers that gate it. Method, so it can be repeated: dry runs
+   with every filter NULL — the table is `CLUSTER BY operator`, so a filtered dry run under-reports
+   — and partition row counts from `INFORMATION_SCHEMA.PARTITIONS`, which is free and exact.
+
+   **What was fixed alongside the measurement, because the refusal used to mislead.** Exceeding the
+   cap raised into the same handler as a missing table, so both pages answered 503 "Could not read
+   the decision log; it may not have been written to yet" — *empty* when the cause is *too full*,
+   which sends a reader looking for an unwritten table at the one moment the table is too big to
+   scan. `historikk._bytes_cap_refusal` now tells the two apart (BigQuery's own
+   `bytesBilledLimitExceeded` reason, with a message substring as the fallback for a client that
+   lost the structured errors), shared with `meldinger`, and each page names what the reader can
+   actually change — the period here, the time range there. Still a 503, deliberately: every
+   decision-log failure on both data endpoints is one, and the pages render `detail` rather than
+   branching on the status.
+
 ### The delivery worker (U11)
 
 `webhook_worker` is a second Helm release of the same chart and the same image, `kix-avvik-worker`,
