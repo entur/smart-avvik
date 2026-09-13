@@ -4097,11 +4097,13 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
     * `llm_provider`, `llm_model` and — where the rule below leaves it — `message_status` are
       CARRIED, so they describe the browser pass's last write for this definition rather than the
       client's wording. The one that could mislead is `message_status`, because `ok` claims a
-      same-input pair (`message_wording_comparison.sql` filters on exactly that) and the row's
-      `message_llm` is by construction from a different cycle's input than the `message_input` now
-      beside it. So the rule is one line and covers every branch: a row that carries a model wording
-      reads `ok_cached`, which is precisely what that value already documents — «message_llm from an
-      EARLIER cycle's input, message_deterministic from this one».
+      same-input pair and `message_wording_comparison.sql` filters on exactly that. So a row whose
+      restated input DIFFERS from the one the ledger was carrying is demoted to `ok_cached`, which
+      is precisely what that value already documents — «message_llm from an EARLIER cycle's input,
+      message_deterministic from this one». A row whose input did not move keeps its `ok`, and that
+      is the ordinary case rather than a corner: most mints are the `predicted` transition, and a
+      transition is one of the thinning rule's keep-reasons, so the pass wrote that row fresh on
+      this very cycle.
     * A WITHDRAWAL mints too, and it marks a row whose `alertworthy` is false. That combination
       cannot arise on the browser channel and it is not an error: a retraction is a notification the
       client received, and a withdrawal can only exist where something was standing, so the
@@ -4174,12 +4176,23 @@ def record_minted_decisions(outcome: "PassOutcome", minted: Sequence[tuple[str, 
                     "message_deterministic": deterministic,
                     "message_input": _message_input_json(wording.message_input),
                 })
-                if row.get("message_llm") and row.get("message_status") == "ok":
-                    # See the docstring's cost list: `ok` claims the row's two wordings were
-                    # written from the `message_input` beside them, and this row's input is this
-                    # cycle's while its `message_llm` is not. `ok_cached` is the value that already
-                    # says exactly that, so the demotion states the truth rather than inventing a
-                    # status for the client channel.
+                if (
+                    row.get("message_llm")
+                    and row.get("message_status") == "ok"
+                    and row["message_input"] != entry["row"].get("message_input")
+                ):
+                    # THE INPUT COMPARISON IS THE WHOLE RULE, and the obvious shorter version --
+                    # "a mint row carrying a model wording reads `ok_cached`" -- is wrong on the
+                    # ordinary case. Most mints are the `predicted` transition, whose cycle is a
+                    # thinning keep-reason, so the pass wrote a fresh row minutes-free of staleness
+                    # and its `ok` is exactly true: `message_llm` and the `message_input` beside it
+                    # ARE the same-input pair the value claims, which is what
+                    # `message_wording_comparison.sql` filters on. Demoting those would retire the
+                    # client channel from that population almost entirely. Only where the restated
+                    # input DIFFERS from the one the ledger was carrying has the claim stopped
+                    # holding, and `ok_cached` is the value that already documents precisely that
+                    # asymmetry. Both sides went through `_message_input_json`, so byte-equality is
+                    # the comparison and not an approximation of one.
                     row["message_status"] = "ok_cached"
             rows.append(row)
             stamped.append((key, row))
