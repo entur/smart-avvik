@@ -213,4 +213,19 @@ check "togvarsel_outcomes_provisional.sql" "$API/togvarsel_outcomes_provisional.
 check "rushhistorikk_days.sql"      "$API/rushhistorikk_days.sql" \
   --parameter=from_date:DATE:2026-08-01
 
+# ---- The servability question, shared by /varsel and the webhook channel ------------------------
+#
+# One job answers every pending stop pair (U10), so this is the file both `main._varsel_connectivity`
+# and the two servability sweeps run. It was an inline Python string until then and therefore
+# unvalidated -- the only check it had was that the poller kept working.
+#
+# The parameter is an ARRAY<STRUCT<...>> with two nested ARRAYs, which `bq --parameter` does accept
+# in JSON form (verified 2026-09-13). Note the usual caveat with extra force here: a dry run does
+# NOT evaluate parameters, so it proves the SHAPE and the column types and nothing about the join.
+# The equivalence that matters -- that a batch of one answers exactly what the single-pair query
+# answered -- was measured against ent-kixavvik-dev over six pairs on 2026-09-13 and is recorded in
+# the U10 pull request.
+check "varsel_connectivity.sql"     "$API/varsel_connectivity.sql" \
+  '--parameter=pairs:ARRAY<STRUCT<pair_id INT64, from_refs ARRAY<STRING>, to_refs ARRAY<STRING>>>:[{"pair_id":0,"from_refs":["NSR:StopPlace:337"],"to_refs":["NSR:StopPlace:548"]}]'
+
 exit "$fail"

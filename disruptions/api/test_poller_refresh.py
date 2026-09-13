@@ -679,33 +679,50 @@ def test_the_servability_seam_is_the_same_one_the_notification_api_answers_from(
     module cannot import. Under-state it and the reservation stops being a ceiling on when the phase
     ends -- which is the whole reason it reserves rather than measures.
 
-    Since 2026-09-09 the seam is `_service_verdict` bound to the NOTIFICATION API connectivity budget rather
-    than the bare function. Both halves take the same bound object, which is what still makes them
-    one answer -- and it is also what keeps a client's bulk onboarding out of the traveller-facing
-    30/min tally the seam used to spend (`main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`). One partial, not
-    two: two would be two tallies, and the sweep exists to backfill what the create path could not
-    establish.
+    Since U10 the sweep's half is the BATCH form -- one BigQuery job for every pending stop pair
+    rather than one per record -- and it names the POLLER budget, which is what keeps it out of the
+    traveller-facing 30/min tally (`main._POLLER_CONNECTIVITY_MAX_PER_MIN`). The notification API has
+    no connectivity seam at all any more: a create and a replace answer `servable: null` and this
+    sweep establishes it.
 
     Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
     this suite must never do (it spends real BigQuery money per cycle).
     """
     import inspect
 
+    import notification_api
+    import varsel
+
     source = inspect.getsource(main.lifespan)
-    bound = (
-        "notification_api_connectivity = functools.partial(\n"
-        "        varsel._service_verdict, path=_CONNECTIVITY_NOTIFICATION_API_PATH\n"
-        "    )"
+    assert "notification_servability.configure(verdicts=varsel._service_verdicts)" in source, (
+        "the sweep must take the BATCH seam"
     )
-    assert bound in source, "the client seam must name the client budget, not the default one"
-    assert "notification_servability.configure(connectivity=notification_api_connectivity)" in source
-    api = source[source.index("notification_api.configure(") :]
-    assert "connectivity=notification_api_connectivity," in api[: api.index(")")]
+    bound = (
+        "connectivity_batch_provider=functools.partial(\n"
+        "            _varsel_connectivity_batch, path=_CONNECTIVITY_POLLER_PATH\n"
+        "        ),"
+    )
+    assert bound in source, (
+        "both sweeps must spend the POLLER budget, not the traveller-facing one; it is bound at "
+        "wiring time because neither of them owns the vocabulary"
+    )
+    # The signature rather than the call text: the comment beside the call explains why the seam
+    # is gone, so matching the WORD would match the explanation.
+    assert "connectivity" not in inspect.signature(notification_api.configure).parameters, (
+        "a create or replace must not ask BigQuery: `servable` is the sweep's answer now"
+    )
     assert notification_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
+    assert varsel._WORST_CASE_SERVICE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
     assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (
         "a deadline equal to the worst case admits exactly one check, making the count ceiling "
         "decoration"
     )
+    # The two ends of the same bound. A sweep that admitted more records than one job may carry
+    # would have its overflow answered as unknown by a job it had already decided to spend -- and
+    # those records would stay due with nothing in the logs to say why.
+    assert (
+        notification_servability._MAX_WRITES_PER_CYCLE <= main._CONNECTIVITY_MAX_PAIRS_PER_JOB
+    ), "a cycle may not admit more subscriptions than one connectivity job can answer about"
 
 
 # ---- The inverted prediction index, built in the ingest loop (U2) --------------------------------
