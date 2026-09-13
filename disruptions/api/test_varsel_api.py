@@ -2563,10 +2563,17 @@ def test_a_thinned_subject_groups_to_the_same_figures_as_an_unthinned_one(monkey
         (40, 0.36, False),
     ]
 
+    # ONE clock for both replays, and that is the test rather than tidiness: `_group` compares
+    # `first_decided_at` and `first_alert_at`, which are absolute instants derived from it. A clock
+    # per replay reads `datetime.now(UTC)` twice, so the two agree only while both constructions
+    # land in the same second -- and the run where a second boundary falls between them fails with
+    # a bare `AssertionError` that says nothing about a clock. It is not hypothetical: it failed
+    # `cd.yml` on the merge of #176 (2026-09-13 05:12 UTC) and took that deploy to dev with it.
+    clock = _Clock()
+
     def replay(interval_s):
         log, jid, journey, key = _thinning_fixture(monkeypatch)
         monkeypatch.setattr(varsel, "_DECISION_THINNING_INTERVAL_S", interval_s)
-        clock = _Clock()
         for minute, p, push in history:
             now = clock.now + timedelta(minutes=minute)
             alert = _alert("S9", DEP, jkey="t1", p_impact=p, decided_at=now)
