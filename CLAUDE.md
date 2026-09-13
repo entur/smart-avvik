@@ -1662,8 +1662,8 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   two asserts by never noticing it. **The ceiling is not a throughput and the document says so**:
   warming raises the HIT RATE and does not make a miss cheaper — U2's index did that. Measured
   2026-09-13 with `scripts/bench_matcher.py --pull-read` at 20 000 definitions: a miss **0.32 ms**
-  (it was 15 ms p50 in dev before U2, which is where 300/min came from), a hit **0.017 ms**, warming
-  **3.3 %** of the pass, and ~**3 000** misses per second sustainable against R6's 50. The 50 rps run
+  (it was 15 ms p50 in dev before U2, which is where 300/min came from), a hit **0.017 ms**, warming a
+  few per cent of the pass, and ~**3 000** misses per second sustainable against R6's 50. The 50 rps run
   against a real dev process is still owed. Three smaller things this unit had to get right, each
   silent if taken the other way. **`_enriched` now also clears `impact.alternative_journey`**:
   `llm_message.build_message_input` falls back to it, and every alert the pass produces carries one

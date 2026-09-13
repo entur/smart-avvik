@@ -1085,9 +1085,13 @@ contract document says so in its own words; this is the operating half of the sa
    | a read that MISSES the figures cache | **0.32 ms** | 0.39 ms |
    | a read that HITS it | **0.017 ms** | 0.019 ms |
    | the match pass, without warming | 10.27 s | 1.29 s |
-   | what warming adds to the pass | **0.34 s (3.3 %)**, warming all 20 000 | 0.08 s |
+   | what warming adds to the pass | **0.34–0.56 s, 3–5 %**, warming all 20 000 | ~0.08 s |
    | sustainable rate **if every read misses** | **~3 000 /s** | ~2 500 /s |
    | what the warmed cache RETAINS | **373 MB** over 19 300 entries | — |
+
+   The warm figure is a **range** because it is a delta of two whole-pass timings and moves that far
+   between runs; read it as "a few per cent of the pass", not as three significant figures. The
+   others are direct measurements of the thing named.
 
    So R6's 50 reads a second is met with roughly sixty times the headroom, and it is U2's index that
    did it: the same miss measured **15 ms p50 / 55 ms p90** in dev on 2026-09-10, before that index
