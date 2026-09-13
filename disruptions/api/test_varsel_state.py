@@ -972,6 +972,10 @@ def test_the_round_markers_go_through_the_blob_when_the_backend_is_gcs(_mp):
     one key of the state object and `save_state()` writes them with the rest of it. The store must
     not be reached at all — including on load, where the blob's own `load_state` has applied them."""
     _reset()
+    # Poisoned first, so the assertions below actually depend on `configure_rounds` doing
+    # something: started from the module default they would pass with the call deleted.
+    _mp.setattr(varsel_state, "_rounds_in_store", True)
+    varsel_state.configure_rounds(in_store=False)
     calls: list[int] = []
     _mp.setattr(varsel_state, "save_state", lambda: (calls.append(1), True)[1])
 
