@@ -94,15 +94,44 @@ _cache: dict[tuple, tuple[float, Any]] = {}
 #   2. The volume must be thinned, or the derived figure describes a log that no longer exists.
 #      `varsel._thinning_reason` (KTD15) does that from the same date.
 #   3. The thinned pruned scan must be MEASURED, at a scale that matters -- the harness at 10 000
-#      definitions in dev, and prd's own `INFORMATION_SCHEMA.JOBS` figures for a 14-day request.
-#      That measurement is owed and this constant moves with it, not before.
+#      definitions in dev, and prd's own figures for a 14-day request. HALF DONE, 2026-09-13: prd is
+#      measured (below); the dev harness is still owed.
 #
-# Until then the value stays the 2 GiB its siblings use. Deriving a cap from today's 1.5 GB log
-# would turn the log's growth into refusals on the page that reads the longest window (180 days),
-# which is the failure this constant exists to prevent rather than to cause -- and the cap is not a
-# pruning detector either way: a correctly pruned read is a few MB. It is a blast-radius bound on an
-# endpoint sharing its project quota with the poller, and what it catches is a query that starts
-# reading something big -- the ET tables a mistyped join can reach are ~10 TiB for a two-year scan.
+# THE MEASUREMENT, and it did not move this constant -- it settled why the constant should not move.
+# Dry runs against prd on 2026-09-13, UNFILTERED, because the table is `CLUSTER BY operator` and a
+# filtered dry run therefore under-reports; row counts per partition from
+# `INFORMATION_SCHEMA.PARTITIONS`, which is free and exact. Post-thinning the log runs **153.7 rows
+# per definition per day** (86 definitions), against the ~152 KTD15's 2.63x ratio predicts -- so the
+# rule is behaving. Bytes per row are unaffected by thinning, which is what lets these carry:
+#
+#   | query                | window | B/row | MiB/definition | definitions at 2 GiB |
+#   | historikk_decisions  |   14 d |   515 |           1.21 |               ~1 700 |
+#   | historikk_summary    |   14 d |   150 |           0.35 |               ~5 800 |
+#   | meldinger_decisions  |    1 d |   817 |           0.36 |               ~5 700 |
+#   | meldinger_messages   |    1 d |   542 |           0.24 |               ~8 600 |
+#
+# A 14-day window scans SIXTEEN partitions rather than fourteen, because of the +/- 1 day cover; the
+# 180-day maximum scans 182 and therefore reaches the cap at about **150 definitions** -- prd's
+# registration count today. It does not bind yet only because the log does not reach back that far
+# (a 180-day request reads 774 MB now, 36 % of the cap, and flattens between 30 and 90 days, which
+# is where the log starts). So the first refusal arrives with no change in registrations at all,
+# once ~180 days of thinned log exist.
+#
+# WHY THE VALUE STAYS 2 GiB, which is now a decision rather than a gap. Four times prd's measured
+# thinned 14-day scan (~190 MB) is ~760 MB -- BELOW this placeholder -- and adopting it would refuse
+# the 180-day window sooner, which is the failure this constant exists to prevent rather than to
+# cause. The cap is not a pruning detector either way: a correctly pruned read is a few MB. It is a
+# blast-radius bound on an endpoint sharing its project quota with the poller, and what it catches
+# is a query that starts reading something big -- the ET tables a mistyped join can reach are
+# ~10 TiB for a two-year scan.
+#
+# AND WHAT THE MEASUREMENT SAYS THAT IS NOT ABOUT THIS NUMBER. At the 35 000-80 000 definitions the
+# 100k plan sizes for, a 14-day window wants 41-94 GiB, i.e. 20 to 47 times this cap: the pages stop
+# answering at roughly 2 % of the population the push and pull paths are built for. No thinning
+# interval closes that -- KTD15 measured 3.76x at 30 min and 4.96x at 60 against 15 min's 2.63x, so
+# an hour buys ~3 200 definitions -- and holding 35 000 inside 2 GiB needs about one row per
+# definition every three hours. That is not a thinning rule, it is the deferred per-day summary
+# table, and this is the arithmetic that gates it.
 _MAX_BYTES_BILLED = 2 * 1024**3
 
 # A page shows a window, not a history. Bounded so a hand-written query string cannot ask for a
@@ -654,6 +683,28 @@ def _window(from_date: date | None, to_date: date | None) -> tuple[date, date]:
     return start, end
 
 
+def _bytes_cap_refusal(exc: BaseException) -> bool:
+    """Whether BigQuery refused this query for exceeding ``maximum_bytes_billed``.
+
+    Its own branch rather than one more cause folded into "the log may not have been written to
+    yet", because the two ask OPPOSITE things of the reader and the wrong message is expensive: an
+    unwritten log is waited out, a refused scan is narrowed -- and the misleading one claims the log
+    is EMPTY at exactly the moment it has grown too full to scan. Not a theoretical state at the
+    population this stack is being sized for: the figures on :data:`_MAX_BYTES_BILLED` put the
+    14-day default at the cap around 1 700 journey definitions and the 180-day maximum around 150,
+    which is prd's registration count today.
+
+    Two tests, neither load-bearing alone. ``reason`` is what BigQuery names it and what a real
+    client carries; the message substring is the fallback for a client version, a wrapper or a
+    suite stub that lost the structured errors. Shared with ``meldinger``, which runs queries of
+    the same shape over the same table under the same cap.
+    """
+    for err in getattr(exc, "errors", None) or ():
+        if hasattr(err, "get") and err.get("reason") == "bytesBilledLimitExceeded":
+            return True
+    return "bytes billed" in str(exc).lower()
+
+
 def _query(sql: str, params: list, cache_key: tuple):
     """Run a parameterised query behind the TTL cache. Rows are returned as a list."""
     if _bq_client is None:
@@ -671,6 +722,19 @@ def _query(sql: str, params: list, cache_key: tuple):
     try:
         rows = list(_bq_client.query(sql, job_config=job_config).result())
     except Exception as exc:
+        if _bytes_cap_refusal(exc):
+            # Still a 503, deliberately: every decision-log failure on both data endpoints is one
+            # (`config`'s docstring rests on that) and the page renders `detail` rather than
+            # branching on the status, so a new code would buy the reader nothing and cost a
+            # contract change. What the reader needs is the SENTENCE.
+            logger.warning("Decision-log query refused by the bytes cap", exc_info=True)
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "This window reads more of the decision log than the query cap allows. "
+                    "Choose a shorter period, or narrow the filters."
+                ),
+            ) from exc
         # Most likely cause on a fresh environment: the tables do not exist yet because no decision
         # has been recorded. Say so rather than surfacing a raw BigQuery traceback.
         logger.warning("Decision-log query failed", exc_info=True)
