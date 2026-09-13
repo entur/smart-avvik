@@ -929,6 +929,21 @@ contract document says so in its own words; this is the operating half of the sa
    oldest created on 2026-07-08 — so under the retired creation-anchored rule the first expiries
    would have fallen on 2027-01-04 whatever the import did.
 
+   **What prd still needs, beyond repeating dev's steps.** A `create-browser-account` in prd with
+   the same two ceilings, and the export running there for at least one interval before anybody
+   relies on a rollback. And the **privacy texts**, which dev deliberately went without: T5's
+   «Reiser du har registrert lagres til du sletter dem» is false under this horizon — a traveller
+   who does not open the app for 180 days has their journeys deleted without deleting them — so it
+   needs a clause and a `CONSENT_TEXT_VERSION` bump.
+
+   **That text lands with PRD's cutover, not dev's** (product owner, 2026-09-13), and the reason is
+   that the texts are baked into the one image every environment shares while the cutover is per
+   environment. There is no window without a mismatch, only a choice of which: landing the clause
+   at dev's cutover would have prd's traveller-facing notice promise a deletion prd does not yet
+   perform — we would be keeping data longer than the notice says — while landing it at prd's means
+   dev deletes on the new rule for a while with its notice unchanged. Dev's registrations are the
+   team's own, and over-promising deletion on the public host is the worse of the two errors.
+
    **One thing the cutover still owes: the togvarsel round markers are not persisted under
    `store`.** They are off the protocol and ride in the blob half; the durable write behind
    `varsel.store_togvarsel_rounds` is `_save_state()`, which on the store backend is a no-op
