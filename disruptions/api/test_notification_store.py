@@ -3688,6 +3688,48 @@ def _emulator_setup() -> Any:
     return client
 
 
+def emulator_test_a_renewal_moves_the_browser_horizon_through_the_real_client():
+    """U14's renewal against a real transaction, because the hermetic fake runs a body once.
+
+    Two things only the real client can say. The renewal reads the document and then writes it, and
+    Firestore raises `ReadAfterWriteError` on a read placed below a write in a transaction -- the
+    rule that broke U12's erasure on every device that had anything to erase, which the fake
+    records but does not enforce. And the TTL field the emulator stores is the one Firestore's
+    policy deletes on, so a horizon written under the wrong channel's rule would be a real deletion
+    date rather than a dict key.
+    """
+    client = _emulator_setup()
+    notification_store.create_subscription(_web_push_spec(), now=NOW)
+    notification_store.upsert_device(
+        device_id="device-1",
+        client_id=CLIENT,
+        endpoint="https://push.example.com/x",
+        p256dh="k",
+        auth="a",
+        brand="entur",
+        now=NOW,
+    )
+    later = NOW + timedelta(days=notification_store.WEB_PUSH_RENEW_AFTER_DAYS + 1)
+    subs = notification_store.device_journeys(device_id="device-1", client_id=CLIENT, now=later)
+    assert len(subs) == 1, subs
+    assert (
+        notification_store.note_web_push_activity(
+            "device-1", client_id=CLIENT, subscriptions=subs, now=later
+        )
+        == 1
+    )
+    renewed = notification_store.get_subscription(SID, client_id=CLIENT, now=later)
+    assert renewed is not None
+    assert renewed.inactivity_expires_at == later + timedelta(
+        days=notification_store.WEB_PUSH_INACTIVITY_DAYS
+    )
+    assert renewed.lifetime_expires_at is None, "the retired horizon came back through the store"
+    assert renewed.expires_at == renewed.inactivity_expires_at
+    device = notification_store.get_device("device-1")
+    assert device is not None and device.last_seen_at == later
+    assert client is not None
+
+
 def emulator_test_the_subscription_round_trip_survives_the_real_client():
     client = _emulator_setup()
     created = notification_store.create_subscription(_spec(), now=NOW)
@@ -4669,29 +4711,41 @@ def test_the_webhook_definition_digest_did_not_move_when_device_id_arrived():
     assert notification_store._definition_digest(_web_push_spec()) != notification_store._definition_digest(spec)
 
 
-def test_a_web_push_registration_has_a_lifetime_horizon_and_no_inactivity_one():
-    """U12's horizon rule, and the product change inside it.
+def test_a_web_push_registration_has_an_inactivity_horizon_and_no_lifetime_one():
+    """U14's horizon rule, which INVERTS U12's, and the product change inside it.
 
-    The inactivity horizon exists because a client's integration nobody has touched for sixty days
-    is probably forgotten. A traveller's registered commute is the opposite: not opening the PWA for
-    two months is what a working alert service looks like. So `web_push` keeps the lifetime horizon
-    alone -- which is still a change, because today's GCS blob has NO expiry on a registration at
-    all, and 180 days from creation is a real ceiling somebody has to have chosen.
+    U12 gave this channel the lifetime horizon alone, reasoning that the 60-day inactivity one is
+    about a client's forgotten integration and that a traveller not opening the PWA for two months
+    is what a working alert service looks like. Both halves of that are right and the conclusion
+    was wrong: what it left was a clock anchored on CREATION that nothing could reset, so a
+    commuter opening the app every morning lost the journey on day 181 -- silently, since it stops
+    matching, drops out of `device_journeys` and is TTL-deleted within ~24 h. A storage-limitation
+    rule is for ageing out what nobody uses. So the channel keeps an inactivity horizon at its own
+    longer number instead, and `note_web_push_activity` is what moves the anchor.
+
+    It is still a change from today's GCS blob, which has NO expiry on a registration at all: 180
+    days of not opening the app is a real ceiling somebody has to have chosen.
 
     The field is OMITTED rather than written far ahead: a field that lies about its meaning is worse
     than an absent one, and `subscription_is_live` reads the absence correctly.
     """
     doc = notification_store._new_subscription_doc(_web_push_spec(), NOW)
-    assert "inactivity_expires_at" not in doc
-    lifetime = NOW + timedelta(days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS)
-    assert doc["lifetime_expires_at"] == lifetime
-    assert doc[notification_store.TTL_FIELD] == lifetime
+    assert "lifetime_expires_at" not in doc
+    inactive = NOW + timedelta(days=notification_store.WEB_PUSH_INACTIVITY_DAYS)
+    assert doc["inactivity_expires_at"] == inactive
+    assert doc[notification_store.TTL_FIELD] == inactive
     assert notification_store.subscription_is_live(doc, NOW)
-    assert not notification_store.subscription_is_live(doc, lifetime + timedelta(seconds=1))
+    assert not notification_store.subscription_is_live(doc, inactive + timedelta(seconds=1))
+    # The horizon is the traveller's, not the client's: sixty days is the number that would have
+    # expired a commuter over a summer holiday.
+    assert notification_store.WEB_PUSH_INACTIVITY_DAYS > notification_store.SUBSCRIPTION_INACTIVITY_DAYS
     # A webhook document is untouched: both horizons, TTL the minimum.
     webhook = notification_store._new_subscription_doc(_spec(), NOW)
     assert webhook["inactivity_expires_at"] == NOW + timedelta(
         days=notification_store.SUBSCRIPTION_INACTIVITY_DAYS
+    )
+    assert webhook["lifetime_expires_at"] == NOW + timedelta(
+        days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS
     )
 
 
@@ -4700,7 +4754,14 @@ def test_a_document_with_no_channel_still_needs_both_horizons():
 
     U5's convention is that a document without `channel` MEANS webhook, which is what every document
     written before that field existed is. So the dispatch cannot weaken them: they still need both
-    horizons, and a `web_push` document missing its LIFETIME one is still dead.
+    horizons, and a `web_push` document missing its own one is still dead.
+
+    That second half is what makes U14's inversion safe to deploy. The field a `web_push` document
+    must be inside moved from `lifetime_expires_at` to `inactivity_expires_at`, so a document
+    written under the old rule reads as expired rather than as immortal -- the direction a horizon
+    change has to fail in. Nothing in any environment holds such a document (no deployment selects
+    the store backend, and `varsel_state` is the only writer of the channel), which is what makes
+    the inversion a free choice rather than a migration.
     """
     doc = notification_store._new_subscription_doc(_spec(), NOW)
     doc.pop("channel")
@@ -4710,8 +4771,136 @@ def test_a_document_with_no_channel_still_needs_both_horizons():
         "a channel-less document is a webhook document and still needs both horizons"
     )
     web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
-    web_push.pop("lifetime_expires_at")
+    web_push.pop("inactivity_expires_at")
     assert not notification_store.subscription_is_live(web_push, NOW)
+    # A document written under U12's rule carries the other field and nothing else, and is dead.
+    old_shape = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    old_shape.pop("inactivity_expires_at")
+    old_shape["lifetime_expires_at"] = NOW + timedelta(days=90)
+    assert not notification_store.subscription_is_live(old_shape, NOW), (
+        "a pre-U14 web_push document must read as expired, never as live on the retired field"
+    )
+
+
+def test_a_renewal_and_an_amendment_each_keep_their_own_channels_horizon_shape():
+    """Both `_horizons` call sites that have to read the channel off the STORED document.
+
+    `_create_body` always knew it -- the channel is on the spec. `_touch_body` and `_replace_body`
+    take it off the document they just read, and until U14 neither passed it at all: both called
+    `_horizons` with its `webhook` default. Unreachable while no web_push document existed
+    anywhere, and the primary path the moment a renewal is what the browser channel's horizon
+    rests on. Neither failure raises. A renewed registration would carry a 60-day inactivity
+    horizon -- the number chosen for a client's forgotten integration -- and a
+    `lifetime_expires_at` this channel is not supposed to have, and would then expire at whichever
+    came first, with the document looking perfectly well-formed.
+    """
+    later = NOW + timedelta(days=30)
+    expected = later + timedelta(days=notification_store.WEB_PUSH_INACTIVITY_DAYS)
+
+    def written(body: str) -> dict[str, Any]:
+        client = _FakeClient()
+        refs = notification_store._Refs(client)
+        client.put(
+            notification_store.SUBSCRIPTIONS,
+            SID,
+            notification_store._new_subscription_doc(_web_push_spec(), NOW),
+        )
+        txn = _Txn()
+        with _NoClockNoLog():
+            if body == "touch":
+                notification_store._touch_body(
+                    txn, refs, subscription_id=SID, client_id=CLIENT, now=later
+                )
+            else:
+                notification_store._replace_body(
+                    txn, refs, spec=_web_push_spec(begin="06:30"), expected_version=1, now=later
+                )
+        assert len(txn.writes) == 1, txn.writes
+        return txn.writes[0][2] or {}
+
+    for body in ("touch", "replace"):
+        patch = written(body)
+        assert patch["inactivity_expires_at"] == expected, body
+        assert patch[notification_store.TTL_FIELD] == expected, body
+        assert "lifetime_expires_at" not in patch, (
+            f"a {body} gave a web_push registration the horizon this channel does not have"
+        )
+
+
+def test_the_renewal_pass_writes_nothing_until_the_anchor_is_actually_stale():
+    """The cut that makes a renewal affordable, and the arithmetic behind the constant.
+
+    The PWA polls the journey list every 60 s, so a pass that renewed on every read would be one
+    write per registration per minute per open app. The cut is a week against a 180-day horizon,
+    so what it costs is that a registration expires 173-180 days after its last use rather than
+    exactly 180 -- and what it buys is that all but one read a week is free.
+
+    The device document rides on the same event and is asserted here rather than separately,
+    because renewing the journeys while letting the device that owns them expire is the same
+    defect one document along.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        doc = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+        client.put(notification_store.SUBSCRIPTIONS, SID, doc)
+        client.put(
+            notification_store.DEVICES,
+            "device-1",
+            notification_store._new_device_doc(
+                device_id="device-1",
+                client_id=CLIENT,
+                endpoint="https://push.example.com/x",
+                p256dh="k",
+                auth="a",
+                brand="entur",
+                now=NOW,
+            ),
+        )
+        subs = [notification_store._subscription_from_doc(doc)]
+        cut = notification_store.WEB_PUSH_RENEW_AFTER_DAYS
+
+        fresh = notification_store.note_web_push_activity(
+            "device-1", client_id=CLIENT, subscriptions=subs, now=NOW + timedelta(days=cut - 1)
+        )
+        assert fresh == 0 and client.transactions == [], "a fresh anchor was rewritten"
+
+        at_the_cut = NOW + timedelta(days=cut)
+        assert (
+            notification_store.note_web_push_activity(
+                "device-1", client_id=CLIENT, subscriptions=subs, now=at_the_cut
+            )
+            == 1
+        )
+        stored = client.doc(notification_store.SUBSCRIPTIONS, SID) or {}
+        assert stored["inactivity_expires_at"] == at_the_cut + timedelta(
+            days=notification_store.WEB_PUSH_INACTIVITY_DAYS
+        )
+        device = client.doc(notification_store.DEVICES, "device-1") or {}
+        assert device[notification_store.TTL_FIELD] == at_the_cut + timedelta(
+            days=notification_store.SUBSCRIPTION_MAX_LIFETIME_DAYS
+        ), "the journeys were renewed and the device document they belong to was not"
+    finally:
+        _uninstall()
+
+
+def test_a_renewal_cannot_recreate_a_device_document_an_erasure_removed():
+    """«Slett alt» deletes the device document, and a renewal reads before it writes.
+
+    The race is ordinary rather than exotic: the journey list and the erasure are two requests from
+    the same phone, and the list's renewal can land after the delete. Writing unconditionally would
+    put back a husk carrying the very id the traveller asked us to forget -- with a fresh 180-day
+    TTL on it, so the resurrection would outlive the erasure by half a year.
+    """
+    client = _FakeClient()
+    _install(client)
+    try:
+        assert notification_store.renew_device("gone-1", client_id=CLIENT, now=NOW) is None
+        assert client.doc(notification_store.DEVICES, "gone-1") is None
+        assert client.transactions, "the renewal must at least have looked"
+        assert client.transactions[-1].writes == [], "a missing device must not be written"
+    finally:
+        _uninstall()
 
 
 def test_the_channel_only_fields_are_absent_rather_than_empty_on_the_other_channel():
@@ -4746,7 +4935,14 @@ def test_the_liveness_map_carries_every_field_the_predicate_reads():
     import inspect
 
     read: set[str] = set()
-    for fn in (notification_store.subscription_is_live, notification_store._horizon_fields):
+    # `_channel_of` is in the walk because the predicate reads `channel` THROUGH it since U14: a
+    # scan of the two obvious functions stopped seeing the field the moment the dispatch moved into
+    # a helper, and the assertion below went green while the map could have lost it.
+    for fn in (
+        notification_store.subscription_is_live,
+        notification_store._horizon_fields,
+        notification_store._channel_of,
+    ):
         tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
         for node in ast.walk(tree):
             if (

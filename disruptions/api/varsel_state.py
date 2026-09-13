@@ -896,12 +896,33 @@ class StoreRegistrations:
         return _device_record(device), len(self.device_journeys(device_id))
 
     def device_journeys(self, device_id: str) -> list[tuple[str, dict]]:
-        return [
-            (sub.subscription_id, _journey_record(sub))
-            for sub in notification_store.device_journeys(
-                device_id=device_id, client_id=self._client_id
-            )
-        ]
+        """The device's registrations — and the read that RENEWS them, which the blob has no
+        equivalent of because a blob record has no expiry at all.
+
+        `web_push`'s horizon is 180 days of inactivity (U14), and this is the one call that means
+        "the traveller is here": it runs on every app open, and — unlike the device upsert — it
+        runs for the traveller who never turned notifications on, which was 79 of prd's 186
+        journeys when the device report last counted. Hooking the renewal to the upsert instead
+        would have expired exactly that population while it was using the page every day.
+
+        Renewing inside a read rather than behind a method of its own, and the seam is the reason:
+        `RegistrationStore` is a list of questions the CALLER asks, and "the traveller was here" is
+        not one /varsel has any reason to ask — it is this backend's own storage-limitation rule,
+        so a protocol method would be a no-op the blob has to implement for a concept it does not
+        have. The cost is that a read writes, which is why it is named here rather than buried:
+        `notification_store.note_web_push_activity` bounds it to one write per journey per week and
+        swallows its own failures.
+
+        `forget_device` reads through here too, so «Skru av» also renews. That is correct rather
+        than tolerated — somebody pressing a button in the app is present by definition.
+        """
+        subs = notification_store.device_journeys(
+            device_id=device_id, client_id=self._client_id
+        )
+        notification_store.note_web_push_activity(
+            device_id, client_id=self._client_id, subscriptions=subs
+        )
+        return [(sub.subscription_id, _journey_record(sub)) for sub in subs]
 
     def create_journey(self, journey_id: str, record: dict) -> None:
         spec = notification_store.SubscriptionSpec(
