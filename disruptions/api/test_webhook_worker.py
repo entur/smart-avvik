@@ -54,8 +54,11 @@ class _Deliver:
 class _Sleeps:
     """A stop event that records what it was asked to wait for and stops the loop after N rounds.
 
-    Subclassing `threading.Event` rather than stubbing it: `run` calls both `is_set` and `wait`, and
-    a hand-rolled double would drift from whichever one the loop stops using.
+    Only the two methods `run` actually calls -- `is_set` and `wait` -- because recording what the
+    loop waited FOR is the whole assertion and a real `threading.Event` cannot be asked. The pairing
+    is what keeps that honest: `test_a_stop_already_set_delivers_nothing_at_all` drives a real
+    `threading.Event`, so a loop that started using a third method of it would fail there rather
+    than pass here against a double that quietly grew.
     """
 
     def __init__(self, rounds: int) -> None:
@@ -178,9 +181,14 @@ def test_a_stop_already_set_delivers_nothing_at_all():
 
 
 def test_the_signal_handler_only_sets_the_event():
-    """What a handler must NOT do is the point. It runs on the main thread between bytecodes, so
-    anything that takes a lock -- a store write, a `logging` call that blocks, `sys.exit` unwinding
-    through a round -- can deadlock against whatever it interrupted. Setting an Event cannot.
+    """What a handler must NOT do is the point. It runs on the main thread between bytecodes, so it
+    can interrupt anything -- a store write, `sys.exit` unwinding through a round in flight -- and
+    the only thing it is allowed to do is flip a flag the loop reads between rounds.
+
+    The one call beside `set` is `info`, which is deliberate and is ordered after it: the stdlib's
+    logging locks are reentrant so it cannot deadlock, and setting first means the state change
+    cannot be lost to a slow stream. Asserted as the exact SET of calls rather than a substring
+    search, so a store write added here fails.
     """
     tree = ast.parse(inspect.getsource(webhook_worker._install_stop))
     handler = next(

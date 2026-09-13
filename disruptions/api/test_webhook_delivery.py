@@ -261,6 +261,11 @@ def _install() -> _Fake:
     webhook_delivery.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     notification_events.ThreadPoolExecutor = _RecordingPool  # type: ignore[misc]
     _pools.clear()
+    # The rolling per-destination minute ledger (U11). A module budget that survives between tests
+    # is the leaked-budget failure this repo has had twice, and it reads exactly like a real
+    # refusal: the second test to use a destination id finds its allowance already spent by the
+    # first, and the pass it drives simply delivers nothing.
+    webhook_delivery.reset_destination_window()
     notification_store._firestore_client = lambda: client  # type: ignore[assignment]
 
     def _run(body: Any) -> Any:
@@ -1897,8 +1902,13 @@ def test_the_per_destination_attempt_ceiling_reaches_the_store_as_the_clients_qu
     seen: list[int] = []
     real = notification_store.pending_deliveries
 
-    def _pending(*, limit: int, per_destination_limit=None, now=None):
+    def _pending(*, limit: int, per_destination_limit=None, per_destination_spent=None, now=None):
         assert per_destination_limit is not None, "the resolver must be passed"
+        # U11's second resolver, to EXACT ARITY beside the first: without it this stub raises a
+        # TypeError that `deliver_pending` catches as a store error, and the test then fails on an
+        # empty list with nothing saying the signature moved.
+        assert per_destination_spent is not None, "the spend resolver must be passed"
+        assert per_destination_spent("dest-nobody-has-used") == 0
         seen.append(per_destination_limit("client-x"))
         return real(limit=limit, now=now)
 
@@ -1913,6 +1923,57 @@ def test_the_per_destination_attempt_ceiling_reaches_the_store_as_the_clients_qu
         notification_store.pending_deliveries = real  # type: ignore[assignment]
         notification_auth.quotas_for = saved_quotas  # type: ignore[assignment]
     assert seen == [777], seen
+
+
+def test_the_per_destination_ceiling_is_per_MINUTE_and_not_per_read():
+    """U11. The ceiling is applied inside the read, which under the poller meant "per ~296 s cycle"
+    and under the worker's continuous rounds would mean "per five seconds" -- twelve times the
+    number `deliveries_per_minute` is named after, at one receiver, whose own 429 and U7's backoff
+    would then make it look like the client misbehaving.
+
+    Driven through the REAL `pending_deliveries` and the real ledger: a stub above the read would
+    prove the argument is passed and nothing about what it does.
+    """
+    client = _install()
+    saved = notification_auth.quotas_for
+    try:
+        _live(client)
+        _pending(client, n=6)
+        notification_auth.quotas_for = lambda client_id: notification_auth.Quotas(  # type: ignore[assignment]
+            deliveries_per_minute=4
+        )
+        first = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
+        second = webhook_delivery.deliver_pending(now=NOW, sender=_sender())
+    finally:
+        notification_auth.quotas_for = saved  # type: ignore[assignment]
+        _uninstall()
+    assert first.ready == 4, first
+    # The SECOND read inside the same minute must find the allowance spent, where a per-read ceiling
+    # would hand it another four.
+    assert second.ready == 0, second
+    assert webhook_delivery._spent_this_minute(DEST) == 4
+
+
+def test_the_window_rolls_and_a_destination_nothing_has_tried_is_unspent():
+    """The other half: the tally has to expire, or one busy minute would throttle a destination for
+    the life of the process. Driven by moving the marks backwards rather than by sleeping a minute.
+    """
+    webhook_delivery.reset_destination_window()
+    assert webhook_delivery._spent_this_minute("dest-fresh") == 0
+    webhook_delivery._destination_attempts["dest-fresh"] = [
+        webhook_delivery.monotonic() - webhook_delivery._DESTINATION_WINDOW_S - 1.0,
+        webhook_delivery.monotonic(),
+    ]
+    assert webhook_delivery._spent_this_minute("dest-fresh") == 1, "the old mark must have expired"
+    webhook_delivery._destination_attempts["dest-gone"] = [
+        webhook_delivery.monotonic() - webhook_delivery._DESTINATION_WINDOW_S - 1.0
+    ]
+    assert webhook_delivery._spent_this_minute("dest-gone") == 0
+    assert "dest-gone" not in webhook_delivery._destination_attempts, (
+        "a destination with nothing left in the window must leave the ledger, or a process that has "
+        "seen many destinations keeps every one of them forever"
+    )
+    webhook_delivery.reset_destination_window()
 
 
 if __name__ == "__main__":
