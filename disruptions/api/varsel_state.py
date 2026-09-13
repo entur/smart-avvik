@@ -1535,6 +1535,17 @@ def export_store_to_blob(
     than a multi-get over the ids the journeys name: that record is a push endpoint, a brand and
     the signup instant `_upsert_device_body` restores, and dropping it would make that traveller
     read as a new install on their next visit.
+
+    **One known difference from the blob it replaces, measured on dev's first export (2026-09-13):
+    a device's `subscription` loses `expirationTime`.** The browser's `PushSubscription.toJSON()`
+    includes that key, the blob stored the object verbatim, and the store keeps only the endpoint
+    and the two keys -- so a round trip drops it. It is null on every device dev holds, nothing in
+    this repository reads it, and `pywebpush` needs the endpoint and the keys; it is written down
+    because somebody diffing the artefact against an older copy will find it and should not have
+    to work out whether it matters. Everything else round-trips: on that first export all 14
+    journeys and 4 devices came back with the same ids and the same field names, the round markers
+    rode through, and the only journey field that moved was `service_checked_ts` -- the poller's
+    six-hourly servability stamp, which is live data rather than the export.
     """
     started = time.monotonic()
     instant = now or _now()
