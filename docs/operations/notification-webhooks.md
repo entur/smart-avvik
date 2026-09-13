@@ -321,13 +321,31 @@ green plan; deleting the resource blocks outright would have planned a destroy, 
 Two planes, and only one of them has retention.
 
 **Notification plane** — `subscriptions`, `alert_subjects`, `events`,
-`deliveries`. Every subscription document carries `channel` (`webhook` today; `web_push` is the value
-`/varsel`'s registrations take when they move into this store, named now so that move is a new value
-and not a backfill) and `daily_cap` (the client's, copied on every client write). All four TTL on
-`expires_at`. All four **top level**, carrying a
-`subscription_id`, because a document delete does not remove subcollections and a TTL field does not
-cascade into them — as subcollections they would be orphaned by a delete and the delivery query would
-keep returning them forever.
+`deliveries`, and since U12 `devices`. Every subscription document carries `channel` (`webhook`, or
+`web_push` for `/varsel`'s own registrations, whose move into this store U13 wires) and `daily_cap`
+(the client's, copied on every client write). All five TTL on `expires_at`. All five **top level**,
+carrying a `subscription_id` — or, for a device, its own id and the journeys' `device_id` — because a
+document delete does not remove subcollections and a TTL field does not cascade into them: as
+subcollections they would be orphaned by a delete and the delivery query would keep returning them
+forever. That argument is what makes `devices` a second collection rather than a parent: a deleted
+device would otherwise orphan every journey under it and the mirror would keep matching them.
+
+**What a `web_push` document has that a `webhook` one does not**, and vice versa. A journey carries
+`device_id`, the traveller's typed `from_name`/`to_name` (display only — the webhook event's route
+line uses the stop REGISTRY's names, decided 2026-09-10), `consent_version`, and the three push
+ledgers `notified` (per situation), `pushed_trains` and `daily_pushes`. A webhook subscription
+carries `destination_id`, `delivered` (per train), `daily_deliveries` and `daily_reservations`. Each
+channel's fields are **absent** on the other rather than written empty, because a Firestore equality
+does not match a document that lacks the field — which is what makes it impossible for the
+`device_journeys` query to return a client's subscription, as a property of the data rather than of
+whoever writes the query next. Validation refuses the wrong one in both directions.
+
+A **device** is one browser install: a Web Push endpoint, its two keys, the brand it installed under,
+and a `tombstone` recording why it stopped being pushable (`expired` after a 410, `turned_off` when
+the traveller declined). A tombstoned device KEEPS its journeys — that is the 2026-09-04 finding,
+that a journey never needed notifications to be on, and 79 of prd's 186 journeys sit on devices with
+no usable subscription — so the tombstone clears the endpoint and the keys and explains the absence
+rather than erasing the registration.
 
 **Identity plane** — `clients`, `credentials`, `destinations`,
 `admin_audit`. `clients` carries the three quota fields (`max_active_subscriptions`,
@@ -1068,6 +1086,10 @@ support the clause, the clause was changed.
 | 13 | Events, deliveries and subjects are **top-level collections carrying a subscription id**, not subcollections | `COLLECTIONS` and `_Refs`. A document delete does not remove subcollections and a TTL field does not cascade into them |
 | 14 | A delivered dedup mark lives **48 h** | `DELIVERED_MARK_TTL_H = 48`, pruned by `_prune_marks`. A bound rather than an exact rule, and generous on purpose: a mark that expires *early* re-notifies a train the traveller has already been told about |
 | 15 | The **operator audit is append-only and never expires** | `notification_auth.ADMIN_AUDIT`; the `_Docs` seam has **no `delete`**, and no TTL field config exists for that collection in `terraform/firestore.tf`. Deleting a subscription never touches it. Its `reason` can hold a refused destination's host |
+| 17 | A **`web_push` registration expires 180 days after it was created** and has no inactivity horizon | `_horizons(..., channel="web_push")` writes `lifetime_expires_at` alone and `expires_at` equal to it; `_horizon_fields()` is what `subscription_is_live` dispatches through, and a document with no `channel` reads as `webhook` and still needs both. The inactivity horizon exists because a client's integration nobody has touched for sixty days is probably forgotten; a traveller not opening the PWA for two months is what a working alert service looks like. **This is a change, not a restatement**: today's GCS blob has no expiry on a registration at all, so 180 days is a ceiling somebody has to have chosen (U12) |
+| 18 | A **device document expires 180 days after its last refresh** | `_new_device_doc` and `_upsert_device_body` write `expires_at = now + SUBSCRIPTION_MAX_LIFETIME_DAYS`, refreshed on every upsert, and `devices` carries a TTL field config in `terraform/firestore.tf`. What the document holds until then is a Web Push endpoint and two keys -- personal data with no reader once the browser is gone. Matched to the journeys' own horizon so a device and its registrations expire together |
+| 19 | **«Slett alt» erases within the transaction, not within 24 hours** | `erase_device` -> `_erase_device_body`. The device document is hard-deleted; each journey is TOMBSTONED and redacted in the SAME write -- route, window, typed names, device id and the three push ledgers cleared -- so nothing personal outlives the transaction. That is stricter than clause 11, and deliberately: a client revoking a subscription is administering its own integration, while this is a traveller exercising erasure, and "the route is gone within 24 hours" is not what that answer should be |
+| 20 | A traveller's journeys are **tombstoned rather than deleted, and the reason is the mirror** | `_erase_device_body` is in `MIRROR_STAMPING_BODIES`. A hard-deleted document matches no query, including `mirror_sync`'s watermark query, so a deletion would leave the poller's in-memory mirror holding the journeys for up to `MIRROR_MAX_AGE_S` (6 h) -- still matching, wording and writing decision rows about somebody who asked to be forgotten. What survives the tombstone is an id, a status and a 7-day TTL |
 | 16 | The **7-day event retention is shorter than the 10-day outcome-labelling window**, so retrospectively scoring client alerts is foreclosed | `HISTORY_DAYS = 7` against the nightly job's retry window. Published, so lengthening it later is a contract change |
 
 ### Published numbers, and where they come from
