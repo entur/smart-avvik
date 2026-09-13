@@ -463,6 +463,37 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `VARSEL_STATE_BUCKET` — a GCS bucket holding `varsel_state.json` (devices/journeys/notified)
     so registrations survive redeploys (the container fs is ephemeral). The runtime SA needs
     `roles/storage.objectAdmin` on it. Without the bucket, state is local-only (lost on redeploy).
+    **Behind a seam since 2026-09-13** (U13 of the 100k plan, first half): `varsel` no longer
+    indexes a state dict anywhere — every read and write goes through
+    `varsel_state.RegistrationStore`, whose one implementation today is `BlobRegistrations`, the
+    same five dicts and the same blob moved across unchanged. The point is the second
+    implementation, U12's Firestore collections, and the shape of the protocol is what decides how
+    reviewable that one is: it is the CALLER's question, never either backend's primitives, so
+    `erase_device(device_id)` is a method while "pop the device, pop its journeys, pop their marks,
+    and put them all back if the write failed" is not — the blob does that under one lock, the
+    store as a paged transaction, and a seam naming the steps would be the blob wearing a
+    protocol's clothes. Three things a later change has to keep. **`save()` is the one asymmetry**
+    and it is published rather than hidden: the blob BATCHES, so its mutators change memory and
+    `save()` is the write that makes them durable, while the store has already written each
+    mutation as its own document and answers True with nothing to flush — so "mutate, then save" is
+    one correct sequence on both, and it is what lets the request path stop writing a blob at the
+    cutover without a call site moving. **Reads hand out COPIES**, which is why the two in-place
+    edits `varsel` used to make to stored records now have methods of their own
+    (`set_canonical_stops`, `stamp_service_check`): the blob can hand out a live record and the
+    store cannot, so an in-place edit would work on one backend and vanish on the other, silently
+    and only in production. And **`apply_state` mutates in place rather than rebinding**, because
+    `varsel` aliases the blob's objects for one release so the existing suites read exactly the
+    state they always read — a rebind orphans those aliases, and then the module serves pre-load
+    state while every test reading through the alias asserts happily against the dict the load
+    discarded. `main` passes `registrations=` explicitly (a seam whose only caller is its own
+    default is one nobody has to keep honest) and reads no backend flag: which backend is the
+    cutover's decision, and `VARSEL_STATE_BACKEND` arrives with the implementation it would select.
+    The togvarsel round markers are deliberately **off** the protocol — a rush round marker is not
+    a registration, and putting it there would make the store grow a document nothing reads.
+    `disruptions/api/test_varsel_state.py` is the seam's own suite (26 checks), and what it exists
+    for is the three properties above plus a signature-by-signature comparison of the
+    implementation against the protocol: a `Protocol` nothing checks is a comment, and a method
+    renamed on one side type-checks in the editor and fails on the poller's thread hours later.
   - Non-prod deployments label themselves in the PWA header and tab title —
     `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
     because phones truncate on the right), because dev and prd installs are otherwise identical on

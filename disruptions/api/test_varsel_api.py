@@ -59,6 +59,7 @@ from datetime import UTC, datetime, timedelta
 import alternatives
 import impact
 import varsel
+import varsel_state
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from test_varsel import (  # reuse the synthetic call shape + the stubbed main
@@ -3739,7 +3740,10 @@ def test_delete_all_unknown_id_is_idempotent_and_does_zero_io(monkeypatch):
     either — nothing happened."""
     _reset_state()
     saves = []
-    monkeypatch.setattr(varsel, "_save_state", lambda: saves.append(1))
+    # `varsel_state.save_state` and not `varsel._save_state`: the erasure persists through the seam,
+    # so a patch on the delegator would leave the real write in place and this assertion would pass
+    # while the endpoint uploaded a blob per random UUID.
+    monkeypatch.setattr(varsel_state, "save_state", lambda: saves.append(1) or True)
     with _capture_varsel_logs() as records:
         for _ in range(2):
             r = client.delete("/varsel-api/devices/dev-nobody-1234/data")
@@ -3878,7 +3882,7 @@ def test_a_failed_erasure_restores_the_tombstone_with_everything_else(monkeypatc
     _register_journey(DEVICE)
     client.delete(f"/varsel-api/devices/{DEVICE}")
     before = dict(varsel._device_tombstones[DEVICE])
-    monkeypatch.setattr(varsel, "_save_state", lambda: False)
+    monkeypatch.setattr(varsel_state, "save_state", lambda: False)
     assert client.delete(f"/varsel-api/devices/{DEVICE}/data").status_code == 503
     assert varsel._device_tombstones[DEVICE] == before
     assert len([j for j in varsel._journeys.values() if j["device_id"] == DEVICE]) == 1
@@ -4004,7 +4008,7 @@ def test_save_state_reports_failure_when_a_configured_upload_fails(monkeypatch):
         def upload_from_string(self, *a, **k):
             raise RuntimeError("503 backend error")
 
-    monkeypatch.setattr(varsel, "_gcs_blob", lambda: _FailingBlob())
+    monkeypatch.setattr(varsel_state, "_gcs_blob", lambda: _FailingBlob())
     assert varsel._save_state() is False
     # The local file is still written — that half stays best-effort and is unaffected.
     with open(_STATE_PATH) as fh:
@@ -4026,9 +4030,9 @@ def test_delete_all_rolls_back_and_503s_when_the_durable_write_fails(monkeypatch
         varsel._notified.add(f"{jid1}|S1")
         varsel._notified.add(f"{jid2}|S1")
 
-    real_save = varsel._save_state
+    real_save = varsel_state.save_state
     durable = {"ok": False}
-    monkeypatch.setattr(varsel, "_save_state", lambda: real_save() and durable["ok"])
+    monkeypatch.setattr(varsel_state, "save_state", lambda: real_save() and durable["ok"])
 
     with _capture_varsel_logs() as records:
         r = client.delete(f"/varsel-api/devices/{DEVICE}/data")
