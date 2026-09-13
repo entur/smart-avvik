@@ -1650,7 +1650,32 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   poller's**: `MAX_PER_MIN` global and `PER_PAIR_PER_MIN` per canonical pair, wordings through
   `notification_wording.PULL` (its own `WORDINGS_PER_MIN/HOUR/DAY` ledger and its own latch holder)
   and Journey Planner fetches on `alternatives._PULL_PATH` (`_PULL_FETCH_MAX_PER_MIN`) — a read
-  burst that moves `spent("browser")` or `spent("webhook")` is a bug. **It never writes poller
+  burst that moves `spent("browser")` or `spent("webhook")` is a bug.
+  **Since U15 (2026-09-13) the PASS warms the figures, and the two ceilings moved with it**:
+  `MAX_PER_MIN` 300 → 3 000 (R6's 50/s stated per minute) and `FIGURES_CACHE_MAX` 512 → 20 000, the
+  second because at 512 the warm pass evicts its own oldest entries before a read arrives. Pass 1a
+  hands each definition's alerts to `notification_pull.warm_figures` through a callable `main`
+  injects as `varsel.configure(figures_warmer=...)` — injected and not imported because
+  `notification_pull` imports `varsel`, a plan stop condition pinned both ways — so a favourite that
+  IS a registered definition, on EITHER channel, is a figures hit for every caller for the whole
+  cycle. Absent the callable, pass 1a is byte-for-byte what it was, which is what every suite but
+  two asserts by never noticing it. **The ceiling is not a throughput and the document says so**:
+  warming raises the HIT RATE and does not make a miss cheaper — U2's index did that. Measured
+  2026-09-13 with `scripts/bench_matcher.py --pull-read` at 20 000 definitions: a miss **0.32 ms**
+  (it was 15 ms p50 in dev before U2, which is where 300/min came from), a hit **0.017 ms**, warming
+  **3.3 %** of the pass, and ~**3 000** misses per second sustainable against R6's 50. The 50 rps run
+  against a real dev process is still owed. Three smaller things this unit had to get right, each
+  silent if taken the other way. **`_enriched` now also clears `impact.alternative_journey`**:
+  `llm_message.build_message_input` falls back to it, and every alert the pass produces carries one
+  (`with_alternative=True`), so a warmed winner would otherwise put an `alternativ_reise` into the
+  message input — and so into the wording key and the payload — that the same definition's answer on
+  a cold cycle does not have. **The third forget rule pops by a `(pair, train)` index** rather than
+  scanning the whole wording cache, because that scan ran on a read miss (a handful a minute) and
+  now runs once per registered definition per cycle; the index is derived and REBUILT rather than
+  evicted, since evicting it alone would silently retire the rule. And **`coverage`'s stop-place set
+  is memoised on the identity of the stop-cache list**, not on the prediction generation the plan
+  proposed: coverage is a function of the stop cache and the two refresh on different TTLs, so
+  identity is both cheaper and strictly fresher. **It never writes poller
   state** (`_messages`, `_alternatives`, `_notified`, `varsel_decisions`, Firestore): the one
   accessor it reads through is `varsel.cached_wording_and_alternative`, read-only by contract. A
   cold prediction cache is **503 `predictions_not_loaded`, never an empty list**. **Byte-identity

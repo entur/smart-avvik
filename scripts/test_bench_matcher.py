@@ -313,6 +313,42 @@ def test_the_pair_count_can_be_overridden_for_the_phase_a_gate():
     assert len({(j["from_stop"], j["to_stop"]) for j in fake._journeys.values()}) == 120
 
 
+def test_the_pull_read_mode_names_the_symbols_it_drives_and_the_seam_it_wires():
+    """`--pull-read` reaches into `notification_pull`'s internals and into `varsel`'s warm seam. A
+    rename on either side must fail here rather than produce a benchmark that silently measures
+    something else -- which is `--unpruned`'s lesson one module over."""
+    _api_on_path()
+    import notification_pull
+    import varsel
+
+    for name in ("_compute_figures", "_cached_figures", "_remember_figures", "_cache_key",
+                 "_alive", "_listed_states", "_assemble", "_coverage", "warm_figures", "_figures"):
+        assert hasattr(notification_pull, name), f"bench_matcher --pull-read drives {name}, which is gone"
+    assert hasattr(varsel, "_figures_warmer"), "the warm seam bench_matcher wires is gone"
+
+
+def test_the_pull_read_table_carries_r6s_target_and_what_the_number_is_a_share_of():
+    """A misses-per-second figure with neither the target nor the period beside it cannot be read.
+
+    The two the table must carry are R6's 50/s -- so a reader can tell pass from fail without
+    opening the plan -- and the cycle period the free-interpreter share is derived against, because
+    the rate is a SHARE of one interpreter and means nothing without it.
+    """
+    reports = [
+        {
+            "ratio": "prd", "definitions": 20000, "definitions_warmed": 20000,
+            "miss_ms": 0.32, "hit_ms": 0.017, "cold_pass_s": 10.27, "warm_delta_s": 0.34,
+            "free_interpreter_share": 0.964, "sustainable_misses_per_s": 3014.7,
+        }
+    ]
+    text = bm.render_pull_read(reports)
+    assert "3014.7" in text and "0.320" in text, text
+    assert "50/s" in text, "R6's target is what makes the measured rate readable as pass or fail"
+    assert "295 s period" in text, "the share is of one interpreter over a cycle; say which cycle"
+    # And the honest limit of a synthetic run, or the figure reads as the verification it is not.
+    assert "real dev process" in text, text
+
+
 def _run() -> None:
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

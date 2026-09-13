@@ -5311,6 +5311,57 @@ def test_a_webhook_only_definition_is_written_for_through_the_webhook_policy(mon
     assert len(browser_calls) == 1 and not client_calls, (browser_calls, client_calls)
 
 
+def test_the_figures_warmer_sees_every_match_target_on_the_passs_one_instant(monkeypatch):
+    """U15's seam, from the pass's side. Three properties, and each is a different failure.
+
+    EVERY match target, webhook-only ones included: the read serves anybody, and a favourite that
+    matches a client's registered corridor is as much a hit as one that matches a browser's. The
+    obvious wrong version wires this to `by_journey_key`, which is browser-only by construction
+    (KTD3) and would silently warm a subset.
+
+    ONE INSTANT, `cycle_now`, shared with the match itself (U2): the figures are keyed on the Oslo
+    date of the instant they were built at, and a warm stamped with each worker's own wall clock
+    would file a definition matched either side of midnight under a key no read then asks for.
+
+    And the alerts handed over are the journey's own, not a rebuild -- pinned by identity against
+    what the pass returns, because a second `match_journey` call here would double the pass's cost
+    for an answer it already holds.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    # TWO DISTINCT definitions on the corridor, and that is what makes the assertions below able to
+    # fail: the webhook subscription's window differs from the browser registration's, so they are
+    # separate `journey_key`s and separate match targets. Given one shared definition every claim
+    # here passes vacuously -- "browser-only" and "all targets" are the same set, and "one instant"
+    # is one call.
+    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC_ROUTED, "begin": "06:00", "end": "10:00"}])
+    _register(DEVICE, from_stop="A", to_stop="B", begin="00:00", end="23:59", days=[0, 1, 2, 3, 4, 5, 6])
+
+    seen: list[tuple] = []
+    matched: dict[str, list] = {}
+    real_match = varsel.match_journey
+
+    def _remember(journey, now, **kw):
+        alerts = real_match(journey, now, **kw)
+        matched[varsel.journey_key(journey)] = alerts
+        return alerts
+
+    monkeypatch.setattr(varsel, "match_journey", _remember)
+    monkeypatch.setattr(varsel, "_figures_warmer", lambda key, journey, alerts, now: seen.append((key, alerts, now)))
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(matched) == 2, f"control: two distinct definitions were matched, not {len(matched)}"
+    assert seen, "the seam was wired and pass 1a warmed nothing"
+    assert {key for key, _, _ in seen} == set(matched), (
+        "every definition the pass MATCHED was warmed -- webhook-only ones included, which is what "
+        "wiring this to the browser-only `by_journey_key` would silently break"
+    )
+    assert len({now for _, _, now in seen}) == 1, "one instant across the pass, never a worker's own clock"
+    for key, alerts, _ in seen:
+        assert alerts is matched[key], "the pass's own alerts, not a second match"
+
+
 def test_the_webhook_wording_gate_is_the_webhook_switch_not_varsel_llm_enabled(monkeypatch):
     """The two delivery switches stay separate, which is the rollout order's whole point.
 

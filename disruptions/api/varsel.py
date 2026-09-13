@@ -555,6 +555,14 @@ _span_provider: Callable[..., Any] | None = None
 # and the epoch gauge the runbook pages on), and a copy of that rule here would be the second place
 # it had to stay true.
 _beat_provider: Callable[[], None] | None = None
+# The journey-alerts read's warm seam (U15). `main` injects `notification_pull.warm_figures`;
+# absent, pass 1a is byte-for-byte what it was and the read computes on every miss, exactly as it
+# did before the seam existed. Injected rather than imported, and that is a PLAN STOP CONDITION
+# rather than a preference: `notification_pull` imports this module, so an import the other way is
+# a cycle, and `test_varsel_api.test_the_pull_read_is_the_dependent_side` pins the direction.
+# `varsel` therefore knows nothing about figures, generations or caches -- it hands over the one
+# thing only pass 1a holds, this definition's alerts, and the read decides what to keep.
+_figures_warmer: Callable[[str, dict, list["Alert"], datetime], None] | None = None
 #: How many definitions the match pass may get through between heartbeats, and likewise how many
 #: wordings the writing pass may. Small enough that a chunk cannot itself outlast
 #: `HEALTH_STALE_AFTER_S` (600 s) — a definition's match is bounded by the Journey Planner's own
@@ -579,6 +587,7 @@ def configure(
     webhook_recipients_provider: WebhookRecipientProvider | None = None,
     span: Callable[..., Any] | None = None,
     beat: Callable[[], None] | None = None,
+    figures_warmer: Callable[[str, dict, list["Alert"], datetime], None] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -609,6 +618,11 @@ def configure(
     poller, and the restart that follows comes up with both planned-call tables cold. See
     :data:`_HEARTBEAT_EVERY`.
 
+    `figures_warmer` is `notification_pull.warm_figures` (U15), injected for the reason the two
+    above are and for one that is stronger: `notification_pull` imports THIS module, so an import
+    the other way is a cycle, and the direction is a plan stop condition pinned both ways. Absent,
+    pass 1a is byte-for-byte what it was.
+
     `registrations` is where a registration LIVES (U13) — `varsel_state.BlobRegistrations` today,
     the Firestore-backed implementation next. Absent keeps the module's own blob backend, which is
     what every suite and every deployment before the cutover gets: the seam is proved by this
@@ -618,7 +632,7 @@ def configure(
     global _registrations
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
     global _connectivity_batch_provider
-    global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider
+    global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider, _figures_warmer
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     if registrations is not None:
@@ -630,6 +644,7 @@ def configure(
     _webhook_provider = webhook_recipients_provider
     _span_provider = span
     _beat_provider = beat
+    _figures_warmer = figures_warmer
 
 
 def _span(name: str, **attributes: Any):
@@ -4192,6 +4207,12 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # `alternatives._KeyedTTLCache.get`'s `wait_for_refresh`. Without that half, journeys sharing a
     # stop pair would each be told there is no alternative, which is the regression a fan-out is
     # expected to cause and would have shipped silently.
+    # Pass-local, for the same reason `PassOutcome` is a return value: a module-level counter would
+    # need registering in the stale sweep and in `_reset_state`, and a leaked one reads exactly like
+    # a warm that is failing now. Appended to from `_MATCH_WORKERS` threads, which needs no lock --
+    # `list.append` is atomic and the only thing read off it is the length.
+    warm_failures: list[int] = []
+
     def _match(item: tuple[str, dict]) -> tuple[str, list[Alert]]:
         key, journey = item
         try:
@@ -4201,7 +4222,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # disagree by however long the pass takes, which at 100 000 subscriptions is seconds.
             # It is also what lets `impact`'s per-generation window memo be SHARED: a memo keyed on
             # a window each caller derived from its own clock is shared by nobody.
-            return key, match_journey(journey, cycle_now, with_alternative=True)
+            alerts = match_journey(journey, cycle_now, with_alternative=True)
         except Exception:
             # One journey's failure must not stop the remaining journeys being scored or any push
             # going out. Empty alerts for this key; the next tick retries. Caught INSIDE the worker
@@ -4214,6 +4235,23 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 extra={"fields": {"event": "varsel_match_error"}},
             )
             return key, []
+        # The journey-alerts read's warm (U15), in its OWN try and deliberately not inside the one
+        # above: that one answers an exception with empty alerts for the journey, which is the right
+        # answer for a match that failed and the wrong one for a warm that did -- it would drop a
+        # registered traveller's alerts for the whole cycle to save a cache entry. The read is a
+        # READER of this pass, never a step of it, and a warm that raises costs one figures miss.
+        warmer = _figures_warmer
+        if warmer is not None:
+            try:
+                warmer(key, journey, alerts, cycle_now)
+            except Exception:
+                # Counted, not logged per definition: at a hundred thousand registrations a
+                # per-definition warning is a hundred thousand lines for one cause, which is how a
+                # real warning stops being read (`varsel_webhook_load`'s `unroutable` lesson). The
+                # traceback still goes to DEBUG, once per failure.
+                logger.debug("Journey-alerts figures warm raised", exc_info=True)
+                warm_failures.append(1)
+        return key, alerts
 
     matched: list[tuple[str, list[Alert]]] = []
     # The five sub-pass spans (R16) start here. `varsel_notify` showed as one opaque phase with the
@@ -4231,6 +4269,13 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 matched = _drain(
                     pool.map(_match, list(match_targets.items())), len(match_targets)
                 )
+    if warm_failures:
+        logger.warning(
+            "The journey-alerts figures warm failed for %d of %d definitions; those reads compute",
+            len(warm_failures),
+            len(match_targets),
+            extra={"fields": {"event": "notification_pull", "result": "warm_failed", "n": len(warm_failures)}},
+        )
     # A pass boundary is a progress point in exactly `main._phase`'s sense, and the two beats inside
     # `_drain` above deliberately skip the last chunk so this is the one that reports the pass done.
     _heartbeat()

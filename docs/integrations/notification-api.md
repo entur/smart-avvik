@@ -141,7 +141,7 @@ subscription on your next `POST` of it — the idempotent re-registration is eno
 | active credentials per client | 8 | operator-side `Conflict` |
 | active destinations per client | 4 | operator-side `Conflict` |
 | list page size | default 100, max 500 | `422` outside 1–500 |
-| `GET /journey-alerts`, process-wide, every anonymous caller, 60 s sliding | 300 req/min | `429 rate_limited`, `Retry-After: 60` |
+| `GET /journey-alerts`, process-wide, every anonymous caller, 60 s sliding | 3 000 req/min | `429 rate_limited`, `Retry-After: 60` |
 | `GET /journey-alerts`, per canonical stop pair, 60 s sliding | 30 req/min | `429 rate_limited`, `Retry-After: 60` |
 | `GET /journey-alerts` wordings, every anonymous caller together | 30 / min, 500 / h, 2 000 / day | the entry carries the template with `wording.status: rate_limited`; never a 429 |
 | `GET /journey-alerts` Journey Planner lookups, every anonymous caller together | 30 / min | the entry carries no alternative with `alternative.status: unanswered`; never a 429 |
@@ -152,6 +152,14 @@ The two limiter tiers exist because *verifying a credential is itself store work
 credential is refused by the global tier and a short-TTL negative cache before any Firestore read, so
 it cannot spend a real client's budget. An anonymous flood can still exhaust the global tier — the
 same accepted trade `/impact`'s limiter makes.
+
+**3 000 a minute is a CEILING, not a throughput promise.** It was 300 until 2026-09-13. What the
+process can actually serve depends on how many of your reads hit its per-cycle cache: a read for a
+journey definition somebody has registered with us is answered from figures the poller already
+built, and one for a definition nobody has registered runs the matcher in the same interpreter the
+poller uses. You cannot tell which yours is, and the answer does not say. In practice: poll on a
+human cadence (a favourites panel needs one read a minute, not one a second), keep your own cached
+answer, and treat a `429` as an ordinary state rather than an error to retry immediately.
 
 **The public read's limiter and allowances are a separate ledger, and a SHARED one.** They are not
 the credentialed tiers above and never touch a client's own budget — but they are also not per
