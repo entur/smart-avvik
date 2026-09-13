@@ -851,6 +851,19 @@ contract document says so in its own words; this is the operating half of the sa
    `varsel_capacity` with its `kind` — under the store that line means a client QUOTA refused the
    registration, so the fix is `set-quotas` on `browser` rather than a code change.
 
+   **One thing the cutover still owes: the togvarsel round markers are not persisted under
+   `store`.** They are off the protocol and ride in the blob half; the durable write behind
+   `varsel.store_togvarsel_rounds` is `_save_state()`, which on the store backend is a no-op
+   returning True, and the matching `load()` is a no-op too. So under `store` a restart re-fires
+   the accepted crash window for whatever rush round is still inside its timeliness window, rather
+   than only for a crash mid-round. It costs nothing as things stand — `SHOW_RUSHVARSEL` is off in
+   every environment, so no round is evaluated at all, and no environment sets this backend — which
+   is precisely why it is written down here rather than left to be found at the cutover. Two
+   shapes, neither chosen: keep the markers on the blob regardless of backend (`store_rounds` calls
+   `varsel_state.save_state()` itself and `main` always calls `load_state()`), or move them to one
+   Firestore document. **Decide it before `SHOW_RUSHVARSEL` and `VARSEL_STATE_BACKEND=store` are on
+   in the same environment**, which is the only state in which it can bite.
+
 5. **A `count()` aggregation for the active-subscription ceiling — done, 2026-09-13 (U7).**
    `_create_body` counted a client's live subscriptions by READING them inside the create
    transaction, up to the ceiling: bounded, and paid on a create, which is what made it affordable

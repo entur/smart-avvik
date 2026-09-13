@@ -527,7 +527,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     loop's collect pass was **re-ordered**: which registrations have an alert-worthy train at all is
     decided first and from memory, and only then is one multi-get issued for their devices — device
     first was one store round trip per registration per cycle, serial, on the poller's thread, for a
-    question almost every registration answers "no" to.
+    question almost every registration answers "no" to. **A per-journey mirror read is KEYED**
+    (`SubscriptionMirror.entry`), which is the same lesson one layer along: `recipients` copies the
+    whole entry list and tests liveness on every element — right for the pass, which wants all of
+    them, and the wrong shape for `get_journey` (three calls per push) and `push_ledger` (one per
+    candidate), where at a hundred thousand entries a thousand pushes is ~4 000 full walks and the
+    backend that exists to scale is slower per cycle than the blob it replaces. A suite at n=2 can
+    see none of that, so what pins it is a test that makes `recipients` RAISE and asserts every
+    per-journey read still answers. **The togvarsel round markers are NOT persisted under
+    `store`**, and that is U14's to settle rather than a defect this backend hides: the durable
+    write behind `store_togvarsel_rounds` is `_save_state()`, which is a no-op returning True on
+    the store, whose `load()` is a no-op too — so a restart re-fires the accepted crash window for
+    whatever rush round is inside its timeliness window. It costs nothing today (`SHOW_RUSHVARSEL`
+    is off everywhere and no environment sets this backend) and the two shapes are keeping the
+    markers on the blob regardless of backend, or one Firestore document.
   - Non-prod deployments label themselves in the PWA header and tab title —
     `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
     because phones truncate on the right), because dev and prd installs are otherwise identical on

@@ -2573,6 +2573,26 @@ class SubscriptionMirror:
             entries = list(self._entries.values())
         return [e for e in entries if e.channel == channel and e.is_live(now)]
 
+    def entry(
+        self, subscription_id: str, now: datetime, *, channel: str = CHANNEL_WEBHOOK
+    ) -> MirrorEntry | None:
+        """ONE live entry, by id. A dict lookup, never a scan.
+
+        `recipients` copies the whole entry list and tests liveness on every element, which is the
+        right shape for the pass -- it wants all of them -- and the wrong one for a caller that
+        wants a single registration. At a hundred thousand entries the difference is not constant
+        factors: `varsel`'s delivery loop asks `get_journey` three times per push and `push_ledger`
+        once per candidate, so a thousand pushes is ~4 000 full scans, and the store backend --
+        the one that exists to scale -- would be slower per cycle than the blob it replaces. The
+        liveness test stays on the read for `recipients`' own reason: expiry is the one state
+        change nothing writes a document for.
+        """
+        with self._lock:
+            entry = self._entries.get(subscription_id)
+        if entry is None or entry.channel != channel or not entry.is_live(now):
+            return None
+        return entry
+
     def documents(self, now: datetime, *, channel: str = CHANNEL_WEBHOOK) -> list[dict[str, Any]]:
         """:func:`recipient_documents`' shape, served from memory."""
         return [e.as_recipient_document(now) for e in self.recipients(now, channel=channel)]
@@ -3668,7 +3688,7 @@ def _record_push_body(
     refs: _Refs,
     *,
     subscription_id: str,
-    train_ref: str,
+    train_ref: str | None,
     now: datetime,
     charge_cap: bool = True,
 ) -> dict[str, Any]:
@@ -3687,6 +3707,11 @@ def _record_push_body(
     -- it is what the next replacement is recognised by, and a replacement that did not refresh it
     would let the mark age out mid-disruption and turn the third notification about one train into
     a fourth charged push.
+
+    `train_ref` is None when the alert cannot say which train it is about, and then NOTHING is
+    recorded for the train while the day's count is still charged -- the cap is spent per push, and
+    the lock screen falls back to the situation number, which is what it always did. A placeholder
+    would be a mark no later push can ever match, occupying a slot in a map `_prune_marks` bounds.
     """
     stored = _web_push_journey(transaction, refs, subscription_id)
     day = oslo_day(now)
@@ -3694,7 +3719,8 @@ def _record_push_body(
     if charge_cap:
         counters[day] = int(counters.get(day) or 0) + 1
     trains = dict(stored.get("pushed_trains") or {})
-    trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
+    if train_ref is not None:
+        trains[train_ref] = now + timedelta(days=HISTORY_DAYS)
     patch = {
         "daily_pushes": _prune_daily(counters, now),
         "pushed_trains": _prune_marks(trains, now),
@@ -3731,7 +3757,7 @@ def mark_notified(*, subscription_id: str, situation_number: str, now: datetime 
 def record_push(
     *,
     subscription_id: str,
-    train_ref: str,
+    train_ref: str | None,
     charge_cap: bool = True,
     now: datetime | None = None,
 ) -> None:

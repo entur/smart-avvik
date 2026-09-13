@@ -702,6 +702,32 @@ def test_a_push_mark_is_on_the_document_and_the_next_cycle_sees_it(_mp):
     assert store.notified_snapshot(["j1"]) == {"j1|S1"}
 
 
+def test_a_push_that_cannot_name_its_train_charges_the_day_and_marks_no_train(_mp):
+    """The `tag is None` branch, on BOTH backends, because they used to answer it differently.
+
+    An alert that cannot say which departure it is about gets no lock-screen tag -- the worker falls
+    back to the situation number. The store wrote a `"<jid>|unidentified"` placeholder for it: a
+    mark no later push can ever match, taking a slot in a map `_prune_marks` bounds by age. The
+    day's count is still spent, because the cap is per PUSH and not per train.
+    """
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    store.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
+
+    stored = client.doc(notification_store.SUBSCRIPTIONS, "j1")
+    assert not stored["pushed_trains"], "an unnamed train left a mark nothing can match"
+    assert stored["daily_pushes"], "the day's count was not charged"
+    assert store.push_ledger("j1").sent_today == 1
+
+    blob = varsel_state.BlobRegistrations(max_devices=MAX_DEVICES, max_journeys=MAX_JOURNEYS)
+    blob.create_journey("j1", _journey())
+    blob.record_push("j1", tag=None, departure=None, oslo_day="2026-09-13", charge_cap=True)
+    assert blob.push_ledger("j1").pushed_trains == frozenset(), "the two backends disagree"
+    assert blob.push_ledger("j1").sent_today == 1
+
+
 def test_a_mark_for_a_journey_erased_mid_push_is_dropped_rather_than_raised(_mp):
     """The plan's fourth scenario. A push can be in flight past `_prepare_alert`'s re-check when the
     traveller presses «Slett alt»: the push went out, and the only thing this call could add is a
@@ -744,6 +770,32 @@ def test_a_deleted_journey_is_gone_from_the_cycles_view_at_once(_mp):
     store.delete_journey("j1")
     assert store.get_journey("j1") is None, "the cycle can still see a journey this request deleted"
     assert store.all_journeys() == []
+
+
+def test_a_per_journey_read_is_keyed_and_never_a_scan_of_the_mirror(_mp):
+    """The cost the store backend exists to remove, pinned where a benchmark cannot reach it.
+
+    `recipients` copies the whole entry list and tests liveness on every element. The delivery loop
+    asks `get_journey` three times per push and `push_ledger` once per candidate, so answering
+    either by scanning makes a thousand pushes ~4 000 walks of a hundred thousand entries -- and a
+    suite running at n=2 sees nothing at all. So the mechanism is asserted rather than the timing:
+    with `recipients` refusing to answer, every per-journey read still does. `all_journeys` is
+    deliberately not in this test -- it wants all of them, which is exactly what `recipients` is.
+    """
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    store.mark_notified("j1", "S1")
+
+    def _refuse(self, *a, **k):
+        raise AssertionError("a per-journey read walked the whole mirror")
+
+    _mp.setattr(notification_store.SubscriptionMirror, "recipients", _refuse)
+    assert store.get_journey("j1") is not None
+    assert store.push_ledger("j1").notified == {"S1"}
+    assert store.notified_snapshot(["j1"]) == {"j1|S1"}
+    assert store.get_journey("nosuch") is None, "an unknown id must answer without a scan too"
 
 
 def test_the_ceilings_are_the_clients_quotas_under_the_store(_mp):
