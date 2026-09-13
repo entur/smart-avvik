@@ -43,6 +43,12 @@ Design notes
   by design and the labelling job writes a *separate* outcomes table.
 * **Privacy.** `journey_digest` (shared with :func:`llm_message.key_digest` so the two records
   join) plus a device count. No device_id, no journey_id, no time window, no weekday pattern.
+  **Two channels since 2026-09-13** (U16, KTD4) and the claim above is unchanged by it: a webhook
+  route contributes a `channel` value and a `n_subscriptions` count and nothing else, so the grain
+  is still the journey definition and no subscription, client, destination or external reference
+  reaches this table. KTD10 held client routes out of it entirely until `/historikk` and
+  `/meldinger` were behind authentication; they have been since 2026-09-10, and at a hundred
+  thousand commuters leaving them out would have meant leaving the product unscored.
   `message_input` is the one field that carries origin, destination and departure time together — it
   is what the writer was shown, so it cannot be redacted here without defeating the purpose — which
   is why `/historikk-api` serves neither it nor `from_stop`/`to_stop`.
@@ -100,6 +106,18 @@ logger = logging.getLogger(__name__)
 _OSLO = ZoneInfo("Europe/Oslo")
 
 TABLE = "disruptions.varsel_decisions"
+
+#: The `channel` column's vocabulary (U16, KTD4). A fixed three-value set rather than anything read
+#: out of the data: it is also the allow-list `/historikk-api` and `/meldinger-api` validate their
+#: channel filter against, and a value landing in a public endpoint's response-cache key has to come
+#: from a bounded set. 'browser' is a /varsel registration, 'webhook' a client subscription and
+#: 'both' a definition the two share -- deliberately NOT `notification_store.CHANNELS`' 'web_push',
+#: because this table's word for that side has been 'browser' everywhere since it existed and this
+#: module may not import that one.
+CHANNEL_BROWSER = "browser"
+CHANNEL_WEBHOOK = "webhook"
+CHANNEL_BOTH = "both"
+CHANNELS = (CHANNEL_BROWSER, CHANNEL_WEBHOOK, CHANNEL_BOTH)
 
 _DDL_PATH = Path(__file__).parent / "create_varsel_decisions.sql"
 
@@ -466,6 +484,8 @@ def build_row(
     journey_digest: str,
     n_devices: int,
     pushed: bool,
+    channel: str = CHANNEL_BROWSER,
+    n_subscriptions: int = 0,
     message: str | None,
     message_source: str,
     message_llm: str | None = None,
@@ -505,6 +525,18 @@ def build_row(
 
     The keyword arguments default to None so a caller that has no LLM context — a test, a future
     surface — still produces a valid row rather than needing to fake provenance it does not have.
+
+    `channel` and `n_subscriptions` are U16's (2026-09-13, KTD4): a row now says which channel or
+    channels watched this journey definition, and how many webhook subscriptions were on it beside
+    `n_devices`' browser registrations. They default to the browser and to zero because that is what
+    every row written before them meant and what every caller outside `varsel.check_and_notify`
+    still means — the pull read records nothing, and a test building a row has a browser journey in
+    front of it.
+
+    **What is NOT here, and must not be added.** No subscription id, client id, destination or
+    external reference: the grain stays the journey DEFINITION, which is a route, a window and a
+    weekday set and names nobody, and `test_notification_contract` greps this module for exactly
+    those names. A count is the whole of what the client side contributes.
     """
     departure = getattr(alert, "departure_time", None)
     decided_at = getattr(alert, "decided_at", None) or datetime.now(tz=_OSLO)
@@ -554,6 +586,8 @@ def build_row(
         "alertworthy": bool(getattr(alert, "alertworthy", False)),
         "pushed": bool(pushed),
         "n_devices": n_devices,
+        "channel": channel,
+        "n_subscriptions": n_subscriptions,
         "message": message,
         "message_source": message_source,
         # The two candidate wordings, recorded whether or not they were the one delivered. Reading
@@ -586,7 +620,16 @@ def rescored(row: dict, alert: Alert) -> dict:
     pages quote is taken off the first PUSHED row, which is never thinned.
 
     `pushed` is forced False: a row nobody was notified on must not inherit an earlier cycle's mark,
-    which `pushed_any` would OR into a subject that never had a push.
+    which `pushed_any` would OR into a subject that never had a push. That is also what keeps a
+    CLOSING row honest now that `pushed` covers a minted webhook event as well as a Web Push (U16):
+    the mint is stamped onto the ledger's row, and a later cycle re-stating it must not claim a
+    notification it did not issue.
+
+    `channel` and `n_subscriptions` are carried by `**row` rather than recomputed, like the wording
+    and the message input beside them: both describe the recipients, which this function has no
+    access to. So a closing row's channel can be up to one thinning interval old — a client that
+    subscribed to a corridor during the quiet middle reads as 'browser' on that row and as 'both' on
+    the next written one, and the view's aggregate is what makes the SUBJECT read 'both' either way.
     """
     departure = getattr(alert, "departure_time", None)
     decided_at = getattr(alert, "decided_at", None) or datetime.now(UTC)

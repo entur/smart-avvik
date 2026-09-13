@@ -264,6 +264,19 @@ class WebhookObservation:
     payload: Mapping[str, Any] = field(default_factory=dict)
     expected_departure_time: datetime | None = None
 
+    #: The decision log's own subject, (journey definition, situation, departure) -- `varsel.
+    #: _decision_key`'s tuple, opaque here. U16's seam, and it is on the OBSERVATION rather than
+    #: derived from the alert id because the two grains do not convert: an alert id is per
+    #: (subscription, train) and a decision row is per (definition, situation, departure), so a
+    #: corridor with a hundred thousand subscriptions mints a hundred thousand alert ids for the
+    #: one row this names. Carried rather than recomputed for the same reason `train_ref` is: the
+    #: collapse that picked the winning situation happened in `varsel`, and restating it here would
+    #: be a second definition of which situation a train's notification is about.
+    #:
+    #: None where the caller did not supply one; `emit` then simply reports nothing for that
+    #: observation, which is what keeps every existing test and the `/test-events` route working.
+    decision_key: tuple[str, str, str] | None = None
+
     def subject(self, recipient: Recipient) -> WebhookSubject:
         """This observation as one recipient's subject. The payload is SHARED, not copied.
 
@@ -332,15 +345,25 @@ class EmitReport:
     #: in this repository is swept to avoid, and it would need registering in two stale sweeps to
     #: be safe.
     #:
-    #: Two things U16 has to decide rather than inherit, both stated here so neither is discovered.
     #: The ORDER is which transaction finished first, not which was submitted, so it carries no
-    #: meaning beyond membership. And this pass runs AFTER `_record_decisions` -- KTD6 puts every
-    #: client step after the cycle's two durable writes, deliberately -- so a cycle's ledger cannot
-    #: reach that cycle's rows; it reaches the next one's, or the row has to be written somewhere
-    #: else. The grain is also not the decision log's: an alert id is per (subscription, train)
-    #: while a decision row is per (definition, situation, departure), so U16 needs a mapping this
-    #: does not carry.
+    #: meaning beyond membership.
     minted: tuple[str, ...] = ()
+    #: The same mints at the DECISION LOG's grain and deduplicated: one entry per (definition,
+    #: situation, departure) any of whose recipients minted a revision. U16 reads it; nothing else
+    #: does. Empty where the caller supplied no `decision_key` on its observations.
+    #:
+    #: **U9 left two questions here and U16 answered both, so the answers live here rather than in
+    #: a commit message.** The grain is the first: it is carried on the observation
+    #: (:attr:`WebhookObservation.decision_key`) rather than derived, because an alert id embeds a
+    #: subscription and a decision key embeds a situation and neither converts to the other. The
+    #: ORDERING is the second, and it is the one that shaped the design: this pass runs AFTER
+    #: `_record_decisions` -- KTD6 puts every client step after the cycle's two durable writes,
+    #: deliberately -- so a cycle's mints cannot reach the rows that cycle already wrote. U16 took
+    #: the other branch U9 named, "the row has to be written somewhere else": `varsel.
+    #: record_minted_decisions` writes ONE more row per newly-notified subject, right here in the
+    #: `notification_webhooks` phase, copied from the ledger's own row with `pushed` flipped. What
+    #: that costs is stated where it is paid, on that function.
+    minted_decisions: tuple[tuple[str, str, str], ...] = ()
     #: Transactions still in flight when the collection's deadline passed, walked away from rather
     #: than waited on -- a transactional commit carries no client-side deadline, so waiting would
     #: hold the pass lock on a hung store and refuse every later cycle. An abandoned transaction
@@ -504,23 +527,42 @@ def _skip_reason_for(
 
 
 class _Ledger:
-    """The alert ids a pass minted, appended by the workers as they commit.
+    """What a pass minted, in two grains, appended by the workers as they commit.
 
-    Its own structure rather than a key on :class:`_Counts` because it is not a count: it is the
-    pass's own record of what it wrote, and `EmitReport.minted` is where it goes.
+    Its own structure rather than a key on :class:`_Counts` because neither is a count: it is the
+    pass's own record of what it wrote, and `EmitReport.minted` / `.minted_decisions` are where the
+    two go.
+
+    TWO GRAINS because the two readers ask different questions. An operator reading a pass asks
+    which alert subjects moved, which is per (subscription, train). The decision log asks which
+    journey definitions were notified about, which is per (definition, situation, departure) -- and
+    on a shared corridor one of those covers every subscription on it, so the second list is
+    deduplicated and is orders of magnitude shorter than the first. Deriving either from the other
+    is not possible in this module: an alert id embeds a subscription and the decision key embeds a
+    situation, and neither carries the other.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._minted: list[str] = []
+        self._decisions: dict[tuple[str, str, str], None] = {}
 
-    def add(self, alert_id: str) -> None:
+    def add(self, alert_id: str, decision_key: tuple[str, str, str] | None = None) -> None:
         with self._lock:
             self._minted.append(alert_id)
+            if decision_key is not None:
+                # A dict rather than a set, so the order is first-mint order and therefore stable
+                # between runs -- the same reason `minted` is a list. Membership is what the caller
+                # reads; the order is what makes a failure reproducible.
+                self._decisions.setdefault(decision_key, None)
 
     def frozen(self) -> tuple[str, ...]:
         with self._lock:
             return tuple(self._minted)
+
+    def frozen_decisions(self) -> tuple[tuple[str, str, str], ...]:
+        with self._lock:
+            return tuple(self._decisions)
 
 
 class _Counts:
@@ -968,7 +1010,7 @@ def _run_pass(
         if commit.status != "created" or commit.superseded_delivery_id:
             ledger.refund(recipient.destination_id)
         if commit.status == "created":
-            ledger_of_mints.add(commit.alert_id)
+            ledger_of_mints.add(commit.alert_id, observation.decision_key)
         if commit.status == "created" and commit.event_type == notification_store.EVENT_WITHDRAWN:
             counts.add("withdrawn")
             return
@@ -1115,6 +1157,7 @@ def _run_pass(
         run_clear_error=counts.get("run_clear_error"),
         abandoned=counts.get("abandoned"),
         minted=ledger_of_mints.frozen(),
+        minted_decisions=ledger_of_mints.frozen_decisions(),
     )
 
 

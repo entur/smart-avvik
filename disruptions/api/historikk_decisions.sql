@@ -55,7 +55,8 @@ SELECT
   o.ever_alerted, o.first_alert_at, o.alert_lead_min,
   o.max_impact_probability, o.final_impact_probability, o.final_cancel_probability,
   o.final_delay_p50_min, o.final_delay_p90_min, o.alert_threshold, o.et_cancelled,
-  o.pushed_any, o.n_devices, o.message, o.message_source,
+  o.pushed_any, o.n_devices, o.channel, o.n_subscriptions,
+  o.message, o.message_source,
   o.actual_cancelled, o.actual_dep_delay_min, o.actual_trouble, o.verdict,
   -- An unresolved row is only permanently unknown once it has aged out of the labelling job's
   -- 10-day retry window; inside it, the nightly run deletes and re-labels it, so a late ET row can
@@ -70,6 +71,12 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR o.operator = @operator)
   AND (@verdict  IS NULL OR o.verdict  = @verdict)
   AND (@line     IS NULL OR o.line     = @line)
+  -- The channel filter (U16). NULL in the parameter is "every channel"; a NAMED channel excludes
+  -- rows whose own channel is NULL, which are the rows written before 2026-09-13 -- the
+  -- n_unsegmented rule, one column over. Those were all browser subjects in fact, and folding them
+  -- into 'browser' would still be a guess the data does not carry, and one that would silently
+  -- become wrong for any environment backfilled later.
+  AND (@channel  IS NULL OR o.channel  = @channel)
   -- The traveller's own registered endpoints. Both filtered on AND selected since 2026-08-22 (see
   -- the PRIVACY note at the top); the refs go no further than this process, which pops them and
   -- serves resolved NSR names in their place, so extra="forbid" still guards the ref itself.
@@ -119,7 +126,8 @@ SELECT
   TIMESTAMP_DIFF(g.departure_time, g.first_alert_at, MINUTE) AS alert_lead_min,
   g.max_impact_probability, g.final_impact_probability, g.final_cancel_probability,
   g.final_delay_p50_min, g.final_delay_p90_min, g.alert_threshold, g.et_cancelled,
-  g.pushed_any, g.n_devices, g.message, g.message_source,
+  g.pushed_any, g.n_devices, g.channel, g.n_subscriptions,
+  g.message, g.message_source,
   CAST(NULL AS BOOL)   AS actual_cancelled,
   CAST(NULL AS INT64)  AS actual_dep_delay_min,
   CAST(NULL AS BOOL)   AS actual_trouble,
@@ -141,6 +149,7 @@ FROM `disruptions.varsel_decision_groups_between`(
 WHERE g.call_date BETWEEN @from_date AND @to_date
   AND (@operator IS NULL OR g.operator = @operator)
   AND (@line     IS NULL OR g.line     = @line)
+  AND (@channel  IS NULL OR g.channel  = @channel)
   -- Same three as the labelled side; see the note there for why they are filtered but not selected,
   -- and why a place is an array of refs rather than one.
   AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR g.from_stop IN UNNEST(@from_place_refs))

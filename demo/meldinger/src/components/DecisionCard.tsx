@@ -236,12 +236,21 @@ function ReplayBlock({
 function DepartureWhen({ decision }: { decision: Decision }) {
   if (decision.would_send_at) {
     const devices = decision.n_devices ?? 0;
+    // The two recipient counts, each named for its own channel and never added together: one is
+    // /varsel registrations, the other is a client's webhook subscriptions, and neither is a share
+    // of the other. A webhook-only subject reads 0 devices, so the browser clause simply does not
+    // fire and the client one does.
+    const subscriptions = decision.n_subscriptions ?? 0;
+    const recipients = [
+      devices > 1 ? `${devices} mottakere` : '',
+      subscriptions > 0 ? `${subscriptions} klientabonnement` : '',
+    ].filter(Boolean);
     return (
       <span
         className="tb-when"
         title={withLooks(
           'Varselet gikk ut på dette tidspunktet' +
-            (devices > 1 ? ` — til ${devices} mottakere` : '') +
+            (recipients.length ? ` — til ${recipients.join(' og ')}` : '') +
             '. Teksten under er den samme situasjonen skrevet på nytt av dagens prompt, ' +
             'ikke det som faktisk ble sendt.',
           decision,

@@ -801,6 +801,37 @@ def test_the_no_sx_placeholders_are_one_option_that_expands_to_every_stored_text
         assert params["sx_summaries"] == both, "the option must expand to every text behind it"
 
 
+def test_the_channel_filter_reaches_all_three_queries_and_is_allow_listed():
+    """U16's filter, and the property that makes it more than a dropdown on this page.
+
+    `/messages` repeats `/decisions`' predicate VERBATIM — that is what aligns the two responses
+    position by position — so a filter applied to one and not the other silently pairs each card
+    with another card's wording. And it narrows the POPULATION, so `/summary` takes it too.
+
+    The vocabulary is checked against `decisions.CHANNELS`, not against the window: the value lands
+    in the response-cache key on a page any Entur employee can reach.
+    """
+    _reset([_row()], message_rows=[_message_row()])
+    client.get("/meldinger-api/decisions", params={"channel": "webhook"})
+    client.get("/meldinger-api/messages", params={"channel": "webhook"})
+    client.get("/meldinger-api/summary", params={"channel": "webhook"})
+    for query in (
+        meldinger._DECISIONS_QUERY,
+        meldinger._MESSAGES_QUERY,
+        meldinger._SUMMARY_QUERY,
+    ):
+        _, params = next(c for c in fake.calls if c[0] == query)
+        assert params["channel"] == "webhook", (
+            "every query that narrows the population takes it, or the two lists stop aligning"
+        )
+
+    _reset([_row()])
+    bad = client.get("/meldinger-api/decisions", params={"channel": "sms"})
+    assert bad.status_code == 400
+    assert "channel must be one of" in bad.json()["detail"]
+    assert fake.calls == [], "a rejected channel must not reach BigQuery"
+
+
 def test_the_label_is_never_a_value():
     """"Ingen" is what the page renders, never what it sends.
 
@@ -1006,10 +1037,11 @@ def test_response_carries_route_names_but_no_internal_identifiers_or_writer_inpu
         "ever_alerted", "first_alert_at", "alert_lead_min",
         "max_impact_probability", "final_impact_probability", "final_cancel_probability",
         "final_delay_p50_min", "final_delay_p90_min", "alert_threshold", "et_cancelled",
-        "pushed_any", "n_devices", "other_pushed_on_train", "would_send_at", "send_state",
+        "pushed_any", "n_devices", "channel", "n_subscriptions",
+        "other_pushed_on_train", "would_send_at", "send_state",
         "prompt_version",
         "actual_cancelled", "actual_dep_delay_min", "actual_trouble", "verdict", "outcome_state",
-    }
+    }, "`channel` and `n_subscriptions` joined the set on 2026-09-13 (U16); nothing else did"
 
 
 def test_route_names_fall_back_to_refs_when_the_stop_registry_is_unavailable():
@@ -2142,21 +2174,22 @@ def _run():
 
 
 def test_no_notification_store_field_or_collection_name_appears_in_this_pages_sql():
-    """KTD10, as a grep over the UNCOMMENTED SQL, because a query that cannot name a column
-    cannot leak it however the code above it drifts.
+    """KTD10 as it stands after U16, as a grep over the UNCOMMENTED SQL: a query that cannot name a
+    column cannot leak it however the code above it drifts.
 
-    `varsel_decisions` is written for every match and this page publishes it on a public host --
-    with resolved origin and destination names since 2026-08-22, accepted then because prd's
-    registrations are test users. Client-app travellers are members of the public, so client
-    decisions and deliveries are recorded in Firestore and NEVER in that table. Its `pushed` column
-    is also journey-DEFINITION grain and cannot tell a webhook from a Web Push, so a client
-    delivery recorded there would corrupt this page's meaning as well as its privacy claim.
+    **What changed on 2026-09-13 and what did not.** Webhook routes ARE in `varsel_decisions` now
+    (KTD4): the pages are behind Entur SSO since 2026-09-10, and at a hundred thousand commuters
+    leaving client routes unscored would have meant leaving the product unscored. What is
+    unchanged, and is the whole of what this guard is about, is the GRAIN: a row is one journey
+    DEFINITION's view of one situation on one train, and the client side contributes a `channel`
+    value and a COUNT. No subscription, client, destination, event or delivery identity reaches the
+    decision log or either page.
 
-    The rule is enforced three ways and this is the cheapest of them: nothing writes a client row
-    (`varsel.check_and_notify` hands `_record_decisions` the browser grouping only), no client
-    module imports `decisions`, and no query here names a client column or collection. Over the
-    uncommented text on purpose -- `meldinger_decisions.sql`'s own headers discuss what they refuse
-    to select, so a grep over the raw file would match an explanation.
+    So the ban is on the names of Firestore's collections and identifying fields, matched as WHOLE
+    WORDS -- `n_subscriptions` is a count and is asserted to be present below, while a bare
+    `subscriptions` would be the collection this page must never join to. Over the uncommented text
+    on purpose: these files' own headers discuss what they refuse to select, so a grep over the raw
+    file would match an explanation.
     """
     import pathlib
     import re
@@ -2181,7 +2214,21 @@ def test_no_notification_store_field_or_collection_name_appears_in_this_pages_sq
             re.sub(r"--.*$", "", line) for line in path.read_text().splitlines()
         )
         for name in forbidden:
-            assert name not in code, f"{path.name} names {name!r}: KTD10 keeps notification state out"
+            # Whole words: the identifying names are banned, a column that merely ends in one is
+            # not. `\b` does not match between `n_` and `subscriptions` (an underscore is a word
+            # character), which is exactly the distinction -- `n_subscriptions` is a count and
+            # `subscriptions` is the collection.
+            assert not re.search(rf"\b{name}\b", code), (
+                f"{path.name} names {name!r}: the decision log records webhook routes at DEFINITION "
+                "grain (KTD4) and carries no client identity of any kind"
+            )
+    counts = "\n".join(
+        re.sub(r"--.*$", "", line) for line in (here / "meldinger_decisions.sql").read_text().splitlines()
+    )
+    assert "n_subscriptions" in counts, (
+        "control: the guard must still admit the client-side COUNT, or it is passing because the "
+        "column it is meant to distinguish from the collection is not there at all"
+    )
 
 if __name__ == "__main__":
     _run()

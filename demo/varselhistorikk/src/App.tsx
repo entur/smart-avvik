@@ -35,6 +35,16 @@ const NO_OPTIONS: FilterOptions = {
   lines: [],
   from_places: [],
   to_places: [],
+  channels: [],
+};
+
+/** The Norwegian label per channel value. The server publishes the VALUES ('browser', 'webhook',
+ *  'both') and never a label, like every other vocabulary here: a label edit must not 400 the page
+ *  by becoming a filter value the allow-list has never heard of. */
+const CHANNEL_LABELS: Record<string, string> = {
+  browser: 'Appen',
+  webhook: 'Klient',
+  both: 'Begge',
 };
 
 const WINDOW_OPTIONS = [
@@ -57,6 +67,7 @@ export default function App() {
   // because that is what the decision log stores and what the API filters on; the readable name is
   // only ever the label. So an unnamed stop still filters correctly, it just shows as its ref.
   const [line, setLine] = useState('');
+  const [channel, setChannel] = useState('');
   const [fromPlace, setFromPlace] = useState('');
   const [toPlace, setToPlace] = useState('');
 
@@ -105,6 +116,7 @@ export default function App() {
       line: line || undefined,
       fromPlace: fromPlace || undefined,
       toPlace: toPlace || undefined,
+      channel: channel || undefined,
       verdict: utfall || undefined,
       alertedOnly,
       resolvedOnly,
@@ -130,6 +142,11 @@ export default function App() {
           [line, opts.lines.includes(line), setLine],
           [fromPlace, opts.from_places.some((pl) => pl.ref === fromPlace), setFromPlace],
           [toPlace, opts.to_places.some((pl) => pl.ref === toPlace), setToPlace],
+          // `channel` is deliberately NOT here. The others are vocabularies read from the window,
+          // so narrowing the window can strand a selection on a value the allow-list no longer
+          // knows — a 400. This one is a fixed three-value set the server always accepts, and an
+          // empty result for «Klient» is the true answer (no client route in this window) rather
+          // than a stale selection to clear.
         ] as const;
         const stale = gone.filter(([value, present]) => value && !present);
         if (stale.length) {
@@ -160,7 +177,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [days, operator, line, fromPlace, toPlace, utfall, resolvedOnly, alertedOnly, sxOnly]);
+  }, [days, operator, line, fromPlace, toPlace, channel, utfall, resolvedOnly, alertedOnly, sxOnly]);
 
   return (
     <main className="vh-page">
@@ -259,6 +276,22 @@ export default function App() {
             {options.to_places.map((pl) => (
               <option key={pl.ref} value={pl.ref}>
                 {pl.name ?? pl.ref}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {/* Which channel the journey was watched on. A definition both channels share is ONE
+            decision — one match, one wording, one verdict — so «Begge» is a property of the
+            subject rather than a second row. Decisions taken before 2026-09-13 carry no channel at
+            all and drop out of any selection here; «Alle» is what shows them. */}
+        <label className="vh-select">
+          <span>Kanal</span>
+          <select value={channel} onChange={(e) => setChannel(e.target.value)}>
+            <option value="">Alle</option>
+            {options.channels.map((c) => (
+              <option key={c} value={c}>
+                {CHANNEL_LABELS[c] ?? c}
               </option>
             ))}
           </select>

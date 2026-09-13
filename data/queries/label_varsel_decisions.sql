@@ -82,7 +82,14 @@ INSERT INTO `disruptions.varsel_decision_outcomes` (
   final_delay_p50_min, final_delay_p90_min, alert_threshold,
   pushed_any, n_devices, message, message_source,
   actual_cancelled, actual_dep_delay_min, actual_trouble, verdict, labelled_at,
-  et_cancelled
+  et_cancelled,
+  -- New names go LAST here, matching where ALTER ADD COLUMN puts them on a table that already
+  -- exists. The two arrived on 2026-09-13 (U16), and adding them is why this file's registered
+  -- COPY has to be updated in both environments in the same operation as the DDL: run the deploy
+  -- first so the columns exist, then `bq update --transfer_config` in dev and prd. The old stored
+  -- text keeps working until then -- it simply inserts two columns short, leaving them NULL -- and
+  -- the job fails outright the moment the new text runs against a table without the columns.
+  channel, n_subscriptions
 )
 WITH
 -- The decision subjects to label. The grouping itself lives in the
@@ -182,7 +189,12 @@ SELECT
   -- Carried straight from the view, which decides what it means (relayed fact vs prediction, taken
   -- at the cycle the verdict judges). Resolving it here instead would put a second definition of
   -- the split next to the one /historikk-api reads, and the two would drift.
-  et_cancelled
+  et_cancelled,
+  -- Same rule, one unit later: the view aggregates `channel` onto the subject ('both' where either
+  -- a row said so or browser rows and webhook rows both occur) and takes the highest
+  -- n_subscriptions, exactly as it takes the highest n_devices. Restating either here would be a
+  -- second definition of which channel a shared definition belongs to.
+  channel, n_subscriptions
 FROM labelled AS l
 -- Idempotent, but only for subjects that actually RESOLVED. A subject labelled while ET had not yet
 -- caught up carries actual_trouble = NULL; skipping it here too would freeze that "unknown" forever,

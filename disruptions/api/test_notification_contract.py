@@ -460,11 +460,19 @@ def test_no_front_end_bundle_names_a_notification_store_field_or_collection():
 
 
 def test_the_decision_log_names_no_notification_store_field():
-    """The decision log and its outcomes table stay exactly as they were.
+    """The decision log records webhook ROUTES and no client IDENTITY, which is the whole of KTD4.
 
-    Two reasons, and the second is operational rather than about privacy: adding a column to
+    It recorded neither until 2026-09-13 (KTD10, while `/historikk` and `/meldinger` were public);
+    both are behind Entur SSO since 2026-09-10, and at R1's population leaving client routes
+    unscored would have meant leaving the product unscored. What a webhook route contributes is a
+    `channel` value and a `n_subscriptions` COUNT, so the grain stays the journey definition — a
+    route, a window and a weekday set, which names nobody.
+
+    So this guard did not relax with that change: it is the same token ban, and it is what makes
+    "no client identity" a property of the files rather than of the sentence above. The operational
+    half still holds too, and this unit paid it: adding those two columns to
     `varsel_decision_outcomes` breaks the registered scheduled query until it is re-registered in
-    both environments, and the config holds a COPY of the SQL.
+    both environments, because the config holds a COPY of the SQL.
     """
     for relative in (
         "disruptions/api/decisions.py",
@@ -473,13 +481,22 @@ def test_the_decision_log_names_no_notification_store_field():
     ):
         path = REPO_ROOT / relative
         assert path.exists(), f"{relative} has moved; this guard now checks nothing"
-        hits = _hits(path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8")
+        hits = _hits(text)
         assert not hits, (
             f"{relative} now names {hits}. Client decisions and deliveries are recorded in "
             "Firestore and never in `varsel_decisions` (KTD10) — and a new column in "
             "`varsel_decision_outcomes` also breaks the registered scheduled query in both "
             "environments until it is re-registered."
         )
+        if relative.endswith("create_varsel_decisions.sql"):
+            # The control, and it is what stops the assertion above being vacuous in the direction
+            # that matters now: the guard must be passing because the client COLUMNS are absent,
+            # not because the webhook channel never reached this file at all.
+            assert "n_subscriptions" in text and "channel" in text, (
+                "the decision log is supposed to record webhook routes (KTD4); if these columns "
+                "are gone the token ban above is guarding a table nothing writes to"
+            )
 
 
 # ---- The flags, and which of them needs a restart ----------------------------------------------

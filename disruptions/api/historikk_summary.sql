@@ -84,6 +84,11 @@ WITH labelled AS (
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- A POPULATION filter, so it reaches this file (U16). `verdict`, `alerted_only` and
+    -- `resolved_only` narrow by OUTCOME and deliberately never do -- filtering to hits makes
+    -- precision read 100 %. A named channel excludes rows whose own channel is NULL (written
+    -- before 2026-09-13), which is the same third-bucket rule n_unsegmented follows below.
+    AND (@channel  IS NULL OR channel  = @channel)
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
 ),
@@ -102,6 +107,7 @@ unlabelled AS (
   WHERE g.call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR g.operator = @operator)
     AND (@line     IS NULL OR g.line     = @line)
+    AND (@channel  IS NULL OR g.channel  = @channel)
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR g.from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR g.to_stop   IN UNNEST(@to_place_refs))
     AND NOT EXISTS (
@@ -149,6 +155,8 @@ hits_per_train AS (
   WHERE call_date BETWEEN @from_date AND @to_date
     AND (@operator IS NULL OR operator = @operator)
     AND (@line     IS NULL OR line     = @line)
+    -- The same population filter; see the CTE above.
+    AND (@channel  IS NULL OR channel  = @channel)
     AND (IFNULL(ARRAY_LENGTH(@from_place_refs), 0) = 0 OR from_stop IN UNNEST(@from_place_refs))
     AND (IFNULL(ARRAY_LENGTH(@to_place_refs), 0) = 0 OR to_stop   IN UNNEST(@to_place_refs))
     AND verdict = 'hit'

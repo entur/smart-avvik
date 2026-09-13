@@ -508,6 +508,45 @@ def test_the_row_still_carries_no_device_or_journey_id():
     assert "journey_id" not in row
 
 
+def test_a_row_says_which_channel_watched_the_definition_and_counts_both_sides():
+    """U16's two columns (KTD4), and the defaults are the claim that matters most.
+
+    Every row written before 2026-09-13 was a browser subject, and every caller outside
+    `varsel.check_and_notify` still is one — so a caller that says nothing gets the browser and a
+    zero client count rather than a NULL that would have to be read as a third state. The
+    `varsel_decision_groups` aggregation reads 'both' off rows saying so OR off a subject having
+    rows of each kind, which only works while every writer says which it is.
+    """
+    assert (_row()["channel"], _row()["n_subscriptions"]) == ("browser", 0), (
+        "the default is the reading every existing row carries"
+    )
+    shared = _row(channel="both", n_subscriptions=317)
+    assert shared["channel"] == "both"
+    assert (shared["n_devices"], shared["n_subscriptions"]) == (2, 317), (
+        "two counts, each about its own channel; neither is a count of the other's recipients"
+    )
+    assert set(decisions.CHANNELS) == {"browser", "webhook", "both"}, (
+        "the vocabulary is also the two pages' allow-list, so it stays a bounded set"
+    )
+
+
+def test_a_restated_row_keeps_the_channel_and_the_counts_it_was_written_with():
+    """`rescored` carries them through `**row` rather than recomputing, and cannot do otherwise.
+
+    It sees only the alert, which knows nothing about recipients. So a closing row's channel can be
+    up to one thinning interval old — `_record_decisions` restates it from the live view on every
+    cycle it sees the subject, and the view's aggregate is what makes the SUBJECT read 'both' even
+    where one row does not. What must not happen is the fields vanishing: a row with a NULL channel
+    reads as "written before the column existed", which would be a lie about a row written today.
+    """
+    original = _row(channel="webhook", n_subscriptions=4, pushed=True)
+    again = decisions.rescored(original, FakeAlert())
+    assert (again["channel"], again["n_subscriptions"]) == ("webhook", 4)
+    assert again["pushed"] is False, (
+        "control: `pushed` is the one recipient-shaped field that is deliberately NOT carried"
+    )
+
+
 # ---- the DDL is two halves, and only one of them can stop the log --------------------------------
 class _FakeQueryJob:
     def __init__(self, fail: bool):

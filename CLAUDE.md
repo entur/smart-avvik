@@ -175,8 +175,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **Since 2026-09-09 that group can also contain a webhook subscription** (KTD3, see the client
   channel's own section below): a webhook recipient is another registration in the same group, so one
   match and one wording fan out to both channels. It is a **view merged at match time, never a
-  materialization** — `by_journey_key` stays browser-only because that is what `_record_decisions`
-  iterates, and `_journeys`, `_notified` and the GCS state blob never carry a client id.
+  materialization** — `by_journey_key` stays browser-only because it is the BROWSER grouping, which
+  is what says whether a definition has a browser side at all, and `_journeys`, `_notified` and the
+  GCS state blob never carry a client id. It was also what `_record_decisions` iterated until
+  2026-09-13; since U16 that function walks `_recipient_view` — every definition pass 1a matched,
+  with a channel and two counts — and `by_journey_key` is one of its two inputs.
   **`to_stop` narrows `/impact`**: only trains that actually reach it are returned, so a caller
   passing it sees fewer situations than one that does not.
   **One picker row per physical place** (2026-08-03): `/varsel-api/stops` collapses stop refs that
@@ -883,9 +886,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   **client** (the Entur app is one, an external operator another — "partner" is Entur's word for the
   latter only), the channel is **webhook**, the shared machinery is **notification**, and the Firestore
   database is `notifications` with unprefixed collections. `/varsel` stays as the test-bed for
-  experimental features ahead of this API, and the decision log will cover both once `/historikk`
-  is behind authentication — **which it is since 2026-09-10, so that work is unblocked and not yet
-  done** (see the next paragraph). The three documents are
+  experimental features ahead of this API, and the decision log covers both channels since
+  2026-09-13 (U16, KTD4) — the precondition being `/historikk` behind authentication, which it has
+  been since 2026-09-10 (see the KTD10 paragraph below for the grain, which did not move). The three documents are
   `docs/integrations/notification-api.md` (the client contract), `docs/integrations/firebase-bff.md`
   (the two vendored TypeScript packages under `integrations/`) and
   `docs/operations/notification-webhooks.md` (the operating contract, which carries the
@@ -902,24 +905,61 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   about what a threshold means; `is_material` — the origin branch's widening of that gate by a
   declared cancellation anywhere on the ridden segment — is **refused by name** and its absence is
   pinned by a grep, because a widening only ever adds subjects and would therefore be silent.
-  **Notification state is Firestore's and never `varsel_decisions`'** (KTD10). That table is written for
-  every match including sub-threshold ones and `/historikk` and `/meldinger` publish it on public
-  hosts — including resolved origin and destination names since 2026-08-22, accepted then because
-  prd's registrations are the team's test users. Client-app travellers are not, and `/meldinger`
-  measured 21 of 31 stop pairs isolating exactly one journey. Its `pushed` column is also
-  journey-definition grain and cannot tell a webhook from a Web Push, so writing webhook deliveries
-  there would corrupt both pages' meaning as well as their privacy claim. **The consequence is the
-  fourth of KTD12's limitations and it is created by this feature rather than inherited: a
-  webhook-only route produces no decision row at all, so its alerts are not thinly evidenced — they
-  are unscored, deliberately.** Hence the Definition-of-Done term: no client is enabled for an
-  operator `/historikk`'s verdicts do not cover without that gap recorded and signed off, and nothing
-  anywhere is a claim about any operator but **Vy rail** (21 308 of 21 331 replayed subjects were
-  VYG). **Decided 2026-09-09: webhook-only routes stay out until `/historikk` and `/meldinger` are
-  behind authentication, then go in** — and that is not a simplification of this channel: `pushed`
-  cannot tell a webhook from a Web Push, so the row needs a channel discriminator, and that column
-  reaches the groups view, the labelling INSERT and the scheduled-query re-registration in one
-  operation. **The precondition was met on 2026-09-10** (Entur SSO, #142) and the work itself is
-  still owed: until it lands, a webhook-only route is unscored exactly as the DoD term says.
+  **Notification DELIVERY state is Firestore's and never `varsel_decisions`'** (KTD10), and since
+  2026-09-13 the decision itself is in both. That table is written for every match including
+  sub-threshold ones and `/historikk` and `/meldinger` publish it — including resolved origin and
+  destination names since 2026-08-22, accepted then because prd's registrations are the team's test
+  users. Client-app travellers are not (`/meldinger` measured 21 of 31 stop pairs isolating exactly
+  one journey), which is why a webhook route stayed out of it entirely while those pages were
+  **public**. They are behind Entur SSO in every environment since 2026-09-10 (#142), and at the
+  population the 100k plan sizes for "a webhook-only route is unscored" would have meant the product
+  is unscored — so **U16 (2026-09-13, KTD4) records every definition pass 1a matches**, at the grain
+  both channels already share. What did NOT move is that grain: a row is one journey DEFINITION's
+  view of one situation on one train, and the client side contributes `channel` ('browser',
+  'webhook', 'both') and an `n_subscriptions` COUNT beside `n_devices`. No subscription, client,
+  destination or external reference reaches the decision log, the outcomes table, the groups view or
+  either page — `test_notification_contract` greps the three files for exactly those names, and each
+  page suite greps its own SQL as WHOLE WORDS, which is what tells `n_subscriptions` (a count) from
+  `subscriptions` (the collection).
+  **Three readings changed with it and each is silent if taken the other way.** `pushed` means "a
+  notification was ISSUED on any channel" — for the client the event MINT, not its delivery, which
+  lags by up to two cycles and would read as never-notified for a subject retired in between — so a
+  `both` row can say `pushed` with no Web Push behind it. `push_disabled` is a BROWSER answer (no
+  VAPID keypair) and is never given to a definition with no browser side, or the value would quietly
+  start covering two unlike states. And which LLM delivery switch chose the recorded wording follows
+  the row's channel (`VARSEL_LLM_ENABLED` for the push, `NOTIFICATION_WEBHOOK_LLM_ENABLED` for the
+  event), so a webhook-only row does not quote prose no client received and a shared row keeps the
+  browser's. **The mint row is an EXTRA row, written after emit**: emit runs in its own phase after
+  `check_and_notify` has returned (KTD6), so a cycle's mints cannot reach the rows it already wrote —
+  `varsel.record_minted_decisions` copies the thinning ledger's own row with `pushed` flipped rather
+  than rebuilding one, and skips a subject the browser already pushed this cycle so the view's "first
+  pushed row" wording pick stays decidable. **What the copy cannot carry is the five wording columns,
+  and they are restated** — on a thinned cycle the ledger's row came through `decisions.rescored`,
+  which refreshes the prediction figures but carries `message_input`, `message_deterministic` and
+  `message_status` from the last row actually WRITTEN, up to `_DECISION_THINNING_INTERVAL_S` ago. The
+  browser channel never meets that (`pushed` is one of the thinning rule's keep-reasons, so a pushed
+  row there is always a fresh `build_row`), and `/meldinger` replays the FIRST pushed row's
+  `message_input` under that row's own `decided_at` — so a straight copy had it wording "what we
+  would send now" from a quarter-hour-old document beside figures that are not. Two rules the
+  restatement follows, both silent if taken the other way: `message_llm` falls back to the pass's
+  answer where this channel read no cached wording, because `_webhook_wording` answers None when
+  `NOTIFICATION_WEBHOOK_LLM_ENABLED` is off while a model wording sits in the cache — which is the
+  "written but withheld" population, not an absence; and `ok` is demoted to `ok_cached` exactly where the restated
+  `message_input` DIFFERS from the one the ledger was carrying, never merely because a model wording
+  is present — `ok` claims a same-input pair (`message_wording_comparison.sql` filters on exactly
+  that), and most mints are the `predicted` transition, which is itself a thinning keep-reason, so
+  the pass wrote that row fresh on the same cycle and its `ok` is true. Demoting those would retire
+  the client channel from that population almost entirely. Anything else that reads `_decision_ledger`'s stored
+  row has the same trap. The groups view AGGREGATES `channel` onto the subject and
+  never groups on it: grouping would split a shared definition into two subjects and two verdicts.
+  **The operator step is not optional and its order is fixed**: two columns on
+  `varsel_decision_outcomes` break the registered scheduled query until it is re-registered in BOTH
+  environments, so deploy first (the startup `ADD COLUMN IF NOT EXISTS` creates them), then
+  `bq update --transfer_config`. What is still gated is the product decision, not the code: enabling
+  webhook scoring in prd for a real client waits on the DPO answer to finding 46, and prd is inert by
+  POPULATION today (no webhook client) rather than by a switch — there deliberately is no flag.
+  Nothing anywhere is a claim about any operator but **Vy rail** (21 308 of 21 331 replayed subjects
+  were VYG).
   **The poller matches against an in-memory MIRROR, not a per-cycle read** (U6, 2026-09-12, KTD5).
   `varsel._load_webhook_recipients` used to pull every active subscription from Firestore on every
   cycle, capped at 2 000 documents in two places that had to be edited together. At 100 000 that read
@@ -1758,7 +1798,20 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - **Every decision is logged, not every push.** `varsel.check_and_notify` appends rows keyed on
     (journey definition x situation x departure) to `disruptions.varsel_decisions`
     via `disruptions/api/decisions.py`, *including* matches that stayed below the alert threshold.
-    Without those, a `miss` leaves no trace and only precision is measurable. Repeats across cycles
+    Without those, a `miss` leaves no trace and only precision is measurable.
+    **Both channels since 2026-09-13** (U16, KTD4): a row now carries `channel` ('browser',
+    'webhook' or 'both') and `n_subscriptions` beside `n_devices`, and both pages have a Kanal
+    filter — a POPULATION filter, so it reaches `/summary` like operator, line and the two places
+    and unlike `verdict`/`alerted_only`/`resolved_only`. The vocabulary is a FIXED three-value set
+    rather than one read from the window: three values is a bounded response-cache key, and "no
+    client route in this window" has to be an empty page rather than a 400, which is also why it is
+    the one selection the page never reconciles when the window moves. A named channel EXCLUDES
+    rows whose own channel is NULL — written before that date — rather than folding them into
+    'browser', which is `n_unsegmented`'s third-bucket rule one column over. Read `pushed_any` with
+    it: it means a notification was ISSUED on either channel, so a 'both' subject can be true with
+    no Web Push behind it, and the client half is the event MINT rather than its delivery. The
+    grain did not move and no client identity is anywhere in the table — see the webhook section's
+    KTD10 paragraph. Repeats across cycles
     are intentional — they are the lead-time series. Writing fails open: a BigQuery problem never
     blocks a push.
     **Not one row per cycle since 2026-09-12** (KTD15 of the 100k plan): it was from the day the
