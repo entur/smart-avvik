@@ -419,7 +419,7 @@ class ConnectivityProvider(Protocol):
     outage, a timeout, the rate limit. None is not "no service".
 
     ``path`` names whose per-minute budget the question spends. The provider owns the vocabulary and
-    the ceilings (`main._CONNECTIVITY_NOTIFICATION_API_PATH` and its neighbours); this module only forwards
+    the ceilings (`main._CONNECTIVITY_POLLER_PATH` and its neighbours); this module only forwards
     the tag it was handed, so an unrecognised one is charged the public budget rather than minting a
     new one. It is keyword-only and defaulted so a caller that does not care — and every existing
     one — is unchanged.

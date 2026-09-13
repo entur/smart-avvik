@@ -132,7 +132,6 @@ _QUOTA_RETRY_AFTER_S = notification_store.RETRY_AFTER_CAP_S
 _store: Any = notification_store
 _auth: Any = notification_auth
 _canonicalize: Any = None
-_connectivity: Any = None
 _deliver: Any = None
 _signer: Any = None
 
@@ -145,24 +144,28 @@ def configure(
     store: Any | None = None,
     auth: Any | None = None,
     canonicalize: Any | None = None,
-    connectivity: Any | None = None,
     deliver: Any | None = None,
     signer: Any | None = None,
 ) -> None:
     """Wire the seams. Called once from ``main.lifespan``; the suites pass fakes.
 
-    ``canonicalize`` is ``varsel.canonical_stop`` and ``connectivity`` is ``varsel._service_verdict``
-    -- /varsel's own two, injected rather than imported so this module does not pull 147 KB of
-    poller state onto a request path, and so R2's and R5's shapes cannot drift into a second
-    statement. ``connectivity`` already expands both places to every ref
-    (``varsel.place_refs``) and already fails open to ``None``, which is why nothing here talks to
-    BigQuery.
+    ``canonicalize`` is ``varsel.canonical_stop`` -- /varsel's own, injected rather than imported
+    so this module does not pull 147 KB of poller state onto a request path, and so R2's shape
+    cannot drift into a second statement.
+
+    **There is no connectivity seam here any more** (U10). A create and a replace used to ask
+    /varsel's 20-second BigQuery question in a second transaction after the write, which put a
+    BigQuery job on the registration path of a channel whose whole purpose is onboarding an
+    existing commuter base -- a client may issue ``notification_auth.PER_CLIENT_PER_MIN`` (120)
+    writes a minute, and every one of them drew on a shared per-minute ceiling. ``servable`` is
+    therefore ``null`` on a create or replace response, which the contract already defines as "not
+    established" and which must never render as an all-clear; `notification_servability.recheck`
+    answers it from a single job per cycle, within roughly an hour for a fresh bulk load.
     """
-    global _store, _auth, _canonicalize, _connectivity, _deliver, _signer
+    global _store, _auth, _canonicalize, _deliver, _signer
     _store = store if store is not None else notification_store
     _auth = auth if auth is not None else notification_auth
     _canonicalize = canonicalize
-    _connectivity = connectivity
     _deliver = deliver
     _signer = signer
     with _lock:
@@ -718,73 +721,6 @@ def _same_definition(spec: notification_store.SubscriptionSpec, sub: notificatio
     )
 
 
-def _record_servability(
-    spec: notification_store.SubscriptionSpec, *, expected_version: int
-) -> notification_store.Subscription | None:
-    """Ask /varsel's connectivity seam and record R5's caveat. Never fails the request.
-
-    Two things it deliberately does not do. It does not write when the verdict could not be
-    established: ``_new_subscription_doc`` and ``_replace_body`` both leave ``servable`` as ``None``
-    with no ``servable_checked_at``, which is already "not established" -- so a provider timeout
-    returns no caveat rather than a false one (AE13), and it costs no second transaction. And it
-    does not raise: the servability answer is a caveat on a registration that is never refused for
-    it, so a failure here leaves the record exactly as a timeout would and the client reads
-    ``servable: null``.
-
-    It is a second transaction after the create, which is the one seam in this flow. The store's
-    ``servable`` is written by ``set_servability`` and hard-coded to ``None`` by the create, so
-    folding them would mean either a wider store API or a caveat computed inside a transaction body
-    -- and a transaction body may run more than once, which is the last place a 20-second BigQuery
-    question belongs.
-
-    ``expected_version`` is the version the QUESTION was asked about, and it is what keeps the
-    answer about a route rather than about an id: the question takes up to
-    ``main._CONNECTIVITY_TIMEOUT_S`` (20 s) while a replace is one request, so a concurrent replace
-    can land in between and this would otherwise stamp the new route with the old route's verdict,
-    freshly timestamped. The store enforces it inside the transaction; a conflict here means the
-    definition moved and the verdict is discarded, exactly as an unestablished one is.
-    """
-    if _connectivity is None:
-        return None
-    try:
-        verdict = _connectivity(spec.from_stop, spec.to_stop)
-    except Exception:
-        logger.warning(
-            "Client servability check raised; storing no caveat",
-            exc_info=True,
-            extra={"fields": {"event": "notification_servability", "result": "error"}},
-        )
-        return None
-    if verdict is None:
-        return None
-    try:
-        return _store.set_servability(
-            spec.subscription_id, servable=bool(verdict[0]), expected_version=expected_version
-        )
-    except notification_store.Conflict:
-        # The route was replaced while we were asking. Not a failure and not an error: the newer
-        # definition retired the answer AND its stamp on purpose, and `notification_servability.recheck`
-        # picks a never-established record up on its own cadence.
-        logger.info(
-            "A client servability verdict arrived after the route was replaced; discarded",
-            extra={
-                "fields": {
-                    "event": "notification_servability",
-                    "result": "superseded",
-                    "subscription_id": spec.subscription_id,
-                }
-            },
-        )
-        return None
-    except Exception:
-        logger.warning(
-            "Client servability write failed; the record keeps its null caveat",
-            exc_info=True,
-            extra={"fields": {"event": "notification_servability", "result": "write_failed"}},
-        )
-        return None
-
-
 def _expected_version(if_match: str | None) -> int | None:
     if if_match is None:
         return None
@@ -911,12 +847,10 @@ def create_or_replace_subscription(
             )
         except Exception as exc:
             raise _http(exc) from exc
-        # A changed route is a different servability question, and the store has already retired the
-        # old answer, so this re-asks rather than carrying a stale verdict forward (R6).
-        return _out(
-            principal.client_id,
-            _record_servability(spec, expected_version=replaced.version) or replaced,
-        )
+        # A changed route is a different servability question and the store has already retired
+        # the old answer, so the response carries `servable: null` -- "not established", never an
+        # all-clear -- until `notification_servability.recheck` answers it (U10).
+        return _out(principal.client_id, replaced)
 
     if expected is not None:
         # An If-Match on a reference that does not exist cannot be satisfied, and creating anyway
@@ -954,10 +888,7 @@ def create_or_replace_subscription(
     except Exception as exc:
         raise _http(exc) from exc
     response.status_code = 201
-    return _out(
-        principal.client_id,
-        _record_servability(spec, expected_version=created.version) or created,
-    )
+    return _out(principal.client_id, created)
 
 
 @router.get(

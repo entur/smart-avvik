@@ -679,34 +679,31 @@ def test_the_servability_seam_is_the_same_one_the_notification_api_answers_from(
     module cannot import. Under-state it and the reservation stops being a ceiling on when the phase
     ends -- which is the whole reason it reserves rather than measures.
 
-    Since 2026-09-09 the seam is bound to the NOTIFICATION API connectivity budget rather than
-    left on the default, which is what keeps a client's bulk onboarding out of the traveller-facing
-    30/min tally (`main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`). Since U10 the sweep's half is the
-    BATCH form -- one BigQuery job for every pending pair rather than one per record -- and both
-    still bottom out in `main._varsel_connectivity_batch`, which is what keeps them one answer.
+    Since U10 the sweep's half is the BATCH form -- one BigQuery job for every pending stop pair
+    rather than one per record -- and it names the POLLER budget, which is what keeps it out of the
+    traveller-facing 30/min tally (`main._POLLER_CONNECTIVITY_MAX_PER_MIN`). The notification API has
+    no connectivity seam at all any more: a create and a replace answer `servable: null` and this
+    sweep establishes it.
 
     Checked over `lifespan`'s source because entering the lifespan starts the poller thread, which
     this suite must never do (it spends real BigQuery money per cycle).
     """
     import inspect
 
+    import notification_api
+
     source = inspect.getsource(main.lifespan)
-    bound = (
-        "notification_api_connectivity = functools.partial(\n"
-        "        varsel._service_verdict, path=_CONNECTIVITY_NOTIFICATION_API_PATH\n"
-        "    )"
-    )
-    assert bound in source, "the client seam must name the client budget, not the default one"
     sweep = (
         "notification_servability.configure(\n"
-        "        verdicts=functools.partial(\n"
-        "            varsel._service_verdicts, path=_CONNECTIVITY_NOTIFICATION_API_PATH\n"
-        "        )\n"
+        "        verdicts=functools.partial(varsel._service_verdicts, path=_CONNECTIVITY_POLLER_PATH)\n"
         "    )"
     )
-    assert sweep in source, "the sweep must take the BATCH seam, on the client budget"
-    api = source[source.index("notification_api.configure(") :]
-    assert "connectivity=notification_api_connectivity," in api[: api.index(")")]
+    assert sweep in source, "the sweep must take the BATCH seam, on the poller budget"
+    # The signature rather than the call text: the comment beside the call explains why the seam
+    # is gone, so matching the WORD would match the explanation.
+    assert "connectivity" not in inspect.signature(notification_api.configure).parameters, (
+        "a create or replace must not ask BigQuery: `servable` is the sweep's answer now"
+    )
     assert "connectivity_batch_provider=_varsel_connectivity_batch," in source
     assert notification_servability._WORST_CASE_CHECK_S == main._CONNECTIVITY_TIMEOUT_S
     assert notification_servability._DEADLINE_S > notification_servability._WORST_CASE_CHECK_S, (

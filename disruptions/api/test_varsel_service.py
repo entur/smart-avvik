@@ -203,37 +203,39 @@ def test_the_rate_limit_does_not_apply_to_cached_pairs(monkeypatch):
     assert main._varsel_connectivity(["C"], ["D"]) is None
 
 
-def test_a_client_onboarding_burst_cannot_spend_a_travellers_budget(monkeypatch):
+def test_a_poller_sweep_cannot_spend_a_travellers_budget(monkeypatch):
     """`alternatives._POLLER_FETCH_MAX_PER_MIN`'s split, for the same reason and one layer over.
 
     The 30/min ceiling is an ABUSE-CONTROL number: /varsel-api is unauthenticated, and it bounds a
     caller who keeps inventing pairs. The webhook channel then arrived and spent the same tally --
-    `notification_api._record_servability` on every create and replace (a client may issue 120 of those
-    a minute) and `notification_servability.recheck` on the poller's cadence. A bulk onboarding of an
-    existing commuter base, which is exactly what this channel is for, therefore exhausted a
-    traveller-facing budget as a side effect, and the degradation is silent: `None` means "could not
-    establish", so a real traveller's journey registers with no no-direct-service caveat at all.
+    a servability question on every create and replace (a client may issue 120 of those a minute)
+    and `notification_servability.recheck` on the poller's cadence. A bulk onboarding of an existing
+    commuter base, which is exactly what that channel is for, therefore exhausted a traveller-facing
+    budget as a side effect, and the degradation is silent: `None` means "could not establish", so a
+    real traveller's journey registers with no no-direct-service caveat at all.
 
-    Two tallies, never one, and the ceilings are deliberately different -- see the constants.
+    Onboarding no longer asks at all (U10) and what is left on the second tally is the two poller
+    sweeps. Two tallies, never one, and the ceilings are deliberately different -- see the
+    constants.
     """
     fake = _FakeBQ(_row(True, False))
     _install(fake, monkeypatch)
-    for i in range(main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN):
-        assert main._varsel_connectivity([f"P{i}"], ["B"], path=main._CONNECTIVITY_NOTIFICATION_API_PATH) == (
+    for i in range(main._POLLER_CONNECTIVITY_MAX_PER_MIN):
+        assert main._varsel_connectivity([f"P{i}"], ["B"], path=main._CONNECTIVITY_POLLER_PATH) == (
             True,
             False,
         )
-    assert main._varsel_connectivity(["P-over"], ["B"], path=main._CONNECTIVITY_NOTIFICATION_API_PATH) is None
-    # The traveller's own budget is untouched: a full client minute buys a full traveller minute.
+    assert main._varsel_connectivity(["P-over"], ["B"], path=main._CONNECTIVITY_POLLER_PATH) is None
+    # The traveller's own budget is untouched: a full poller minute buys a full traveller minute.
     for i in range(main._CONNECTIVITY_MAX_PER_MIN):
         assert main._varsel_connectivity([f"T{i}"], ["B"]) == (True, False)
     assert main._varsel_connectivity(["T-over"], ["B"]) is None
 
 
-def test_the_notification_api_path_is_the_smaller_share(monkeypatch):
-    """A client's onboarding is a batch that can take longer; a traveller is waiting on a page."""
+def test_the_poller_path_is_the_smaller_share(monkeypatch):
+    """A sweep issues one job a cycle; a traveller is waiting on a page."""
     del monkeypatch
-    assert 0 < main._NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN < main._CONNECTIVITY_MAX_PER_MIN
+    assert 0 < main._POLLER_CONNECTIVITY_MAX_PER_MIN < main._CONNECTIVITY_MAX_PER_MIN
 
 
 def test_the_query_asks_both_call_sources(monkeypatch):
