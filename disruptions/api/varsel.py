@@ -4628,12 +4628,6 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 if dev is not None:
                     device = dev.get("subscription")
                     brand = normalize_brand(dev.get("brand"))
-                # ONE read of this registration's push marks for the whole train loop below, which
-                # is the shape the store backend needs: three fields of one journey document, so
-                # asking per train per question would be three reads per push. Safe as a snapshot
-                # because nothing in this loop writes them -- the marks are written in loop 2, after
-                # every delivery -- and `reserved` carries what THIS cycle is about to spend.
-                ledger = _registrations.push_ledger(jid)
             if device is None:
                 continue
             key = journey_key(journey)
@@ -4651,6 +4645,18 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     a.departure_time.timestamp() if a.departure_time else 0.0,
                 ),
             )
+            if not trains:
+                # BEFORE the ledger read, deliberately: most registrations have no alert-worthy
+                # train on most cycles, and under the store backend a ledger is a document read --
+                # so reading it above this line would put one read per registration per cycle on a
+                # question nothing was going to ask.
+                continue
+            # ONE read of this registration's push marks for the whole train loop below, which is
+            # the shape the store backend needs: three fields of one journey document, so asking per
+            # train per question would be three reads per push. Safe as a snapshot because nothing
+            # in this loop writes them -- the marks are written in loop 2, after every delivery --
+            # and `reserved` carries what THIS cycle is about to spend.
+            ledger = _registrations.push_ledger(jid)
             sent_today = ledger.sent_today if ledger.day == oslo_today else 0
             for alert in trains:
                 if alert.situation_number in ledger.notified:

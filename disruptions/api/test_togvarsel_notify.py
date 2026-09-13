@@ -1020,7 +1020,11 @@ def test_evaluate_survives_a_lost_persist_and_a_restart_is_bounded_by_timeliness
             assert marker == {"level": "yellow", "pushed": False}
     finally:
         with varsel._state_lock:
-            varsel._togvarsel_rounds = saved_rounds
+            # IN PLACE, not a rebind: since U13 the markers live in `varsel_state` and `varsel`
+            # only aliases them, so assigning to the alias restores nothing and leaks this test's
+            # markers into every test that runs after it.
+            varsel._togvarsel_rounds.clear()
+            varsel._togvarsel_rounds.update(saved_rounds)
 
 
 # ---------------------------------------------------------------------------- the dev-only test trigger
