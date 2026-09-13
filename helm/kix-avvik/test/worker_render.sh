@@ -32,8 +32,17 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # the deploy will, while `update` would silently re-resolve and could template a version nobody
 # chose. Skipped where the archive is already there, which is the local case.
 if ! ls "$CHART"/charts/common-*.tgz >/dev/null 2>&1; then
-  helm dependency build "$CHART" >/dev/null 2>&1 \
-    || fail "could not fetch the common chart pinned in $CHART/Chart.lock"
+  # `dependency build` resolves a non-OCI dependency through the local repository CACHE, not
+  # straight from the URL in Chart.yaml, so a runner that has never seen this repo answers "no
+  # cached repo found" -- which is what the first attempt at this did, and the error was hidden
+  # because the command was redirected to /dev/null. The URL is read from Chart.yaml rather than
+  # written here twice; the alias is local to the runner and its name means nothing.
+  repo=$(awk '/repository:/ {gsub(/"/, "", $2); print $2; exit}' "$CHART/Chart.yaml")
+  [ -n "$repo" ] || fail "no dependency repository in $CHART/Chart.yaml"
+  out=$(helm repo add worker-render-dep "$repo" --force-update 2>&1) \
+    || fail "could not add $repo: $out"
+  out=$(helm dependency build "$CHART" 2>&1) \
+    || fail "could not fetch the chart pinned in $CHART/Chart.lock: $out"
 fi
 checks=0
 check() { checks=$((checks + 1)); }
