@@ -335,10 +335,21 @@ device would otherwise orphan every journey under it and the mirror would keep m
 line uses the stop REGISTRY's names, decided 2026-09-10), `consent_version`, and the three push
 ledgers `notified` (per situation), `pushed_trains` and `daily_pushes`. A webhook subscription
 carries `destination_id`, `delivered` (per train), `daily_deliveries` and `daily_reservations`. Each
-channel's fields are **absent** on the other rather than written empty, because a Firestore equality
-does not match a document that lacks the field — which is what makes it impossible for the
-`device_journeys` query to return a client's subscription, as a property of the data rather than of
-whoever writes the query next. Validation refuses the wrong one in both directions.
+**web_push** fields are **absent** on a webhook document rather than written empty, because a
+Firestore equality does not match a document that lacks the field — which is what makes it
+impossible for the `device_journeys` query to return a client's subscription, as a property of the
+data rather than of whoever writes the query next. Validation refuses the wrong one in both
+directions.
+
+`destination_id` is the exception and the asymmetry is the code's, not the design's: it is written
+by `_new_subscription_doc` rather than by `_channel_fields`, so a `web_push` document carries it as
+`""` — measured on prd after the 2026-09-13 cutover, all 275 imported registrations. The half that
+matters holds (validation refuses a non-empty value there, so no such document names a real
+destination, and U5's `channel` equality is a real filter); what is missing is only the extra layer
+absence would give, since an empty string is matchable by an `order_by` or a range. Moving the field
+into `_channel_fields` requires `_subscription_from_doc` and `_delivery_subscription_from_doc` to
+stop indexing `doc["destination_id"]` directly in the same change, or every web_push read KeyErrors
+in production.
 
 A **device** is one browser install: a Web Push endpoint, its two keys, the brand it installed under,
 and a `tombstone` recording why it stopped being pushable (`expired` after a 410, `turned_off` when

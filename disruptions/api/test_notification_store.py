@@ -4869,6 +4869,58 @@ def test_a_web_push_registration_has_an_inactivity_horizon_and_no_lifetime_one()
     )
 
 
+def test_the_channel_only_fields_are_absent_one_way_and_an_empty_string_the_other():
+    """The absence argument holds for the web_push set and NOT for `destination_id`. Pinned because
+    three documents claimed otherwise until prd's cutover showed it.
+
+    `_channel_fields` writes the web_push-only fields conditionally, so a webhook document LACKS
+    `device_id` -- and a Firestore equality does not match a document that lacks a field, which is
+    what makes `device_journeys` unable to return a client's subscription as a property of the DATA.
+    `destination_id` is written by `_new_subscription_doc` itself, outside that helper, so a
+    web_push document carries it as `""`. CLAUDE.md, the operations document and the helper's own
+    docstring all generalised the first half into "each channel's fields are absent on the other";
+    dev's webhook documents happened to agree, because they predate the `device_id` field entirely,
+    and prd's 275 imported registrations are what showed the other half was never true.
+
+    The half that MATTERS is asserted here too, and it is the one the security argument rests on: a
+    non-empty `destination_id` is refused on this channel, so no web_push document can name a real
+    destination however this dict is built.
+
+    Whoever makes the two symmetric must change `_subscription_from_doc` and
+    `_delivery_subscription_from_doc` in the same commit -- both index `doc["destination_id"]`
+    directly, so omitting the field KeyErrors every web_push read in production.
+    """
+    web_push = notification_store._new_subscription_doc(_web_push_spec(), NOW)
+    webhook = notification_store._new_subscription_doc(_spec(), NOW)
+
+    # The direction that holds, and the mechanism the queries rely on.
+    assert "device_id" not in webhook, (
+        "a webhook document must LACK device_id, or device_journeys stops being unable to return "
+        "one as a property of the data"
+    )
+    assert web_push["device_id"], "the web_push document names its device"
+
+    # The direction that does not. Asserted as it IS, so the day somebody makes it absent this
+    # fails and sends them to the two direct-index readers before production does.
+    assert "destination_id" in web_push and web_push["destination_id"] == "", (
+        "destination_id is written outside _channel_fields and is an empty string here; if this "
+        "is now absent, _subscription_from_doc and _delivery_subscription_from_doc must have "
+        "stopped indexing it directly"
+    )
+
+    # What the refusal guarantees regardless: no web_push document names a real destination. The
+    # refusal lives on `SubscriptionSpec.validate`, which `create_subscription` and
+    # `replace_subscription` call -- NOT in `_new_subscription_doc`, which builds the body of an
+    # already-validated spec. Asserted through the validator rather than the builder, or this
+    # would pass for the wrong reason.
+    try:
+        _web_push_spec(destination_id=DEST).validate()
+    except notification_store.Conflict:
+        pass
+    else:
+        raise AssertionError("a non-empty destination_id must be refused on a web_push spec")
+
+
 def test_a_document_with_no_channel_still_needs_both_horizons():
     """The fail-closed half survives the dispatch, and this is the assertion that says so.
 
