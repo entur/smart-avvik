@@ -30,16 +30,46 @@ jobs:
     with:
       dockerfile: Dockerfile
 
-  # Helm charts are linted per environment to catch env-specific value errors
+  # Helm charts are linted per environment to catch env-specific value errors.
+  # SIX combinations since U11, not three: `kix-avvik-worker` is a second RELEASE of this same chart
+  # (the common chart renders one Deployment per release, so a second workload cannot be a second
+  # block in one values file), and a values file nothing lints is a values file that fails at deploy
+  # time. `include` rather than a second matrix axis: the two sets are not a cross product.
   helm-lint:
     strategy:
       matrix:
-        environment: [dev, tst, prd]
+        include:
+          - environment: dev
+            values: values-kub-ent-dev.yaml
+          - environment: tst
+            values: values-kub-ent-tst.yaml
+          - environment: prd
+            values: values-kub-ent-prd.yaml
+          - environment: dev
+            values: worker-values-kub-ent-dev.yaml
+          - environment: tst
+            values: worker-values-kub-ent-tst.yaml
+          - environment: prd
+            values: worker-values-kub-ent-prd.yaml
     uses: entur/gha-helm/.github/workflows/lint.yml@v1
     with:
       chart: helm/kix-avvik
       environment: ${{ matrix.environment }}
-      values: values-kub-ent-${{ matrix.environment }}.yaml
+      values: ${{ matrix.values }}
+
+  # What `helm lint` cannot answer: does the worker release come out as a WORKER? Every override
+  # that makes it one is negative -- no Service, no Ingress, no VAPID keys, no SSO secret -- and a
+  # negative that stops holding renders perfectly valid YAML that lints clean. The script renders
+  # all three environments and asserts both directions; it fails rather than skips when helm is
+  # absent, because a check that passes where the binary is missing has never run.
+  helm-render:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: azure/setup-helm@v4
+      - run: bash helm/kix-avvik/test/worker_render.sh
 
   # --- Build and Test ---
 
@@ -220,7 +250,7 @@ jobs:
   # Only runs after all lints and tests pass to avoid wasting resources on broken builds
 
   docker:
-    needs: [test, docker-lint, helm-lint]
+    needs: [test, docker-lint, helm-lint, helm-render]
     uses: entur/gha-docker/.github/workflows/build.yml@v1
     with:
       # Context is the repo root: the multi-stage Dockerfile builds the /demo,
