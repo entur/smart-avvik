@@ -3723,6 +3723,12 @@ class Delivery:
     situations: tuple[str, ...]
     cap_exempt: bool
     test: bool
+    #: When the mint wrote this delivery (U11). Last, with a default, because the field is read by
+    #: exactly one thing -- the worker's backlog-age gauge -- and every other construction of this
+    #: class predates it. ``None`` on a document written before `_mint` carried it, which reads as
+    #: "no age to report" rather than as an infinitely old backlog: a gauge that spikes on the
+    #: deploy that introduces it would page for the change itself.
+    created_at: datetime | None = None
 
 
 def _delivery_from_doc(doc: Mapping[str, Any]) -> Delivery:
@@ -3744,6 +3750,7 @@ def _delivery_from_doc(doc: Mapping[str, Any]) -> Delivery:
         situations=tuple(str(s) for s in (doc.get("situations") or ())),
         cap_exempt=bool(doc.get("cap_exempt")),
         test=bool(doc.get("test")),
+        created_at=_as_dt(doc.get("created_at")),
     )
 
 
