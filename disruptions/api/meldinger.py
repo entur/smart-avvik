@@ -93,6 +93,10 @@ from time import monotonic
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
+# The decision log's own `channel` vocabulary (U16), UNDER AN ALIAS: the route function below
+# is itself named `decisions` and would rebind a bare module name (main.py's `impact_engine`
+# trap, one module over).
+import decisions as decision_log
 import historikk
 import llm_message
 from deployment import environment_label
@@ -363,12 +367,24 @@ class Decision(BaseModel):
         "segment /summary counted this decision in. Null for decisions taken before 2026-08-05.",
     )
     pushed_any: bool | None = Field(
-        description="Whether a Web Push was actually delivered for this subject. This is the "
-        "recorded output of varsel's four delivery filters, not a re-derivation of them.",
+        description="Whether a notification was ISSUED for this subject on any channel: a Web Push "
+        "varsel's four delivery filters let through, or — since 2026-09-13 — a webhook event that "
+        "was minted. The recorded output of those filters, never a re-derivation of them.",
     )
     n_devices: int | None = Field(
-        description="How many registrations shared this journey definition. The dedup key is per "
-        "journey_id, so this card stands for that many real pushes, not one.",
+        description="How many /varsel registrations shared this journey definition — the BROWSER "
+        "side only. The dedup key is per journey_id, so this card stands for that many real "
+        "pushes, not one.",
+    )
+    channel: str | None = Field(
+        default=None,
+        description="Which channel(s) watched this definition: 'browser', 'webhook' or 'both'. "
+        "Null for decisions taken before 2026-09-13, when webhook routes were not recorded.",
+    )
+    n_subscriptions: int | None = Field(
+        default=None,
+        description="How many webhook subscriptions shared this definition. A count and nothing "
+        "more — no client, subscription or destination identity is recorded in the decision log.",
     )
     other_pushed_on_train: int | None = Field(
         description="How many OTHER situations about this same registration and train delivered a "
@@ -616,6 +632,13 @@ class FilterOptions(WindowFields):
     )
     from_places: list[PlaceOption] = Field(description="Registered boarding places, by name.")
     to_places: list[PlaceOption] = Field(description="Registered alighting places, by name.")
+    channels: list[str] = Field(
+        default_factory=list,
+        description="The channel values a decision can carry: 'browser', 'webhook', 'both'. A "
+        "FIXED vocabulary, unlike every list above it: three values is already a bounded "
+        "response-cache key, and a channel absent from this window is a true answer rather than a "
+        "value to hide.",
+    )
     # No default: the one construction site must pass it, or an empty dropdown would look exactly
     # like a window whose decisions carry no summary at all.
     sx_summaries: list[SxSummaryOption] = Field(
@@ -887,6 +910,20 @@ def _resolve_window(
     )
 
 
+def _checked_channel(channel: str | None) -> str | None:
+    """Reject a channel outside `decisions.CHANNELS` -- /historikk's copy, and its reasoning.
+
+    The value lands in the response-cache key, so the vocabulary has to be bounded; it is checked
+    against the CONSTANT rather than against the window, because "no webhook route in this window"
+    must be an empty page rather than a 400.
+    """
+    if channel is not None and channel not in decision_log.CHANNELS:
+        raise HTTPException(
+            status_code=400, detail=f"channel must be one of {', '.join(decision_log.CHANNELS)}."
+        )
+    return channel
+
+
 def _checked_operator(operator: str | None) -> str | None:
     """Reject a codespace this stack does not serve.
 
@@ -1139,6 +1176,7 @@ def _base_query_params(
     from_refs: list[str],
     to_refs: list[str],
     sx_summaries: list[str],
+    channel: str | None = None,
 ) -> list:
     """The opening parameters every decision-log query here takes, built once.
 
@@ -1160,6 +1198,7 @@ def _base_query_params(
         bigquery.ScalarQueryParameter("to_ts", "TIMESTAMP", window.to_ts),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ScalarQueryParameter("channel", "STRING", channel),
         bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
         bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
         bigquery.ArrayQueryParameter("sx_summaries", "STRING", sx_summaries),
@@ -1180,6 +1219,7 @@ def _list_cache_key(
     resolved_only: bool,
     sx_only: bool,
     limit: int,
+    channel: str | None = None,
 ) -> tuple:
     """The cache key for the two row-listing endpoints, which differ only in the leading prefix.
 
@@ -1190,7 +1230,7 @@ def _list_cache_key(
     keep in step with the parameter list above rather than two.
     """
     return (
-        prefix, *window.cache_key, operator, line, from_place, to_place, sx_summary,
+        prefix, *window.cache_key, operator, line, from_place, to_place, sx_summary, channel,
         verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
     )
 
@@ -1579,6 +1619,7 @@ def _message_rows(
     from_place: str | None,
     to_place: str | None,
     sx_summary: str | None,
+    channel: str | None,
     verdict: str | None,
     alerted_only: bool,
     pushed_only: bool,
@@ -1600,7 +1641,8 @@ def _message_rows(
     from google.cloud import bigquery
 
     narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
-    params = _base_query_params(window, operator, line, *narrowed) + [
+    channel = _checked_channel(channel)
+    params = _base_query_params(window, operator, line, *narrowed, channel=channel) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
@@ -1611,7 +1653,7 @@ def _message_rows(
     # Same key shape as /decisions', with its own prefix; see _list_cache_key for what rides on it.
     key = _list_cache_key(
         "messages", window, operator, line, from_place, to_place, sx_summary,
-        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
+        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit, channel,
     )
     return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
 
@@ -1797,6 +1839,13 @@ def decisions(
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
     ),
+    channel: str | None = Query(
+        default=None,
+        description="Filter to decisions watched on one channel: 'browser' (a /varsel "
+        "registration), 'webhook' (a client subscription) or 'both'. A POPULATION filter, so it "
+        "reaches /summary too. Decisions taken before 2026-09-13 carry no channel and are excluded "
+        "by any value here.",
+    ),
     sx_summary: str | None = Query(
         default=None,
         description="Filter to decisions carrying exactly this SIRI-SX summary. Values come from "
@@ -1850,12 +1899,13 @@ def decisions(
 
     window = _resolve_window(day, from_time, to_time)
     operator = _checked_operator(operator)
+    channel = _checked_channel(channel)
     narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
     if verdict is not None and verdict not in historikk._VERDICTS:
         raise HTTPException(
             status_code=400, detail=f"verdict must be one of {', '.join(historikk._VERDICTS)}."
         )
-    params = _base_query_params(window, operator, line, *narrowed) + [
+    params = _base_query_params(window, operator, line, *narrowed, channel=channel) + [
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
         bigquery.ScalarQueryParameter("alerted_only", "BOOL", alerted_only),
         bigquery.ScalarQueryParameter("pushed_only", "BOOL", pushed_only),
@@ -1867,7 +1917,7 @@ def decisions(
     # _list_cache_key for why it is positional and what a forgotten parameter costs.
     key = _list_cache_key(
         "decisions", window, operator, line, from_place, to_place, sx_summary,
-        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit,
+        verdict, alerted_only, pushed_only, resolved_only, sx_only, limit, channel,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
     raw_rows = [dict(r) for r in rows]
@@ -1919,6 +1969,13 @@ def summary(
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
     ),
+    channel: str | None = Query(
+        default=None,
+        description="Filter to decisions watched on one channel: 'browser' (a /varsel "
+        "registration), 'webhook' (a client subscription) or 'both'. A POPULATION filter, so it "
+        "reaches /summary too. Decisions taken before 2026-09-13 carry no channel and are excluded "
+        "by any value here.",
+    ),
     sx_summary: str | None = Query(
         default=None,
         description="Filter to decisions carrying exactly this SIRI-SX summary. Accepted here, "
@@ -1942,14 +1999,15 @@ def summary(
     """
     window = _resolve_window(day, from_time, to_time)
     operator = _checked_operator(operator)
+    channel = _checked_channel(channel)
     narrowed = _checked_data_filters(window, line, from_place, to_place, sx_summary)
     # Only the population filters, so no extras on top of the shared block -- and for the same reason
     # the key carries only those: /summary deliberately accepts none of the outcome filters.
-    params = _base_query_params(window, operator, line, *narrowed)
+    params = _base_query_params(window, operator, line, *narrowed, channel=channel)
     rows = _query(
         _SUMMARY_QUERY,
         params,
-        ("summary", *window.cache_key, operator, line, from_place, to_place, sx_summary),
+        ("summary", *window.cache_key, operator, line, from_place, to_place, sx_summary, channel),
     )
     row = dict(rows[0]) if rows else {}
 
@@ -2016,6 +2074,13 @@ async def messages(
     ),
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
+    ),
+    channel: str | None = Query(
+        default=None,
+        description="Filter to decisions watched on one channel: 'browser' (a /varsel "
+        "registration), 'webhook' (a client subscription) or 'both'. A POPULATION filter, so it "
+        "reaches /summary too. Decisions taken before 2026-09-13 carry no channel and are excluded "
+        "by any value here.",
     ),
     sx_summary: str | None = Query(
         default=None,
@@ -2095,7 +2160,7 @@ async def messages(
         )
     async with _replay_slots:
         return await _messages(
-            window, operator, line, from_place, to_place, sx_summary, verdict,
+            window, operator, line, from_place, to_place, sx_summary, channel, verdict,
             alerted_only, pushed_only, resolved_only, sx_only, limit, deadline,
         )
 
@@ -2107,6 +2172,7 @@ async def _messages(
     from_place: str | None,
     to_place: str | None,
     sx_summary: str | None,
+    channel: str | None,
     verdict: str | None,
     alerted_only: bool,
     pushed_only: bool,
@@ -2136,6 +2202,7 @@ async def _messages(
                 from_place=from_place,
                 to_place=to_place,
                 sx_summary=sx_summary,
+                channel=channel,
                 verdict=verdict,
                 alerted_only=alerted_only,
                 pushed_only=pushed_only,

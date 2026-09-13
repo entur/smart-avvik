@@ -44,6 +44,11 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+# The decision log's own `channel` vocabulary (U16). Imported UNDER AN ALIAS for main.py's
+# `impact_engine` reason: the route function below is itself named `decisions` and rebinds the
+# module-level name, so a bare `decisions.CHANNELS` resolves to the route and raises at request
+# time -- which is exactly what happened before this alias existed.
+import decisions as decision_log
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -182,8 +187,29 @@ class Decision(BaseModel):
         "relayed a fact rather than predicted one. Null for decisions taken before 2026-08-05, "
         "which cannot be placed in either segment after the fact.",
     )
-    pushed_any: bool | None = Field(description="Whether a Web Push was actually delivered.")
-    n_devices: int | None = Field(description="How many registrations shared this journey.")
+    pushed_any: bool | None = Field(
+        description="Whether a notification was ISSUED on any channel: a Web Push the push service "
+        "accepted, or — since 2026-09-13 — a webhook event that was minted. Web Push alone before "
+        "that date. Read `channel` beside it: a 'both' subject can say true with no Web Push "
+        "behind it.",
+    )
+    n_devices: int | None = Field(
+        description="How many /varsel registrations shared this journey definition — the BROWSER "
+        "side only, with n_subscriptions counting the client side.",
+    )
+    channel: str | None = Field(
+        default=None,
+        description="Which channel(s) watched this definition: 'browser', 'webhook' or 'both'. "
+        "Null for decisions taken before 2026-09-13, when webhook routes were not recorded at "
+        "all — the same third-bucket rule n_unsegmented follows, so a channel filter excludes "
+        "them rather than guessing 'browser'.",
+    )
+    n_subscriptions: int | None = Field(
+        default=None,
+        description="How many webhook subscriptions shared this definition. A count and nothing "
+        "more: no client, subscription, destination or external reference is recorded anywhere in "
+        "the decision log, so a card never says whose integration it was.",
+    )
     message: str | None = Field(description="The message text the traveller was sent.")
     message_source: str | None = Field(
         description="Which wording was sent: 'llm' or 'deterministic'. Since 2026-08-07 both are "
@@ -278,6 +304,14 @@ class FilterOptions(BaseModel):
     )
     from_places: list[PlaceOption] = Field(description="Registered boarding places, by name.")
     to_places: list[PlaceOption] = Field(description="Registered alighting places, by name.")
+    channels: list[str] = Field(
+        default_factory=list,
+        description="The channel values a decision can carry: 'browser', 'webhook', 'both'. A "
+        "FIXED vocabulary rather than one read from the window, unlike every list above it — "
+        "three values is already a bounded response-cache key, and a channel absent from this "
+        "window is a true answer ('none this week') rather than a value to hide, which is what "
+        "the data-derived lists cannot say without a second query.",
+    )
 
 
 class Segment(BaseModel):
@@ -415,6 +449,23 @@ def _checked_operator(operator: str | None) -> str | None:
             status_code=400, detail=f"operator must be one of {', '.join(sorted(_OPERATORS))}."
         )
     return operator
+
+
+def _checked_channel(channel: str | None) -> str | None:
+    """Reject a channel outside `decisions.CHANNELS`.
+
+    :func:`_checked_operator`'s job and its reason — the value lands in the response-cache key on
+    an endpoint any Entur employee can reach, so an unbounded vocabulary is one cache entry and one
+    BigQuery query per distinct string. Checked against the CONSTANT rather than against the window
+    (which is what `_checked_choice` beside it does): the three values are what the writer can
+    produce, and 'no webhook route in this window' has to be an empty result rather than a 400 —
+    otherwise the page could not show a reader that the client channel is quiet.
+    """
+    if channel is not None and channel not in decision_log.CHANNELS:
+        raise HTTPException(
+            status_code=400, detail=f"channel must be one of {', '.join(decision_log.CHANNELS)}."
+        )
+    return channel
 
 
 def _checked_choice(value: str | None, field: str, allowed: list[str]) -> str | None:
@@ -695,6 +746,7 @@ def filters(
         lines=opts["lines"],
         from_places=places(opts["from_places"]),
         to_places=places(opts["to_places"]),
+        channels=list(decision_log.CHANNELS),
     )
 
 
@@ -720,6 +772,12 @@ def decisions(
     to_place: str | None = Query(
         default=None,
         description="Filter to registrations alighting at this StopPlace ref.",
+    ),
+    channel: str | None = Query(
+        default=None,
+        description="Filter to decisions watched on one channel: 'browser' (a /varsel "
+        "registration), 'webhook' (a client subscription) or 'both'. Decisions taken before "
+        "2026-09-13 carry no channel and are excluded by any value here.",
     ),
     verdict: str | None = Query(
         default=None,
@@ -754,6 +812,7 @@ def decisions(
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
+    channel = _checked_channel(channel)
     from_refs, to_refs = _checked_places(start, end, line, from_place, to_place)
     if verdict is not None and verdict not in _VERDICTS:
         raise HTTPException(
@@ -764,6 +823,7 @@ def decisions(
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ScalarQueryParameter("channel", "STRING", channel),
         bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
         bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
         bigquery.ScalarQueryParameter("verdict", "STRING", verdict),
@@ -773,7 +833,7 @@ def decisions(
         bigquery.ScalarQueryParameter("limit", "INT64", limit),
     ]
     key = (
-        "decisions", start, end, operator, line, from_place, to_place,
+        "decisions", start, end, operator, line, from_place, to_place, channel,
         verdict, alerted_only, resolved_only, sx_only, limit,
     )
     rows = _query(_DECISIONS_QUERY, params, key)
@@ -801,6 +861,12 @@ def summary(
     to_place: str | None = Query(
         default=None, description="Filter to registrations alighting at this StopPlace ref."
     ),
+    channel: str | None = Query(
+        default=None,
+        description="Filter to decisions watched on one channel: 'browser' (a /varsel "
+        "registration), 'webhook' (a client subscription) or 'both'. Decisions taken before "
+        "2026-09-13 carry no channel and are excluded by any value here.",
+    ),
 ) -> Summary:
     """Counts and rates over the window, with the unresolved share reported alongside.
 
@@ -808,8 +874,9 @@ def summary(
     over a fifth of the decisions is a different claim from one computed over almost all of them,
     and a caller cannot tell which it has without them.
 
-    The four filters it accepts are exactly the ones that narrow the POPULATION — which trains, on
-    whose registered journeys — so these rates describe the same slice the list beside them shows.
+    The five filters it accepts are exactly the ones that narrow the POPULATION — which trains, on
+    whose registered journeys, watched from where — so these rates describe the same slice the list
+    beside them shows.
     `verdict`, `alerted_only` and `resolved_only` narrow by OUTCOME instead and are deliberately not
     accepted here at all: filtering to hits would make precision read 100 %.
     """
@@ -817,17 +884,21 @@ def summary(
 
     start, end = _window(from_date, to_date)
     operator = _checked_operator(operator)
+    channel = _checked_channel(channel)
     from_refs, to_refs = _checked_places(start, end, line, from_place, to_place)
     params = [
         bigquery.ScalarQueryParameter("from_date", "DATE", start),
         bigquery.ScalarQueryParameter("to_date", "DATE", end),
         bigquery.ScalarQueryParameter("operator", "STRING", operator),
         bigquery.ScalarQueryParameter("line", "STRING", line),
+        bigquery.ScalarQueryParameter("channel", "STRING", channel),
         bigquery.ArrayQueryParameter("from_place_refs", "STRING", from_refs),
         bigquery.ArrayQueryParameter("to_place_refs", "STRING", to_refs),
     ]
     rows = _query(
-        _SUMMARY_QUERY, params, ("summary", start, end, operator, line, from_place, to_place)
+        _SUMMARY_QUERY,
+        params,
+        ("summary", start, end, operator, line, from_place, to_place, channel),
     )
     row = dict(rows[0]) if rows else {}
 

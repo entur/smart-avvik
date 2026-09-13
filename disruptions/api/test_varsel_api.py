@@ -2126,9 +2126,8 @@ def test_the_pushed_mark_is_keyed_per_departure_not_per_situation(monkeypatch):
     second = _alert("S1", DEP + timedelta(minutes=30), jkey="t4")
 
     varsel._record_decisions(
-        {key: journey},
+        varsel._recipient_view({key: journey}, [(jid, journey)]),
         {key: [first, second]},
-        [(jid, journey)],
         {varsel._decision_key(key, first)},
         {},
         push_on=True,
@@ -2171,9 +2170,8 @@ def _thinning_fixture(monkeypatch):
 
 def _decide(key, journey, jid, alerts, *, now, pushed=()):
     varsel._record_decisions(
-        {key: journey},
+        varsel._recipient_view({key: journey}, [(jid, journey)]),
         {key: list(alerts)},
-        [(jid, journey)],
         {varsel._decision_key(key, a) for a in pushed},
         {},
         push_on=True,
@@ -2441,8 +2439,8 @@ def test_a_closing_row_lost_to_a_failed_write_is_offered_again(monkeypatch):
     broken = _use_decision_log(monkeypatch, insert_error=RuntimeError("BigQuery is down"))
     retired = varsel._retire_decision_subjects(live=set())
     assert retired, "control: the sweep had a closing row to hand over"
-    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
-                             push_on=True, now=clock.tick(5), closing_rows=retired)
+    varsel._record_decisions(varsel._recipient_view({key: journey}, [(jid, journey)]), {key: []},
+                             set(), {}, push_on=True, now=clock.tick(5), closing_rows=retired)
     assert broken.rows == [], "control: the closing row was offered and refused"
 
     healthy = _use_decision_log(monkeypatch)
@@ -2451,8 +2449,8 @@ def test_a_closing_row_lost_to_a_failed_write_is_offered_again(monkeypatch):
         "the closing row was dropped for good: the subject is out of the ledger, nothing will ever "
         "offer it again, and final_impact_probability keeps the older successful write (0.40)"
     )
-    varsel._record_decisions({key: journey}, {key: []}, [(jid, journey)], set(), {},
-                             push_on=True, now=clock.tick(5), closing_rows=again)
+    varsel._record_decisions(varsel._recipient_view({key: journey}, [(jid, journey)]), {key: []},
+                             set(), {}, push_on=True, now=clock.tick(5), closing_rows=again)
     assert [r["impact_probability"] for r in healthy.rows] == [0.38], (
         "the retried closing row must carry the LAST look, not the last write"
     )
@@ -4939,18 +4937,260 @@ def test_a_cycle_with_webhook_recipients_writes_a_byte_identical_state_blob(monk
     assert not any("sub-000" in json.dumps(rec) for rec in varsel._journeys.values())
 
 
-def test_a_webhook_only_route_records_no_decision_row(monkeypatch):
-    """KTD10, and the limitation KTD12 records rather than hides.
+def test_a_definition_both_channels_share_is_ONE_row_that_says_so(monkeypatch):
+    """KTD4's grouping half: one match, one wording, one decision — and one row reading 'both'.
 
-    `varsel_decisions` is published on public hosts, with resolved origin and destination names
-    since 2026-08-22 — accepted then because prd's registrations are the team's own test users.
-    Client-app travellers are members of the public, so webhook subjects stay out of that table
-    entirely, which `_record_decisions` gets for free by iterating the BROWSER grouping.
+    The alternative was a row per channel, and it is wrong in a way the page would show: two cards
+    for one train on one corridor, two verdicts from the nightly job, and every rate over
+    `varsel_decision_groups` counting a shared definition twice. So `channel` is a property OF the
+    subject and never part of its key.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])
+    _register(DEVICE)  # the SAME definition the webhook document names
 
-    The cost is real and is the reason this is a test rather than a comment: a webhook-only route
-    produces no row at all, so `/historikk` scores the definitions both channels share and nothing
-    else. Scoring webhook-only routes is deferred work; the enablement gate is conditional on
-    `/historikk`'s per-operator verdicts with that gap written down.
+    varsel.check_and_notify(SNAPSHOT)
+
+    assert len(log.rows) == 1, f"a shared definition is one subject, not one per channel: {log.rows}"
+    row = log.rows[0]
+    assert row["channel"] == "both", row["channel"]
+    assert (row["n_devices"], row["n_subscriptions"]) == (1, 1), (
+        "both counts, each about its own channel"
+    )
+
+
+def test_push_disabled_is_a_browser_answer_and_is_never_a_client_only_subjects(monkeypatch):
+    """`message_status` has to name THIS subject's cause, and one value stopped being able to.
+
+    `push_disabled` means "this deployment has no VAPID keypair, so nothing could be delivered to a
+    browser and no wording was written". That is the true cause for a browser or shared definition
+    and says nothing whatever about one only a client watches — and every row in
+    `varsel_decisions` carrying the value since the column existed means the browser reading. Given
+    to a webhook-only subject it would be a false cause on a row `/historikk` displays, and the
+    value would silently start covering two unlike states.
+
+    Driven through `_record_decisions` with nothing in `_messages`, which is the only way to REACH
+    the fallback chain: through a cycle the client earns a wording (KTD4's write gate is "a
+    deliverable recipient on ANY channel"), `meta` is set and this branch is never taken — so the
+    same assertion on an end-to-end test passes however the branch is written.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    journey = {"from_stop": "A", "to_stop": "B", "begin": "00:00", "end": "23:59",
+               "days": [0, 1, 2, 3, 4, 5, 6]}
+    key = varsel.journey_key(journey)
+    alert = _alert("S1", DEP, jkey="t1")
+    view = {
+        "client-only": varsel._Recipients(journey, "webhook", n_devices=0, n_subscriptions=1),
+        "shared": varsel._Recipients(journey, "both", n_devices=1, n_subscriptions=1),
+    }
+    del key
+
+    varsel._record_decisions(
+        view, {k: [alert] for k in view}, set(), {}, push_on=False, now=datetime.now(UTC)
+    )
+
+    by_channel = {r["channel"]: r["message_status"] for r in log.rows}
+    assert by_channel["both"] == "push_disabled", (
+        "control: a definition WITH a browser side keeps the value and its meaning"
+    )
+    assert by_channel["webhook"] != "push_disabled", (
+        f"a client-only subject was told the browser's cause: {by_channel}"
+    )
+
+
+def test_a_minted_client_notification_marks_its_subject_pushed_on_the_same_cycle(monkeypatch):
+    """KTD4's `pushed` half, across the ordering KTD6 imposes.
+
+    Emit runs after `check_and_notify` has returned, so the mint cannot reach the row the pass
+    already wrote. `record_minted_decisions` writes its own, copied from the ledger with `pushed`
+    flipped and the CLIENT's wording in `message` — the text alone, as the column stores a wording,
+    never the event body, which leads with a route line the card prints itself.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+
+    assert [r["pushed"] for r in log.rows] == [False], "control: the pass itself notifies nobody"
+    observation = next(o for o in outcome.webhook_observations if o.decision_key)
+    key = observation.decision_key
+
+    written = varsel.record_minted_decisions(outcome, [key])
+
+    assert written == 1, "the mint is one more row for the subject it notified"
+    mint = log.rows[-1]
+    assert mint["pushed"] is True
+    assert mint["situation_number"] == log.rows[0]["situation_number"], "the same subject"
+    assert mint["channel"] == "webhook" and mint["n_subscriptions"] == 1
+    assert mint["message"] and mint["message"] in observation.body, (
+        "the wording the client received, and it is the body's wording rather than the body: the "
+        f"body leads with a route line. body={observation.body!r} message={mint['message']!r}"
+    )
+    assert not mint["message"].startswith(observation.body.split("\n")[0]), (
+        "the route line is the event envelope's, not part of the recorded wording"
+    )
+    assert mint["message_status"] == "ok", (
+        "the CONTROL the `ok_cached` demotion must not fire on: this subject was written fresh on "
+        "this very cycle, so the row's `message_llm` and the `message_input` beside it genuinely "
+        f"are a same-input pair, which is what `ok` claims: {mint['message_status']}"
+    )
+
+
+# Still alert-worthy and no new maximum — only the cancellation figure has eased, which is what
+# keeps the subject THINNED on the second cycle (`_thinning_reason` reads `alertworthy` and
+# `impact_probability`, neither of which moves here) while its message input genuinely changes.
+SNAPSHOT_LESS_LIKELY_CANCELLED = {
+    "S1": [
+        FakeCall("t1", "A", 1, DEP, p_cancel=0.55, p_impact_dep=0.9),
+        FakeCall("t1", "B", 5, None, aimed_arr=DEP + timedelta(minutes=40)),
+    ]
+}
+
+
+def test_a_mint_on_a_thinned_cycle_records_that_cycles_input_not_the_ledgers(monkeypatch):
+    """The mint row is a copy, and the five wording columns are the ones a copy gets WRONG.
+
+    KTD15 thins a standing subject to one row per 15 min, and between writes the ledger's row is
+    re-stated through `decisions.rescored` — which refreshes the prediction figures and carries
+    `message_input`, `message_deterministic` and `message_status` from the last row actually
+    written. The browser channel never meets that: `pushed` is one of the rule's keep-reasons, so a
+    pushed row there is always a fresh `build_row`. A mint is deliberately not in `pushed_keys`, so
+    it lands on whatever the rule left behind — and `/meldinger` replays the FIRST pushed row's
+    `message_input` and stamps that row's `decided_at` as `would_send_at`. Copied, the page would
+    word "what we would send now" from a quarter-hour-old document under this cycle's timestamp,
+    beside figures that are not, for every client subject on the page this channel is scored by.
+
+    Driven at the DEFAULT thinning interval, since the whole defect is a cycle the rule skipped.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(log.rows) == 1, f"control: the first cycle writes the subject's first row: {log.rows}"
+    first = log.rows[0]
+    assert first["message_status"] == "ok", (
+        "control: the first row is a fresh write with a wording of its own -- the status the "
+        f"demotion below has something to demote: {first['message_status']}"
+    )
+
+    _use_snapshot(SNAPSHOT_LESS_LIKELY_CANCELLED)
+    outcome = varsel.check_and_notify(SNAPSHOT_LESS_LIKELY_CANCELLED)
+    assert len(log.rows) == 1, (
+        f"control: the second cycle is THINNED -- no row, which is what makes this the case: {log.rows}"
+    )
+
+    key = next(o.decision_key for o in outcome.webhook_observations if o.decision_key)
+    assert varsel.record_minted_decisions(outcome, [key]) == 1
+
+    mint = log.rows[-1]
+    assert mint["pushed"] is True
+    assert mint["cancel_probability"] != first["cancel_probability"], (
+        "control: the two cycles genuinely differ, or nothing below can fail"
+    )
+    assert mint["message_input"] != first["message_input"], (
+        "the replayed document is THIS cycle's, not the one the ledger was carrying"
+    )
+    assert json.loads(mint["message_input"]) == json.loads(
+        varsel._message_input_json(outcome.webhook_wordings[key].message_input)
+    ), "and it is the very document the client's wording was written from"
+    assert mint["message_deterministic"] == varsel._deterministic_body(
+        outcome.webhook_wordings[key].message_input
+    ), "the template beside it is worded from the same input, so the pair stays same-input"
+    assert mint["message_llm"] and mint["message_status"] == "ok_cached", (
+        "a carried model wording was written from an earlier cycle's input than the one now beside "
+        f"it, which is exactly what `ok_cached` says: {mint['message_status']}"
+    )
+
+
+def test_a_mint_for_a_subject_the_browser_already_pushed_writes_no_second_row(monkeypatch):
+    """One PUSHED row per subject per cycle, which is what keeps the view's wording pick decidable.
+
+    `varsel_decision_groups` quotes the FIRST pushed row. Two of them at one `decided_at` makes the
+    ORDER BY a tie, so the card would flip between the browser's wording and the client's between
+    two runs of the same query — with nothing having changed. The fact `pushed` carries is already
+    recorded by the pass's own row, and `channel` is what says a client was there too.
+
+    Driven through `_record_decisions` rather than a cycle, because what this is about is the state
+    the ledger is left in by a successful browser push, and the suite's fake subscription cannot
+    produce one end to end.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    jid, journey = next(iter(varsel._journeys.items()))
+    key = varsel.journey_key(journey)
+    alert = _alert("S1", DEP, jkey="t1")
+    subject = varsel._decision_key(key, alert)
+
+    varsel._record_decisions(
+        varsel._recipient_view({key: journey}, [(jid, journey)]),
+        {key: [alert]},
+        {subject},
+        {},
+        push_on=True,
+    )
+
+    assert [r["pushed"] for r in log.rows] == [True], "control: the browser push is on the row"
+    outcome = varsel.PassOutcome(webhook_wordings={subject: ("klientens ordlyd", "deterministic")})
+
+    assert varsel.record_minted_decisions(outcome, [subject]) == 0
+    assert len(log.rows) == 1, "a second pushed row at one instant is what this refuses"
+    assert log.rows[0]["message"] != "klientens ordlyd", (
+        "and the browser's own wording is the one the page quotes for a shared subject"
+    )
+
+
+def test_a_mint_for_a_subject_that_already_retired_leaves_its_closing_row_alone(monkeypatch):
+    """The sweep pops a retiring subject, so there is no ledger row for the mint to copy.
+
+    Writing one anyway would need a second builder, and rebuilding a row from an alert the pass no
+    longer holds is how a decision row stops describing a decision. The closing row the sweep
+    already wrote is the subject's last look and stands; the mint is counted, not warned per row.
+
+    The counter is `mint_no_row` rather than `mint_retired` because retirement is only one of its
+    two causes: a subject whose very first row was lost to a short write commits no ledger entry
+    either, and has never had a row to mark.
+    """
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC])
+    _register(DEVICE)
+
+    outcome = varsel.check_and_notify(SNAPSHOT)
+    before = len(log.rows)
+    varsel._decision_ledger.clear()  # the sweep's effect, without a second cycle
+
+    with _capture_varsel_logs() as records:
+        assert varsel.record_minted_decisions(outcome, [("gone", "S1", "")]) == 0
+    assert len(log.rows) == before, "nothing is invented for a subject that is over"
+    written = _events(records, "varsel_decision_write")
+    assert [r["result"] for r in written] == ["mint_no_row"], (
+        "a subject with no row is an expected, counted outcome -- not an exception the guard "
+        f"swallows, which is what this distinguishes: {written}"
+    )
+
+
+def test_a_webhook_only_route_is_recorded_at_definition_grain_and_names_no_client(monkeypatch):
+    """KTD4, and the exact reversal of what KTD10 required until /historikk was authenticated.
+
+    `varsel_decisions` is published with resolved origin and destination names, so while
+    /historikk and /meldinger were public a client-app traveller's commute could not go in it and
+    `_record_decisions` got that for free by iterating the BROWSER grouping. Both pages are behind
+    Entur SSO since 2026-09-10, and at R1's population "a webhook-only route is unscored" would
+    have meant the product is unscored — so U16 records them, at the grain both channels already
+    share.
+
+    What has to hold is that the grain did not move with it: a row says WHICH channel and HOW MANY
+    subscriptions, and nothing that identifies one. The falsification is the same shape as the
+    contract test's, applied to a row rather than to a file.
     """
     _reset_state()
     log = _use_decision_log(monkeypatch)
@@ -4961,7 +5201,15 @@ def test_a_webhook_only_route_records_no_decision_row(monkeypatch):
     varsel.check_and_notify(SNAPSHOT)
 
     assert [s for _k, s in written] == ["S1"], "the subscription was matched and written for"
-    assert log.rows == [], "and recorded nowhere in varsel_decisions"
+    assert [r["situation_number"] for r in log.rows] == ["S1"], "and recorded, which it was not before U16"
+    row = log.rows[0]
+    assert row["channel"] == "webhook", row["channel"]
+    assert row["n_subscriptions"] == 1 and row["n_devices"] == 0, (
+        "the two counts are per channel; a webhook-only definition has no browser registration"
+    )
+    blob = json.dumps(row)
+    for token in ("sub-0001", "client-a", "dest-a", "commuter-42"):
+        assert token not in blob, f"{token!r} reached a decision row; the grain is the definition"
 
 
 # ---- U6: the pass outcome -- what the notification phase is handed --------------------------------
@@ -6443,7 +6691,11 @@ def test_recording_a_cycles_decisions_takes_the_state_lock_a_constant_number_of_
     counting = _CountingLock(varsel._state_lock)
     monkeypatch.setattr(varsel, "_state_lock", counting)
     varsel._record_decisions(
-        {key: journey}, {key: alerts}, [(jid, journey)], set(), {}, push_on=True
+        varsel._recipient_view({key: journey}, [(jid, journey)]),
+        {key: alerts},
+        set(),
+        {},
+        push_on=True,
     )
 
     assert len(log.rows) == 50, "control: every subject was recorded"

@@ -1511,7 +1511,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                     # The per-client pending ceiling, resolved HERE rather than in the emit module:
                     # `notification_events` pins its own import set exactly, and the answer lives in
                     # `notification_auth`. This module already imports both.
-                    notification_events.emit(
+                    report = notification_events.emit(
                         outcome.webhook_observations,
                         pending_quota=lambda client_id: notification_auth.quotas_for(
                             client_id
@@ -1522,6 +1522,21 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                         # phase that merely got slow must keep saying so while it works.
                         beat=_beat,
                     )
+                    # U16: the decision log's `pushed` means "a notification was issued on any
+                    # channel" (KTD4), and for the client channel that is the MINT the pass above
+                    # just committed. It has to be written here rather than inside
+                    # `check_and_notify`, because emit deliberately runs after that function has
+                    # returned — see `record_minted_decisions`, which carries the whole argument.
+                    #
+                    # Its own `try`, and not folded into the emit call's: an event that was
+                    # committed must not be un-notified by a bookkeeping row, and — the direction
+                    # that actually bites — a decision-log problem must not be reported as
+                    # "Notification event emission failed" on a cycle where every event was
+                    # emitted. The function swallows too; this is the second net.
+                    try:
+                        varsel.record_minted_decisions(outcome, report.minted_decisions)
+                    except Exception:
+                        logger.exception("Recording this cycle's mint marks failed")
             except Exception:
                 logger.exception("Notification event emission failed")
             # U11: delivery moves to `webhook_worker`, its own Deployment from this same image, and

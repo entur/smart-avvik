@@ -42,8 +42,18 @@ export interface Decision {
   /** ET had already declared the boarding call cancelled when we decided — the probabilities are
    *  1.0 by construction. Null for decisions taken before the flag existed. */
   et_cancelled: boolean | null;
+  /** A notification was ISSUED on some channel: a Web Push the push service accepted, or — since
+   *  2026-09-13 — a webhook event that was minted. Read `channel` beside it: a 'both' subject can
+   *  say true with no Web Push behind it. */
   pushed_any: boolean | null;
+  /** /varsel registrations on this definition — the BROWSER side only. */
   n_devices: number | null;
+  /** 'browser' | 'webhook' | 'both'. Null for decisions taken before webhook routes were recorded
+   *  (2026-09-13), which is its own answer and not 'browser'. */
+  channel: string | null;
+  /** Webhook subscriptions on this definition. A count and nothing more — the decision log carries
+   *  no client, subscription or destination identity. */
+  n_subscriptions: number | null;
   message: string | null;
   message_source: string | null;
 
@@ -144,6 +154,10 @@ export interface FilterOptions {
   lines: string[];
   from_places: PlaceOption[];
   to_places: PlaceOption[];
+  /** 'browser' | 'webhook' | 'both'. A FIXED vocabulary, unlike every list above it: three values
+   *  is already a bounded cache key, and a channel absent from the window is a true answer rather
+   *  than an option to hide. So this one never goes stale when the window moves. */
+  channels: string[];
 }
 
 /** Which deployment answered. Its own endpoint because it must survive a decision log that cannot
@@ -164,6 +178,10 @@ export interface Filters {
   fromPlace?: string;
   /** StopPlace ref the registration alights at. */
   toPlace?: string;
+  /** Which channel watched the definition: 'browser' (a /varsel registration), 'webhook' (a client
+   *  subscription) or 'both'. A POPULATION filter, so it reaches the summary too. Decisions taken
+   *  before 2026-09-13 carry no channel and are excluded by any value here. */
+  channel?: string;
   verdict?: Verdict;
   alertedOnly?: boolean;
   /** Only decisions whose outcome is known — 'avklart', i.e. everything except 'venter' and
@@ -194,6 +212,7 @@ function query(filters: Filters, extra: Record<string, string> = {}): string {
   if (filters.line) params.set('line', filters.line);
   if (filters.fromPlace) params.set('from_place', filters.fromPlace);
   if (filters.toPlace) params.set('to_place', filters.toPlace);
+  if (filters.channel) params.set('channel', filters.channel);
   if (filters.verdict) params.set('verdict', filters.verdict);
   if (filters.alertedOnly) params.set('alerted_only', 'true');
   if (filters.resolvedOnly) params.set('resolved_only', 'true');
@@ -214,8 +233,10 @@ export function fetchSummary(filters: Filters): Promise<Summary> {
   // registered journeys — so its rates describe the same slice the list beside it shows. The
   // verdict/alerted/resolved ones narrow by OUTCOME and deliberately do not: filtering to hits
   // would make precision read 100 %. The API refuses them here for the same reason.
-  const { fromDate, toDate, operator, line, fromPlace, toPlace } = filters;
-  return get(`/historikk-api/summary?${query({ fromDate, toDate, operator, line, fromPlace, toPlace })}`);
+  const { fromDate, toDate, operator, line, fromPlace, toPlace, channel } = filters;
+  return get(
+    `/historikk-api/summary?${query({ fromDate, toDate, operator, line, fromPlace, toPlace, channel })}`,
+  );
 }
 
 /** The dropdown vocabulary for a window. Takes only the window: options narrowed by the current
