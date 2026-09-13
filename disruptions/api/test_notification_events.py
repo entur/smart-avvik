@@ -1471,6 +1471,50 @@ def test_a_superseding_mint_gives_its_pending_slot_back():
         _uninstall()
 
 
+def test_the_cycles_mints_are_reported_and_no_per_event_line_is_written():
+    """U9 step 5. One record per cycle with counts, not one per committed revision.
+
+    `commit_event` wrote an INFO line per mint carrying the client, the destination, the alert id
+    and the revision. At the pilot's few hundred events a day that was the right grain; a widened
+    pass writes 20 000 a cycle over ~300 cycles a day, which is a logging bill and a summary nobody
+    can read. Nothing durable was lost — the events are Firestore documents, not log lines — and a
+    question about one client still starts at the per-failure records, which carry `client_id`.
+
+    What replaces it for a reader inside the process is the ledger on the report: what this pass
+    minted, on the value the pass returns rather than on a module global, which is
+    `varsel.PassOutcome`'s rule and for its reason.
+    """
+    client = _install()
+    try:
+        _live(client)
+        handler = _capture()
+        # The per-revision record was `notification_store`'s, so that logger has to be watched too
+        # or this assertion could never see it come back.
+        store_logger = logging.getLogger("notification_store")
+        store_logger.setLevel(logging.INFO)
+        store_logger.addHandler(handler)
+        subjects = [
+            _subject(journey_ref=f"DatedServiceJourney:{9600 + i}") for i in range(3)
+        ]
+        report = _emit(subjects, now=NOW, workers=1)
+        records = list(handler.records)
+        store_logger.removeHandler(handler)
+        logging.getLogger("notification_events").removeHandler(handler)
+
+        assert report.created == 3, report
+        assert len(report.minted) == 3, report.minted
+        assert set(report.minted) == {
+            notification_store.alert_subject_id(SID, notification_events.train_ref(s))
+            for s in subjects
+        }
+        names = {getattr(r, "fields", {}).get("event") for r in records}
+        assert "notification_event" not in names, (
+            f"a per-revision line is back; a cycle would write 20 000 of them. Saw {names}"
+        )
+    finally:
+        _uninstall()
+
+
 def test_a_destinations_uncountable_ceiling_costs_that_destination_and_not_the_cycle():
     """R20, applied to the two Firestore calls U9 moved onto the coordinator.
 

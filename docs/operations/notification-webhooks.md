@@ -456,7 +456,6 @@ silently.
 | `varsel_webhook_load` | the pass's one read of notification state | `result` (`ok`/`error`/`skipped`/`flag_error`), `n`, `skipped`, `unroutable`, `truncated`, `ms` |
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated` |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `retryable`, `failed`, `standing_error`, `run_clear_error`), `created`, `withdrawn`, `unchanged`, `obsolete`, `quota`, `capped`, `retryable`, `ms` |
-| `notification_event` | one committed revision | `result` = the event type, `client_id`, `destination_id`, `alert_id`, `revision`, `superseded` |
 | `webhook_delivery_round` | the delivery step | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `ms`. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery fault | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
@@ -482,8 +481,10 @@ and the fourth entry below is why it needs one.
 **What some do carry, named rather than glossed** — this is the honest half of the retention claim:
 
 - **`subscription_id` is `<client_id>~<the client's own reference>`**, so a client-chosen reference
-  reaches `notification_subscription` and `notification_cleanup`, and is hashed into `alert_id` on
-  `notification_event`. `external_ref` — the client's handle on a *traveller* — reaches no log line.
+  reaches `notification_subscription` and `notification_cleanup`. It is also hashed into `alert_id`,
+  which no longer reaches a log line at all: the per-revision `notification_event` record went in
+  U9, because a widened pass writes 20 000 of them a cycle. `external_ref` — the client's handle on
+  a *traveller* — reaches no log line and never did.
 - **`webhook_delivery_refused.reason` can carry a callback destination's hostname and its resolved IP
   addresses** (`'host' resolves to N address(es) that are not globally routable unicast: ...`). Not a
   path or query, but not nothing.
