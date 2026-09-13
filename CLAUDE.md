@@ -534,13 +534,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     candidate), where at a hundred thousand entries a thousand pushes is ~4 000 full walks and the
     backend that exists to scale is slower per cycle than the blob it replaces. A suite at n=2 can
     see none of that, so what pins it is a test that makes `recipients` RAISE and asserts every
-    per-journey read still answers. **The togvarsel round markers are NOT persisted under
-    `store`**, and that is U14's to settle rather than a defect this backend hides: the durable
-    write behind `store_togvarsel_rounds` is `_save_state()`, which is a no-op returning True on
-    the store, whose `load()` is a no-op too — so a restart re-fires the accepted crash window for
-    whatever rush round is inside its timeliness window. It costs nothing today (`SHOW_RUSHVARSEL`
-    is off everywhere and no environment sets this backend) and the two shapes are keeping the
-    markers on the blob regardless of backend, or one Firestore document.
+    per-journey read still answers. **The togvarsel round markers are OFF the protocol and durable under both
+    backends**, and the distinction is the point: a rush round marker is not a registration, so it
+    has no business on a seam whose every method is a question about one — but "off the protocol"
+    never meant "not persisted". U13 shipped them persisted under `gcs` only, which U14 settled
+    (2026-09-13) in favour of ONE Firestore document, `notification_store.ROUNDS` — a collection of
+    its own, one document of fixed id, no TTL (there is nothing to age out and a TTL could only
+    delete the live copy). **The shape that looks simpler is the trap**: keeping the blob as their
+    home under `store` means writing through `save_state()`, which serialises the blob GLOBALS —
+    empty under this backend — so a marker write would replace the rollback artefact with
+    `{"devices": {}, "journeys": {}, …}`; writing only the one key instead is a read-modify-write of
+    the whole GCS object racing the six-hourly export, with no generation precondition on either
+    side. `varsel_state.configure_rounds` names the home, set by `main` from the same
+    `VARSEL_STATE_BACKEND` the registrations follow — they must agree, because a rollback to the
+    blob-reading binary has to find the markers where that binary looks. The document's body is
+    `{date, areas: {<area>: {<issue>: marker}}}` and **the area level is nested before it carries
+    any weight**: Rushvarsel is one geography today (`togvarsel_oslo_stations`, 39 stations) and is
+    planned to become several rush areas, so nested from the start that split is a data change here
+    rather than a migration, and a build that knows one area reads its own key and ignores the
+    rest — which is what makes a rollback ACROSS the split safe. The in-memory map and the injected
+    accessor pair stay per-issue; widening them is the split's own work. The markers are
+    deliberately NOT part of the cutover import: they are keyed by Oslo date and one filed under an
+    earlier date already reads as absent, so by the first midnight after any cutover there would be
+    nothing left to have migrated — what a mid-day cutover costs is instead that rounds still inside
+    their timeliness window are decided again, which is `togvarsel_notify`'s documented crash window
+    and something a restart can already produce. The export writes the LIVE markers into the blob
+    rather than carrying the old object's copy through, or the artefact would fossilise the day of
+    the cutover and a rollback would read it as the current day's dedup.
     **The cutover is a ONE-SHOT startup import** (`varsel_state.import_blob_into_store`, U14):
     inside `lifespan` before the port binds, so `/varsel` never serves against a half-imported
     store, and every document goes through the same functions the request path uses
@@ -576,9 +596,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     hours is therefore the rollback loss WINDOW. On the poller's tick rather than a CronJob,
     because a second workload would resolve the bucket and the database again per environment and
     the bucket names differ. It writes the blob backend's own five keys through `_journey_record`
-    and `_device_record` so `apply_state` can load it verbatim, and carries `togvarsel_rounds` and
-    any unknown keys through from the existing blob — the store has no home for those, so a
-    document rebuilt from it alone would delete them from the only place they exist. Every device
+    and `_device_record` so `apply_state` can load it verbatim, and carries any UNKNOWN top-level
+    key through from the existing blob — the store has no home for one a future build wrote, so a
+    document rebuilt from it alone would delete that feature's state from the only place it exists.
+    `togvarsel_rounds` is the exception and is written LIVE (`varsel_state.all_rounds`) rather than
+    carried: the markers have their own document in the store now, so copying the old object's
+    would fossilise the day of the cutover and a rollback would read it as the current day's dedup. Every device
     is exported, including one with no journeys left (`all_devices` pages `device_listing` rather
     than multi-getting the ids the journeys name), because that record is an endpoint, a brand and
     the signup instant `_upsert_device_body` restores.
@@ -1243,8 +1266,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   no `channel` reads as `webhook` (U5's convention) and still needs both, and a `web_push` document
   missing its INACTIVITY horizon is still dead — so a document written under U12's rule reads as
   expired rather than as immortal, which is the direction a horizon change has to fail in. No
-  environment holds one (nothing selects the store backend and `varsel_state` is the only writer of
-  the channel), which is what made the inversion a free choice rather than a migration. **What it
+  environment held one when the inversion was made (nothing selected the store backend until dev's
+  cutover later the same day, and `varsel_state` is the only writer of the channel), which is what
+  made it a free choice rather than a migration. **What it
   still costs is a privacy-text change, not a silent one: «Reiser du har registrert lagres til du
   sletter dem» is false for a traveller who abandons the app for 180 days**, so U14 owes T5 a
   clause and a `CONSENT_TEXT_VERSION` bump. Two call sites had to learn the channel with it —

@@ -423,16 +423,97 @@ def save_state() -> bool:
 
 
 # ---- Togvarsel round markers (off the protocol; see `_togvarsel_rounds`) ------------------------
-# **They are not persisted under `VARSEL_STATE_BACKEND=store`, and that is U14's to settle.** These
-# two functions are module state either way, but the durable write behind them is the caller's
-# `_save_state()` -- which is `BlobRegistrations.save()` on the blob and a no-op that returns True
-# on the store, whose `load()` is a no-op too. So under the store backend a restart re-fires the
-# accepted crash window for whatever rush round is still inside its timeliness window, rather than
-# only for one mid-round crash. It costs nothing today: `SHOW_RUSHVARSEL` is off in every
-# environment and no environment sets this backend, so nothing evaluates a round at all. The two
-# shapes, neither decided here: keep the markers on the blob regardless of backend (this module
-# calls `save_state()` itself and `main` always calls `load_state()`), or move them to one
-# Firestore document. What must not happen is the cutover discovering it.
+# They are not on `RegistrationStore` and they ARE durable under both backends, and the distinction
+# is worth keeping: a rush round marker is not a registration, so it has no business on a seam
+# whose every method is a question about one -- but "off the protocol" never meant "not persisted".
+# Under `gcs` they ride in the state blob and `save_state()` writes them with everything else.
+# Under `store` they are ONE document (`notification_store.ROUNDS`), and the reason it is not the
+# other shape is a trap this repo built for itself with U14's export: `save_state()` serializes the
+# blob GLOBALS, which under `store` are empty, so a marker write through it would replace the
+# rollback artefact with `{"devices": {}, "journeys": {}, ...}` and destroy the one thing the
+# six-hourly export exists to keep current. Writing only the one key instead means a
+# read-modify-write of the whole GCS object racing that export, with no generation precondition on
+# either side -- and the near-term split into several rush areas triples the writes that would
+# race. The markers follow the REGISTRATIONS rather than choosing their own home, because a
+# rollback to the blob-reading binary must find them where that binary looks.
+
+#: The rush area every marker is filed under. Rushvarsel is one geography today
+#: (`disruptions.togvarsel_oslo_stations`, 39 stations); the durable body is nested by area anyway,
+#: so the planned split is a data change rather than a migration -- see `notification_store.ROUNDS`.
+#: The in-memory map and the accessor pair below stay per-issue: widening THEM is the split's own
+#: work, and doing it here would be doing the split.
+ROUND_AREA = "oslo"
+
+#: Where the markers are made durable this deployment. Module state rather than an argument on the
+#: two accessors: `togvarsel_notify` holds those as injected callables and must not learn which
+#: backend a deployment runs.
+_rounds_in_store = False
+
+
+def configure_rounds(*, in_store: bool) -> None:
+    """Name the markers' durable home. Called once from the lifespan, beside the registration
+    backend it has to agree with; unset means the blob, which is what every deployment did before
+    the store backend existed."""
+    global _rounds_in_store
+    _rounds_in_store = in_store
+
+
+def load_rounds() -> None:
+    """Populate the markers from their durable home, at startup.
+
+    A no-op under the blob, whose `load_state()` has already applied them with the rest of the
+    object. Never raises: a Firestore blip must not fail a lifespan for a feature that is off in
+    every environment, and what an empty map costs is that rounds still inside their timeliness
+    window are decided again -- `togvarsel_notify`'s documented crash window, not a new failure.
+    """
+    if not _rounds_in_store:
+        return
+    try:
+        body = notification_store.read_rounds()
+    except Exception:
+        logger.exception("Reading the togvarsel round markers failed; this process starts with none")
+        return
+    if not body:
+        return
+    date_str = str(body.get("date") or "")
+    areas = body.get("areas")
+    markers = (areas or {}).get(ROUND_AREA) if isinstance(areas, Mapping) else None
+    if not date_str or not isinstance(markers, Mapping):
+        return
+    with lock:
+        _togvarsel_rounds.clear()
+        _togvarsel_rounds[date_str] = {
+            str(k): dict(v) for k, v in markers.items() if isinstance(v, Mapping)
+        }
+
+
+def save_rounds() -> bool:
+    """Make the markers durable, and say whether it worked. Best-effort on both backends: a
+    failure is logged rather than raised, so the in-memory markers still dedup THIS process and the
+    cost of a lost write is bounded by the next restart re-deciding inside the timeliness window.
+    """
+    if not _rounds_in_store:
+        return save_state()
+    with lock:
+        date_str = next(iter(_togvarsel_rounds), "")
+        markers = {k: dict(v) for k, v in _togvarsel_rounds.get(date_str, {}).items()}
+    try:
+        notification_store.write_rounds({"date": date_str, "areas": {ROUND_AREA: markers}})
+    except Exception:
+        logger.exception("Writing the togvarsel round markers failed; they stay in memory only")
+        return False
+    return True
+
+
+def all_rounds() -> dict[str, dict[str, Any]]:
+    """Every marker, {date: {issue: marker}} -- the export's copy for the rollback artefact."""
+    with lock:
+        return {
+            date_str: {k: dict(v) for k, v in issues.items()}
+            for date_str, issues in _togvarsel_rounds.items()
+        }
+
+
 def rounds_for(date_str: str) -> dict[str, Any]:
     """A copy of the togvarsel round markers for one Oslo date ({} when none exist)."""
     with lock:
@@ -1285,9 +1366,12 @@ def import_blob_into_store(
     horizon that is not a cliff but a fresh 180 days, and the only registration it ever expires is
     one whose traveller does not open the app in the six months after the cutover.
 
-    **What it deliberately does not carry.** The togvarsel round markers: they are off the protocol
-    and ride in the blob half, which is the gap the operations document's cutover section names.
-    Importing them here would be inventing a home for them that nothing reads.
+    **What it deliberately does not carry.** The togvarsel round markers, although they now have a
+    home in the store: they are keyed by Oslo date and a marker from any earlier date already reads
+    as absent, so by the first midnight after any cutover there would be nothing left to have
+    migrated. What a mid-day cutover costs instead is that rounds still inside their timeliness
+    window are decided again -- `togvarsel_notify`'s documented crash window, which a restart can
+    already produce. Migrating a value with a lifetime shorter than the operation is not caution.
     """
     started = time.monotonic()
     instant = now or _now()
@@ -1593,9 +1677,12 @@ def export_store_to_blob(
     payload = json.dumps(
         {
             **carried,
-            # The one key the store has no home for, carried through from whatever is already
-            # there rather than rebuilt or dropped.
-            "togvarsel_rounds": existing.get("togvarsel_rounds", {}),
+            # The markers as THIS process holds them, not as the blob last held them. They have
+            # their own home in the store now, so carrying the old object's copy through would
+            # fossilise it -- and a rollback would then replay a day that has already happened.
+            # An empty map overwriting a stale one is correct rather than a loss: markers are
+            # keyed by Oslo date and one filed under any other date already reads as absent.
+            "togvarsel_rounds": all_rounds(),
             "devices": records,
             "journeys": journeys,
             "notified": sorted(marks),
