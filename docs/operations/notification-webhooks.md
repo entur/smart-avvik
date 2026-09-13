@@ -971,6 +971,16 @@ contract document says so in its own words; this is the operating half of the sa
    who does not open the app for 180 days has their journeys deleted without deleting them — so it
    needs a clause and a `CONSENT_TEXT_VERSION` bump.
 
+   **The text is written and waiting** (2026-09-13, PR #189): T5's «Hvor lenge» now says the
+   registrations age out after «rundt et halvt år» of disuse and that opening the app resets the
+   period, the varselabonnement is stated to go with them, and `CONSENT_TEXT_VERSION` is
+   `2026-09-13.1`. Two things about it an operator should know. The version moved although the
+   REGISTRATION texts did not, because the privacy page renders «Sist oppdatert» from that version
+   — leaving it alone would have dated the new text to 2 September. And the sentence is bound to
+   the code by a test, so `WEB_PUSH_INACTIVITY_DAYS` can no longer move away from 180 without
+   somebody being told to rewrite the page. **That PR must be merged in the same operation as
+   prd's cutover**, and it is deliberately left open until then.
+
    **That text lands with PRD's cutover, not dev's** (product owner, 2026-09-13), and the reason is
    that the texts are baked into the one image every environment shares while the cutover is per
    environment. There is no window without a mismatch, only a choice of which: landing the clause

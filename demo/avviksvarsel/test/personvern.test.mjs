@@ -26,9 +26,16 @@ import {
 // nothing local can. What it does is put that choice in front of them, in one
 // block, with the reason attached — the same derived-version reasoning as
 // disruptions/api/llm_message.py's PROMPT_VERSION.
+//
+// 2026-09-13: bumped for a T5-only edit, which is NOT the usual reason and is worth the note.
+// The privacy page's «Sist oppdatert» is rendered from consentTextDate(), i.e. from this version —
+// so when T5 changed what we actually DO with the data (registrations now age out after ~180 days
+// of not being used, because /varsel's registrations moved into Firestore under a
+// storage-limitation rule), leaving the version alone would have dated the new text to the day the
+// old text was written. REGISTRATION_TEXTS itself did not change.
 const PINNED_CONSENT = {
-  version: '2026-09-02.1',
-  hash: '3cb83e56',
+  version: '2026-09-13.1',
+  hash: 'af1b2f62',
 };
 
 /** sha256[:8] of the exact corpus a registering user consents to, version included. */
