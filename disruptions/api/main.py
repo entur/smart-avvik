@@ -4,7 +4,7 @@ import os
 import re
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -56,6 +56,12 @@ _PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
 _ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").read_text()
 _DISRUPTIONS_AS_OF_QUERY = (Path(__file__).parent / "disruptions_as_of.sql").read_text()
 _ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
+# Does any planned trip today run between these two places, and does any run the other way?
+# Asked about many stop pairs at once since U10; its own header carries the argument for the
+# shape. A FILE rather than the inline string it was until then, because nothing in this repo
+# executes SQL and `data/queries/validate_varsel_sql.sh` can only dry-run a file — so a query
+# held in a Python string is a query no check reaches.
+_VARSEL_CONNECTIVITY_QUERY = (Path(__file__).parent / "varsel_connectivity.sql").read_text()
 # Per-call (per-train) serving: the planned-timetable call source and the scoring query.
 # NSB/prod family (rail): predict_calls.sql -> call_predictions_today.
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
@@ -735,71 +741,16 @@ def _varsel_stops() -> list[dict]:
         return _varsel_stops_cache
 
 
-# Does any planned trip today run from one of these stops to one of those, and does any run the other
-# way? Asked when a journey is registered, because varsel can only ever alert on a DIRECT trip
-# (`to_stop` narrowing keeps only trains that reach the alighting stop), so a pair no single trip
-# connects is a registration that cannot produce an alert however bad the day gets. Answering "no"
-# out loud is the point: the failure it replaces was a card reading "ingen aktive avvik akkurat nå"
-# for the rest of the journey's life.
-#
-# MIN and MAX per side rather than a plain join on stop_order: a circular route calls at the same
-# stop twice, and "is there a boarding call before an alighting call" is then a question about the
-# earliest boarding and the latest alighting — with the mirror image for the other direction.
-#
-# A missing `boarding_allowed` column (a planned table the poller has not rebuilt since 2026-09-01)
-# makes this query error, which `_varsel_connectivity` already turns into "could not establish" —
-# no warning, registration proceeds. That is the right failure and it self-heals on the next
-# rebuild; the alternative, guessing the column away, would be a silent wrong answer.
-_VARSEL_CONNECTIVITY_QUERY = """
-    WITH calls AS (
-        SELECT jkey, stop_place, stop_order, boarding_allowed, alighting_allowed
-        FROM `disruptions.rail_calls_planned_today`
-        WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
-        UNION ALL
-        SELECT jkey, stop_place, stop_order, boarding_allowed, alighting_allowed
-        FROM `disruptions.bus_calls_planned_today`
-        WHERE stop_place IN UNNEST(@from_refs) OR stop_place IN UNNEST(@to_refs)
-    ),
-    -- Boarding and alighting, not merely "calls here": a trip nobody may get on or off is not
-    -- service, and the question has to be asked in exactly the shape `impact._trip_cells` matches
-    -- in — otherwise the caveat and the alerting disagree, and a pair served only by boarding-only
-    -- long-distance trains is told service exists and then never hears about one of them.
-    --
-    -- FOUR CTEs, NOT TWO, because the two directions need opposite ends of the same restriction:
-    -- travelling to->from, the traveller BOARDS at the to-place and ALIGHTS at the from-place. One
-    -- pair of "calls at from" / "calls at to" sets filtered by one activity each would answer the
-    -- reverse direction with the forward direction's permissions.
-    board_from AS (
-        SELECT jkey, MIN(stop_order) AS ord
-        FROM calls WHERE stop_place IN UNNEST(@from_refs) AND boarding_allowed GROUP BY jkey
-    ),
-    alight_to AS (
-        SELECT jkey, MAX(stop_order) AS ord
-        FROM calls WHERE stop_place IN UNNEST(@to_refs) AND alighting_allowed GROUP BY jkey
-    ),
-    board_to AS (
-        SELECT jkey, MIN(stop_order) AS ord
-        FROM calls WHERE stop_place IN UNNEST(@to_refs) AND boarding_allowed GROUP BY jkey
-    ),
-    alight_from AS (
-        SELECT jkey, MAX(stop_order) AS ord
-        FROM calls WHERE stop_place IN UNNEST(@from_refs) AND alighting_allowed GROUP BY jkey
-    )
-    SELECT
-        (SELECT COUNT(*) FROM board_from AS b JOIN alight_to   AS a USING (jkey)
-          WHERE b.ord < a.ord) > 0 AS forward,
-        (SELECT COUNT(*) FROM board_to   AS b JOIN alight_from AS a USING (jkey)
-          WHERE b.ord < a.ord) > 0 AS reverse
-"""
 # Answers are cached: the planned tables are rebuilt on their own TTL, so re-asking about the same
 # pair within a few minutes cannot change the verdict, and a client retrying a rejected registration
 # must not cost a query each time.
 _CONNECTIVITY_TTL_S = 10 * 60
-_CONNECTIVITY_CACHE_MAX = 512
-# A ceiling on how often DISTINCT pairs may be asked about. /varsel-api is unauthenticated, and the
-# cache cannot bound the cost of a caller that keeps inventing pairs. Past the ceiling the check
-# reports "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery
-# outage, which is the right way for a guard-rail to fail.
+# A ceiling on how often a JOB may be issued — one job however many pairs it asks about, since U10.
+# /varsel-api is unauthenticated, and the cache cannot bound the cost of a caller that keeps
+# inventing pairs; that caller asks about ONE pair per request, so for it a job and a pair are still
+# the same thing and this number means exactly what it did. Past the ceiling the check reports
+# "unknown" and registration proceeds unvalidated — the same degradation as a BigQuery outage, which
+# is the right way for a guard-rail to fail.
 _CONNECTIVITY_MAX_PER_MIN = 30
 # ...and the Webhook channel gets its own, smaller ceiling, because the paragraph above is an
 # argument about the public unauthenticated endpoint only. `alternatives._POLLER_FETCH_MAX_PER_MIN`
@@ -814,19 +765,31 @@ _CONNECTIVITY_MAX_PER_MIN = 30
 #
 # 15, half the traveller's rather than equal to it, and the asymmetry is the point: a client's
 # onboarding is a batch that may legitimately take longer, a traveller is waiting on a page. 15/min
-# is 900 distinct pairs an hour against a pilot measured in tens, and the sweep contributes at most
+# is 900 jobs an hour against a pilot measured in tens, and the sweep contributes at most
 # `notification_servability._MAX_CHECKS_PER_CYCLE` (4) per ~296 s cycle. The worst-case BigQuery draw
 # from this seam therefore goes 30/min -> 45/min, which is the honest cost of the split.
 _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN = 15
 _CONNECTIVITY_REQUEST_PATH = "request"
 _CONNECTIVITY_NOTIFICATION_API_PATH = "notification_api"
+# One job's worth of pairs. The callers bound their own sweeps well under this; it is here so a
+# caller that forgets to costs its own pairs an answer — they come back `None`, which every caller
+# already reads as "could not establish" and leaves due — rather than costing the process a
+# multi-megabyte query parameter.
+_CONNECTIVITY_MAX_PAIRS_PER_JOB = 2000
+# Derived rather than chosen, and it was a flat 512 until U10: two sweeps run per cycle
+# (`notification_servability.recheck` and `varsel.recheck_service`), each able to fill a whole job,
+# so anything under twice the job bound would have a sweep evicting the other sweep's answers — and
+# both evicting the traveller-facing entries the cache exists for. Doubled again for the request
+# path's own pairs. Each entry is two short ref tuples, a float and two booleans, so the whole cache
+# is a megabyte or so.
+_CONNECTIVITY_CACHE_MAX = 4 * _CONNECTIVITY_MAX_PAIRS_PER_JOB
 # This one runs on a request path, so it gets an explicit ceiling rather than "wait forever": a slow
 # BigQuery is not a reason for a traveller's registration to hang.
 _CONNECTIVITY_TIMEOUT_S = 20.0
 _connectivity_lock = threading.Lock()
 # ONE cache across both paths, deliberately: an established answer about a stop pair is the same
-# answer whoever asked, and splitting it would make a client's onboarding re-ask questions a
-# traveller has already paid for. Only the BUDGET is per caller.
+# answer whoever asked, and splitting it would make the poller's sweep re-ask questions a traveller
+# has already paid for. Only the BUDGET is per caller.
 _connectivity_cache: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[float, tuple[bool, bool]]] = {}
 _connectivity_calls: dict[str, list[float]] = {
     _CONNECTIVITY_REQUEST_PATH: [],
@@ -834,34 +797,70 @@ _connectivity_calls: dict[str, list[float]] = {
 }
 
 
-def _varsel_connectivity(
-    from_refs: Sequence[str],
-    to_refs: Sequence[str],
+def _connectivity_key(
+    from_refs: Sequence[str], to_refs: Sequence[str]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The cache key for one pair. Sorted, so the order a caller lists refs in cannot split it."""
+    return (tuple(sorted(from_refs)), tuple(sorted(to_refs)))
+
+
+def _varsel_connectivity_batch(
+    pairs: Sequence[tuple[Sequence[str], Sequence[str]]],
     *,
     path: str = _CONNECTIVITY_REQUEST_PATH,
-) -> tuple[bool, bool] | None:
-    """(runs from→to today, runs to→from today), or None when it could not be established.
+) -> list[tuple[bool, bool] | None]:
+    """One answer per input pair — (runs from→to today, runs to→from today), or None — in ONE job.
 
-    Takes every ref of each place (varsel.place_refs), not just the canonical one: each feed records
-    its calls on its own ref, so asking about one ref of a merged stop would report "no service" for
-    a trip that plainly exists.
+    Takes every ref of each place (`varsel.place_refs`), not just the canonical one: each feed
+    records its calls on its own ref, so asking about one ref of a merged stop would report "no
+    service" for a trip that plainly exists.
 
-    ``path`` names WHOSE per-minute budget this question spends — see
+    **Answers are positional**, so the caller pairs them with its own list and nothing here has to
+    know what a pair is FOR. Duplicates in the input are asked about once and answered twice; a pair
+    the cache already holds costs no place in the job at all.
+
+    ``path`` names WHOSE per-minute budget this job spends — see
     :data:`_NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN`. It defaults to the public one, which is the safe
     direction: a caller that forgets to name itself is charged the tighter, traveller-facing tally
     rather than silently minting a budget of its own.
+
+    Every failure — the ceiling, a BigQuery error, a pair the job answered nothing for — is ``None``
+    for the pairs it touches and never ``False``: an unanswerable question is not evidence of no
+    service, and a caller that stored it as one would render a caveat R5 forbids.
     """
-    ceiling = (
-        _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN
-        if path == _CONNECTIVITY_NOTIFICATION_API_PATH
-        else _CONNECTIVITY_MAX_PER_MIN
-    )
-    key = (tuple(sorted(from_refs)), tuple(sorted(to_refs)))
+    keys = [_connectivity_key(from_refs, to_refs) for from_refs, to_refs in pairs]
+    answers: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[bool, bool]] = {}
     now = monotonic()
     with _connectivity_lock:
-        hit = _connectivity_cache.get(key)
-        if hit is not None and now - hit[0] < _CONNECTIVITY_TTL_S:
-            return hit[1]
+        for key in keys:
+            hit = _connectivity_cache.get(key)
+            if hit is not None and now - hit[0] < _CONNECTIVITY_TTL_S:
+                answers[key] = hit[1]
+        # Deduped and in first-seen order, which is what makes `pair_id` an index into this list.
+        asked = [key for key in dict.fromkeys(keys) if key not in answers]
+        if not asked:
+            return [answers.get(key) for key in keys]
+        if len(asked) > _CONNECTIVITY_MAX_PAIRS_PER_JOB:
+            logger.warning(
+                "A connectivity batch asked about %d stop pairs; %d of them are answered as "
+                "unknown and stay due",
+                len(asked),
+                len(asked) - _CONNECTIVITY_MAX_PAIRS_PER_JOB,
+                extra={
+                    "fields": {
+                        "event": "varsel_service_check",
+                        "result": "truncated",
+                        "path": path,
+                        "asked": len(asked),
+                    }
+                },
+            )
+            asked = asked[:_CONNECTIVITY_MAX_PAIRS_PER_JOB]
+        ceiling = (
+            _NOTIFICATION_API_CONNECTIVITY_MAX_PER_MIN
+            if path == _CONNECTIVITY_NOTIFICATION_API_PATH
+            else _CONNECTIVITY_MAX_PER_MIN
+        )
         calls = _connectivity_calls.setdefault(path, [])
         calls[:] = [t for t in calls if now - t < 60]
         if len(calls) >= ceiling:
@@ -875,48 +874,152 @@ def _varsel_connectivity(
                         "event": "varsel_service_check",
                         "result": "rate_limited",
                         "path": path,
+                        "asked": len(asked),
                     }
                 },
             )
-            return None
+            return [answers.get(key) for key in keys]
         calls.append(now)
+    parameter = bigquery.ArrayQueryParameter(
+        "pairs",
+        "STRUCT",
+        [
+            bigquery.StructQueryParameter(
+                None,
+                bigquery.ScalarQueryParameter("pair_id", "INT64", index),
+                bigquery.ArrayQueryParameter("from_refs", "STRING", list(from_refs)),
+                bigquery.ArrayQueryParameter("to_refs", "STRING", list(to_refs)),
+            )
+            for index, (from_refs, to_refs) in enumerate(asked)
+        ],
+    )
     try:
         job = bq_client.query(
             _VARSEL_CONNECTIVITY_QUERY,
-            job_config=bigquery.QueryJobConfig(
-                query_parameters=[
-                    bigquery.ArrayQueryParameter("from_refs", "STRING", list(from_refs)),
-                    bigquery.ArrayQueryParameter("to_refs", "STRING", list(to_refs)),
-                ]
-            ),
+            job_config=bigquery.QueryJobConfig(query_parameters=[parameter]),
         )
-        row = next(iter(job.result(timeout=_CONNECTIVITY_TIMEOUT_S)), None)
+        rows = list(job.result(timeout=_CONNECTIVITY_TIMEOUT_S))
     except Exception:
-        # Never blocks a registration: an unanswerable question is not evidence of no service.
+        # Never blocks a registration: an unanswerable question is not evidence of no service. The
+        # refs are deliberately NOT in this message — see `_log_connectivity`.
         logger.warning(
-            "Could not check planned service between %s and %s; registering without the check",
-            from_refs,
-            to_refs,
+            "Could not check planned service for %d stop pair(s); registering without the check",
+            len(asked),
             exc_info=True,
-            extra={"fields": {"event": "varsel_service_check", "result": "error"}},
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "error",
+                    "path": path,
+                    "asked": len(asked),
+                }
+            },
         )
-        return None
-    verdict = (bool(row.forward), bool(row.reverse)) if row is not None else (False, False)
+        return [answers.get(key) for key in keys]
+    established: dict[tuple[tuple[str, ...], tuple[str, ...]], tuple[bool, bool]] = {}
+    for row in rows:
+        index = row.pair_id
+        if index is not None and 0 <= index < len(asked):
+            established[asked[index]] = (bool(row.forward), bool(row.reverse))
+    # A pair the job returned no row for stays OUT of `established` and answers `None`. The query
+    # LEFT JOINs from the parameter, so it cannot happen — and if it ever does, "we could not
+    # establish it" is the only safe reading of a missing row.
     with _connectivity_lock:
-        if len(_connectivity_cache) >= _CONNECTIVITY_CACHE_MAX:
-            oldest = min(_connectivity_cache, key=lambda k: _connectivity_cache[k][0])
-            _connectivity_cache.pop(oldest, None)
-        _connectivity_cache[key] = (now, verdict)
+        for key, verdict in established.items():
+            _connectivity_cache[key] = (now, verdict)
+        if len(_connectivity_cache) > _CONNECTIVITY_CACHE_MAX:
+            # Keep the newest, in one pass. Evicting one entry per insertion — which is what this
+            # did while a job asked about one pair — is quadratic once a sweep inserts thousands.
+            keep = sorted(
+                _connectivity_cache.items(), key=lambda item: item[1][0], reverse=True
+            )[:_CONNECTIVITY_CACHE_MAX]
+            _connectivity_cache.clear()
+            _connectivity_cache.update(keep)
+    answers.update(established)
+    _log_connectivity(asked, established, path=path)
+    return [answers.get(key) for key in keys]
+
+
+def _log_connectivity(
+    asked: Sequence[tuple[tuple[str, ...], tuple[str, ...]]],
+    established: Mapping[tuple[tuple[str, ...], tuple[str, ...]], tuple[bool, bool]],
+    *,
+    path: str,
+) -> None:
+    """What a reader gets out of a connectivity job, WITHOUT either stop ref.
+
+    Until U10 this wrote both refs into the record's *message* on every established verdict, which
+    is why the webhook channel's "no notification log line carries an origin or a destination" claim
+    needed a qualifier: a webhook subscription's own stop pair reached Cloud Logging under
+    `/varsel`'s event name. It is a registered traveller's origin and destination either way, and
+    `alternatives.pair_digest` is the derivation this repo already uses for exactly this — salted per
+    process, because an unsalted SHA-256 over two public enumerable refs is a reversible pseudonym.
+
+    ONE record per pair while a job asks about one, which is the traveller's registration and the
+    case a reader looks up by hand; ONE summary for a batch, because a sweep asking about thousands
+    would otherwise be thousands of INFO lines a cycle — and each of those answers is stored on the
+    record it is about, which is where a reader should look for it.
+    """
+    if len(asked) == 1:
+        key = asked[0]
+        verdict = established.get(key)
+        if verdict is None:
+            return
+        logger.info(
+            "Planned service for pair %s: forward=%s reverse=%s",
+            alternatives.pair_digest(key[0][0] if key[0] else "?", key[1][0] if key[1] else "?"),
+            verdict[0],
+            verdict[1],
+            extra={
+                "fields": {
+                    "event": "varsel_service_check",
+                    "result": "ok",
+                    "path": path,
+                    "pair_digest": alternatives.pair_digest(
+                        key[0][0] if key[0] else "?", key[1][0] if key[1] else "?"
+                    ),
+                    "forward": verdict[0],
+                    "reverse": verdict[1],
+                }
+            },
+        )
+        return
+    forward = sum(1 for verdict in established.values() if verdict[0])
+    reverse_only = sum(1 for verdict in established.values() if not verdict[0] and verdict[1])
     logger.info(
-        "Planned service %s -> %s: forward=%s reverse=%s",
-        from_refs[0] if from_refs else "?",
-        to_refs[0] if to_refs else "?",
-        verdict[0],
-        verdict[1],
-        extra={"fields": {"event": "varsel_service_check", "result": "ok",
-                          "forward": verdict[0], "reverse": verdict[1]}},
+        "Planned service established for %d of %d stop pair(s): %d served, %d reverse only",
+        len(established),
+        len(asked),
+        forward,
+        reverse_only,
+        extra={
+            "fields": {
+                "event": "varsel_service_check",
+                "result": "batch",
+                "path": path,
+                "asked": len(asked),
+                "established": len(established),
+                "forward": forward,
+                "reverse_only": reverse_only,
+            }
+        },
     )
-    return verdict
+
+
+def _varsel_connectivity(
+    from_refs: Sequence[str],
+    to_refs: Sequence[str],
+    *,
+    path: str = _CONNECTIVITY_REQUEST_PATH,
+) -> tuple[bool, bool] | None:
+    """(runs from→to today, runs to→from today), or None when it could not be established.
+
+    A batch of one, and deliberately not a second implementation: the caveat a traveller is shown at
+    registration and the answer a sweep stores six hours later have to be the same question, and two
+    queries that must agree are the arrangement this repo has already watched drift apart twice.
+    """
+    return _varsel_connectivity_batch([(from_refs, to_refs)], path=path)[0]
+
 
 
 def _varsel_snapshot() -> dict[str, list]:
