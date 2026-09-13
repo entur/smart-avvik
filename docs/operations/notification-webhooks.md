@@ -500,7 +500,7 @@ silently.
 | `webhook_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
 | `notification_auth_config` / `webhook_signing_config` | once per process: a secret arrived with whitespace and was stripped | `variable` — the **name only**, never the value |
 | `notification_wording` | a webhook wording fault | `result` (`error`, `rate_limited`), `surface` |
-| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
+| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. **One record under this name is NOT per request**: since U15 the poller emits `result="warm_failed"` with `n` at WARNING, once per PASS, when the pass's figures warm raised for one or more definitions — those reads then compute instead of hitting, which costs latency and nothing else. It carries no `cache`, `n_alerts` or `pair_digest`, and it is counted rather than logged per definition because at a hundred thousand registrations one line per definition is how a real warning stops being read. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
 | `notification_pull_bounded` | a bound binding on the read's enrichment (U4) | `reason` (`queue_full` — the task was refused and every listed entry marked `capped`; `wordings_per_read`; `alternative_lookups`; `wording_allowance` — the PULL allowance answered `rate_limited`; `waiters` — no waiter slot, the read behaved as `wait=0`), `n` (entries the bound touched), `pair_digest`. Nothing identifying. The read's own record also carries `result="enrich_failed"` at WARNING when the task's matcher run raised — the exception's TYPE in the message, never its text |
 | `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `cpu_ms`, `result`, and `rss_delta_bytes` where /proc can be read. `cpu_ms` is process CPU for the step, so it includes request-path work served during it and can exceed `ms` when a pool fans out; it is the figure the capacity table above is read from |
 
@@ -756,11 +756,16 @@ and a replace answer `servable: null` always, and a background sweep establishes
 A client rendering the caveat from the create response now renders nothing until it re-reads. The
 contract document says so in its own words; this is the operating half of the same note.
 
-1. **The matcher, once per place pair rather than once per definition.** `impact._trip_cells` scans
-   every scored call of every situation per journey definition at ~40 ms each; ten thousand
-   definitions is minutes per cycle, for both channels. Evaluate each (from, to) pair once against
-   the situations, then apply the definitions' windows. Outside this channel's code and the first
-   thing that binds — a single client at 500 subscriptions already costs ~20 s of matcher per cycle.
+1. **The matcher, once per place pair rather than once per definition — done, 2026-09-12 (U2).**
+   `impact._trip_cells` scanned every scored call of every situation per journey definition, per
+   window, per stop-ref pair, rebuilding two per-situation groupings on every scan: a cache sized by
+   the NETWORK re-walked for a question about two stops. `main.refresh_call_predictions_cache` now
+   builds an inverted index by stop ref in the same ingest loop and `impact` keeps a generation
+   derived from it, so a scan sees only the situations that can touch the pair. Measured **15.7x**
+   cheaper per definition (0.52 ms against 8.2 ms) on a synthetic late-evening cache. The matcher
+   itself was not forked — `_trip_cells` is handed fewer situations — and a differential test
+   compares the pruned scan against the full one over randomised snapshots. Item 7 below is what
+   that index buys the public read.
 2. **A mirror instead of a full read — done, 2026-09-12 (U6).** `varsel._load_webhook_recipients`
    used to read every active subscription every cycle through the provider callable, capped at
    `MAX_SUBSCRIPTIONS_PER_CYCLE` (2 000) because a full read is what it was. It now reads
@@ -1050,6 +1055,82 @@ contract document says so in its own words; this is the operating half of the sa
    predicates returns 18, which is what the mirror holds, so the checked-in index really does serve
    it. Worth doing rather than reasoning about — the emulator tracks no composite indexes, so it
    cannot answer this, and a missing one is a `FailedPrecondition` on *every* create.
+
+7. **The journey-alerts read at scale — the pass warms it, 2026-09-13 (U15).** `GET /journey-alerts`
+   is the one public, unauthenticated, uncredentialed surface here, and its ceiling was 300 req/min
+   because a read that misses its per-cycle figures cache runs the matcher **on the request pool, in
+   the same interpreter the poller needs**. That is the binding resource and it is not Firestore:
+   measured in dev on 2026-09-10, 2 986 of 3 000 load-test requests missed, at 15 ms p50 and 55 ms
+   p90 each — so 50 reads a second of pure misses is about 0.75 s of interpreter time per second,
+   most of the one core the pass runs in.
+
+   Two changes, and they attack different halves of that number. **U2's index** brought the cost of
+   a miss down (item 1). **The pass now warms the cache** for every definition it matches: pass 1a
+   hands its own alerts to `notification_pull.warm_figures` through a callable `main` injects into
+   `varsel.configure`, so a favourite that IS a registered definition — on either channel — is a
+   figures hit for every caller for the whole cycle, at no matcher cost. `MAX_PER_MIN` rises to
+   **3 000** (R6's 50/s stated per minute) and `FIGURES_CACHE_MAX` to **20 000**, which is what stops
+   the warm pass evicting its own oldest entries before a read arrives.
+
+   **Be honest about what warming does not do**: the app's favourites are mostly not registrations,
+   so warming raises the HIT RATE and does not remove the miss. The sustainable rate is therefore
+   two numbers, not one — the ceiling above, and what the process can actually serve, which is the
+   interpreter share the pass leaves divided by the measured per-miss time.
+
+   **Measured with `scripts/bench_matcher.py --pull-read`, 2026-09-13**, over the synthetic
+   late-evening cache (930 trips, 1 100 situations) at the pilot's own definition-to-pair ratio:
+
+   | | 20 000 definitions | 2 000 definitions |
+   |---|---|---|
+   | a read that MISSES the figures cache | **0.32 ms** | 0.39 ms |
+   | a read that HITS it | **0.017 ms** | 0.019 ms |
+   | the match pass, without warming | 10.27 s | 1.29 s |
+   | what warming adds to the pass | **0.34–0.56 s, 3–5 %**, warming all 20 000 | ~0.08 s |
+   | sustainable rate **if every read misses** | **~3 000 /s** | ~2 500 /s |
+   | what the warmed cache RETAINS | **373 MB** over 19 300 entries | — |
+
+   The warm figure is a **range** because it is a delta of two whole-pass timings and moves that far
+   between runs; read it as "a few per cent of the pass", not as three significant figures. The
+   others are direct measurements of the thing named.
+
+   So R6's 50 reads a second is met with roughly sixty times the headroom, and it is U2's index that
+   did it: the same miss measured **15 ms p50 / 55 ms p90** in dev on 2026-09-10, before that index
+   existed, which is where the 300 req/min ceiling came from. Warming is cheap enough to be
+   unconditional — 3 % of a pass, for a cache that turns every registered corridor's reads into
+   0.017 ms — and note it is NOT what makes R6 fit: a miss at 0.32 ms fits on its own.
+
+   **The memory row is the one to read carefully**, because it is the only figure here that could
+   move the constant. It is set by ENTRIES — alert-worthy trains — and not by definitions: on an
+   ordinary evening cycle almost every warmed `_Figures` is empty (0-1 alert-worthy trains across
+   ~85 matched definitions in prd), so the cost is a dict slot. The 19 300 entries above are the
+   synthetic cache's ~1-per-definition shape, well above anything measured; a bad morning at
+   100 000 definitions is ~13 000 entries, about 250 MB, against the pod's 2 048 MiB and the
+   350-435 MiB prd runs at. **The lever if it ever binds is `FIGURES_CACHE_MAX`, not the entry's
+   shape**: most of the ~19 KB an entry costs is the winner's `impact`, which the message input
+   reads, and the uncollapsed `contributing` alerts beside it are nearly free — measured over 540
+   entries, 539 had a `contributing` that IS the winner object, one situation per train being the
+   ordinary case. Watch `kix_` memory against entries, not against registrations.
+
+   **What is still owed is the run against a real process**: 50 rps against dev during pass 1a in
+   the evening shape, reporting p95 for complete reads and the figures-cache hit rate. The numbers
+   above are one process over a synthetic cache, so they bound the interpreter cost and say nothing
+   about anyio, the event loop, or a real cache's shape. If that run contradicts them the honest
+   answer is to publish it here and take R6 back to the product owner — **not** to leave the
+   constant high and let the queue form in front of the GIL. The lever then is a second process
+   (splitting the poller from the API), which is KTD17's stated fallback and its own plan.
+
+   Two smaller costs went with them, both of which only became costs because warming runs this code
+   once per registered definition per cycle instead of a few times a minute. The third forget rule
+   popped a train's wordings by **scanning** the whole wording cache, which is ~1 ms per definition
+   that had a train leave its list; it is answered by a `(pair, train)` index now, derived from the
+   cache and rebuilt rather than evicted, because evicting the index alone would silently retire the
+   rule. And the `coverage` block rebuilt a set over the poller's **whole** stop cache on every
+   request; it is memoised on the identity of the stop-cache list, which is both cheaper than the
+   per-cycle memo the plan proposed and strictly fresher than it.
+
+   Nothing about this touches the wire contract, the wording policy or the allowances: a read burst
+   still spends `notification_wording.PULL`'s own ledger and `alternatives._PULL_PATH`'s own fetch
+   budget, and moves neither the browser's nor the webhook channel's.
 
 ### The delivery worker (U11)
 
@@ -1382,13 +1463,13 @@ reads it — the other five are read from the account on each pass.
 | `webhook_delivery._DELIVERY_DEADLINE_S` | 20.0 |
 | `webhook_delivery._DELIVERY_WAIT_S` | 20.0 |
 | `webhook_delivery._WORKERS` | 4 |
-| `notification_pull.MAX_PER_MIN` | 300 |
+| `notification_pull.MAX_PER_MIN` | 3000 |
 | `notification_pull.PER_PAIR_PER_MIN` | 30 |
 | `notification_pull.LIMITER_KEYS_MAX` | 10000 |
 | `notification_pull.MAX_WAIT_S` | 20 |
 | `notification_pull.DEFAULT_LIMIT` | 10 |
 | `notification_pull.MAX_LIMIT` | 20 |
-| `notification_pull.FIGURES_CACHE_MAX` | 512 |
+| `notification_pull.FIGURES_CACHE_MAX` | 20000 |
 | `notification_pull.MAX_WORDINGS_PER_READ` | 4 |
 | `notification_pull.WORKERS` | 4 |
 | `notification_pull.QUEUE_MAX` | 16 |
