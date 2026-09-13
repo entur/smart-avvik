@@ -167,6 +167,9 @@ def test_every_retention_constant_is_published():
         "HISTORY_DAYS",
         "SUBSCRIPTION_MAX_LIFETIME_DAYS",
         "SUBSCRIPTION_INACTIVITY_DAYS",
+        # The traveller's own bound since U14, and the one a privacy question is answered from:
+        # 180 days after the last app open, not after the registration was made.
+        "WEB_PUSH_INACTIVITY_DAYS",
         "EVENT_VALIDITY_MINUTES",
         "TTL_RESIDUAL_HOURS",
         "DELIVERED_MARK_TTL_H",

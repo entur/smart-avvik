@@ -113,6 +113,28 @@ HISTORY_DAYS = 7
 MAX_DEVICES_PER_CLIENT = 5000
 SUBSCRIPTION_MAX_LIFETIME_DAYS = 180
 SUBSCRIPTION_INACTIVITY_DAYS = 60
+#: `web_push`'s single horizon, and it is an INACTIVITY one -- 180 days since the traveller was
+#: last here, never 180 days since they registered. U12 gave this channel the lifetime horizon
+#: alone and U14 inverts that, because a creation-anchored clock deletes data that is in active
+#: use: nothing resets it (`_replace_body` keeps `created_at`, and a touch recomputes the lifetime
+#: from it), so a commuter who opens the app every morning still loses the journey on day 181 --
+#: silently, since it simply stops matching, drops out of `device_journeys` and is hard-deleted by
+#: TTL within ~24 h. The device record does not fail that way (`_new_device_doc` restamps its TTL
+#: on every upsert), so the steady state was: notifications on, device healthy, journey list
+#: quietly shorter, alerts stopped. What a storage-limitation rule is actually for is ageing out
+#: what nobody uses, which is what an inactivity horizon says and a lifetime one does not.
+#: 180 rather than `SUBSCRIPTION_INACTIVITY_DAYS`' 60: that number is right for a client's
+#: forgotten integration and wrong for a traveller, for whom not opening a PWA for two months is
+#: what a working alert service looks like.
+WEB_PUSH_INACTIVITY_DAYS = 180
+#: How stale the anchor has to be before the journey list renews it. Sized against the HORIZON, not
+#: against the poll: the PWA polls `list_journeys` every 60 s, so renewing on every read would be
+#: three writes a minute per open app, and renewing on every distinct day would put 100 000
+#: commuters' morning opens -- 300 000 stamped documents -- through one hour and into the mirror's
+#: watermark query. At a week the effective expiry is 173-180 days after last use, which against a
+#: 180-day horizon is nothing, and the write rate is at most one per journey per week: ~14 000 a
+#: day at 100 000 journeys, ~1 200 documents per sync in the morning peak.
+WEB_PUSH_RENEW_AFTER_DAYS = 7
 # R12's event validity horizon, quoted by U6, U8, AE12 and the client documentation. Validity is
 # the EARLIER of this, the departure, and the subscription's lifetime; the retry *interval* is one
 # attempt per notification pass and is deliberately not a constant -- the pass runs on SIRI
@@ -616,23 +638,35 @@ def subscription_is_live(doc: Mapping[str, Any], now: datetime) -> bool:
     return True
 
 
+def _channel_of(doc: Mapping[str, Any]) -> str:
+    """The stored channel, with U5's convention that a document lacking the field is a `webhook`.
+
+    One reader, because every channel dispatch in this module has to agree with
+    :func:`_horizon_fields` -- a body that resolved it differently would write horizons the
+    liveness predicate then reads under the other channel's rule, and nothing would raise.
+    """
+    return str(doc.get("channel") or CHANNEL_WEBHOOK)
+
+
 def _horizon_fields(doc: Mapping[str, Any]) -> tuple[str, ...]:
     """Which horizons this document has to be inside. Channel-dispatched since U12.
 
-    A `web_push` registration has a LIFETIME horizon and no inactivity one. The inactivity horizon
-    exists because a client's subscription that nobody has touched for sixty days is probably a
-    forgotten integration; a traveller's registered commute is the opposite -- not opening the PWA
-    for two months is what a working alert service looks like, and today's GCS blob has no expiry
-    on a registration at all.
+    A `web_push` registration has an INACTIVITY horizon and no lifetime one, which is U14's
+    inversion of U12's shape and the reasoning is at :data:`WEB_PUSH_INACTIVITY_DAYS`: the
+    traveller's clock has to run from when they were last here, or the horizon deletes a commute
+    somebody is still commuting. The two channels therefore carry opposite single horizons for the
+    same reason -- what the rule is about is disuse, and disuse means different things to a
+    forgotten integration and to a person.
 
     **The fail-closed property survives, and it is worth saying which part.** A document with no
     `channel` reads as `webhook` (U5's convention), so nothing written before this needs both
-    horizons any less. A `web_push` document missing its LIFETIME horizon is still dead, because
-    that field is still required and a missing one still reads as expired. What is given up is only
-    the second belt on the one channel that never had a second horizon.
+    horizons any less. A `web_push` document missing its INACTIVITY horizon is still dead, because
+    that field is still required and a missing one still reads as expired -- so the deploy that
+    inverts the field cannot resurrect anything, it can only refuse. What is given up is only the
+    second belt on the one channel that never had a second horizon.
     """
-    if str(doc.get("channel") or CHANNEL_WEBHOOK) == CHANNEL_WEB_PUSH:
-        return ("lifetime_expires_at",)
+    if _channel_of(doc) == CHANNEL_WEB_PUSH:
+        return ("inactivity_expires_at",)
     return ("lifetime_expires_at", "inactivity_expires_at")
 
 
@@ -641,13 +675,21 @@ def _horizons(
 ) -> dict[str, datetime]:
     """R5's horizons and the TTL field derived as their minimum. Channel-dispatched since U12.
 
-    `web_push` gets the lifetime horizon only -- see :func:`_horizon_fields` for why, and note that
-    the inactivity field is OMITTED rather than set far ahead: a field that lies about its meaning
-    is worse than an absent one, and `subscription_is_live` reads the absence correctly.
+    `web_push` gets the inactivity horizon only, at its own longer number -- see
+    :func:`_horizon_fields` and :data:`WEB_PUSH_INACTIVITY_DAYS` for why -- and note that the
+    lifetime field is OMITTED rather than set far ahead: a field that lies about its meaning is
+    worse than an absent one, and `subscription_is_live` reads the absence correctly.
+
+    **Every caller must pass the stored channel.** The default is `webhook`, so a call site that
+    forgets it writes a 60-day inactivity horizon and a lifetime horizon onto a traveller's
+    registration -- which does not fail, it just expires the journey at whichever of two wrong
+    dates comes first. `_replace_body` and `_touch_body` both did exactly that until U14, harmless
+    only because no web_push document had ever reached either.
     """
-    lifetime = created_at + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS)
     if channel == CHANNEL_WEB_PUSH:
-        return {"lifetime_expires_at": lifetime, TTL_FIELD: lifetime}
+        inactive = last_seen_at + timedelta(days=WEB_PUSH_INACTIVITY_DAYS)
+        return {"inactivity_expires_at": inactive, TTL_FIELD: inactive}
+    lifetime = created_at + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS)
     inactivity = last_seen_at + timedelta(days=SUBSCRIPTION_INACTIVITY_DAYS)
     return {
         "lifetime_expires_at": lifetime,
@@ -1717,7 +1759,7 @@ def _replace_body(
         # rather than carried over: R6 says a stale answer must never read as an all-clear.
         "servable": None,
         "servable_checked_at": None,
-        **_horizons(created, now),
+        **_horizons(created, now, channel=_channel_of(stored)),
     }
     # Two things an amendment deliberately does NOT reset. `daily_deliveries`, because R11's cap is
     # per subscription per Oslo day and letting an amendment clear it would be a cap bypass anyone
@@ -1862,7 +1904,7 @@ def _touch_body(
         "last_seen_at": now,
         "updated_at": now,
         MIRROR_FIELD: _mirror_stamp(),
-        **_horizons(created, now),
+        **_horizons(created, now, channel=_channel_of(stored)),
     }
     if daily_cap is not None:
         patch["daily_cap"] = int(daily_cap)
@@ -3261,11 +3303,15 @@ def _new_device_doc(
         "updated_at": now,
         "last_seen_at": now,
         "tombstone": {},
-        # A device nobody has upserted in `SUBSCRIPTION_MAX_LIFETIME_DAYS` is an uninstalled
+        # A device nobody has been seen on in `SUBSCRIPTION_MAX_LIFETIME_DAYS` is an uninstalled
         # browser, and what the document holds until then is a push endpoint and two keys -- which
-        # is personal data with no reader. Refreshed on every upsert, so an install in use never
-        # expires; matched to the journeys' own lifetime horizon, so a device and its registrations
-        # go at the same time rather than leaving one without the other.
+        # is personal data with no reader. Refreshed on every upsert, so an install that pushes
+        # never expires, and since U14 also by `renew_device` on the journey list, which is what
+        # covers an install that never turned notifications on. The two claims that go with that
+        # matter: this horizon now means the same thing as the journeys' -- 180 days since the
+        # traveller was last here, not since they arrived -- so "a device and its registrations go
+        # at the same time" is true rather than aspirational, and it is true because both are
+        # renewed by the same event.
         TTL_FIELD: now + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS),
     }
 
@@ -3410,6 +3456,58 @@ def tombstone_device(
     doc = _run_transaction(
         lambda txn: _tombstone_device_body(
             txn, refs, device_id=device_id, client_id=client_id, reason=reason, now=instant
+        )
+    )
+    return None if doc is None else _device_from_doc(doc)
+
+
+def _renew_device_body(
+    transaction: Any,
+    refs: _Refs,
+    *,
+    device_id: str,
+    client_id: str,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """Push this device document's TTL out because the traveller is here. Reads first.
+
+    Reads first for `_touch_body`'s reason: a document that is gone stays gone. «Slett alt» deletes
+    the device, and a renewal that wrote unconditionally would recreate a husk carrying the id the
+    erasure removed -- so a missing document returns None rather than being created.
+
+    A TOMBSTONED device is renewed like any other. The tombstone says there is no push
+    subscription, not that the traveller has left; it carries the original `created_ts` that
+    `_upsert_device_body` restores so a lapse does not read as a new install, and letting it expire
+    under somebody who is opening the app every week would throw that away for the one population
+    that needs it most -- 79 of prd's 186 journeys sat on devices with no push subscription when
+    the device report last counted (2026-09-04).
+    """
+    stored = _doc(_read(transaction, refs.device(device_id)))
+    if not stored:
+        return None
+    if stored.get("client_id") != client_id:
+        raise Forbidden("device belongs to another client")
+    patch = {
+        "last_seen_at": now,
+        TTL_FIELD: now + timedelta(days=SUBSCRIPTION_MAX_LIFETIME_DAYS),
+    }
+    transaction.update(refs.device(device_id), patch)
+    return {**stored, **patch}
+
+
+def renew_device(
+    device_id: str, *, client_id: str, now: datetime | None = None
+) -> Device | None:
+    """Record that this device is still in use, without touching its push subscription.
+
+    :func:`upsert_device` is the other renewal and it needs an endpoint and two keys, which is
+    exactly what the traveller who never turned notifications on does not have -- so before U14
+    the only way to keep a device document alive was to be a device that pushes.
+    """
+    refs = _Refs(_firestore_client())
+    doc = _run_transaction(
+        lambda txn: _renew_device_body(
+            txn, refs, device_id=device_id, client_id=client_id, now=now or _now()
         )
     )
     return None if doc is None else _device_from_doc(doc)
@@ -3814,6 +3912,68 @@ def device_journeys(*, device_id: str, client_id: str, now: datetime | None = No
         except Exception:
             logger.debug("Unreadable web_push registration; skipping it", exc_info=True)
     return out
+
+
+
+def note_web_push_activity(
+    device_id: str,
+    *,
+    client_id: str,
+    subscriptions: Iterable[Subscription],
+    now: datetime | None = None,
+) -> int:
+    """Renew a traveller's registrations because they are here right now. Returns documents written.
+
+    **This is what makes `web_push`'s horizon an inactivity horizon rather than a countdown.**
+    :data:`WEB_PUSH_INACTIVITY_DAYS` is measured from `last_seen_at`, and nothing on the browser
+    channel moved that field before U14: the client never touches, an amendment keeps `created_at`,
+    and the device upsert writes the device document alone. Without this pass the constant would
+    simply be the old 180-day cliff wearing a different field name.
+
+    **It takes the subscriptions the caller has already read**, rather than querying for them,
+    because its one caller is the journey list -- the PWA polls that every 60 s, and a renewal pass
+    that issued its own query would be a second indexed read per poll per open app for a question
+    already answered on the same request. The staleness cut comes from
+    :data:`WEB_PUSH_RENEW_AFTER_DAYS`, so the poll costs nothing at all on all but one read a week:
+    no write, and no read beyond the one the list made anyway.
+
+    The device document is renewed only when a journey was, which is a PROXY for its own staleness
+    and deliberately not a read of it: the two horizons are renewed by the same event, so a device
+    whose journeys were all written inside the last week is one whose traveller is demonstrably
+    active. What the proxy cannot see is a device whose every journey is younger than the cut on
+    every visit -- a traveller who deletes and re-creates their only journey each week and does
+    nothing else -- and that device expires on its own clock with its journeys still live. The
+    journeys survive it; what is lost is the signup instant `_upsert_device_body` restores, so the
+    next push registration reads as a new install.
+
+    Every write is best-effort and failures are swallowed at DEBUG. A renewal that does not happen
+    costs a week of a 180-day horizon and the next poll retries it; a renewal that raised through
+    would fail the journey list, which is the traveller's whole page.
+    """
+    instant = now or _now()
+    stale_before = instant - timedelta(days=WEB_PUSH_RENEW_AFTER_DAYS)
+    renewed = 0
+    for sub in subscriptions:
+        if sub.channel != CHANNEL_WEB_PUSH:
+            continue
+        # A registration with no `last_seen_at` at all is renewed rather than skipped: the field is
+        # the anchor the horizon is derived from, so an absent one is the case that most needs a
+        # write, not the one that can afford to wait.
+        if sub.last_seen_at is not None and sub.last_seen_at > stale_before:
+            continue
+        try:
+            touch_subscription(sub.subscription_id, client_id=client_id, now=instant)
+        except Exception:
+            logger.debug("Could not renew a web_push registration; the next read retries", exc_info=True)
+            continue
+        renewed += 1
+    if renewed:
+        try:
+            renew_device(device_id, client_id=client_id, now=instant)
+        except Exception:
+            logger.debug("Could not renew a device document; the next read retries", exc_info=True)
+    return renewed
+
 
 
 # ---- Ordered, durable deletion ----------------------------------------------------------------

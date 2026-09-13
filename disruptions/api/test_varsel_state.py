@@ -839,6 +839,75 @@ def test_the_store_backend_has_nothing_to_flush_and_nothing_to_sweep(_mp):
     store.load()  # a no-op: the mirror seeds on the poller thread
 
 
+def test_a_registration_read_every_week_outlives_the_horizon_it_was_created_under(_mp):
+    """U14's whole point, walked over 200 days of a 180-day horizon.
+
+    U12 anchored the browser channel's horizon on `created_at` and nothing could move it: the
+    client never touches, an amendment keeps `created_at`, and the device upsert writes the device
+    document alone. So a commuter who opened the app every morning lost the journey on day 181 --
+    and not visibly, because an expired registration stops matching, drops out of this very list
+    and is TTL-deleted within about a day. The device record did not fail that way, since its TTL
+    is restamped on every upsert, so the steady state was: notifications on, device healthy,
+    journey list quietly shorter, alerts stopped.
+
+    The walk is the assertion because the defect is only reachable in time. Every check inside the
+    loop passes under the old rule too, for 180 days.
+
+    The second half is what keeps this an inactivity horizon rather than no horizon at all: a
+    traveller who stops opening the app does age out, which is the whole storage-limitation reason
+    the field exists.
+    """
+    store, client = _store()
+    clock = {"now": NOW}
+    _mp.setattr(notification_store, "_clock", lambda: clock["now"])
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    last_read = NOW
+    for day in range(0, 201, 7):
+        clock["now"] = NOW + timedelta(days=day)
+        listed = [jid for jid, _rec in store.device_journeys(DEVICE)]
+        assert listed == ["j1"], f"the registration was gone on day {day}"
+        last_read = clock["now"]
+    # The device document went with the journeys rather than expiring under them -- the population
+    # that needs this most is the traveller who never turned notifications on, whose device is
+    # never upserted and so has no other way to be renewed.
+    device_doc = client.doc(notification_store.DEVICES, DEVICE) or {}
+    assert device_doc[notification_store.TTL_FIELD] >= last_read, "the device document was not renewed"
+    # And a traveller who stops opening the app still ages out, one horizon after their last visit.
+    clock["now"] = last_read + timedelta(
+        days=notification_store.WEB_PUSH_INACTIVITY_DAYS, seconds=1
+    )
+    assert store.device_journeys(DEVICE) == [], "an abandoned registration must not live forever"
+
+
+def test_a_journey_list_renews_at_most_once_a_week_however_often_the_page_polls(_mp):
+    """The cut, from the caller's side, with the arithmetic the constant is sized on.
+
+    `list_journeys` is polled every 60 s by an open PWA, so a renewal on every read would be one
+    write per registration per minute per open app -- and at a hundred thousand commuters those
+    writes all land in the mirror's watermark query as well. What the week buys is that the poll
+    costs nothing: no write, and no read beyond the one the list already made.
+    """
+    store, client = _store()
+    clock = {"now": NOW}
+    _mp.setattr(notification_store, "_clock", lambda: clock["now"])
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    for i in range(3):
+        store.create_journey(f"j{i}", _journey())
+    settled = len(client.transactions)
+
+    for minute in range(10):
+        clock["now"] = NOW + timedelta(minutes=minute)
+        assert len(store.device_journeys(DEVICE)) == 3
+    assert len(client.transactions) == settled, "a 60 s poll wrote to the store"
+
+    clock["now"] = NOW + timedelta(days=notification_store.WEB_PUSH_RENEW_AFTER_DAYS, seconds=1)
+    store.device_journeys(DEVICE)
+    assert len(client.transactions) - settled == 4, "three registrations and one device document"
+    store.device_journeys(DEVICE)
+    assert len(client.transactions) - settled == 4, "the renewal repeated on the very next read"
+
+
 class _MonkeyPatch:
     """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
 

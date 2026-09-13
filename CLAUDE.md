@@ -1173,16 +1173,42 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   written empty — a Firestore equality does not match a document that LACKS a field, so an absent
   `device_id` is what makes it impossible for the `device_journeys` query to return a client's
   subscription, as a property of the data rather than of whoever writes the query next.
-  **`web_push` has a lifetime horizon and no inactivity one.** The inactivity horizon exists
-  because a client's integration nobody has touched for sixty days is probably forgotten; a
-  traveller not opening the PWA for two months is what a working alert service looks like. The
-  field is OMITTED rather than written far ahead, because a field that lies about its meaning is
-  worse than an absent one, and `subscription_is_live` dispatches through `_horizon_fields`. The
-  fail-closed property survives and it is worth saying which part: a document with no `channel`
-  reads as `webhook` (U5's convention) and still needs both, and a `web_push` document missing its
-  LIFETIME horizon is still dead. **What it costs is a product question, flagged rather than
-  decided: a registration now expires 180 days after it was created, where the GCS blob has no
-  expiry on one at all.**
+  **`web_push` has an INACTIVITY horizon and no lifetime one — 180 days since the traveller was
+  last here, and U14 inverted that from U12's shape on the product owner's decision (2026-09-13).**
+  U12 gave this channel the lifetime horizon alone, reasoning that the 60-day inactivity one is
+  about a client's forgotten integration while a traveller not opening the PWA for two months is
+  what a working alert service looks like. Both halves are right and the conclusion was backwards:
+  what it left was a clock anchored on `created_at` that NOTHING could reset — the client never
+  touches, `_replace_body` keeps `created_at`, and the device upsert writes the device document
+  alone — so a commuter opening the app every morning still lost the journey on day 181. Silently:
+  an expired registration stops matching, drops out of `device_journeys` and is TTL-deleted within
+  ~24 h, while the device record stays healthy because its own TTL is restamped on every upsert.
+  A storage-limitation rule is for ageing out what nobody uses, which is what an inactivity horizon
+  says and a creation-anchored one does not. **`notification_store.note_web_push_activity` is what
+  moves the anchor**, called from `StoreRegistrations.device_journeys` — the journey list, because
+  that is the one request every app open makes *and* the one the traveller who never turned
+  notifications on still makes (79 of prd's 186 journeys sat on such devices when the device report
+  last counted); hooking it to the device upsert instead would have expired exactly that population
+  while it was using the page daily. It renews at most once per `WEB_PUSH_RENEW_AFTER_DAYS` (7) per
+  journey, so the PWA's 60 s poll costs nothing and the effective expiry is 173–180 days after last
+  use; the device document rides on the same event through `renew_device`, so «a device and its
+  registrations go at the same time» is finally true. It is a read that WRITES, deliberately not a
+  protocol method: the seam is a list of questions the caller asks, and "the traveller was here" is
+  this backend's own storage-limitation rule, which the blob has no concept of. The field is
+  OMITTED rather than written far ahead, because a field that lies about its meaning is worse than
+  an absent one, and `subscription_is_live` dispatches through `_horizon_fields` — via `_channel_of`
+  since U14, which is the one reader of the stored channel and is in the liveness-map field scan for
+  that reason. The fail-closed property survives and it is worth saying which part: a document with
+  no `channel` reads as `webhook` (U5's convention) and still needs both, and a `web_push` document
+  missing its INACTIVITY horizon is still dead — so a document written under U12's rule reads as
+  expired rather than as immortal, which is the direction a horizon change has to fail in. No
+  environment holds one (nothing selects the store backend and `varsel_state` is the only writer of
+  the channel), which is what made the inversion a free choice rather than a migration. **What it
+  still costs is a privacy-text change, not a silent one: «Reiser du har registrert lagres til du
+  sletter dem» is false for a traveller who abandons the app for 180 days**, so U14 owes T5 a
+  clause and a `CONSENT_TEXT_VERSION` bump. Two call sites had to learn the channel with it —
+  `_replace_body` and `_touch_body` both called `_horizons` with its `webhook` default, unreachable
+  while no web_push document existed and the primary path now.
   Two traps this had to not fall into, both of them silent. `device_id` shares `destination_id`'s
   slot in the **definition digest** through an `or`, because exactly one is non-empty by
   construction — a slot of its own would add a separator, change every stored hash and turn every
