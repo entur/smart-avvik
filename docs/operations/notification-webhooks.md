@@ -876,6 +876,18 @@ contract document says so in its own words; this is the operating half of the sa
    exception and are written LIVE rather than carried: they have a home of their own in the store
    now, so copying the old object's would fossilise the day of the cutover.
 
+   **Do not turn this phase off when the rollback window passes without checking the artefact's
+   other reader.** `scripts/make_device_report.py` renders every device and its journeys straight
+   out of the blob — it is how the "79 of 186 journeys sit on devices that never turned
+   notifications on" split was measured, which is what decided where the inactivity horizon is
+   renewed. Under the store backend this export is the only thing keeping that input current, and
+   nothing else in the deployment reads the blob at all, so switching the phase off retires the
+   report silently. Moving the report onto the store is the answer, and prd's cutover is the
+   natural moment: it is one code path rather than two only once both environments are on the
+   store, and the report's own successor question — which registrations are approaching the
+   180-day inactivity horizon — cannot be answered from the blob in any case, since the exported
+   journey record carries no `last_seen_at` and the blob backend has no concept of one.
+
    **What to watch after the cutover.** `varsel_state_import` on startup — `result` is `imported`
    once and `skipped` at every restart after it, and a second `imported` in the same environment
    means somebody deleted the marker; `varsel_state_backend` with `result: "store"` on startup,
