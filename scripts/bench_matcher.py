@@ -546,6 +546,34 @@ def run_pull_read(
         notification_pull._coverage(journey)
     hit_s = time.process_time() - started
 
+    # 5. What the warmed cache RETAINS. Its own pass, untimed, because `tracemalloc` roughly
+    #    doubles allocation cost and would report the harness in the warm delta above. Measured as
+    #    "free it and see how much comes back", which is retained size rather than peak: snapshot
+    #    with the cache full, drop it, collect, snapshot again. An `_Entry` holds the winner and
+    #    every uncollapsed alert about its train, and those carry per-alert `impact` COPIES, so the
+    #    figure is set by how many definitions are alert-worthy -- which is the bad morning's shape,
+    #    not an ordinary evening's, where almost every `_Figures` is empty.
+    import gc
+    import tracemalloc
+
+    reseed()
+    varsel._figures_warmer = notification_pull.warm_figures
+    tracemalloc.start()
+    try:
+        varsel.check_and_notify(snapshot)
+        entries = sum(len(f.entries) for f in notification_pull._figures.values())
+        with_cache = tracemalloc.take_snapshot()
+        with notification_pull._figures_lock:
+            notification_pull._figures.clear()
+        gc.collect()
+        without_cache = tracemalloc.take_snapshot()
+        retained = sum(s.size for s in with_cache.statistics("filename")) - sum(
+            s.size for s in without_cache.statistics("filename")
+        )
+    finally:
+        tracemalloc.stop()
+        varsel._figures_warmer = stashed
+
     n = len(registered) or 1
     miss_ms = miss_s * 1000 / n
     free_share = max(0.0, 1.0 - warm_pass_s / CYCLE_PERIOD_S)
@@ -563,6 +591,10 @@ def run_pull_read(
         "warm_delta_s": round(warm_pass_s - cold_pass_s, 3),
         "warm_share_of_pass": round((warm_pass_s - cold_pass_s) / cold_pass_s, 4) if cold_pass_s else None,
         "definitions_warmed": warmed,
+        "figures_entries": entries,
+        "figures_bytes": max(0, retained),
+        "figures_mb": round(max(0, retained) / 1_048_576, 1),
+        "figures_bytes_per_definition": round(max(0, retained) / definitions) if definitions else None,
         "cycle_period_s": CYCLE_PERIOD_S,
         "free_interpreter_share": round(free_share, 4),
         # What the process can serve if EVERY read misses: the honest floor, and the number R6's
@@ -636,13 +668,14 @@ def render(reports: Sequence[dict]) -> str:
 def render_pull_read(reports: Sequence[dict]) -> str:
     lines = ["", "bench_matcher --pull-read — what GET /journey-alerts costs the one interpreter", ""]
     head = (
-        f"{'ratio':<6} {'defs':>7} {'warmed':>7} {'miss ms':>8} {'hit ms':>8} "
-        f"{'pass s':>8} {'warm s':>8} {'free':>6} {'miss/s':>8}"
+        f"{'ratio':<6} {'defs':>7} {'warmed':>7} {'entries':>8} {'cache MB':>9} "
+        f"{'miss ms':>8} {'hit ms':>8} {'pass s':>8} {'warm s':>8} {'free':>6} {'miss/s':>8}"
     )
     lines += [head, "-" * len(head)]
     for r in reports:
         lines.append(
             f"{r['ratio']:<6} {r['definitions']:>7} {r['definitions_warmed']:>7} "
+            f"{r.get('figures_entries', 0):>8} {r.get('figures_mb', 0):>9.1f} "
             f"{r['miss_ms']:>8.3f} {r['hit_ms']:>8.3f} {r['cold_pass_s']:>8.2f} "
             f"{r['warm_delta_s']:>8.2f} {r['free_interpreter_share']:>6.2f} "
             f"{r['sustainable_misses_per_s']:>8.1f}"
@@ -653,6 +686,10 @@ def render_pull_read(reports: Sequence[dict]) -> str:
         f"leaves at a {CYCLE_PERIOD_S:.0f} s period, divided by the per-miss time. R6 asks for 50/s.",
         "A read for a definition the pass warmed costs the hit column instead, and warming is what",
         "moves reads from the first column to the second — it does not make a miss cheaper.",
+        "",
+        "cache MB is what the warmed figures RETAIN, against the pod's 2 048 MiB. It is set by the",
+        "ENTRIES, not the definitions: almost every _Figures is empty on an ordinary evening, and a",
+        "bad morning is the shape that fills them (~13 % of definitions alert-worthy in prd).",
         "",
         "This is a synthetic cache in one process. The figure R6 is settled against is a 50 rps run",
         "against the real dev process during pass 1a, in the evening shape.",

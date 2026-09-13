@@ -135,11 +135,22 @@ MAX_LIMIT = 20
 #: entry is one `_Figures` per definition, and almost every one of them is EMPTY: an ordinary
 #: evening cycle has 0-1 alert-worthy trains across ~85 matched definitions, so the cost is the
 #: dict slot. What is not free is the bad-morning shape, where ~13 % of definitions are
-#: alert-worthy and each such entry holds `Alert` copies; that figure is in the operations
-#: document's capacity table beside the mirror's, measured the same way.
+#: alert-worthy. **Measured 2026-09-13** (`bench_matcher.py --pull-read`, which reports it): a
+#: warmed cache of 19 300 alert-worthy entries retains **373 MB**, about **19 KB per entry**,
+#: against the pod's 2 048 MiB and the 350-435 MiB prd runs at. That synthetic shape is ~1 entry
+#: per definition, far above anything measured -- a bad morning at 100 000 definitions is ~13 000
+#: entries, ~250 MB -- so the bound holds, but **the number to watch is ENTRIES, not definitions**.
+#:
+#: The lever is this bound and NOT the entry's shape. Most of those 19 KB is `winner.impact`, which
+#: `_message_input` reads, so it cannot be stripped; and `contributing` is not the cost it looks
+#: like -- measured over 540 entries, 539 of them have a `contributing` that IS the winner object,
+#: because one situation per train is the ordinary case.
 #:
 #: Past this many registered definitions the warm pass evicts insertion-oldest and the read falls
-#: back to computing, which is the documented degradation rather than a failure.
+#: back to computing, which is the documented degradation rather than a failure. `_listed_trains`
+#: is bounded by this same number, so past it the third forget rule also stops firing for whichever
+#: definitions were evicted -- their stale wordings then age out on `WORDING_TTL_S` instead of going
+#: when the train leaves the list. Both are one signal: this bound is under the population.
 FIGURES_CACHE_MAX = 20_000
 #: Trains worded per read, spent soonest-first (KTD7). Four is a panel's worth and one Vertex call
 #: each; the rest carry the template under `not_worded`. That verdict is POSITIONAL -- derived at
@@ -634,7 +645,7 @@ def warm_figures(journey_key: str, definition: dict, alerts: list[varsel.Alert],
     Wired by `main` into `varsel.configure(figures_warmer=...)` and called from pass 1a, which is
     the only place the alerts already exist. It is an INJECTED callable rather than an import
     because `varsel` may not depend on this module -- a plan stop condition, pinned both ways by
-    `test_varsel_api.test_the_pull_read_is_the_dependent_side`.
+    `test_varsel_api.test_varsel_does_not_import_the_pull_read`.
 
     What it buys is bounded and worth stating plainly: a favourite that IS a registered definition
     is a figures hit for the whole cycle, for every caller, at no matcher cost. A favourite nobody
@@ -739,7 +750,9 @@ _listed_trains: OrderedDict[str, frozenset] = OrderedDict()
 #: wording, dropped with the train -- rather than the four a mirror would need, each of them a
 #: silent leak if missed. It is bounded by REBUILDING from `_wordings` rather than by evicting:
 #: evicting the index alone would retire the forget rule for whichever train went, which is a wrong
-#: answer, while a rebuild is one pass over a bounded cache once per `WORDING_CACHE_MAX` writes.
+#: answer, while a rebuild is one pass over a bounded cache. It fires at MOST once per write and in
+#: practice far less -- the trigger is the index outgrowing the cache, which needs stale entries to
+#: have accumulated, and `notification_wording.PULL`'s allowance bounds writes to 30 a minute.
 _wording_keys_by_train: dict[tuple, set[tuple]] = {}
 
 # ---- The enrichment pool (KTD5) ----------------------------------------------------------------

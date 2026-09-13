@@ -500,7 +500,7 @@ silently.
 | `webhook_delivery_response_truncated` | a 2xx body over the response cap | `limit` |
 | `notification_auth_config` / `webhook_signing_config` | once per process: a secret arrived with whitespace and was stripped | `variable` — the **name only**, never the value |
 | `notification_wording` | a webhook wording fault | `result` (`error`, `rate_limited`), `surface` |
-| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
+| `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. **One record under this name is NOT per request**: since U15 the poller emits `result="warm_failed"` with `n` at WARNING, once per PASS, when the pass's figures warm raised for one or more definitions — those reads then compute instead of hitting, which costs latency and nothing else. It carries no `cache`, `n_alerts` or `pair_digest`, and it is counted rather than logged per definition because at a hundred thousand registrations one line per definition is how a real warning stops being read. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
 | `notification_pull_bounded` | a bound binding on the read's enrichment (U4) | `reason` (`queue_full` — the task was refused and every listed entry marked `capped`; `wordings_per_read`; `alternative_lookups`; `wording_allowance` — the PULL allowance answered `rate_limited`; `waiters` — no waiter slot, the read behaved as `wait=0`), `n` (entries the bound touched), `pair_digest`. Nothing identifying. The read's own record also carries `result="enrich_failed"` at WARNING when the task's matcher run raised — the exception's TYPE in the message, never its text |
 | `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `cpu_ms`, `result`, and `rss_delta_bytes` where /proc can be read. `cpu_ms` is process CPU for the step, so it includes request-path work served during it and can exceed `ms` when a pool fans out; it is the figure the capacity table above is read from |
 
@@ -1087,12 +1087,25 @@ contract document says so in its own words; this is the operating half of the sa
    | the match pass, without warming | 10.27 s | 1.29 s |
    | what warming adds to the pass | **0.34 s (3.3 %)**, warming all 20 000 | 0.08 s |
    | sustainable rate **if every read misses** | **~3 000 /s** | ~2 500 /s |
+   | what the warmed cache RETAINS | **373 MB** over 19 300 entries | — |
 
    So R6's 50 reads a second is met with roughly sixty times the headroom, and it is U2's index that
    did it: the same miss measured **15 ms p50 / 55 ms p90** in dev on 2026-09-10, before that index
    existed, which is where the 300 req/min ceiling came from. Warming is cheap enough to be
    unconditional — 3 % of a pass, for a cache that turns every registered corridor's reads into
    0.017 ms — and note it is NOT what makes R6 fit: a miss at 0.32 ms fits on its own.
+
+   **The memory row is the one to read carefully**, because it is the only figure here that could
+   move the constant. It is set by ENTRIES — alert-worthy trains — and not by definitions: on an
+   ordinary evening cycle almost every warmed `_Figures` is empty (0-1 alert-worthy trains across
+   ~85 matched definitions in prd), so the cost is a dict slot. The 19 300 entries above are the
+   synthetic cache's ~1-per-definition shape, well above anything measured; a bad morning at
+   100 000 definitions is ~13 000 entries, about 250 MB, against the pod's 2 048 MiB and the
+   350-435 MiB prd runs at. **The lever if it ever binds is `FIGURES_CACHE_MAX`, not the entry's
+   shape**: most of the ~19 KB an entry costs is the winner's `impact`, which the message input
+   reads, and the uncollapsed `contributing` alerts beside it are nearly free — measured over 540
+   entries, 539 had a `contributing` that IS the winner object, one situation per train being the
+   ordinary case. Watch `kix_` memory against entries, not against registrations.
 
    **What is still owed is the run against a real process**: 50 rps against dev during pass 1a in
    the evening shape, reporting p95 for complete reads and the figures-cache hit rate. The numbers

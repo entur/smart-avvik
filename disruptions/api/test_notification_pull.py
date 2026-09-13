@@ -1601,6 +1601,15 @@ def test_an_alternative_the_pass_found_never_reaches_a_read_that_established_non
     figures = notification_pull._compute_figures(definition, now, journey_key="k")
     winner = figures.entries[0].winner
     assert winner.impact is not None and winner.alternative_journey is None, "control: a cold winner"
+    # BOTH halves of the control. If a cold match could attach a response-level alternative -- from
+    # `alternatives._cache`'s TTL'd answer for a pair the poller looked up minutes ago -- then reads
+    # were already serving `alternativ_reise` through the fallback before U15, and `_enriched`'s
+    # clear would be a behaviour change on the existing path rather than a no-op on it. It cannot:
+    # `_compute_figures` calls `match_journey` without `with_alternative`, so no lookup is consulted.
+    assert winner.impact.alternative_journey is None, (
+        "a cold read's winner must carry no response-level alternative either, or clearing it in "
+        "`_enriched` changes what every pre-U15 read served"
+    )
 
     journey = varsel.AlternativeJourney(
         legs=[], departure_time=dep + timedelta(minutes=20), arrival_time=dep + timedelta(minutes=70),
