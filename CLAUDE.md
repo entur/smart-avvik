@@ -1233,10 +1233,22 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   on `webhook` and refused on `web_push`; `device_id` is the mirror image. Refusing matters as much
   as requiring: a `web_push` document carrying a destination id would be offered to the delivery
   pass by any future query that forgets its channel filter, which is a traveller's commute POSTed
-  to a client's callback. The channel-only fields are **absent** on the other channel rather than
-  written empty — a Firestore equality does not match a document that LACKS a field, so an absent
-  `device_id` is what makes it impossible for the `device_journeys` query to return a client's
-  subscription, as a property of the data rather than of whoever writes the query next.
+  to a client's callback. The **web_push**-only fields are **absent** on a webhook document rather
+  than written empty — a Firestore equality does not match a document that LACKS a field, so an
+  absent `device_id` is what makes it impossible for the `device_journeys` query to return a
+  client's subscription, as a property of the data rather than of whoever writes the query next.
+  **That holds in one direction only, and the asymmetry is the code's rather than the design's**
+  (found on prd after the 2026-09-13 cutover, where all 275 imported registrations carry it):
+  `_channel_fields` writes the web_push set conditionally, while `destination_id` is written by
+  `_new_subscription_doc` itself, so a `web_push` document has it as `""`. The half that matters
+  still holds — validation refuses a NON-EMPTY `destination_id` here, so no such document can name
+  a real destination, and U5's `channel` equality is a genuine filter — but the defence-in-depth
+  claimed above is not there for that one field: an empty string is matchable by an `order_by` or a
+  range, where an absent field is invisible. Do not "fix" it by moving one line:
+  `_subscription_from_doc` and `_delivery_subscription_from_doc` index `doc["destination_id"]`
+  directly, so omitting it KeyErrors every web_push read in production until both learn `.get`.
+  Note dev's pre-U12 webhook documents lack `device_id` because the field did not exist when they
+  were written, which is what made the stronger claim look true from the data.
   **`web_push` has an INACTIVITY horizon and no lifetime one — 180 days since the traveller was
   last here, and U14 inverted that from U12's shape on the product owner's decision (2026-09-13).**
   U12 gave this channel the lifetime horizon alone, reasoning that the 60-day inactivity one is

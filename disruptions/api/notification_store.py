@@ -1619,13 +1619,28 @@ def _new_subscription_doc(
 
 
 def _channel_fields(spec: SubscriptionSpec) -> dict[str, Any]:
-    """The fields only one channel has, written only on that channel.
+    """The web_push-only fields, written only on that channel.
 
-    Not written as empty strings on the other channel, deliberately: a Firestore equality filter
+    Not written as empty strings on a webhook document, deliberately: a Firestore equality filter
     does not match a document that LACKS a field, which is what makes an absent `device_id` on a
     webhook subscription the right answer -- the `device_journeys` query can never return one,
     whatever its channel filter does. Empty strings would make that a property of the filter
     instead of a property of the data.
+
+    **That argument holds in ONE direction only, and the asymmetry is in the code rather than in
+    the reasoning.** `destination_id` is written by `_new_subscription_doc` itself, outside this
+    helper, so a `web_push` document carries it as `""` rather than not at all -- verified on prd
+    after the 2026-09-13 cutover, where all 275 imported registrations have it. What still holds is
+    the part that matters: `SubscriptionSpec.validate` REFUSES a non-empty `destination_id` here, so no
+    web_push document can name a real destination, and the `channel` equality U5 put in the
+    delivery-side queries is a genuine filter. What does NOT hold is the defence-in-depth this
+    paragraph claims for that field -- an empty string is matchable by an `order_by` or a range
+    where an absent field is invisible.
+
+    Moving it in here would be a two-line change and is deliberately NOT one: `_subscription_from_doc`
+    and `_delivery_subscription_from_doc` both index `doc["destination_id"]` directly, so omitting
+    it KeyErrors every web_push read in production -- prd's 275 included -- until both learn `.get`.
+    Worth doing with that pair; not worth doing by editing this dict alone.
 
     `notified`, `pushed_trains` and `daily_pushes` are the push-side ledgers `/varsel` keeps in
     memory today (`_notified`, `_pushed_trains`, `_daily_pushes`). They start empty and are written
