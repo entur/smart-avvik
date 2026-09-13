@@ -56,21 +56,26 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   after `varsel_notify`, i.e. after `check_and_notify` has returned, so a raise inside it cannot
   unwind the decision-log write or the state save at all. Two of its worst cases are **ceilings**
   rather than timings and the distinction is worth keeping: a destination hanging forever costs
-  `_DELIVERY_WAIT_S` (20.0 s) and a hung store costs `_EMIT_WAIT_S` + `_DELIVERY_WAIT_S` = **28.0 s**,
-  2 s under KTD6's 30 s reversal trigger and pinned as such by
-  `test_notification_events.test_the_two_ceilings_leave_the_phase_under_ktd6s_reversal_trigger`. The
-  timings beside them: a hanging destination ~5.0 s (one attempt at the 5 s per-attempt ceiling —
-  since claims are sharded per subscription, 30 pending on one subscription are one shard and the
-  first failure skips the rest), a healthy backlog of 200 pending in 7 ms, emit of 200 subjects in
-  14 ms. `notification_servability` is the six-hourly re-ask of a stale or never-established servability
+  `_DELIVERY_WAIT_S` (20.0 s) and a hung store costs `_EMIT_WAIT_S` + `_DELIVERY_WAIT_S`, which
+  **U9 moved from 28.0 s to 110.0 s** (2026-09-13) when it widened the emit pass — see the webhook
+  section's own paragraph on it. The timings beside them: a hanging destination ~5.0 s (one attempt
+  at the 5 s per-attempt ceiling — since claims are sharded per subscription, 30 pending on one
+  subscription are one shard and the first failure skips the rest), a healthy backlog of 200 pending
+  in 7 ms, emit of 200 subjects in 14 ms **one-wide, which is what that figure was taken at**.
+  `notification_servability` is the six-hourly re-ask of a stale or never-established servability
   answer (`varsel.recheck_service`'s webhook copy, which cannot reach these because it walks
   `_journeys`). Its own number is likewise a **ceiling**: `_DEADLINE_S` (30 s) **plus one
   `set_servability`**, because the budget reserves the BigQuery question and not the store write that
   follows it — typical is ~0, since nothing is due on a healthy list and a due one costs ~2 s. It is
-  its own phase rather than folded into `notification_webhooks` precisely because that phase's measured
-  `ms` is the unit KTD6's reversal trigger is stated in, and adding this reservation to its 28 s
-  would fire the trigger on a healthy cycle. Note the period quoted above is **stale**: measured
-  again on 2026-09-08 it is ~296 s, against which the 28 s ceiling is ~9.5 % of one cycle.
+  its own phase rather than folded into `notification_webhooks` for a reason that has outlived its
+  original wording: that phase's measured `ms` was the unit KTD6's reversal trigger was stated in,
+  and adding this reservation to its ceiling would have fired the trigger on a healthy cycle.
+  **KTD6's trigger is no longer 30 s of wall clock** — U9's widened pass exceeds that by design, so
+  the operations document restates it as emit's own share being exceeded (`capped` above zero on
+  `notification_emit`, or `overlap_refused`), with half the cycle period as the wall-clock bound
+  that still means something. Note the period quoted above is **stale**: measured again on
+  2026-09-08 it is ~296 s, against which the 110 s ceiling is ~37 % of one cycle and the 28 s one
+  was ~9.5 %.
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
@@ -806,10 +811,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   was owed and a `confirmed` mint for a train ET has cancelled. At one client with 100 000
   subscriptions that fallback is the steady state. `SubjectMirror` answers it completely from memory,
   **kept current by the poller's own commits rather than a watermark**: subject documents have exactly
-  one writer (KTD6), so every change passes through this process. Re-check that when U11 moves delivery
-  to its own Deployment — what a worker writes there is `delivered_revision` and `pending_delivery_id`,
-  neither of which is in the standing set. It is indexed BY SUBSCRIPTION as well as by alert id,
-  because the pass asks per subscription and a flat map would make each of 100 000 questions a scan.
+  one writer (KTD6), so every change passes through this process. It is indexed BY SUBSCRIPTION as
+  well as by alert id, because the pass asks per subscription and a flat map would make each of
+  100 000 questions a scan.
+  **U6 BUILT it and U9 WIRED it, and for one deploy it was neither read nor written** — the class,
+  its seed and its tests shipped with no caller at all, which is worth knowing because the sentence
+  above described the intent rather than the state. Since U9 (2026-09-13): the emit pass reads it in
+  place of `client_alerts`, and `notification_store._mirror_subject` is the one place a commit
+  reaches it, called from `commit_event`, `record_below_threshold` and `clear_below_threshold` and
+  from nothing else. **Which bodies mirror is declared as a SET**, `SUBJECT_MIRRORING_BODIES` beside
+  `SUBJECT_WRITERS_OUTSIDE_THE_MIRROR`, pinned off the source both ways for `MIRROR_STAMPING_BODIES`'
+  reason: what has to hold is a property of the set, and a body added next year is the case no
+  behavioural test over today's four can see. That pin is also the answer to "should the standing set
+  re-seed periodically, like the subscription mirror's `MIRROR_MAX_AGE_S`?" — **no**: the
+  subscription mirror's bound exists because a revocation arrives as a tombstone whose own TTL
+  deletes it, which is a timing race; this one's failure mode is a forgotten writer, and a clock
+  cannot catch that while the set-pin does. The apply is on the RESULT of a transaction and never
+  from inside a body — a body may run more than once, so an apply from inside records a state a
+  later attempt overwrote — and an emulator-backed test drives the three commits through the real
+  client, because the hermetic fake runs each body exactly once and so cannot see that ordering.
+  `_sent_body` is the declared exemption: `delivered_revision`, `delivered_at` and the pending
+  pointer are not in the standing set, and mirroring them would put the busiest documents in the
+  hottest loop for no reader. **Re-check that exemption when U11 moves delivery to its own
+  Deployment** — those three fields are exactly what a worker there writes, and the moment one of
+  them enters the standing set this process stops being their only writer. `sync_mirrors` also
+  prunes expired subjects, which correctness never needed (both readers test expiry) and memory
+  does: a subject document lives `HISTORY_DAYS` (7), so an unpruned mirror holds every train every
+  subscription was ever warned about for a week.
   **Both 2 000 ceilings are gone**, with `active_subscriptions`, the `load_active_subscriptions` spec,
   its composite index and the `truncated` flag that reported it — an index paid for on every write with
   no reader is what the bidirectional index test exists to refuse. Note U5 added that index one PR
@@ -927,6 +955,62 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   subscription. The saving is one document read per minted transition; the cost is the only
   enforcement point of a rule the plan does not otherwise replace. Revisit if the mirror ever syncs
   inside the pass.
+
+  **Emit is ONE WIDENED PASS, and the deadline had to move with the width** (U9, 2026-09-13, KTD2).
+  One transaction at a time against a ~200 ms round trip is about **five emits a second** however
+  many are waiting, so a bad morning's lifecycle transitions could not be emitted inside one cycle
+  at any population worth the name. Three things moved together and any one alone changes nothing.
+  The **width** is `_EMIT_WORKERS` (64), derived as the target rate times the measured transaction
+  latency (250/s × ~250 ms) rather than chosen; the pass decides SERIALLY on the coordinator — the
+  sort, the train identity, the standing set, the skip rule, the ceiling, all microseconds and no
+  lock because there is one of it — and submits only the transaction. A whole observation as one
+  task would make a 100 000-recipient corridor a single task and defeat the pool; deciding inside
+  the workers would put the standing set behind a lock all sixty-four take. The **deadline** went
+  6 s → 80 s with the wait at 90 s, because at 6 s the pass stops after ~4 s of claims whether it is
+  one-wide or sixty-four-wide; `_MAX_EMITS_PER_CYCLE` is that deadline times R2's 250/s = 20 000,
+  and a test refuses the two drifting apart. And the **count**: `commit_event` ran a pending-delivery
+  aggregation per mint, which was most of that ~250 ms and would be sixty-four concurrent
+  aggregations against one collection — `_PendingLedger` counts each destination once per pass,
+  charges on the coordinator and REFUNDS in the worker whatever did not leave a new pending delivery
+  behind. The refund is the load-bearing half: a superseding mint is net zero (`_mint` flips the old
+  delivery to `superseded` in the same transaction), so a counter that only counted up would refuse
+  at HALF the ceiling on exactly the morning where many mints are a confirmation. A **withdrawal**
+  now passes the same ledger, where only a first `QuotaExceeded` stopped one before.
+  **What makes the ceiling exact is no longer the shape of the loop.** KTD6's "one writer" is now
+  sixty-four threads of one pass, so exactness rests on that lock plus `emit`'s refusal to start a
+  second pass while the first is draining (`overlap_refused`) — the module lock is taken without
+  blocking and released by `_run`'s own `finally`, never by the thread that gave up waiting, and the
+  future collection is bounded for the same reason: a transactional commit carries no client-side
+  deadline, so waiting on a hung one would hold the lock and refuse every later cycle forever.
+  `abandoned` on the record is how many were walked away from; read it beside `capped`, which is a
+  pass simply larger than its budget when `abandoned` is zero and a slow store when it is not.
+  **Two things above the loop cost a whole cycle if unguarded**, and both were inside the
+  per-subject `try` before this unit: the quota resolver and the ledger's first-sight aggregation.
+  Unguarded on the coordinator, one 4 s deadline hit reports the entire cycle as a timeout and
+  discards the counts of every transaction already committed. Guarded per destination now.
+  **`varsel` hands over one observation per (definition, train) with its recipients**, not one
+  `WebhookSubject` per (recipient, train): the payload was always shared by reference and the
+  dataclasses around it were not, so a 100 000-subscription corridor with AE3's thirteen departures
+  built 1.3 million of them in one burst on the ingestion thread. The fan-out moved into the emit
+  loop, after the standing set has said whether a store call can happen at all — which for the ~83 %
+  of matched alerts that are sub-threshold with nothing standing is never. `_sort_key` orders TRAINS
+  now and the subscription id has left it: urgency is a property of the departure.
+  **No per-revision log line survives**: `commit_event`'s INFO record per mint would be 20 000 lines
+  a cycle, so what a reader gets is the one `notification_emit` summary, and the events themselves
+  are Firestore documents rather than log lines. `EmitReport.minted` is U16's seam, on the returned
+  value and never a module global.
+  **Six never-queried fields are exempt from Firestore's automatic single-field indexes** — `payload`
+  and `situations` on `events`, `situations` on `deliveries`, and `delivered`, `daily_deliveries`
+  and `daily_reservations` on `subscriptions`. Every field is indexed ascending and descending
+  automatically, and every element of an array separately, so each was paid for on every write by a
+  query that does not exist. A map's exemption covers its subfields, which is what makes one
+  resource per map enough (the keys are alert ids and Oslo dates, so a per-key resource could not be
+  written). The precondition is the SPEC TABLE and a test checks it against `QUERY_SPECS` in both
+  directions, because both failures are silent: `retry_not_before` exempted makes `pending_deliveries`
+  return nothing at all, and an exempted `expires_at` stops TTL finding documents. Note `index_config {}`
+  now means opposite things in two resources in `terraform/firestore.tf` — absent on the TTL field
+  ("leave the automatic indexes alone") and present on these six ("remove them") — and the two
+  comments say so to each other.
 
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
@@ -1086,7 +1170,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   writer* — one poller thread, no route invoking the pass, one replica under Recreate — and a route
   calling `commit_event` would falsify every quota check in that module.
   **What a reader sees in the logs**: `varsel_webhook_load`, `notification_store_load`, `notification_emit`,
-  `notification_event`, `webhook_delivery_round`, `webhook_delivery`, `notification_quota`,
+  `webhook_delivery_round`, `webhook_delivery`, `notification_quota`,
   `notification_subscription`, `notification_cleanup`, `notification_auth`, `notification_admin`, `notification_test_event`,
   `notification_servability`, `notification_alert_state`, `webhook_delivery_refused`,
   `webhook_delivery_response_truncated`, `notification_auth_config` / `webhook_signing_config`,
