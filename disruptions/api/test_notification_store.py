@@ -5660,6 +5660,7 @@ def test_the_declared_mirroring_bodies_are_the_ones_whose_commit_actually_applie
         "_delete_body": "delete_subscription",
         "_touch_body": "touch_subscription",
         "_servability_body": "set_servability",
+        "_canonicalize_body": "canonicalize_stops",
         "_mark_notified_body": "mark_notified",
         "_record_push_body": "record_push",
     }
