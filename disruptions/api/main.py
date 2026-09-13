@@ -1453,6 +1453,10 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                             "pages": report.pages,
                             "truncated": report.truncated,
                             "watermark_age_s": report.watermark_age_s,
+                            # Documents the read returned that this process had already superseded
+                            # with its own commit (U13). Expect zeros on a webhook-only deployment
+                            # and small numbers once `/varsel` registrations are in the store.
+                            "overtaken": report.overtaken,
                         }
                     },
                 )
