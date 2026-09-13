@@ -194,6 +194,17 @@ class DeliveryReport:
     skipped: int = 0
     skipped_destinations: int = 0
     store_errors: int = 0
+    #: Seconds since the OLDEST deliverable record in this pass was minted (U11) -- the series the
+    #: worker's backlog alert selects on, and 0.0 when nothing was ready.
+    #:
+    #: It measures the oldest DELIVERABLE row, not the oldest row in the collection: `ready`
+    #: excludes what a lease holds, what U7's durable backoff is waiting on, and everything past the
+    #: per-destination ceiling or the scan bound. So a single hung destination cannot drive it,
+    #: which is the point -- what it answers is "is the queue draining", and `throttled` and
+    #: `truncated` beside it answer "is a destination unwell". A delivery minted before U11 carries
+    #: no `created_at` and contributes nothing, so the gauge climbs from zero on the deploy that
+    #: introduces it instead of reporting the whole backlog as infinitely old.
+    backlog_age_s: float = 0.0
     truncated: bool = False
     throttled: tuple[str, ...] = ()
     timed_out: bool = False
@@ -950,8 +961,10 @@ def deliver_pending(
             pool.shutdown(wait=False)
 
     ms = int((monotonic() - started) * 1000)
+    minted = [d.created_at for d in pending.ready if d.created_at is not None]
     report = DeliveryReport(
         ready=len(pending.ready),
+        backlog_age_s=max(0.0, (instant - min(minted)).total_seconds()) if minted else 0.0,
         sent=counts.get("sent"),
         already_resolved=counts.get("already_resolved"),
         superseded=counts.get("superseded"),
@@ -988,6 +1001,7 @@ def deliver_pending(
                 "event": "webhook_delivery_round",
                 "result": "timeout" if timed_out else "ok",
                 "ready": report.ready,
+                "backlog_age_s": int(report.backlog_age_s),
                 "sent": report.sent,
                 # Beside `sent` rather than added into it: U8 publishes this record as operational
                 # telemetry, so "we delivered N notifications" has to mean that.
