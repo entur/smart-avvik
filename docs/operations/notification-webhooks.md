@@ -845,11 +845,48 @@ contract document says so in its own words; this is the operating half of the sa
    this process makes is applied to it from the commit's own result — see the `SUBSCRIPTION_MIRRORING_BODIES`
    note, which supersedes what U12 recorded about reading the push marks.
 
-   **What to watch after the cutover.** `varsel_state_backend` with `result: "store"` on startup,
+   **What to watch after the cutover.** `varsel_state_import` on startup — `result` is `imported`
+   once and `skipped` at every restart after it, and a second `imported` in the same environment
+   means somebody deleted the marker; `varsel_state_backend` with `result: "store"` on startup,
    `overtaken` on the mirror's own record (small numbers are the mechanism working; a steady
    non-zero with no `/varsel` traffic means the local-apply ledger is not being pruned), and
    `varsel_capacity` with its `kind` — under the store that line means a client QUOTA refused the
    registration, so the fix is `set-quotas` on `browser` rather than a code change.
+
+   **The import itself is a startup step, and it is ONE-SHOT.** The store-backed binary reads the
+   blob inside `lifespan`, before the port binds (R15), so `/varsel` never answers a request
+   against a half-imported store — a traveller whose list came back empty would register again and
+   the store would then hold both. It writes every document through the same functions the request
+   path uses (`create_subscription`, `upsert_device`, `mark_notified`, `tombstone_device`) rather
+   than building documents of its own, which costs one transaction per document — about 360 of them
+   for prd's blob, ~20 s, logged as `varsel_state_import.seconds` so a blob growing towards the
+   chart's 300 s startup probe is noticed before it reaches it.
+
+   **What makes it one-shot is a marker document** in the `migrations` collection, read before the
+   blob is so much as opened and written only after the invariants below hold. It is not caution:
+   the import creates by document id and never deletes, it runs at every startup, and dev restarts
+   on every push — so without the marker a traveller who pressed «Slett alt» after the cutover
+   would have every journey, the device record and the push subscription back at the next deploy.
+   That collection therefore carries **no TTL**, and `terraform/firestore.tf` says so in as many
+   words. **Re-importing after a rollback is an operator deleting `migrations/varsel_blob_to_store`
+   on purpose**, never something a restart can do.
+
+   Three failures and what each does. A blob that cannot be READ raises and the marker is not
+   written — "could not reach GCS" must never be read as "there was nothing to import", which would
+   mark the migration complete over a blob nobody ever read. A blob that does not EXIST marks the
+   migration complete: that is a fresh environment, and leaving it pending would import a blob that
+   appeared later — a restored backup, a rollback that wrote one — at whichever pod restarted next.
+   And an import whose invariants do not hold raises `ImportFailed` out of the lifespan with the
+   marker unwritten, so the readiness probe fails, `helm --wait` rolls the release back to the
+   binary still reading the blob — intact, because the import creates and never deletes — and the
+   next start tries again rather than leaving a half-imported store no restart will finish.
+
+   The invariants are KTD13's and are read back OUT of the store rather than counted on the way in:
+   the store returns the same journeys per device as the blob held, the same live push marks, and
+   `device_journeys` is what answers both — its query filters `client_id` and `channel` and its
+   liveness test covers `status` and the horizon, so a journey missing any of the four does not
+   come back at all. `stray_marks` is the one count that is legitimately non-zero: a push mark whose
+   journey the blob no longer holds has nothing to attach to.
 
    **What the horizon means for the import, decided 2026-09-13.** A `web_push` registration
    expires 180 days after the traveller was last here (clause 17), so the import has to set two

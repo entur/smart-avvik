@@ -541,6 +541,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     whatever rush round is inside its timeliness window. It costs nothing today (`SHOW_RUSHVARSEL`
     is off everywhere and no environment sets this backend) and the two shapes are keeping the
     markers on the blob regardless of backend, or one Firestore document.
+    **The cutover is a ONE-SHOT startup import** (`varsel_state.import_blob_into_store`, U14):
+    inside `lifespan` before the port binds, so `/varsel` never serves against a half-imported
+    store, and every document goes through the same functions the request path uses
+    (`create_subscription`, `upsert_device`, `mark_notified`, `tombstone_device`) rather than
+    through hand-built documents — a second builder would be a second definition of what a
+    registration is, and it would drift the first time `_new_subscription_doc` gained a field. What
+    makes it one-shot is a marker document in the new `migrations` collection, read BEFORE the blob
+    is opened and written only after the invariants hold, and **that collection deliberately has no
+    TTL**: the import creates by document id and never deletes, it runs at every startup and dev
+    restarts on every push, so an expired marker would put back every registration a traveller had
+    erased since. Re-importing after a rollback is an operator deleting that document, never
+    something a restart does. Three failure shapes, each deliberate: an unreadable blob raises with
+    the marker unwritten (`read_blob_text` is STRICT where `load_state` is tolerant — "could not
+    reach GCS" must never be read as "there was nothing to import"); a blob that does not exist
+    marks the migration complete (a fresh environment, and leaving it pending would import a
+    restored backup at the next restart); and an invariant that does not hold raises `ImportFailed`
+    out of the lifespan with the marker unwritten, so the release rolls back to the binary still
+    reading the blob — intact, because the import creates and never deletes. The invariants are
+    read back OUT of the store rather than counted on the way in, through `device_journeys`, which
+    carries four of them at once: its query filters `client_id` and `channel` and its liveness test
+    covers `status` and the horizon. **Two instants, two reasons**: `created_at` is the blob's own
+    `created_ts` (the signup cohort the device report groups on, and what `device_journeys` orders
+    by), `last_seen_at` is the import instant — the blob records no per-journey last-seen, and
+    under the inactivity horizon that is a fresh 180 days rather than a cliff. `create_subscription`
+    and `upsert_device` gained a `created_at` override for it, deliberately NOT on
+    `SubscriptionSpec`: the spec is what a CLIENT submits, and a caller-chosen creation instant
+    there would let a client move the webhook channel's lifetime horizon by submitting a date.
   - Non-prod deployments label themselves in the PWA header and tab title —
     `Avviksvarsel (dev)` — and in the **push title** (`[dev] Oslo S → Lillehammer`, prefixed
     because phones truncate on the right), because dev and prd installs are otherwise identical on

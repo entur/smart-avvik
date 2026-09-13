@@ -80,6 +80,14 @@ DELIVERIES = "deliveries"
 #: document delete does not remove subcollections and a TTL field does not cascade into them, so a
 #: deleted device would orphan every journey under it and the mirror would keep matching them.
 DEVICES = "devices"
+#: One-shot markers for migrations that must never run twice (U14). Deliberately NOT in
+#: :data:`COLLECTIONS` and deliberately WITHOUT a TTL field in `terraform/firestore.tf`, which is
+#: the one thing about it that is load-bearing: the cutover import creates by document id and never
+#: deletes, so an expired marker would re-run it at the next pod restart -- and dev restarts on
+#: every push -- resurrecting every registration a traveller erased since the import. A marker
+#: document therefore carries no `expires_at` at all, and `test_every_collection_group_has_exactly
+#: _one_ttl_field` pins the absence in Terraform so nobody adds one for symmetry.
+MIGRATIONS = "migrations"
 
 COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
 
@@ -1195,6 +1203,9 @@ class _Refs:
     def device(self, device_id: str) -> Any:
         return self._client.collection(DEVICES).document(device_id)
 
+    def migration(self, name: str) -> Any:
+        return self._client.collection(MIGRATIONS).document(name)
+
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
     """Run ``body`` under a real Firestore transaction.
@@ -1527,8 +1538,22 @@ def _subscription_from_doc(doc: Mapping[str, Any]) -> Subscription:
 
 
 def _new_subscription_doc(
-    spec: SubscriptionSpec, now: datetime, *, daily_cap: int | None = None
+    spec: SubscriptionSpec,
+    now: datetime,
+    *,
+    daily_cap: int | None = None,
+    created_at: datetime | None = None,
 ) -> dict[str, Any]:
+    """The document a create writes.
+
+    ``created_at`` is separable from ``now`` for exactly one caller, U14's cutover import: a
+    registration a traveller made in July is not a registration made at the instant the import ran,
+    and the signup instant is what the device report cohorts on and what `device_journeys` orders
+    by. Everything else keeps deriving from ``now`` -- the horizons included, so an imported
+    `web_push` journey starts its inactivity window at the import rather than in the past, which is
+    the only defensible reading when the blob records no per-journey last-seen at all.
+    """
+    signup = created_at or now
     return {
         "subscription_id": spec.subscription_id,
         "client_id": spec.client_id,
@@ -1545,7 +1570,7 @@ def _new_subscription_doc(
         "status": "active",
         "daily_cap": MAX_ALERT_DELIVERIES_PER_DAY if daily_cap is None else int(daily_cap),
         "definition_digest": _definition_digest(spec),
-        "created_at": now,
+        "created_at": signup,
         "updated_at": now,
         MIRROR_FIELD: _mirror_stamp(),
         "last_seen_at": now,
@@ -1556,7 +1581,7 @@ def _new_subscription_doc(
         "delivered": {},
         "cleanup": {},
         **_channel_fields(spec),
-        **_horizons(now, now, channel=spec.channel),
+        **_horizons(signup, now, channel=spec.channel),
     }
 
 
@@ -1596,6 +1621,7 @@ def _create_body(
     now: datetime,
     max_active: int | None = None,
     daily_cap: int | None = None,
+    created_at: datetime | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Create one subscription, refusing past the ceiling BEFORE any write.
 
@@ -1658,7 +1684,7 @@ def _create_body(
         raise QuotaExceeded(
             f"client already holds {live} active subscriptions (ceiling {ceiling})"
         )
-    doc = _new_subscription_doc(spec, now, daily_cap=daily_cap)
+    doc = _new_subscription_doc(spec, now, daily_cap=daily_cap, created_at=created_at)
     transaction.set(refs.subscription(spec.subscription_id), doc)
     return "created", doc
 
@@ -1669,11 +1695,17 @@ def create_subscription(
     max_active: int | None = None,
     daily_cap: int | None = None,
     now: datetime | None = None,
+    created_at: datetime | None = None,
 ) -> Subscription:
     """Register a subscription. Idempotent on (id, definition); refused past the ceiling.
 
     The ceiling and the daily cap are the client's own when the API passes them, and the module
     constants otherwise (resolved here, not in the signature, so a test may move the constant).
+
+    ``created_at`` records a signup instant that is not this one -- see
+    :func:`_new_subscription_doc`. It is NOT on :class:`SubscriptionSpec`, and that is the point:
+    the spec is what a CLIENT submits, and a caller-chosen creation instant on a client's own
+    request would move the webhook channel's lifetime horizon by submitting a date.
     """
     spec.validate()
     instant = now or _now()
@@ -1692,7 +1724,14 @@ def create_subscription(
     )
     outcome, doc = _run_transaction(
         lambda txn: _create_body(
-            txn, refs, count_query, spec=spec, now=instant, max_active=ceiling, daily_cap=daily_cap
+            txn,
+            refs,
+            count_query,
+            spec=spec,
+            now=instant,
+            max_active=ceiling,
+            daily_cap=daily_cap,
+            created_at=created_at,
         )
     )
     _mirror_subscription(doc)
@@ -3291,7 +3330,12 @@ def _new_device_doc(
     auth: str,
     brand: str,
     now: datetime,
+    created_at: datetime | None = None,
 ) -> dict[str, Any]:
+    """The document a first registration writes. ``created_at`` is U14's cutover import again --
+    see :func:`_new_subscription_doc` -- and the reason is the same one `_upsert_device_body`
+    already states for a returning device: restamping a signup makes an old install look new in
+    every report that cohorts on it."""
     return {
         "device_id": device_id,
         "client_id": client_id,
@@ -3299,7 +3343,7 @@ def _new_device_doc(
         "p256dh": p256dh,
         "auth": auth,
         "brand": brand,
-        "created_at": now,
+        "created_at": created_at or now,
         "updated_at": now,
         "last_seen_at": now,
         "tombstone": {},
@@ -3329,6 +3373,7 @@ def _upsert_device_body(
     brand: str,
     now: datetime,
     max_devices: int | None = None,
+    created_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Create or refresh one device. The ceiling is checked BEFORE any write.
 
@@ -3371,6 +3416,7 @@ def _upsert_device_body(
         auth=auth,
         brand=brand,
         now=now,
+        created_at=created_at,
     )
     transaction.set(refs.device(device_id), doc)
     return doc
@@ -3386,8 +3432,14 @@ def upsert_device(
     brand: str = "entur",
     now: datetime | None = None,
     max_devices: int | None = None,
+    created_at: datetime | None = None,
 ) -> Device:
-    """Register or refresh one browser install."""
+    """Register or refresh one browser install.
+
+    ``created_at`` is honoured only where there is no stored document to keep one from: an existing
+    device keeps its own signup however it is called, which is the rule `_upsert_device_body`
+    already enforces for a returning install.
+    """
     instant = now or _now()
     client = _firestore_client()
     refs = _Refs(client)
@@ -3409,6 +3461,7 @@ def upsert_device(
             brand=brand,
             now=instant,
             max_devices=max_devices,
+            created_at=created_at,
         )
     )
     return _device_from_doc(doc)
@@ -3913,6 +3966,31 @@ def device_journeys(*, device_id: str, client_id: str, now: datetime | None = No
             logger.debug("Unreadable web_push registration; skipping it", exc_info=True)
     return out
 
+
+
+def read_migration(name: str) -> dict[str, Any] | None:
+    """One migration marker, or None if it has never run. A bounded read outside a transaction.
+
+    Read BEFORE the work it guards and before anything the work needs -- the cutover import does
+    not so much as open the state blob when this answers. There is no TTL on the collection, so a
+    marker is permanent by construction: see :data:`MIGRATIONS`.
+    """
+    ref = _Refs(_firestore_client()).migration(name)
+    with _span("notification_store.read_migration"):
+        doc = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+    return dict(doc) if doc else None
+
+
+def write_migration(name: str, data: Mapping[str, Any], *, now: datetime | None = None) -> None:
+    """Record that a migration has run. Written LAST, after its invariants have held.
+
+    A plain set rather than a transaction: there is exactly one writer (a startup step, under the
+    Recreate strategy, before the port binds), and what the document has to survive is a restart
+    rather than a concurrent writer.
+    """
+    ref = _Refs(_firestore_client()).migration(name)
+    with _span("notification_store.write_migration"):
+        ref.set({**dict(data), "name": name, "recorded_at": now or _now()})
 
 
 def note_web_push_activity(
