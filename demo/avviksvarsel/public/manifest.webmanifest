@@ -1,6 +1,6 @@
 {
-  "name": "Entur Avviksvarsel",
-  "short_name": "Avviksvarsel",
+  "name": "Entur Smarte reisevarsler",
+  "short_name": "Reisevarsler",
   "description": "Få varsel når et avvik kan ramme kollektivreisene dine.",
   "lang": "nb",
   "dir": "ltr",

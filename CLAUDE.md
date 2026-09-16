@@ -156,9 +156,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   prevents. All three front-ends do this from the same `deployment.environment_label()`, each
   through its own `*-api/config` endpoint, kept off the data endpoints because those can fail while
   the page shell still renders. `disruptions/api/test_demo_api.py` covers the `/demo` one.
-- The **Avviksvarsel** PWA at `/varsel` (register a journey → Web Push when a live disruption is
-  predicted to hit it; rail + the trained bus operators, per-operator alert thresholds) lives in
-  `demo/avviksvarsel/` (React + Vite + Entur Linje). Its
+- The **Smarte reisevarsler** PWA at `/varsel` (register a journey → Web Push when a live disruption
+  is predicted to hit it; rail + the trained bus operators, per-operator alert thresholds) lives in
+  `demo/avviksvarsel/` (React + Vite + Entur Linje). **Renamed on 2026-09-16 from «Avviksvarsel»**,
+  which was the traveller-facing name only: the rename moved the displayed strings (masthead, tab
+  title, both manifests, the push fallback title, `/varsel/personvern/`, and the places
+  `/togmelding`, `/historikk` and `/meldinger` name the product to a reader) and nothing else. The
+  directory `demo/avviksvarsel/`, the `/varsel` and `/varsel-api` paths, every `varsel_*`
+  identifier, the `varsel_decisions` tables and the `disruptions/api` docstrings keep the old word — so
+  "Avviksvarsel" surviving in this file or in the code is the internal name, not a missed rename.
+  Its
   API is `/varsel-api` (see `disruptions/api/varsel.py`), which runs in the poller's refresh cycle.
   **It does not match on its own — it calls `/impact`** through an injected in-process provider
   (`main._varsel_impact`, structurally typed as `varsel.ImpactProvider`), so there is one matcher and

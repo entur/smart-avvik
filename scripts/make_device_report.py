@@ -1,4 +1,4 @@
-"""Render the Avviksvarsel device report from the notification STORE and open it in a browser.
+"""Render the Smarte reisevarsler device report from the notification STORE and open it in a browser.
 
 Reads Firestore directly -- every `web_push` registration of the reserved `browser` client and
 every device document -- and renders one HTML page: each device with its signup time, the journeys
@@ -282,7 +282,7 @@ page = f"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Avviksvarsel Device Report ({e(env)})</title>
+<title>Smarte reisevarsler Device Report ({e(env)})</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
@@ -364,7 +364,7 @@ td.reg {{ color:var(--muted); }}
 <body>
 <main>
   <div class="masthead">
-    <div class="eyebrow">Avviksvarsel · {e(env)}</div>
+    <div class="eyebrow">Smarte reisevarsler · {e(env)}</div>
     <h1>Registered devices and their journeys</h1>
     <p class="lede">Read from <span class="mono">{e(source)}</span> on
     <span class="mono">{fmt(snapshot)}</span>. All times are Europe/Oslo. Devices are listed newest signup first;

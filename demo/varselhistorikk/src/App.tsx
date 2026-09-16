@@ -184,7 +184,7 @@ export default function App() {
       <header className="vh-header">
         <Heading1>Varselhistorikk{envSuffix}</Heading1>
         <Paragraph className="vh-intro">
-          Hver avgjørelse Avviksvarsel har tatt om en registrert reise — også de vi valgte å tie om
+          Hver avgjørelse Smarte reisevarsler har tatt om en registrert reise — også de vi valgte å tie om
           — og hvordan det faktisk gikk. Avgjørelser uten varsel er tatt med med vilje: uten dem
           kan vi bare måle hvor ofte vi tok feil når vi varslet, aldri hvor mye vi gikk glipp av.
         </Paragraph>

@@ -1,6 +1,6 @@
 # Varselhistorikk
 
-Intern side på `/historikk`: hvilke avgjørelser Avviksvarsel har tatt om registrerte reiser, hva
+Intern side på `/historikk`: hvilke avgjørelser Smarte reisevarsler har tatt om registrerte reiser, hva
 som ble sendt til folk, og hvordan det faktisk gikk.
 
 ## Hvorfor den finnes
