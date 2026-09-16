@@ -1,5 +1,5 @@
 // Typed client for the /togmelding-api endpoints (disruptions/api/togvarsel.py), plus the one
-// endpoint this page shares with the Avviksvarsel PWA: POST /varsel-api/feedback.
+// endpoint this page shares with the Smarte reisevarsler PWA: POST /varsel-api/feedback.
 //
 // The feedback types below are a deliberate FORK of demo/avviksvarsel/src/api.ts rather than a
 // shared package: every front-end here is built on its own, and the wire contract is small and

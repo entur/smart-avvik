@@ -1,6 +1,6 @@
 {
-  "name": "Avviksvarsel",
-  "short_name": "Avviksvarsel",
+  "name": "Smarte reisevarsler",
+  "short_name": "Reisevarsler",
   "description": "Få varsel når et avvik kan ramme kollektivreisene dine.",
   "lang": "nb",
   "dir": "ltr",

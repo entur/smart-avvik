@@ -32,7 +32,7 @@ import {
 import IssueCard from './components/IssueCard';
 
 // Rushvarsel: the rush-hour forecast for the Oslo local network, rendered from
-// /togmelding-api/today. Entur-branded and laid out like the Avviksvarsel PWA (/varsel) on
+// /togmelding-api/today. Entur-branded and laid out like the Smarte reisevarsler PWA (/varsel) on
 // purpose — a traveller arrives here by tapping a rush-forecast push from that app, and two
 // surfaces of one product should not look like two products.
 //
@@ -166,9 +166,9 @@ export default function App() {
       </Contrast>
 
       <main id="main-content" className="tm-main">
-        <nav className="tm-nav" aria-label="Til Avviksvarsel">
+        <nav className="tm-nav" aria-label="Til Smarte reisevarsler">
           <SmallText>
-            <Link href={VARSEL_URL}>‹ Til Avviksvarsel</Link>
+            <Link href={VARSEL_URL}>‹ Til Smarte reisevarsler</Link>
           </SmallText>
         </nav>
 
@@ -336,7 +336,7 @@ export default function App() {
                   the registration that produces the pushes it shows. */}
               <Paragraph margin="none" className="tm-cta">
                 <Link href={VARSEL_URL}>Få rushvarselet som varsel på telefonen</Link> — registrer
-                reisene dine i Avviksvarsel.
+                reisene dine i Smarte reisevarsler.
               </Paragraph>
             </>
           )
