@@ -16,7 +16,7 @@ baseline on the page, so there is at most one card per rush: the newest.
 
 ## Why it looks like `/varsel`
 
-A traveller usually arrives here by tapping a rush-forecast Web Push from the Avviksvarsel PWA
+A traveller usually arrives here by tapping a rush-forecast Web Push from the Smarte reisevarsler PWA
 (`togvarsel_notify.build_payload` sends the Entur-branded install to `/togmelding`), and two
 surfaces of one product should not look like two products. So the header band, the card language,
 the type scale and the feedback widget are all `/varsel`'s, and `src/styles.css` is deliberately a

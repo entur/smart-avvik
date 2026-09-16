@@ -1,4 +1,4 @@
-// The single source for every published privacy text in Avviksvarsel (plan
+// The single source for every published privacy text in Smarte reisevarsler (plan
 // 2026-08-31-001, U3/KTD9). Components, the /varsel/personvern page, the
 // /togmelding parity test and the node test suite all read from here — no
 // component carries its own copy of a published wording.
@@ -124,10 +124,10 @@ export const T4_VARSELKORT =
   'kryptert, slik at tjenesten som frakter det ikke kan lese det.';
 
 /** T5 — the privacy page at /varsel/personvern/. */
-export const T5_PAGE_HEADING = 'Personvern i Avviksvarsel';
+export const T5_PAGE_HEADING = 'Personvern i Smarte reisevarsler';
 
 export const T5_INTRO =
-  'Avviksvarsel er et eksperiment fra Enturs KI-lab: vi tester om varsler før avviket rammer er ' +
+  'Smarte reisevarsler er et eksperiment fra Enturs KI-lab: vi tester om varsler før avviket rammer er ' +
   'til nytte. Tjenesten kan endres eller avsluttes på kort varsel. Denne siden forklarer hvilke ' +
   'opplysninger vi behandler når du bruker den.';
 
@@ -220,7 +220,7 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
     title: 'Hvor lenge',
     body:
       'Reiser du har registrert lagres til du sletter dem. Bruker du ikke tjenesten på rundt et ' +
-      'halvt år, slettes de automatisk — hver gang du åpner Avviksvarsel, starter det halve året ' +
+      'halvt år, slettes de automatisk — hver gang du åpner Smarte reisevarsler, starter det halve året ' +
       'på nytt. Varselabonnementet slettes når du skrur av varsler, når du bruker «Slett alt», og ' +
       'sammen med reisene dine. Loggen over varsler vi har vurdert å sende lagres så lenge ' +
       'eksperimentet pågår; den identifiserer ikke enheten din. Driftslogger slettes automatisk ' +

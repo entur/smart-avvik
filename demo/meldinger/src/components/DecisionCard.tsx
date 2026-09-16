@@ -149,7 +149,7 @@ function ReplayedWording({
               than as an experiment's output. The app name beside it is the identity, in words — so
               the tile is decorative and aria-hidden. */}
           <span className="tb-notif-mark" aria-hidden="true" />
-          <span className="tb-notif-app">Avviksvarsel</span>
+          <span className="tb-notif-app">Smarte reisevarsler</span>
         </div>
         {/* The push's real title is the journey (varsel._notification_payload), which is why it
             repeats the route already in the card header: the header names the card's subject, this

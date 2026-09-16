@@ -559,7 +559,7 @@ def test_the_published_retention_text_matches_the_horizon_the_store_enforces():
         "the retention section no longer states a period of disuse after which registrations are "
         "deleted -- art. 13(2)(a) requires it, and the store enforces it whether or not we say so"
     )
-    assert "åpner Avviksvarsel" in body, (
+    assert "åpner Smarte reisevarsler" in body, (
         "the retention section must say what RESETS the period. The anchor is renewed by the "
         "journey list, i.e. by opening the app; a traveller who only receives pushes renews "
         "nothing, so «you keep them by using it» is the actionable half of the disclosure"
