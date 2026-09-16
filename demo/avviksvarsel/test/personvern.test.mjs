@@ -85,7 +85,7 @@ test('required phrases: sender line, experiment disclaimer, and all ten T5 secti
     T1_EKSPERIMENT.body.includes('ikke planlegg reisen din på dem alene'),
     'T1 keeps the one warning that matters on the first screen',
   );
-  assert.equal(T5_PAGE_HEADING, 'Personvern i Avviksvarsel');
+  assert.equal(T5_PAGE_HEADING, 'Personvern i Smarte reisevarsler');
   // The reader's order, not the regulation's (design review 2026-09-01, finding 45), with the
   // evaluation pages as their own section (finding 46).
   assert.deepEqual(

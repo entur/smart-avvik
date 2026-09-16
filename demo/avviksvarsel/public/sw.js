@@ -1,4 +1,4 @@
-/* Avviksvarsel service worker (scope /varsel/).
+/* Smarte reisevarsler service worker (scope /varsel/).
  *
  * Three jobs — there is no offline/caching layer (the app is a thin online client):
  *   push                    show the notification the server pushed (title/body/url/icon in the payload)
@@ -23,7 +23,7 @@ self.addEventListener('push', (event) => {
   } catch (e) {
     data = { body: event.data && event.data.text ? event.data.text() : '' };
   }
-  const title = data.title || 'Avviksvarsel';
+  const title = data.title || 'Smarte reisevarsler';
   const options = {
     body: data.body || '',
     icon: data.icon || '/varsel/icons/pwa-192.png',

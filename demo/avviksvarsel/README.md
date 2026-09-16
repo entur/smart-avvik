@@ -1,4 +1,4 @@
-# Avviksvarsel — mobil PWA med push-varsel
+# Smarte reisevarsler — mobil PWA med push-varsel
 
 A phone-first installable web app (PWA) where a traveller registers journeys
 (from-stop → to-stop, a recurring daily time window and weekday selector) and gets a **Web Push
@@ -63,8 +63,8 @@ A brand is four things, and leaving any one of them out still reads as Entur:
 |---|---|---|
 | colour | Linje as shipped | petrol/slate, `src/brands/none.css` |
 | typeface | Entur Nationale | system sans |
-| masthead | `<Logo/>` + "Avviksvarsel" | "Avviksvarsel" |
-| tab title | Entur Avviksvarsel | Avviksvarsel |
+| masthead | `<Logo/>` + "Smarte reisevarsler" | "Smarte reisevarsler" |
+| tab title | Entur Smarte reisevarsler | Smarte reisevarsler |
 | favicon / home screen | Entur "EN" mark | bell on petrol |
 | manifest | `manifest.webmanifest` | `manifest-none.webmanifest`, `start_url=/varsel/?brand=none` |
 | push notification | Entur icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |

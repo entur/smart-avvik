@@ -1,4 +1,4 @@
-/* App-level layout for the Avviksvarsel PWA. Brand colours come from Entur Linje tokens
+/* App-level layout for the Smarte reisevarsler PWA. Brand colours come from Entur Linje tokens
    (imported in main.tsx); this file only adds phone-first layout and a few token-driven accents —
    no hardcoded hex. Staying token-driven is what lets ?brand=none reskin this file for free: the
    brand sheet redefines the tokens, and anything written as a literal here would survive it and
@@ -37,6 +37,19 @@ body {
 
 .av-header-title {
   margin: 0;
+}
+
+/* «Smarte reisevarsler» is 19 characters where «Avviksvarsel» was 12, and the flex masthead leaves
+   the heading only ~188px beside the logo — at Linje's h1 (1.5rem) it wraps to two lines on a
+   360px phone, three with the «(dev)» suffix. One step down the scale restores the old line count
+   from 360px up. Only the SIZE is overridden: keeping h1's 2.625rem line-height is what puts the
+   band back at exactly the height it had under the old name. Under 360px it still wraps, as it
+   already did at the old name and at every size down to 1.125rem — there the binding constraint is
+   the 148px the logo leaves, not the type scale. */
+@media (max-width: 25rem) {
+  .av-header-title {
+    font-size: var(--font-sizes-extra-large, 1.25rem);
+  }
 }
 
 /* ---- main ---- */

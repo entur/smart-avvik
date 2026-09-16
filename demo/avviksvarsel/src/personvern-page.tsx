@@ -77,7 +77,7 @@ applyBrand(brand);
 // whole value is that it renders when nothing else does.
 document.title = T5_PAGE_HEADING;
 
-// Where «Tilbake til Avviksvarsel» goes. The brand has to survive the hop — an installed PWA has
+// Where «Tilbake til Smarte reisevarsler» goes. The brand has to survive the hop — an installed PWA has
 // no address bar to put it back with — so the unbranded variant carries its parameter along,
 // exactly as personvernUrl() does in the other direction. BASE_URL is Vite's '/varsel/'.
 const appBase = import.meta.env.BASE_URL;
@@ -103,7 +103,7 @@ function PersonvernPage() {
             so an installed app opens it in-app with no browser back button — a reader who cannot
             get back is stranded in a standalone window. */}
         <Paragraph className="pv-back" margin="none">
-          <Link href={appHref}>Tilbake til Avviksvarsel</Link>
+          <Link href={appHref}>Tilbake til Smarte reisevarsler</Link>
         </Paragraph>
 
         <LeadParagraph className="pv-intro">{T5_INTRO}</LeadParagraph>

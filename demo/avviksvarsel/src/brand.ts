@@ -40,8 +40,8 @@ const B = import.meta.env.BASE_URL;
 const BRANDS: Record<BrandId, Brand> = {
   entur: {
     id: 'entur',
-    heading: 'Avviksvarsel',
-    documentTitle: 'Entur Avviksvarsel',
+    heading: 'Smarte reisevarsler',
+    documentTitle: 'Entur Smarte reisevarsler',
     showEnturLogo: true,
     manifest: `${B}manifest.webmanifest`,
     faviconSvg: `${B}favicon.svg`,
@@ -52,8 +52,8 @@ const BRANDS: Record<BrandId, Brand> = {
   },
   none: {
     id: 'none',
-    heading: 'Avviksvarsel',
-    documentTitle: 'Avviksvarsel',
+    heading: 'Smarte reisevarsler',
+    documentTitle: 'Smarte reisevarsler',
     showEnturLogo: false,
     manifest: `${B}manifest-none.webmanifest`,
     faviconSvg: `${B}favicon-none.svg`,

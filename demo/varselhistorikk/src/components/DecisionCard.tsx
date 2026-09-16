@@ -171,7 +171,7 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
                       this rather than as an experiment's output. The app name beside it is the
                       identity, in words — so the tile is decorative and aria-hidden. */}
                   <span className="vh-notif-mark" aria-hidden="true" />
-                  <span className="vh-notif-app">Avviksvarsel</span>
+                  <span className="vh-notif-app">Smarte reisevarsler</span>
                 </div>
                 <p className="vh-notif-title">
                   {decision.from_name} → {decision.to_name}

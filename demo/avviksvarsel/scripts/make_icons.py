@@ -1,4 +1,4 @@
-"""Generate the Avviksvarsel PWA icons and favicons — one set per brand.
+"""Generate the Smarte reisevarsler PWA icons and favicons — one set per brand.
 
 DEFAULT BRAND (Entur). The home-screen / PWA / favicon artwork is the official Entur "EN" logo
 (white wordmark + coral underline, i.e. @entur/icons' LogoNegativeIcon) on the app's Lavender-90

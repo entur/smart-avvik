@@ -457,7 +457,7 @@ requests about unchanged data.
 
 ## The journey-keyed read
 
-`GET /notification-api/v1/journey-alerts` answers "what would Avviksvarsel be warning about on this
+`GET /notification-api/v1/journey-alerts` answers "what would Smarte reisevarsler be warning about on this
 trip right now?" for a definition **nobody registered**, with **no credential**. An example is showing
 information about a user's favourite routes: one read per saved route when a user opens the app. The selection is
 the notification pass's own — the same trains, the same per-operator bar, the same collapse of
