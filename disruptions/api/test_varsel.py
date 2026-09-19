@@ -23,6 +23,7 @@ _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 import alert_policy
 import alternatives
 import impact
+import llm_message
 import main
 import varsel
 from varsel import (
@@ -1434,6 +1435,30 @@ def test_the_write_budget_holds_its_count_under_concurrent_claims():
     assert sum(granted) == 64, f"handed out {sum(granted)} of 64 slots"
     assert budget.claimed == 64
     assert budget.refused == 64
+
+
+def test_the_reserved_worst_case_is_one_call_at_the_backend_timeout():
+    """`_WORST_CASE_CALL_S` was `2 * 8.0` for "two backend attempts", and there is only ever one.
+
+    Every environment pins VARSEL_LLM_PROVIDER, so `llm_message._candidates` returns a single name,
+    and the Gemini client is built with no `retry_options` — the SDK's "never retry" strategy, one
+    HTTP request per call. `meldinger._WORST_CASE_CALL_S` was already pinned against the constant
+    and stayed right; this one was unpinned and drifted to double, which costs the write pass 8 s of
+    the 14 it had to admit calls in. Both halves are asserted because either one turning false is
+    what makes a bigger reservation correct again: a second provider in the order, or a retry inside
+    the call.
+    """
+    assert varsel._WORST_CASE_CALL_S == llm_message._TIMEOUT_S, (
+        "the reservation no longer matches one backend call"
+    )
+    provider = llm_message._PROVIDER
+    llm_message._PROVIDER = "gemini"
+    try:
+        assert len(llm_message._candidates(state=llm_message._LatchState())) == 1, (
+            "a call can now try more than one backend; _WORST_CASE_CALL_S must grow with it"
+        )
+    finally:
+        llm_message._PROVIDER = provider
 
 
 def test_the_write_budget_reserves_the_clock_rather_than_checking_it():
