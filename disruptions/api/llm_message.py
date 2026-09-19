@@ -70,6 +70,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -480,6 +481,36 @@ def _log_fields(replay: bool, caller: str | None = None, **fields: Any) -> dict[
         **fields,
         **({"replay": True} if replay else {}),
         **({"caller": caller} if caller else {}),
+    }
+
+
+def _attempt_fields(
+    name: str, started: float, journey_key: str, situation_number: str
+) -> dict[str, Any]:
+    """What every record about ONE backend attempt carries: which backend, how long it took, and
+    which subject it was for.
+
+    Both halves were missing and both were found the same way. On 2026-09-19 a Grafana rule fired on
+    Gemini answering ``504 DEADLINE_EXCEEDED`` — Vertex honouring the ``X-Server-Timeout: 8`` header
+    the SDK builds from :data:`_TIMEOUT_S`, i.e. our own deadline expiring rather than the model
+    being down. Answering "would a longer deadline have helped?" needed the duration of a call, and
+    nothing here recorded one: the only latency available was Vertex's own
+    ``model_invocation_latencies``, which counts the 200s and excludes every timed-out request, so
+    the question could not be answered about the calls it was actually about.
+
+    ``journey_digest`` and ``situation_number`` are the same gap one axis over. They sat on the
+    ``ok`` record and on none of the failures, so a failing SUBJECT could not be followed from one
+    cycle to the next — and "did this subject recover on the next tick?" is what decides whether an
+    in-call retry would buy anything over the cross-cycle one :data:`_MAX_TRANSIENT_ATTEMPTS`
+    already provides. The digest is the hashed journey key the ``ok`` record has always published,
+    on both the poller's and a client's surface, so this adds no identifier that was not already
+    there (R16).
+    """
+    return {
+        "provider": name,
+        "ms": round((monotonic() - started) * 1000),
+        "journey_digest": key_digest(journey_key),
+        "situation_number": situation_number,
     }
 
 
@@ -1256,6 +1287,7 @@ def _write_message_detailed_inner(
     failed_provider: str | None = None
 
     for name in _candidates(state=state):
+        started = monotonic()
         try:
             raw = _call_backend(name, prompt, state, replay, caller)
         except _ConfigurationError:
@@ -1264,8 +1296,8 @@ def _write_message_detailed_inner(
                 name,
                 extra={
                     "fields": _log_fields(
-                        replay, caller, event="llm_message", provider=name,
-                        result="latched_off"
+                        replay, caller, event="llm_message", result="latched_off",
+                        **_attempt_fields(name, started, journey_key, situation_number),
                     )
                 },
             )
@@ -1284,7 +1316,8 @@ def _write_message_detailed_inner(
                 exc_info=True,
                 extra={
                     "fields": _log_fields(
-                        replay, caller, event="llm_message", provider=name, result="error"
+                        replay, caller, event="llm_message", result="error",
+                        **_attempt_fields(name, started, journey_key, situation_number),
                     )
                 },
             )
@@ -1303,8 +1336,8 @@ def _write_message_detailed_inner(
                         replay,
                         caller,
                         event="llm_message",
-                        provider=name,
                         result="ungrounded",
+                        **_attempt_fields(name, started, journey_key, situation_number),
                         # The discarded reply is prose written from the caller's own payload. It is
                         # the single most useful field when a prompt edit starts producing
                         # ungrounded answers, so it stays for the poller and for a replay -- and it
@@ -1330,7 +1363,8 @@ def _write_message_detailed_inner(
                 name,
                 extra={
                     "fields": _log_fields(
-                        replay, caller, event="llm_message", provider=name, result="rejected"
+                        replay, caller, event="llm_message", result="rejected",
+                        **_attempt_fields(name, started, journey_key, situation_number),
                     )
                 },
             )
@@ -1361,11 +1395,9 @@ def _write_message_detailed_inner(
                         replay,
                         caller,
                         event="llm_message",
-                        provider=name,
                         model=_model_of(name),
                         result="ok",
-                        journey_digest=key_digest(journey_key),
-                        situation_number=situation_number,
+                        **_attempt_fields(name, started, journey_key, situation_number),
                     )
                 },
             )
@@ -1380,12 +1412,10 @@ def _write_message_detailed_inner(
                     "fields": _log_fields(
                         replay,
                         event="llm_message",
-                        provider=name,
                         model=_model_of(name),
                         result="ok",
-                        journey_digest=key_digest(journey_key),
-                        situation_number=situation_number,
                         message=message,
+                        **_attempt_fields(name, started, journey_key, situation_number),
                     )
                 },
             )
