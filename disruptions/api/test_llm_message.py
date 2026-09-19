@@ -1157,6 +1157,11 @@ class _Collect(logging.Handler):
         self.records.append(record)
 
 
+def _raise(_body):
+    """A backend that fails the way a Vertex deadline does: an exception out of the call."""
+    raise RuntimeError("504 DEADLINE_EXCEEDED")
+
+
 def _log_fields_of(call):
     """The `extra={"fields": ...}` bodies one call emitted, DEBUG included."""
     handler = _Collect()
@@ -1463,6 +1468,81 @@ def test_a_webhook_ungrounded_reply_stays_out_of_the_log_but_comes_back_in_proce
     assert not any("reply" in f for f in fields), "a client reply must not reach the log"
     assert result.status == "ungrounded"
     assert result.discarded, "the caller still gets what was thrown away"
+
+
+# ---- every attempt is measurable, whatever it did ----------------------------------------------
+def test_every_attempt_record_carries_its_duration_and_its_subject():
+    """A failure that cannot be timed or followed decides nothing.
+
+    On 2026-09-19 Gemini started answering `504 DEADLINE_EXCEEDED` — Vertex honouring the
+    `X-Server-Timeout` the SDK builds from `_TIMEOUT_S`, so our own deadline rather than the model
+    being down. Two questions followed, and neither could be answered from this process: how long
+    the call took (Vertex's own latency metric counts the 200s and excludes every timed-out
+    request), and whether that subject recovered on the next cycle (`journey_digest` and
+    `situation_number` were on the `ok` record and on no failure record). So the assertion is over
+    EVERY outcome, not over the happy one: the record that needs these fields most is the one nobody
+    writes a test for.
+    """
+    for status, backend in (
+        ("ok", lambda body: '{"melding":"Toget er innstilt."}'),
+        ("error", _raise),
+        ("rejected", lambda body: json.dumps({"melding": "x" * 301}, ensure_ascii=False)),
+        ("ungrounded", lambda body: '{"melding":"Det er 47 % sjanse for innstilling."}'),
+    ):
+        _reset(provider="claude")
+        llm_message._BACKENDS["claude"] = backend
+        try:
+            fields = _log_fields_of(
+                lambda: llm_message.write_message_detailed(
+                    build_message_input(JOURNEY, FakeImpact(), FakeAlert()),
+                    journey_key="Oslo S|Lillestrom|07:00|09:00|12345",
+                    situation_number="KIX:ETCancellation:1",
+                )
+            )
+        finally:
+            llm_message._BACKENDS["claude"] = llm_message._claude_write
+        written = [f for f in fields if f.get("result") == status]
+        assert written, f"no record was written for {status}"
+        for f in written:
+            assert isinstance(f.get("ms"), int), f"{status} record carries no duration"
+            assert f["ms"] >= 0
+            assert f["provider"] == "claude", f"{status} record lost its backend"
+            assert f["situation_number"] == "KIX:ETCancellation:1"
+            assert f["journey_digest"] == llm_message.key_digest(
+                "Oslo S|Lillestrom|07:00|09:00|12345"
+            ), f"{status} record must carry the hashed subject, never the raw key"
+
+
+def test_the_subject_on_a_failure_record_is_hashed_on_every_surface():
+    """The digest is what the `ok` record has always published, and nothing more.
+
+    Adding the subject to the failure records must not become the one place a client's route
+    reaches routine logs (R16): `key_digest` is the same one-way function on the poller's surface
+    and on a webhook one, and the raw `journey_key` — from|to|begin|end|days, a commute pattern —
+    stays out of both.
+    """
+    _reset(provider="claude")
+    llm_message._BACKENDS["claude"] = _raise
+    key = "Oslo S|Drammen|07:00|09:00|12345"
+    try:
+        fields = _log_fields_of(
+            lambda: llm_message.write_message_detailed(
+                {"a": 1},
+                journey_key=key,
+                situation_number="KIX:ETCancellation:2",
+                state=llm_message.new_webhook_state(),
+                caller="webhook",
+            )
+        )
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    failed = [f for f in fields if f.get("result") == "error"]
+    assert failed, "the transient failure was not recorded at all"
+    assert all(key not in json.dumps(f, ensure_ascii=False) for f in fields), (
+        "the raw journey key reached the log"
+    )
+    assert failed[0]["journey_digest"] == llm_message.key_digest(key)
+    assert failed[0]["caller"] == "webhook"
 
 
 if __name__ == "__main__":

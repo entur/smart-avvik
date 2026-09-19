@@ -638,6 +638,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
     Every Helm environment pins `VARSEL_LLM_PROVIDER=gemini`; `auto` remains supported by the code
     but is not deployed. Check `jsonPayload.provider` on `event="llm_message"` when diagnosing calls.
+    **Every such record carries `ms`, `journey_digest` and `situation_number` since 2026-09-19** —
+    on the failures as well as on `ok`, which is where they had been alone. A `504
+    DEADLINE_EXCEEDED` from Vertex is this process's OWN deadline expiring (google-genai turns
+    `_TIMEOUT_S` into an `X-Server-Timeout` header) and `499 CANCELLED` is the client half of it, so
+    neither means the model is down; Vertex's `model_invocation_latencies` counts the `200`s only
+    and can say nothing about either, which is what `ms` exists for.
     Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.

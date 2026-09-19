@@ -304,17 +304,27 @@ _MAX_LLM_SECONDS_PER_CYCLE = 30.0
 # against.
 _MATCH_WORKERS = 16
 _LLM_WORKERS = 16
-# What one more "call" can cost before it returns: two backend attempts at llm_message._TIMEOUT_S.
+# What one more "call" can cost before it returns: ONE backend attempt at llm_message._TIMEOUT_S.
 # Restated here rather than imported, like _CANCEL_LIKELY above and for the same reason -- this is
 # consulted on the poller thread before llm_message is necessarily importable, and the value has to
 # bound the budget even when reading that module is what failed.
+#
+# It was `2 * 8.0` until 2026-09-19, on the reasoning that a call may try two backends. It cannot:
+# every environment pins VARSEL_LLM_PROVIDER, so `llm_message._candidates` returns exactly one name,
+# and the google-genai client is built with no `retry_options`, which is the SDK's "never retry"
+# strategy -- one app call is one HTTP request, bounded by `_TIMEOUT_S`. `meldinger._WORST_CASE_CALL_S`
+# already said so and is pinned against the constant; this one was not, which is what let the two
+# drift. Reserving double the reachable worst case is not free: at 16 s the write pass stops
+# ADMITTING calls 14 s into its 30 s budget, where 8 s lets it run to 22. The number is one attempt
+# times one provider -- it has to grow again the day either of those stops being true, which is what
+# `test_the_reserved_worst_case_is_one_call_at_the_backend_timeout` exists to force.
 #
 # It exists because the deadline used to be checked but not RESERVED: `monotonic() >= llm_deadline`
 # is a pre-check, so a call could start with a millisecond left and still run its full worst case.
 # The reachable overshoot was ~46 s against a documented 30 s ceiling -- 53 % over, on the single
 # poller thread that also feeds /disruptions, /journey, /demo and /reisevalg, and ahead of the
 # delivery loop that pushes to travellers.
-_WORST_CASE_CALL_S = 2 * 8.0
+_WORST_CASE_CALL_S = 8.0
 # Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
 # client-supplied endpoint. Sequential delivery meant one sick push service stalled the whole poller
 # -- and with it every cache rebuild -- for devices x 10 s. Fan them out instead.
