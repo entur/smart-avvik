@@ -1452,10 +1452,16 @@ def test_the_reserved_worst_case_is_one_call_at_the_backend_timeout():
         "the reservation no longer matches one backend call"
     )
     provider = llm_message._PROVIDER
-    llm_message._PROVIDER = "gemini"
     try:
+        llm_message._PROVIDER = "gemini"
         assert len(llm_message._candidates(state=llm_message._LatchState())) == 1, (
             "a call can now try more than one backend; _WORST_CASE_CALL_S must grow with it"
+        )
+        # And prove that check CAN fail: `auto` is the branch where a call really does walk two
+        # backends, so an assertion that passes for a pinned provider is not passing vacuously.
+        llm_message._PROVIDER = "auto"
+        assert len(llm_message._candidates(state=llm_message._LatchState())) == 2, (
+            "the one-backend assertion above proves nothing if the unpinned branch is also one"
         )
     finally:
         llm_message._PROVIDER = provider
