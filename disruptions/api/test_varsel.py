@@ -1438,19 +1438,37 @@ def test_the_write_budget_holds_its_count_under_concurrent_claims():
 
 
 def test_the_reserved_worst_case_is_one_call_at_the_backend_timeout():
-    """`_WORST_CASE_CALL_S` was `2 * 8.0` for "two backend attempts", and there is only ever one.
+    """What the write pass reserves has to be what one call can actually cost, and it has now been
+    wrong in both directions.
 
-    Every environment pins VARSEL_LLM_PROVIDER, so `llm_message._candidates` returns a single name,
-    and the Gemini client is built with no `retry_options` — the SDK's "never retry" strategy, one
-    HTTP request per call. `meldinger._WORST_CASE_CALL_S` was already pinned against the constant
-    and stayed right; this one was unpinned and drifted to double, which costs the write pass 8 s of
-    the 14 it had to admit calls in. Both halves are asserted because either one turning false is
-    what makes a bigger reservation correct again: a second provider in the order, or a retry inside
-    the call.
+    It was `2 * 8.0` for "two backend attempts" until 2026-09-19, and there was only ever one: every
+    environment pins VARSEL_LLM_PROVIDER, so `llm_message._candidates` returns a single name, and
+    the Gemini client was built with no `retry_options` — the SDK's "never retry" strategy, one HTTP
+    request per call. Then on 2026-09-20 `_RETRY_OPTIONS` bought two retries, which is the second
+    half of that sentence turning false, and 8.0 became an under-reservation: a call that retries
+    twice runs ~20 s, so the pass could start one 12 s past the point where its own deadline says
+    it must end.
+
+    So this pins the reservation against the derived constant rather than against a timeout, and
+    pins the derivation too — the number is attempts × the per-attempt deadline plus the waits
+    between them, and a later change to either field of `_RETRY_OPTIONS` has to travel all the way
+    here. The one-provider half is still asserted below, because a second provider in the order is
+    the other way the reachable worst case grows.
     """
-    assert varsel._WORST_CASE_CALL_S == llm_message._TIMEOUT_S, (
+    assert varsel._WORST_CASE_CALL_S == llm_message._WORST_CASE_CALL_S, (
         "the reservation no longer matches one backend call"
     )
+    attempts = llm_message._RETRY_OPTIONS["attempts"]
+    assert llm_message._WORST_CASE_CALL_S == (
+        llm_message._TIMEOUT_S * attempts
+        + llm_message._RETRY_OPTIONS["max_delay"] * (attempts - 1)
+    ), "the worst case is every attempt at its own deadline plus the waits between them"
+    # The waits are only that long if `initial_delay` cannot exceed `max_delay`: google-genai reads
+    # every retry field as `options.x or <default>`, so it clips the exponential-jitter wait at
+    # `max_delay` but would silently restore its own 1.0 jitter for a falsy one.
+    assert (
+        0 < llm_message._RETRY_OPTIONS["initial_delay"] <= llm_message._RETRY_OPTIONS["max_delay"]
+    ), "an unclipped backoff makes the reserved worst case an under-estimate"
     provider = llm_message._PROVIDER
     try:
         llm_message._PROVIDER = "gemini"

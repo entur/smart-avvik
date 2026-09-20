@@ -1545,5 +1545,35 @@ def test_the_subject_on_a_failure_record_is_hashed_on_every_surface():
     assert failed[0]["caller"] == "webhook"
 
 
+# ---- one in-call retry, and what it costs every caller on a deadline ----------------------------
+def test_the_gemini_client_is_built_with_the_retry_options():
+    """The retry is a client-construction detail, so nothing behavioural in this suite can see it.
+
+    google-genai's `retry_args` treats a missing `retry_options` as `stop_after_attempt(1)` — its
+    "never retry" strategy — so dropping the keyword is not a syntax error, not a test failure, and
+    not visible anywhere except as `result="error"` records arriving again on the next Vertex blip.
+    Source-inspected rather than driven, because `genai.Client(...)` resolves ADC and fetches a
+    metadata-server token when constructed, which a hermetic suite must not do.
+
+    The reason this exists at all: before 2026-09-20 a transient 504 fell straight through to the
+    deterministic wording, and the recovery — the next poller cycle, ~296 s later — arrives after
+    the push for that train has already gone out on the template, `_notified` having marked it.
+    """
+    source = inspect.getsource(llm_message._gemini_client)
+    assert "retry_options" in source and "_RETRY_OPTIONS" in source, (
+        "the Gemini client is back to google-genai's never-retry default"
+    )
+    assert llm_message._RETRY_OPTIONS["attempts"] >= 2, "attempts below 2 is no retry at all"
+    # And the ceiling, since every caller reserves it against a 30 s pass. 20 s is not a round
+    # number: above it the reservation leaves `varsel`'s write pass under ~10 s to admit calls in,
+    # 16 workers at ~2.2 s stop fitting `_MAX_LLM_CALLS_PER_CYCLE` (64) into that window, and the
+    # clock starts binding ahead of the count -- a ceiling silently doing a different job than the
+    # one it is documented as doing. The SDK's own defaults (5 attempts, 1/2/4/8 s backoff) would
+    # be ~29 s for one wording, i.e. a pass that admits nothing after its first call.
+    assert llm_message._WORST_CASE_CALL_S <= 20.0, (
+        "one call can now outlast the passes that reserve it"
+    )
+
+
 if __name__ == "__main__":
     _run()
