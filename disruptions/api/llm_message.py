@@ -140,12 +140,55 @@ _MAX_CHARS = 300
 # The answer itself is capped separately at 300 characters below, so this extra room is for thinking,
 # not a longer notification.
 _MAX_TOKENS = 1200
-# Hard per-call wall clock. This runs on the poller thread that also rebuilds every BigQuery cache,
-# so an unbounded call stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The
-# Anthropic SDK defaults to 600 s with two retries; google-genai is likewise unbounded. At
-# _MAX_LLM_CALLS_PER_CYCLE=8 sequential calls that is over an hour of stalled ingestion, so the
-# budget is set to match reisevalg's "<= 3 s per external call" rule with a little headroom.
-_TIMEOUT_S = 8.0
+# Hard wall clock for ONE HTTP attempt -- not for one call, since 2026-09-20; `_RETRY_OPTIONS`
+# below buys a second attempt and each gets its own fresh deadline and `X-Server-Timeout` header.
+# This runs on the poller thread that also rebuilds every BigQuery cache, so an unbounded call
+# stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The Anthropic SDK defaults
+# to 600 s with two retries; google-genai is likewise unbounded. At _MAX_LLM_CALLS_PER_CYCLE=8
+# sequential calls that is over an hour of stalled ingestion, so the budget is set to match
+# reisevalg's "<= 3 s per external call" rule with a little headroom.
+#
+# It is deliberately not RAISED to make room for a retry, and it came DOWN from 8.0 to make room
+# for the third attempt: an attempt's deadline and the number of attempts are different levers, and
+# three attempts multiply this one by three inside a fixed 30 s pass. Over the 24 h to 2026-09-20 in
+# dev, of 81 successful calls 18 took over 3 s, 4 over 4.5 s and **none over 6 s**; across both
+# projects' 1 776 Gemini calls that day (`AI.CLASSIFY` included) p99 was 5.0 s and the slowest was
+# 6.3 s. So 6 s clips roughly one call in a thousand -- and clipping is no longer losing a wording,
+# because `_RETRY_OPTIONS` below gives that call another attempt where before it fell straight
+# through to the deterministic template. Retrying is what makes the tighter deadline affordable;
+# the two constants only make sense read together.
+#
+# What it must never be read as is a fix for the 504s: the burst that fired the Grafana rule that
+# morning returned `504 DEADLINE_EXCEEDED` at ~5.3 s, Vertex giving up well inside our header
+# rather than our header expiring, so no value here would have saved one of them.
+_TIMEOUT_S = 6.0
+# Two retries on a transient answer, which is the whole point: Gemini on Vertex is stateless and
+# served at scale, so a later attempt is very likely a different server. Without this the recovery
+# was the next poller tick ~296 s later (`varsel._MAX_TRANSIENT_ATTEMPTS`), which is too late for a
+# traveller twice over -- the push for that train has already gone out carrying the deterministic
+# template and `_notified` means the better wording never reaches them -- and it logs a `result=
+# "error"` record that trips the "LLM wording failures" rule however well the next cycle recovers.
+#
+# THREE attempts, with the waits clipped to 1 s each, because the whole thing is reserved against a
+# 30 s pass (see `_WORST_CASE_CALL_S`) and an attempt count is not free: 3 x 6 s + 2 x 1 s = 20 s,
+# which is the most the write pass can reserve and still have the CALL cap bind before the clock
+# does (16 workers at ~2.2 s fit ~72 calls into the 10 s that leaves, against a cap of 64). The
+# SDK's own defaults would be 5 attempts with 1/2/4/8 s backoff -- ~29 s of wall clock for one
+# wording, i.e. a pass that admits nothing after its first call.
+#
+# `retry_args` reads every field as `options.x or <default>`, so a falsy value silently becomes the
+# SDK default: `jitter=0` is NOT available, and `initial_delay == max_delay` is how each wait is
+# pinned at exactly 1 s instead of drifting to 1-2 s and then 2-3 s. The retriable set is the SDK's
+# own (408, 429, 5xx, plus httpx timeouts and connect errors).
+_RETRY_OPTIONS = {"attempts": 3, "initial_delay": 1.0, "max_delay": 1.0}
+# What one call can cost before it returns, which is what every caller running on a deadline has to
+# reserve: every attempt at its own timeout, plus the waits between them. `varsel` and `meldinger`
+# restate the number rather than importing it -- both are consulted where reading this module may be
+# what failed -- and both are pinned against this constant, which is what stops them drifting the
+# way varsel's did before 2026-09-19.
+_WORST_CASE_CALL_S = _TIMEOUT_S * _RETRY_OPTIONS["attempts"] + _RETRY_OPTIONS["max_delay"] * (
+    _RETRY_OPTIONS["attempts"] - 1
+)
 # Log the full prompt and reply (at DEBUG). Off by default: the prompt embeds the traveller's
 # origin, destination and departure time. Turn on temporarily when debugging message quality.
 # While truthy, logging_setup._resolve_level refuses LOG_LEVEL=DEBUG (KTD12) and mirrors this parse.
@@ -537,6 +580,12 @@ def _claude_client() -> Any:
     # max_retries=0: the SDK's default 2 retries with backoff multiply the wall clock on the
     # ingestion thread, and a failed message just falls back to the deterministic wording -- the
     # next poller tick is the retry.
+    #
+    # Deliberately NOT the one retry `_RETRY_OPTIONS` gave Gemini on 2026-09-20. That number is
+    # reserved against the pass deadline by every caller (`_WORST_CASE_CALL_S`), and reserving two
+    # attempts on a backend no environment reaches -- Claude is served in neither project, and
+    # every deployment pins VARSEL_LLM_PROVIDER=gemini -- would cost the write pass admission time
+    # for nothing. Give it the same treatment the day a deployment actually selects it.
     return AnthropicVertex(
         project_id=_PROJECT, region=_CLAUDE_LOCATION, timeout=_TIMEOUT_S, max_retries=0
     )
@@ -549,7 +598,10 @@ def _gemini_client() -> Any:
         vertexai=True,
         project=_PROJECT,
         location=_GEMINI_LOCATION,
-        http_options={"timeout": int(_TIMEOUT_S * 1000)},  # google-genai takes milliseconds
+        http_options={
+            "timeout": int(_TIMEOUT_S * 1000),  # google-genai takes milliseconds, and PER ATTEMPT
+            "retry_options": _RETRY_OPTIONS,
+        },
     )
 
 

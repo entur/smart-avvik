@@ -640,10 +640,43 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     but is not deployed. Check `jsonPayload.provider` on `event="llm_message"` when diagnosing calls.
     **Every such record carries `ms`, `journey_digest` and `situation_number` since 2026-09-19** —
     on the failures as well as on `ok`, which is where they had been alone. A `504
-    DEADLINE_EXCEEDED` from Vertex is this process's OWN deadline expiring (google-genai turns
+    DEADLINE_EXCEEDED` from Vertex CAN be this process's own deadline expiring (google-genai turns
     `_TIMEOUT_S` into an `X-Server-Timeout` header) and `499 CANCELLED` is the client half of it, so
     neither means the model is down; Vertex's `model_invocation_latencies` counts the `200`s only
-    and can say nothing about either, which is what `ms` exists for.
+    and can say nothing about either, which is what `ms` exists for. **The first reading through
+    that field says it is not always ours** (2026-09-20): the six 504s behind that morning's rule-8
+    firing all returned at **5.27-5.29 s**, well inside the 8 s header, against successes of
+    1.1-2.8 s in the same batch — so read `ms` before assuming the deadline, and note prd did not
+    carry the field until its next deploy.
+    **Three in-call attempts since 2026-09-20** (`llm_message._RETRY_OPTIONS`, `attempts: 3` with
+    each wait pinned at 1 s by `initial_delay == max_delay` — google-genai reads every retry field
+    as `x or <default>`, so a falsy one silently restores the SDK's own, and `jitter: 0` is
+    therefore not available): Gemini on Vertex is stateless and served at scale, so a later attempt
+    is very likely a different server. Before it there were **none** — `retry_args(None)` is the
+    SDK's `stop_after_attempt(1)`, so the tenacity frames in a traceback were a wrapper doing one
+    attempt — and the only recovery was the next poller cycle
+    (`varsel._MAX_TRANSIENT_ATTEMPTS`), which is too late twice over: the push for that train has
+    already gone out on the deterministic template and `_notified` means the better wording never
+    reaches that traveller, while the `result="error"` record trips the Grafana rule however well
+    the next cycle recovers.
+    **`_TIMEOUT_S` came DOWN to 6 s in the same change, and the two only make sense together.** It
+    is **per attempt**, so three attempts multiply it: at 8 s the worst case is 26 s of a 30 s pass
+    and the pass would admit almost nothing. 6 s clips about one call in a thousand (dev's 81
+    successes that day topped out under 6 s; across both projects' 1 776 Gemini calls p99 was 5.0 s
+    and the slowest 6.3 s) — and clipping stopped meaning losing a wording, because the retry now
+    covers that tail. Neither constant is a fix for the 504s themselves: those returned at ~5.3 s,
+    inside the old header.
+    What it costs is the reservation every caller on a deadline makes —
+    `llm_message._WORST_CASE_CALL_S` is 20 s (3 × 6 s + 2 × 1 s), restated in `varsel` and
+    `meldinger` and pinned against it by both suites, which moves the write pass's admission window
+    from 22 s to 10 s of its 30 s. **20 s is the ceiling, not a round number**: above it 16 workers
+    at ~2.2 s stop fitting `_MAX_LLM_CALLS_PER_CYCLE` (64) into the window and the clock starts
+    binding ahead of the count, so a fourth attempt or a slower model needs that arithmetic redone
+    rather than the constant nudged. `/meldinger`'s 4-wide replay pass drops from ~40 to ~18 calls
+    per request, i.e. a full 200-row page takes ~11 «Hent flere» rounds rather than ~5, each
+    re-serving the cached wordings for free; `MELDINGER_REQUEST_DEADLINE_S` is the lever if that
+    becomes tiresome. An `ok` record with `ms >= 7000` is a retry that saved a wording, and that is
+    how to tell whether this was worth it.
     Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.
@@ -2324,7 +2357,9 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     subject is never cached — `capped`/`deadline`/`rate_limited` return before `_remember_wording` —
     so a second `/messages` request for the same filters re-serves every wording already written for
     free and spends its allowance further down the list. A full 200-row page therefore fills in
-    ~3 rounds rather than in one, and the button asks for the filters that produced the cards on
+    ~3 rounds rather than in one — nearer 11 since 2026-09-20, when two in-call Gemini retries took
+    the reserved worst case per call from 8 s to 20 s and with it this pass's admission window from
+    ~22 s to ~10 s of the 30 — and the button asks for the filters that produced the cards on
     screen, never the current control values. A page **reload** would do the same thing, which is
     what the notice used to advise; it just re-runs the window's BigQuery queries to arrive at the
     same cards.
