@@ -1493,7 +1493,9 @@ def test_the_deadline_reserves_the_worst_case_rather_than_measuring_elapsed_time
 
     Nothing downstream cuts a hang off: the chart sets no ingress timeout. So the contract is 200
     with what was answered, never a hang and never a 5xx."""
-    assert meldinger._WORST_CASE_CALL_S == llm_message._TIMEOUT_S
+    # Against the worst case of one CALL, not of one attempt: the Gemini client retries once
+    # inside the call since 2026-09-20, and this reservation is what keeps the 30 s a promise.
+    assert meldinger._WORST_CASE_CALL_S == llm_message._WORST_CASE_CALL_S
     _reset(message_rows=_subjects(8))
     deadline_s, worst_case = meldinger._REQUEST_DEADLINE_S, meldinger._WORST_CASE_CALL_S
     meldinger._REQUEST_DEADLINE_S = 0.6

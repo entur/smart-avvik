@@ -183,7 +183,14 @@ _HOUR_WINDOW_S = 60.0 * 60
 _DAY_WINDOW_S = 24.0 * 60 * 60
 
 # How many backend calls one attempt is charged for. Helm pins VARSEL_LLM_PROVIDER=gemini in dev,
-# tst, and prd, and a named provider never falls through to another backend.
+# tst, and prd, and a named provider never falls through to another backend. Since 2026-09-20 the
+# google-genai client retries a transient answer once inside the call (`llm_message._RETRY_OPTIONS`),
+# so a charged attempt is up to THREE HTTP requests at Vertex and this ledger reads low by at most
+# that -- in exactly the hour it matters least to be exact. Still 1, because the expected cost is
+# ~1 + p_fail (~1.1: dev's worst day was 8 failures in 89 calls), so charging the worst case would
+# be ~90 % high
+# on every healthy hour and would halve a public page's real allowance to buy accuracy during a
+# storm the deadline and the pool width already bound.
 _CALLS_PER_ATTEMPT = 1
 # A replay can recover from one momentary transport/service failure inside the same request. Every
 # attempt rechecks both the deadline and the spend ledger, so retrying cannot bypass any replay bound.
@@ -195,9 +202,18 @@ _MAX_BACKEND_ATTEMPTS = 2
 #    submit time — submitted all at once, every task queues before the deadline is consulted and the
 #    bound guarantees nothing.
 #
-#    Every environment pins one provider, so one subject can consume only the backend's 8 s timeout.
+#    Every environment pins one provider, so one subject can consume only one call's worst case --
+#    `llm_message._WORST_CASE_CALL_S`, which since 2026-09-20 is three HTTP attempts at `_TIMEOUT_S`
+#    with a 1 s wait between them rather than a single 8 s attempt. Restated here rather than
+#    imported and pinned against the constant by the suite, as `varsel._WORST_CASE_CALL_S` is. It
+#    is reserved per app-level attempt (the `_MAX_BACKEND_ATTEMPTS` loop below rechecks it), so the
+#    replay pass still cannot overshoot its deadline; what it costs is admission time, which stops
+#    ~10 s into the 30 s request rather than ~22 s in, so a full page needs more «Hent flere»
+#    rounds. The cached wordings are what make that cheap -- a bounded subject is never cached, so
+#    the next request re-serves everything already written for free and spends its budget further
+#    down the list.
 _REQUEST_DEADLINE_S = float(os.getenv("MELDINGER_REQUEST_DEADLINE_S", "30"))
-_WORST_CASE_CALL_S = 8.0
+_WORST_CASE_CALL_S = 20.0
 # Pool width. `varsel`'s pools are the shape, not the number — they run 16/16/32
 # (`_MATCH_WORKERS`/`_LLM_WORKERS`/`_PUSH_WORKERS`) on the poller thread, on a cadence nobody can
 # trigger; this one is reachable from a public unauthenticated endpoint, so it is deliberately the
