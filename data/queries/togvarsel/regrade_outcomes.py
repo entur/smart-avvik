@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "disruptions" / "api"))
-import togvarsel_outcomes as outcomes  # noqa: E402
+import togvarsel_outcomes as outcomes
 
 
 def _issued_days(client, start: date, end: date) -> list[date]:
@@ -71,7 +72,7 @@ def main() -> None:
     ap.add_argument("--to", dest="end", required=True, type=date.fromisoformat)
     ap.add_argument("--apply", action="store_true", help="write; without it only the current rows are listed")
     args = ap.parse_args()
-    if args.end >= date.today():
+    if args.end >= datetime.now(ZoneInfo("Europe/Oslo")).date():
         ap.error("--to must be a past day: today is only ever provisional")
 
     from google.cloud import bigquery
@@ -95,7 +96,7 @@ def main() -> None:
             ]
         ),
     ).result()
-    outcomes._run_settled(days, datetime.now(timezone.utc))
+    outcomes._run_settled(days, datetime.now(UTC))
     after = _levels(client, args.start, args.end)
     changed = [(k, before.get(k), after.get(k)) for k in sorted(after) if before.get(k, (None, None))[1] != after[k][1]]
     print(f"re-settled {len(days)} days; level changed on {len(changed)} (day, scope) rows:")
