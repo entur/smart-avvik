@@ -354,6 +354,11 @@ def _am_reasons(row: dict, suffix: str) -> list[str]:
         out.append("personalmangel meldt")
     if _f(row, "prev_eve_t5") >= 0.25:
         out.append("problemer i togtrafikken i går kveld")
+    if _f(row, f"cut_{'amrest' if suffix == '0700' else 'am'}_new") >= 20:
+        # docs/rushvarsel/04-cuts: planned rush calls dropped from today's timetable against the
+        # standing plan and not already cut yesterday -- Vy taking trains out instead of cancelling
+        # them. Positive in every model (the rule of 2026-09-03); 20 calls is about two trains.
+        out.append("færre rushtidsavganger enn vanlig i dagens ruteplan")
     if not out:
         out.append("ingen tegn til trøbbel i morgentimene")
     return out[:4]
@@ -379,6 +384,9 @@ def _pm_reasons(row: dict, suffix: str) -> list[str]:
         # it replaces the day count when both would fire; the model still saw both features.
         out = [r for r in out if not r.endswith("innstilte avganger så langt i dag")]
         out.insert(0, f"{_count(pmj_inn, 'avgang', 'avganger')} i ettermiddagsrushet er allerede innstilt")
+    if _f(row, "cut_pm_new") >= 20:
+        # as in _am_reasons: today's plan runs fewer rush trains than the standing timetable
+        out.append("færre rushtidsavganger enn vanlig i dagens ruteplan")
     if not out:
         out.append("normal drift så langt i dag")
     return out[:4]

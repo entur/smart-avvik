@@ -18,6 +18,11 @@
 -- §14j: the local optimum is a strong one. Grid spans both plausible mappings of the study's
 -- C=0.1 onto BQML's penalty scale. Each grid point is a ~40 s LOGISTIC_REG job; the whole script
 -- is ~36 model fits and costs cents. Results land in disruptions.togvarsel_tuning.
+--
+-- cut_* (2026-09-21, docs/rushvarsel/04-cuts): planned Oslo calls the day's timetable dropped
+-- against the standing plan, all and first-seen-today, in every model. Known at 02:06 from the
+-- day's GTFS. Linear on purpose -- the rolling evaluation kept them linear and gained +0.04..+0.07
+-- AUC -- so they are deliberately NOT in the log1p prefix rule below.
 DECLARE l2_grid ARRAY<FLOAT64> DEFAULT [0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0];
 DECLARE cal ARRAY<STRING> DEFAULT ['dow_2', 'dow_3', 'dow_4', 'dow_5', 'dow_6', 'low_season'];
 DECLARE cat0630 ARRAY<STRING> DEFAULT [
@@ -51,24 +56,28 @@ SET specs = [
     'sx_inn_0630', 'sx_infra_0630', 'sx_amj_0630', 'sx_amj_inn_0630', 'sx_mt_0630', 'sx_big_0630', 'sx_n_0630',
     'et_t10_0630', 'et_max_0630', 'et_t5_last_0630', 'et_cxr_0630',
     'sx_planned_0630', 'sx_amj_rest_0630', 'sx_delay_0630', 'sx_fv_0630', 'sx_long_0630',
-    'sx_pers_0630', 'sx_vedl_0630', 'sx_preveve', 'sx_preveve_inn', 'night_t5'
+    'sx_pers_0630', 'sx_vedl_0630', 'sx_preveve', 'sx_preveve_inn', 'night_t5',
+    'cut_am', 'cut_am_new'
   ], cal, cat0630) AS cols),
   -- 07:00, rest of the rush (07–09): the sharpest product in the study (§14e)
   STRUCT('am0700', 'y_amrest10', ARRAY_CONCAT([
     'et_t5_0700', 'et_t10_0700', 'et_cx_0700', 'et_cxj_0700', 'et_md_0700', 'et_max_0700', 'et_t5_last_0700',
     'prev_eve_t5', 'prev_eve_cancel', 'prev_pm_t5',
-    'sx_inn_0700', 'sx_big_0700', 'sx_n_0700', 'sx_amj_0700', 'sx_amj_inn_0700', 'sx_amj_rest_0700', 'sx_planned_0700'
+    'sx_inn_0700', 'sx_big_0700', 'sx_n_0700', 'sx_amj_0700', 'sx_amj_inn_0700', 'sx_amj_rest_0700', 'sx_planned_0700',
+    'cut_amrest', 'cut_amrest_new'
   ], cal, cat0700)),
   -- 12:00 and 14:00, PM rush (§8 part 3, §14h)
   STRUCT('pm1200', 'y_pm10', ARRAY_CONCAT([
     'et_t5_1200', 'et_cx_1200', 'et_t5_last_1200', 'et_t5_0630',
     'prev_eve_t5', 'prev_pm_t5',
-    'sx_inn_1200', 'sx_big_1200', 'sx_n_1200', 'sx_infra_1200', 'sx_pmj_1200', 'sx_pmj_inn_1200', 'sx_planned_1200'
+    'sx_inn_1200', 'sx_big_1200', 'sx_n_1200', 'sx_infra_1200', 'sx_pmj_1200', 'sx_pmj_inn_1200', 'sx_planned_1200',
+    'cut_pm', 'cut_pm_new'
   ], cal)),
   STRUCT('pm1400', 'y_pm10', ARRAY_CONCAT([
     'et_t5_1400', 'et_cx_1400', 'et_t5_last_1400', 'et_t5_1200', 'et_t5_0630',
     'prev_eve_t5', 'prev_pm_t5',
-    'sx_inn_1400', 'sx_big_1400', 'sx_n_1400', 'sx_pmj_1400', 'sx_pmj_inn_1400', 'sx_planned_1400'
+    'sx_inn_1400', 'sx_big_1400', 'sx_n_1400', 'sx_pmj_1400', 'sx_pmj_inn_1400', 'sx_planned_1400',
+    'cut_pm', 'cut_pm_new'
   ], cal))
 ];
 

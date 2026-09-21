@@ -9,6 +9,13 @@ WITH c AS (
     c.cancelled,
     COALESCE(c.arr_delay_min, c.dep_delay_min) AS delay_min,
     (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AS has_actual,
+    -- Corrected-label terms (docs/rushvarsel/04-cuts): an ESTIMATED time is not an observation
+    -- (last_recorded fills the unrun tail of a journey pulled mid-run with its last expected
+    -- times), and an estimated call whose journey went silent > 10 min before it was due never
+    -- ran. has_actual above is kept for the feature columns; the label columns use these two.
+    (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AND NOT IFNULL(c.estimated, FALSE) AS observed,
+    (IFNULL(c.estimated, FALSE) AND (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AND NOT c.cancelled
+       AND c.recorded_at < TIMESTAMP_SUB(c.aimed_ts, INTERVAL 10 MINUTE)) AS silent,
     EXTRACT(HOUR FROM c.aimed_local) + EXTRACT(MINUTE FROM c.aimed_local)/60.0 AS h
   FROM `disruptions.togvarsel_calls` c
   JOIN `disruptions.togvarsel_oslo_stations` s USING (stop_place)
@@ -33,7 +40,11 @@ SELECT local_date AS d, win, corridor,
   ROUND(APPROX_QUANTILES(IF(NOT cancelled, delay_min, NULL), 20)[OFFSET(18)],1) p90_delay,
   ROUND(SAFE_DIVIDE(COUNTIF(cancelled OR delay_min >= 5), COUNTIF(cancelled OR has_actual)),4) trouble5,
   ROUND(SAFE_DIVIDE(COUNTIF(cancelled OR delay_min >= 10), COUNTIF(cancelled OR has_actual)),4) trouble10,
-  ROUND(SAFE_DIVIDE(COUNTIF(cancelled), COUNT(*)),4) cancel_rate
+  ROUND(SAFE_DIVIDE(COUNTIF(cancelled), COUNT(*)),4) cancel_rate,
+  -- label numerator / denominator under the corrected rule; 04_days.sql adds the planned trains
+  -- that never ran (togvarsel_plan_cut) to both before taking the share
+  COUNTIF(cancelled OR silent OR (observed AND delay_min >= 10)) n_t10_lab,
+  COUNTIF(cancelled OR silent OR observed) n_res_lab
 FROM w
 GROUP BY 1,2,3
 UNION ALL
@@ -44,5 +55,7 @@ SELECT local_date, win, 'all',
   ROUND(APPROX_QUANTILES(IF(NOT cancelled, delay_min, NULL), 20)[OFFSET(18)],1),
   ROUND(SAFE_DIVIDE(COUNTIF(cancelled OR delay_min >= 5), COUNTIF(cancelled OR has_actual)),4),
   ROUND(SAFE_DIVIDE(COUNTIF(cancelled OR delay_min >= 10), COUNTIF(cancelled OR has_actual)),4),
-  ROUND(SAFE_DIVIDE(COUNTIF(cancelled), COUNT(*)),4)
+  ROUND(SAFE_DIVIDE(COUNTIF(cancelled), COUNT(*)),4),
+  COUNTIF(cancelled OR silent OR (observed AND delay_min >= 10)),
+  COUNTIF(cancelled OR silent OR observed)
 FROM w GROUP BY 1,2

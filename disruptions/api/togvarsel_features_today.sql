@@ -27,6 +27,10 @@
 -- rail_calls_today refresh, run only a handful of times per weekday.
 DECLARE today DATE DEFAULT CURRENT_DATE('Europe/Oslo');
 DECLARE yday DATE DEFAULT DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY);
+-- the previous weekday (Monday looks back to Friday), for the cut CTE's persistence test
+DECLARE prevwd DATE DEFAULT IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo')) = 2,
+                               DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 3 DAY),
+                               DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY));
 
 -- ---------------------------------------------------------------------------- ET calls (2 days)
 CREATE TEMP TABLE _tv_calls AS
@@ -337,6 +341,61 @@ cats AS (
     COUNT(DISTINCT IF(fh < 7.0 AND cat LIKE 'drift%' AND oslo AND operating_date=CURRENT_DATE('Europe/Oslo') AND amh BETWEEN 6.5 AND 9, j_ref, NULL)) catj_drift_am_0700
   FROM _tv_sx
 ),
+cut AS (
+  -- The day's plan against the standing timetable (docs/rushvarsel/04-cuts; the training twin is
+  -- data/queries/togvarsel/03b_plan.sql and the six names must match 10_train_models.sql). A
+  -- (line, train number) is STANDING if the GTFS plan carried it on >= 3 of the 4 previous
+  -- same-weekday dates; a standing train absent from today's plan is a cut, counted in planned
+  -- Oslo-area calls per label window and netted against trains new today; *_new is the part not
+  -- already cut on the previous weekday. The GTFS partition for a day is written ~02:06 that
+  -- day, so all four issues see it. RE20 is excluded (its numbering does not join). ~0.4 GB.
+  WITH g AS (
+    SELECT g.operating_date d, g.route_short_name line, REGEXP_EXTRACT(g.trip_id, r'ServiceJourney:(\d+)[-_]') trainno,
+      EXTRACT(HOUR FROM DATETIME(COALESCE(g.arrival_time, g.departure_time), 'Europe/Oslo'))
+        + EXTRACT(MINUTE FROM DATETIME(COALESCE(g.arrival_time, g.departure_time), 'Europe/Oslo'))/60.0 h
+    FROM `ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1` g
+    JOIN `disruptions.togvarsel_oslo_stations` s ON s.stop_place = g.parent_station
+    -- spelled out: the table requires a partition filter and a subquery does not count as one
+    WHERE g.operating_date IN (today, DATE_SUB(today, INTERVAL 1 WEEK), DATE_SUB(today, INTERVAL 2 WEEK),
+                               DATE_SUB(today, INTERVAL 3 WEEK), DATE_SUB(today, INTERVAL 4 WEEK),
+                               prevwd, DATE_SUB(prevwd, INTERVAL 1 WEEK), DATE_SUB(prevwd, INTERVAL 2 WEEK),
+                               DATE_SUB(prevwd, INTERVAL 3 WEEK), DATE_SUB(prevwd, INTERVAL 4 WEEK))
+      AND g.agency_id LIKE 'VYG%' AND g.route_type = 'Train' AND g.route_short_name != 'RE20'
+  ),
+  trips AS (SELECT DISTINCT d, line, trainno FROM g WHERE trainno IS NOT NULL),
+  standing AS (
+    SELECT ref, p.line, p.trainno, MAX(p.d) last_seen
+    FROM UNNEST([today, prevwd]) ref
+    JOIN trips p ON p.d IN (DATE_SUB(ref, INTERVAL 1 WEEK), DATE_SUB(ref, INTERVAL 2 WEEK), DATE_SUB(ref, INTERVAL 3 WEEK), DATE_SUB(ref, INTERVAL 4 WEEK))
+    GROUP BY 1,2,3 HAVING COUNT(*) >= 3
+  ),
+  missing AS (
+    SELECT s.ref, s.line, s.trainno, s.last_seen
+    FROM standing s LEFT JOIN trips t ON t.d = s.ref AND t.line = s.line AND t.trainno = s.trainno
+    WHERE t.trainno IS NULL
+  ),
+  miss_today AS (
+    -- a LEFT JOIN, not EXISTS: BigQuery refuses the correlated form inside this script
+    SELECT c.h, (q.trainno IS NOT NULL) persisted
+    FROM missing m
+    JOIN g c ON c.d = m.last_seen AND c.line = m.line AND c.trainno = m.trainno
+    LEFT JOIN missing q ON q.ref = prevwd AND q.line = m.line AND q.trainno = m.trainno
+    WHERE m.ref = today
+  ),
+  added AS (
+    SELECT c.h FROM trips t
+    LEFT JOIN standing s ON s.ref = today AND s.line = t.line AND s.trainno = t.trainno
+    JOIN g c ON c.d = t.d AND c.line = t.line AND c.trainno = t.trainno
+    WHERE t.d = today AND s.trainno IS NULL
+  )
+  SELECT
+    GREATEST((SELECT COUNTIF(h>=6.5 AND h<9) FROM miss_today) - (SELECT COUNTIF(h>=6.5 AND h<9) FROM added), 0) cut_am,
+    GREATEST((SELECT COUNTIF(NOT persisted AND h>=6.5 AND h<9) FROM miss_today) - (SELECT COUNTIF(h>=6.5 AND h<9) FROM added), 0) cut_am_new,
+    GREATEST((SELECT COUNTIF(h>=7 AND h<9) FROM miss_today) - (SELECT COUNTIF(h>=7 AND h<9) FROM added), 0) cut_amrest,
+    GREATEST((SELECT COUNTIF(NOT persisted AND h>=7 AND h<9) FROM miss_today) - (SELECT COUNTIF(h>=7 AND h<9) FROM added), 0) cut_amrest_new,
+    GREATEST((SELECT COUNTIF(h>=15 AND h<18) FROM miss_today) - (SELECT COUNTIF(h>=15 AND h<18) FROM added), 0) cut_pm,
+    GREATEST((SELECT COUNTIF(NOT persisted AND h>=15 AND h<18) FROM miss_today) - (SELECT COUNTIF(h>=15 AND h<18) FROM added), 0) cut_pm_new
+),
 cal AS (
   -- Today's row from the shared calendar (data/queries/togvarsel/00_calendar.sql, copied to prd
   -- by copy_runtime_to_prd.sh). Zero rows means the calendar has EXPIRED: fail loudly rather
@@ -359,8 +418,8 @@ SELECT
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=4,1,0) dow_4,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=5,1,0) dow_5,
   IF(EXTRACT(DAYOFWEEK FROM CURRENT_DATE('Europe/Oslo'))=6,1,0) dow_6,
-  et.*, prev.*, sx.*, cats.*
-FROM et CROSS JOIN prev CROSS JOIN sx CROSS JOIN cats CROSS JOIN cal;
+  et.*, prev.*, sx.*, cats.*, cut.*
+FROM et CROSS JOIN prev CROSS JOIN sx CROSS JOIN cats CROSS JOIN cal CROSS JOIN cut;
 
 -- ---------------------------------------------------------------------------- today's SX list
 -- One row per situation belonging to today's forecast: the deterministic "kjente avvik" list
