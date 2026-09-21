@@ -143,8 +143,16 @@ _MAX_TOKENS = 1200
 # What Vertex charges itself before the model starts producing, measured off the boundary between
 # a success and a 504 rather than guessed. `X-Server-Timeout` is enforced SERVER-side -- the SDK
 # writes `str(math.ceil(timeout_in_seconds))` into it (`_api_client.populate_server_timeout_header`)
-# -- and Vertex answers `504 DEADLINE_EXCEEDED` about this far BEFORE the header expires, so the
-# model time a call actually gets is `ceil(_TIMEOUT_S)` minus this, not `_TIMEOUT_S`.
+# -- and success becomes impossible about this far BEFORE the header expires, so the model time a
+# call actually gets is `ceil(_TIMEOUT_S)` minus this, not `_TIMEOUT_S`.
+#
+# Read it as the SUCCESS CEILING and never as "when a failure arrives". A `429 RESOURCE_EXHAUSTED`
+# arrives whenever the shared project quota says so and bears no relation to the header at all:
+# measured 2026-09-21 at the 10 s header, a three-wide concurrent burst drew two 429s back in
+# ~3.6-4.1 s while every genuine `504 DEADLINE_EXCEEDED` in the same hour returned at 6.78-7.17 s.
+# Telling them apart needs the retry line's own body -- both classes look identical as a bare
+# "the attempt failed early", and reading a fast 429 as a header cut is how this constant would
+# quietly acquire a second meaning.
 #
 # Mind that `ceil`: it made no difference while `_TIMEOUT_S` was 8.0 or 6.0, and at 9.5 the header
 # is 10, so the server cut is ~7.4 s. The 9.5 s is still what `_WORST_CASE_CALL_S` may reserve,
@@ -153,9 +161,17 @@ _MAX_TOKENS = 1200
 #
 # Measured in dev, single-attempt calls, from the `ms` that `_attempt_fields` records:
 #
-#     header   successes   slowest success   fastest 504
-#     8 s      77          4998 ms           5137 ms
-#     6 s      121         3516 ms           (attempt durations 3.0-3.6 s)
+#     header   successes   slowest success   fastest 504   implied overhead
+#     8 s      77          4998 ms           5137 ms       2.71-2.87 s (8 records)
+#     6 s      121         3516 ms           ~3000 ms      2.40-3.00 s
+#     10 s     12 warm     6577 ms           6780 ms       2.83-3.22 s
+#
+# 2.9 is the conservative end of that range: it UNDERSTATES the model time available, which is the
+# safe direction for the floor `test_llm_message` derives from it. The 10 s row is the weakest of
+# the three -- two 504s, and its own first wave had to be thrown away because `started` is taken
+# before `_call_backend` builds and caches the client, so a cold call's `ms` carries ADC resolution
+# and a metadata-server token (one read 9106 ms on a single attempt). The ceiling moved with the
+# header in all three, which is the claim.
 #
 # The boundary is SHARP in both eras -- not one success above it, not one failure below it -- and it
 # moves 1.5 s when the header moves 2 s. That is a deadline being enforced, and the overhead is the
@@ -163,7 +179,7 @@ _MAX_TOKENS = 1200
 # transport and not of `_GEMINI_MODEL`: re-measure it the same way after an SDK or endpoint change,
 # and note it cannot be read off Vertex's `model_invocation_latencies`, which counts the 200s only
 # and so cannot see the cut it is on the wrong side of.
-_VERTEX_HEADER_OVERHEAD_S = 2.6
+_VERTEX_HEADER_OVERHEAD_S = 2.9
 # Hard wall clock for ONE HTTP attempt -- not for one call, since 2026-09-20; `_RETRY_OPTIONS`
 # below buys a second attempt and each gets its own fresh deadline and `X-Server-Timeout` header.
 # This runs on the poller thread that also rebuilds every BigQuery cache, so an unbounded call
