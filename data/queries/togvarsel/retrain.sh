@@ -6,16 +6,20 @@
 #
 #   create_disruptions.sql   ../create_disruptions.sql — refresh disruptions.disruptions
 #                            (2-year SIRI-SX scan, ~$1; the SX-event source for the chain)
-#   00..09_*.sql             calendar + stations → calls → journeys → windows → days → sx →
-#                            features → training (01 scans last_recorded VYG rail, ~$0.5; the
-#                            rest read tiny tables)
+#   00..09_*.sql             calendar + stations → calls → journeys → windows → plan cut → days →
+#                            sx → features → training (01 scans last_recorded VYG rail, ~$0.5;
+#                            03b scans ~21 GB of GTFS, ~$0.15; the rest read tiny tables)
 #   10_train_models.sql      l2_reg grid + final LOGISTIC_REG fits into togvarsel_m_cand_*
 #                            (~36 model jobs, ~25 min, costs cents)
 #   promotion                bq cp the four candidates onto the live togvarsel_m_* names — only
 #                            reached when ALL of the above succeeded, so a failed retrain leaves
 #                            the live model family untouched instead of half-replaced
 #
-# Total ≈ $1.5 and ~40 min. The serving app picks the new models up on its next togvarsel issue
+# Total ≈ $1.7 and ~45 min. SERVING MUST CARRY THE cut_* COLUMNS BEFORE THE MODELS ARE PROMOTED
+# (2026-09-21): ML.PREDICT fails the whole scoring job on a model whose contract names a column
+# its input lacks, so a deploy of togvarsel_features_today.sql precedes the first retrain that
+# includes 10_train_models.sql's cut features. Run this script with the promotion loop commented
+# out to train candidates only. The serving app picks the new models up on its next togvarsel issue
 # (ML.PREDICT names the models; no redeploy needed). After a retrain, eyeball the tuning table
 # printed at the end: holdout AUCs should sit in the neighbourhood of §14a/§14e (0.7–0.9 —
 # and remember §14f: a holdout that lands in winter reads lower than one in summer).

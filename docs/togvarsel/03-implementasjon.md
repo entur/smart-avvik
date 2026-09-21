@@ -17,6 +17,7 @@ menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 |---|---|---|
 | kalender | `data/queries/togvarsel/00_calendar.sql` | `disruptions.togvarsel_calendar` — helligdager + lavsesong, ETT sted; trening, servering og rollover-proben leser alle herfra |
 | treningskjede | `data/queries/togvarsel/00–09_*.sql` | batch-kildene → dag-tabellene → `disruptions.togvarsel_training` |
+| ruteplan mot fast rutetabell | `data/queries/togvarsel/03b_plan.sql` | `disruptions.togvarsel_plan_cut` — per dag: planlagte Oslo-stopp for tog som aldri kom i ET, og for tog som er tatt ut av dagens ruteplan mot den faste (≥ 3 av 4 forrige same-ukedag), nettet mot nye tog, med og uten «allerede kuttet i går». Fra 2026-09-21 (docs/rushvarsel/04-cuts): inngår i etikettene (04/08) og som features `cut_*` (07/10 og serveringstvillingen). GTFS-partisjonen for dagen skrives ~02:06, så 06:30-utgaven ser den. |
 | modelltrening | `data/queries/togvarsel/10_train_models.sql` | `LOGISTIC_REG` med log1p-TRANSFORM og `l2_reg`-grid på holdout; resultat i `disruptions.togvarsel_tuning`, kandidater `togvarsel_m_cand_*` som retrain.sh promoterer til `disruptions.togvarsel_m_{am0630,am0700,pm1200,pm1400}` |
 | retrening | `data/queries/togvarsel/retrain.sh` | hele kjeden, månedlig, ≈ $1.5 / ~40 min; promoterer kandidatene først når ALT lyktes, så en feilet retrening aldri etterlater en blandet modellfamilie |
 | live features | `disruptions/api/togvarsel_features_today.sql` | serveringstvillingen: samme kolonner fra sanntids-ET/SX → `disruptions.togvarsel_features_today` + `togvarsel_sx_today` |
@@ -30,7 +31,12 @@ menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 ## Beslutninger som følger §14k, punkt for punkt
 
 1. **Produktets mål**: alle labels er trouble10 (`am_t10 ≥ 0.10`, rest-av-rush ≥ 0.10,
-   `pm_t10 ≥ 0.15`).
+   `pm_t10 ≥ 0.15`). **Fra 2026-09-21 er telleren og nevneren korrigert** (produkteiers beslutning samme
+   dag, docs/rushvarsel/02–04): en estimert tid er ikke en observasjon, en avgang som ble tatt ut
+   av ET uten innstilling regnes som innstilt, og et tog som er kuttet fra dagens ruteplan mot den
+   faste rutetabellen — og ikke allerede var kuttet dagen før — regnes som innstilt. De gamle
+   verdiene ligger igjen som `am_t10_raw`/`pm_t10_raw` i `togvarsel_days`. `togvarsel_outcomes`
+   (fasiten på /rushhistorikk) bruker fortsatt den gamle regelen — det er neste steg.
 2. **Tunet logistisk regresjon, ikke trær**: log1p på tellekolonnene (studiens prefiksregel
    `cat_/catj_/sx_/et_cx/et_n/early_cx`, bakt inn i modellens TRANSFORM så serveringen sender rå
    kolonner) og `l2_reg` valgt på holdout-logloss over de siste 56 dagene (studiens «held-out

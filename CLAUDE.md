@@ -310,7 +310,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   render for one — the honest answer, since there is no SX message behind it.
   **What bounds the relay is `_PLANNED_TTL`, not the poller cadence.** It reads
   `rail_calls_planned_today` / `bus_calls_planned_today`, each rebuilt at most once per **60 min**
-  (rail) / **120 min** (bus) because each is an ~8 GB / ~12 GB ET partition scan, so a cancellation
+  (rail) / **120 min** (bus) because each is an ~8 GB / ~12 GB ET partition scan (the rail one reads yesterday's partition too since 2026-09-21, ~22 GB by mid-afternoon: a train cancelled the DAY BEFORE, and every evening train ET had not touched since publishing it, was otherwise absent — `rail_calls_planned_today.sql` says why), so a cancellation
   declared just after a rebuild waits that long to reach anybody. Tightening the rail TTL is the one
   lever and it costs linearly — ~190 GB/day per environment at 60 min, ~$1.2, doubling at 30 min.
   Expect the `relayed` segment on `/historikk` to grow sharply against `predicted`: that is the
@@ -2521,6 +2521,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   «manglende togsett meldt» read `sx_mt_0630`, weight +0.09 and no lift over 343 training
   mornings (20.5 % vs 17.3 % bad) — both dropped from the reasons, both still rows of «kjente
   avvik», which is where `02-findings` placed them ("as a known fact, not as a probability").
+  **The plan against the standing timetable is a label term and a feature since 2026-09-21**
+  (`data/queries/togvarsel/03b_plan.sql` → `togvarsel_plan_cut`; docs/rushvarsel/02–04): Vy
+  sometimes takes trains out instead of cancelling them — pulled from ET with no `Cancellation`,
+  or dropped from the day's GTFS plan the evening before — and the product owner ruled the
+  day-before cut a bad rush. The labels count those planned Oslo calls as cancelled (and read an
+  `estimated` time as no observation), `cut_*`/`cut_*_new` are in all four models, linear, and
+  `togvarsel_features_today.sql` computes them live from GTFS (~0.4 GB; the day's partition is
+  written ~02:06, and the table REQUIRES a partition filter spelled out as literals — a subquery
+  does not count). **Serving must carry the columns before the models are promoted**, or
+  `ML.PREDICT` fails the whole scoring job; the outcome passes behind /rushhistorikk still grade on
+  the old rule and are the next step.
   `togvarsel.refresh()` runs on
   every poll tick (wall-clock — an issue is due at its cutoff whether or not SX moved) and
   computes due issues (one rebuild of `togvarsel_features_today` + one `ML.PREDICT` per issue —

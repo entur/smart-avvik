@@ -57,6 +57,10 @@ SELECT dd.d, dd.dow, dd.weekday, EXTRACT(MONTH FROM dd.d) month, EXTRACT(ISOWEEK
   dd.am_t5, dd.pm_t5, dd.am_t10, dd.pm_t10, dd.am_cancel, dd.pm_cancel, dd.mid_t5, dd.eve_t5, dd.am_n, dd.pm_n,
   -- previous evening
   dd.prev_eve_t5, dd.prev_eve_cancel, dd.prev_pm_t5, dd.night_t5,
+  -- the day's plan against the standing timetable (03b_plan.sql via 04_days.sql; 04-cuts):
+  -- planned Oslo calls cut from the plan, all / first seen today. Known at 02:06, linear in the
+  -- models (deliberately outside the log1p prefix rule -- the experiment kept them linear).
+  dd.cut_am, dd.cut_am_new, dd.cut_amrest, dd.cut_amrest_new, dd.cut_pm, dd.cut_pm_new,
   -- et at cutoffs
   et.* EXCEPT(d),
   -- sx
