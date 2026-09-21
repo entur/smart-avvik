@@ -82,8 +82,10 @@ default-groups = ["dev", "api"]
 # would mean rewriting a script whose output is already committed beside it. The cost of excluding
 # rather than exempting per rule is real and worth stating: a genuine bug in a future analysis
 # script here will not be caught, so anything promoted out of this directory into code that runs
-# more than once should move out of the exclusion with it.
-extend-exclude = ["docs/togvarsel/analysis"]
+# more than once should move out of the exclusion with it. docs/rushvarsel/analysis is the same
+# kind of record (the 2026-09-21 area-split, corrected-label and timetable-cut studies) and is
+# excluded for the same reason.
+extend-exclude = ["docs/togvarsel/analysis", "docs/rushvarsel/analysis"]
 
 [tool.ruff.lint.flake8-bugbear]
 # `param: str = Query(...)` in an endpoint signature is how FastAPI declares query
