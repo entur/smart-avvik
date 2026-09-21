@@ -1,0 +1,672 @@
+{
+  "title": "kix-avvik — alert rules",
+  "uid": "kix-avvik-alerts",
+  "tags": [
+    "kix-avvik",
+    "alerts"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "text": "prometheus-thanos",
+          "value": "prometheus-thanos"
+        }
+      },
+      {
+        "name": "env",
+        "type": "custom",
+        "label": "Environment",
+        "query": "kub-ent-dev-001,kub-ent-prd-001",
+        "options": [
+          {
+            "text": "kub-ent-dev-001",
+            "value": "kub-ent-dev-001",
+            "selected": true
+          },
+          {
+            "text": "kub-ent-prd-001",
+            "value": "kub-ent-prd-001",
+            "selected": false
+          }
+        ],
+        "current": {
+          "text": "kub-ent-dev-001",
+          "value": "kub-ent-dev-001"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "1 — Poller stopped",
+      "description": "critical · fires above 900 for 5m\n\nNo poller tick for 15 minutes. The tick moves every ~60 s regardless of upstream, so this is the thread or the pod rather than a quiet night, and /health's self-healing did not recover it. Check the pod; a restart is the usual response.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "time() - max(kix_poller_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 900.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "2 — Rebuild stale",
+      "description": "warning · fires above 3600 for 15m\n\nCycle freshness, not liveness: cycles are event-driven and pause legitimately on quiet nights. If rule 1 is silent the poller is alive — look at poller_phase errors and at whether the SIRI-SX ingestion timestamp is moving.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "time() - max(kix_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 3600.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "2b — Worker stopped",
+      "description": "critical · fires above 900 for 5m\n\nNo delivery round for 15 minutes; the tick moves on every round, including the ones that find nothing. Check the kix-avvik-worker Deployment — scaled to zero, rolled back, or crash-looping. Pending webhook events expire after an hour.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "time() - max(kix_worker_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 900.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "2c — Delivery backlog",
+      "description": "warning · fires above 1800 for 15m\n\nThe oldest deliverable pending delivery was minted over 30 min ago, and an event is valid for 60. Response: raise deployment.forceReplicas in helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml — the drain formula is in docs/operations/notification-webhooks.md.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "max(kix_delivery_backlog_age_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1800.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "3 — Pod restarts",
+      "description": "warning · fires above 3 for 0m\n\nMore than 3 restarts in 15 minutes. A flapping /health lands here; the crash-loop escape is HEALTH_STALE_AFTER_S=0 through a values-only deploy, which disables the staleness branch.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[15m])",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[15m]) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 3.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "4 — Memory near limit",
+      "description": "critical · fires above 0.85 for 5m\n\nWorking set above 85 % of the container's limit. Since common 2.x the limit EQUALS the request, so the response is raising memory: in that release's values file. An OOM kill on the single API replica is a full outage.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"kix-avvik\", container!=\"\", prometheus_group=\"$env\"})\n/\nsum by (pod) (kube_pod_container_resource_limits{exported_namespace=\"kix-avvik\", resource=\"memory\", prometheus_group=\"$env\"})",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.85
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "5 — Pod not ready",
+      "description": "critical · fires below 1 for 3m\n\nWith one replica, not-ready means the service is down. /health 503s from a dead or stale poller land here too. Check the pod's events and logs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "kube_pod_status_ready{exported_namespace=\"kix-avvik\", condition=\"true\", prometheus_group=\"$env\"}",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "6 — ERROR logged",
+      "description": "warning · fires above 0 for 0m\n\nThe ERROR channel is deliberately near-silent, so any ERROR is worth a look. labelling_stale, thread_died and health_degraded all arrive here. Read the record in Cloud Logging — cluster project ent-kub-dev, namespace kix-avvik, not the app project.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "targets": [
+        {
+          "expr": "increase(kix_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m])",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "increase(kix_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m]) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "7 — Push failures",
+      "description": "warning · fires above 0.2 for 10m\n\nMore than 20 % of push attempts failed over 30 minutes, across at least 5 attempts. gone is not an error — that is a device that unsubscribed. Check kix_push_total by result and the varsel push logs.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kix_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(kix_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.2
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "8 — LLM wording failures",
+      "description": "warning · fires above 0.3 for 10m\n\nOver 30 % of live wording attempts failed in 30 minutes. Travellers still receive the deterministic template, so this is quality degradation rather than an outage. Check jsonPayload.event=\"llm_message\" for provider and result; VARSEL_LLM_PROVIDER=off is the egress kill switch and VARSEL_LLM_ENABLED=false the bad-text revert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 32
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.3
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "9 — Labelling stale",
+      "description": "critical · fires above 172800 for 30m\n\n48 hours without successful labelling while decisions were still being written. Unlabelled decisions become permanently unknown after 10 days. Check the varsel-label-daily scheduled query in this environment's project.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "expr": "(time() - max(kix_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))\nand on()\n(sum(increase(kix_decision_write_total{result=\"ok\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[48h])) > 0)",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "(time() - max(kix_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 172800.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "10 — 5xx rate",
+      "description": "critical · fires above 0.05 for 5m\n\n5xx rate above 5 % for 5 minutes, excluding /health. Check the access log and rule 1 — a wedged poller shows up on both.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 40
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(kix_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(kix_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(kix_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(kix_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "11 — p99 latency",
+      "description": "warning · fires above 5 for 10m\n\nGolden-path default threshold, not yet tuned against this app's real traffic. Check whether one path dominates before treating it as a regression.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 48
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 5.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    }
+  ]
+}
