@@ -53,7 +53,18 @@ WITH last_snap AS (
     recordedCalls,
     estimatedCalls
   FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
-  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE()
+  -- YESTERDAY'S partition too (2026-09-21). ET publishes a journey ~22 h ahead, and Vy cancels
+  -- some of them the day before and never sends them again: on 2026-09-21 nine L1 morning trains
+  -- were stop-cancelled at 07:00-10:00 UTC the day before, had no row in today's partition, and
+  -- so were absent from this table while their healthy neighbours were in it -- /impact told a
+  -- Lillestrøm-Asker 07:10 registration "ingen aktive avvik". The partition is ingestion time,
+  -- so "today's journeys" is a property of the CALLS (today_journeys below), not of the partition.
+  -- The same rebuild at 16:00 also gained 264 journeys due LATER TODAY that had no snapshot
+  -- since their publication yesterday -- a quarter of the table -- so an evening registration
+  -- was scored against no trains at all until ET touched them again.
+  -- Cost: about one more day's rail partition per rebuild (measured 14.1 -> 22.2 GB at 16:00).
+  -- togvarsel_features_today.sql has read both partitions since it existed, for the same reason.
+  WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AND CURRENT_DATE()
     AND lineRef LIKE 'VYG:%'
     AND datedVehicleJourneyRef IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
@@ -86,10 +97,19 @@ calls AS (
     CAST(NULL AS INT64)
   FROM last_snap AS s, UNNEST(s.estimatedCalls) AS ec
 ),
+-- Yesterday's partition also holds yesterday's finished journeys. Keep a journey only if one of
+-- its calls is aimed today or later (Oslo) -- which is what the today-only partition delivered in
+-- practice, since a snapshot ingested after 00:00 UTC is a call at or after 02:00 Oslo.
+today_journeys AS (
+  SELECT DISTINCT jkey
+  FROM calls
+  WHERE DATE(COALESCE(aimed_dep, aimed_arr), 'Europe/Oslo') >= CURRENT_DATE('Europe/Oslo')
+),
 dedup AS (
   -- a stop can appear in both lists across the journey's life; keep one (prefer recorded)
-  SELECT *
-  FROM calls
+  SELECT c.*
+  FROM calls AS c
+  JOIN today_journeys USING (jkey)
   WHERE COALESCE(aimed_dep, aimed_arr) IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY jkey, stop_order ORDER BY (call_source = 'recorded') DESC) = 1
