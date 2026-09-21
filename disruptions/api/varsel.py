@@ -281,7 +281,7 @@ _MAX_MESSAGES_PER_JOURNEY = 3
 # re-offered every cycle, so the cap suppresses delivery and nothing else.
 _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY = 4
 # Wall-clock ceiling for the whole message-writing pass. The call cap alone does not bound time:
-# one capped "call" can be two backend attempts at _TIMEOUT_S each, so the count implies half the
+# one capped "call" can be two HTTP attempts at _TIMEOUT_S each, so the count implies half the
 # worst case. Trains past the budget take the deterministic wording and are re-tried next tick.
 #
 # Unchanged at 30 s across the 2026-08-21 fan-out, and that is the point of it: with the calls
@@ -304,7 +304,7 @@ _MAX_LLM_SECONDS_PER_CYCLE = 30.0
 # against.
 _MATCH_WORKERS = 16
 _LLM_WORKERS = 16
-# What one more "call" can cost before it returns: `llm_message._WORST_CASE_CALL_S`, which is THREE
+# What one more "call" can cost before it returns: `llm_message._WORST_CASE_CALL_S`, which is TWO
 # HTTP attempts at `_TIMEOUT_S` with a 1 s wait between them. Restated here rather than imported,
 # like _CANCEL_LIKELY above and for the same reason -- this is consulted on the poller thread before
 # llm_message is necessarily importable, and the value has to bound the budget even when reading
@@ -316,7 +316,9 @@ _LLM_WORKERS = 16
 # so it came down to 8.0, one attempt, one provider. On 2026-09-20 `llm_message._RETRY_OPTIONS` gave
 # the Gemini client two retries, which is the other half of that same sentence turning false, and
 # the reservation went to 20.0 (3 x 6 s + 2 x 1 s -- the per-attempt deadline came down from 8 s in
-# the same change, precisely so three attempts would still fit here). Reserving it is not free and
+# the same change, precisely so three attempts would still fit here). The 20.0 has held since; what
+# moved on 2026-09-21 was the SPLIT inside it, to 2 x 9.5 s + 1 x 1 s, because `X-Server-Timeout`
+# is enforced server-side and the 6 s attempt was cutting the model off at ~3.4 s. Reserving it is not free and
 # the cost is worth knowing: the write pass now stops ADMITTING calls 10 s into its 30 s budget
 # rather than 22 s in. That is the most the reservation may grow before the CLOCK starts binding
 # ahead of the count -- 16 workers at ~2.2 s a call fit ~72 into 10 s against a cap of 64 -- so a

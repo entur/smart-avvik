@@ -140,47 +140,79 @@ _MAX_CHARS = 300
 # The answer itself is capped separately at 300 characters below, so this extra room is for thinking,
 # not a longer notification.
 _MAX_TOKENS = 1200
+# What Vertex charges itself before the model starts producing, measured off the boundary between
+# a success and a 504 rather than guessed. `X-Server-Timeout` is enforced SERVER-side -- the SDK
+# writes `str(math.ceil(timeout_in_seconds))` into it (`_api_client.populate_server_timeout_header`)
+# -- and Vertex answers `504 DEADLINE_EXCEEDED` about this far BEFORE the header expires, so the
+# model time a call actually gets is `ceil(_TIMEOUT_S)` minus this, not `_TIMEOUT_S`.
+#
+# Mind that `ceil`: it made no difference while `_TIMEOUT_S` was 8.0 or 6.0, and at 9.5 the header
+# is 10, so the server cut is ~7.4 s. The 9.5 s is still what `_WORST_CASE_CALL_S` may reserve,
+# because that one is the CLIENT-side httpx deadline and it aborts first -- which is exactly why a
+# non-integer value is safe here: the server is given a whole second more than we will wait.
+#
+# Measured in dev, single-attempt calls, from the `ms` that `_attempt_fields` records:
+#
+#     header   successes   slowest success   fastest 504
+#     8 s      77          4998 ms           5137 ms
+#     6 s      121         3516 ms           (attempt durations 3.0-3.6 s)
+#
+# The boundary is SHARP in both eras -- not one success above it, not one failure below it -- and it
+# moves 1.5 s when the header moves 2 s. That is a deadline being enforced, and the overhead is the
+# gap to it. Nothing about the model is being measured here, which is why this is a property of the
+# transport and not of `_GEMINI_MODEL`: re-measure it the same way after an SDK or endpoint change,
+# and note it cannot be read off Vertex's `model_invocation_latencies`, which counts the 200s only
+# and so cannot see the cut it is on the wrong side of.
+_VERTEX_HEADER_OVERHEAD_S = 2.6
 # Hard wall clock for ONE HTTP attempt -- not for one call, since 2026-09-20; `_RETRY_OPTIONS`
 # below buys a second attempt and each gets its own fresh deadline and `X-Server-Timeout` header.
 # This runs on the poller thread that also rebuilds every BigQuery cache, so an unbounded call
 # stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The Anthropic SDK defaults
 # to 600 s with two retries; google-genai is likewise unbounded. At _MAX_LLM_CALLS_PER_CYCLE=8
-# sequential calls that is over an hour of stalled ingestion, so the budget is set to match
-# reisevalg's "<= 3 s per external call" rule with a little headroom.
+# sequential calls that is over an hour of stalled ingestion, so the budget stays bounded.
 #
-# It is deliberately not RAISED to make room for a retry, and it came DOWN from 8.0 to make room
-# for the third attempt: an attempt's deadline and the number of attempts are different levers, and
-# three attempts multiply this one by three inside a fixed 30 s pass. Over the 24 h to 2026-09-20 in
-# dev, of 81 successful calls 18 took over 3 s, 4 over 4.5 s and **none over 6 s**; across both
-# projects' 1 776 Gemini calls that day (`AI.CLASSIFY` included) p99 was 5.0 s and the slowest was
-# 6.3 s. So 6 s clips roughly one call in a thousand -- and clipping is no longer losing a wording,
-# because `_RETRY_OPTIONS` below gives that call another attempt where before it fell straight
-# through to the deterministic template. Retrying is what makes the tighter deadline affordable;
-# the two constants only make sense read together.
+# 9.5 s, which is ~7.4 s of model time. It went 8.0 -> 6.0 on 2026-09-20 to make room for a third
+# attempt inside the 20 s reservation, and that trade was made against the wrong ceiling: the
+# arithmetic read "none of 81 successful calls took over 6 s, so 6 s clips one call in a thousand",
+# treating the header as the cut. The cut is `_VERTEX_HEADER_OVERHEAD_S` below the header, so 6 s
+# clipped at ~3.5 s -- and by that file's own distribution 18 of 81 calls took over 3 s. Measured
+# after the fact, the 3.6-5.0 s band held 10 of dev's 77 single-attempt successes under the 8 s
+# header and is EMPTY under the 6 s one: the change moved ~13 % of first attempts onto the retry
+# path, where each now costs three attempts and ~11-12 s instead of returning in ~4 s.
 #
-# What it must never be read as is a fix for the 504s: the burst that fired the Grafana rule that
-# morning returned `504 DEADLINE_EXCEEDED` at ~5.3 s, Vertex giving up well inside our header
-# rather than our header expiring, so no value here would have saved one of them.
-_TIMEOUT_S = 6.0
-# Two retries on a transient answer, which is the whole point: Gemini on Vertex is stateless and
+# So attempts came back down to 2 and this went up, spending the SAME 20 s (see
+# `_WORST_CASE_CALL_S`, unchanged, which is why no caller's reservation moves). Attempts and
+# per-attempt deadline are different levers and the payload is the reason to prefer this one: a
+# wording that needs 4.5 s needs it on every attempt, so retries rescue only the boundary -- of
+# dev's 7 first-attempt 504s on 2026-09-21, 5 also failed the second attempt and 4 the third. At
+# ~7.4 s of model time the tail this was cutting completes on the FIRST attempt instead.
+#
+# What the remaining retry is for is the genuine transient: the six simultaneous 504s at 22:04:45 on
+# 2026-09-19, and dev and prd failing in the same second. Note even those crossed OUR cut -- they
+# returned at 5.27-5.29 s under the 8 s header -- which is the general shape of this failure and the
+# reason a tight header is expensive: it converts upstream latency variance into lost wordings.
+_TIMEOUT_S = 9.5
+# One retry on a transient answer, which is the whole point: Gemini on Vertex is stateless and
 # served at scale, so a later attempt is very likely a different server. Without this the recovery
 # was the next poller tick ~296 s later (`varsel._MAX_TRANSIENT_ATTEMPTS`), which is too late for a
 # traveller twice over -- the push for that train has already gone out carrying the deterministic
 # template and `_notified` means the better wording never reaches them -- and it logs a `result=
 # "error"` record that trips the "LLM wording failures" rule however well the next cycle recovers.
+# It works: on 2026-09-21 in dev three calls returned `ok` at 5600, 6047 and 9813 ms after one or
+# two 504s, each one a wording a traveller got instead of the template.
 #
-# THREE attempts, with the waits clipped to 1 s each, because the whole thing is reserved against a
-# 30 s pass (see `_WORST_CASE_CALL_S`) and an attempt count is not free: 3 x 6 s + 2 x 1 s = 20 s,
-# which is the most the write pass can reserve and still have the CALL cap bind before the clock
-# does (16 workers at ~2.2 s fit ~72 calls into the 10 s that leaves, against a cap of 64). The
-# SDK's own defaults would be 5 attempts with 1/2/4/8 s backoff -- ~29 s of wall clock for one
-# wording, i.e. a pass that admits nothing after its first call.
+# TWO attempts, with the wait clipped to 1 s, because the whole thing is reserved against a 30 s
+# pass (see `_WORST_CASE_CALL_S`): 2 x 9.5 s + 1 x 1 s = 20 s, the same total the three-attempt
+# split spent. A third attempt is only affordable by taking ~3.2 s of model time off every call,
+# which is the trade this constant just came back from. The SDK's own defaults would be 5 attempts
+# with 1/2/4/8 s backoff -- ~29 s of wall clock for one wording, i.e. a pass that admits nothing
+# after its first call.
 #
 # `retry_args` reads every field as `options.x or <default>`, so a falsy value silently becomes the
-# SDK default: `jitter=0` is NOT available, and `initial_delay == max_delay` is how each wait is
-# pinned at exactly 1 s instead of drifting to 1-2 s and then 2-3 s. The retriable set is the SDK's
-# own (408, 429, 5xx, plus httpx timeouts and connect errors).
-_RETRY_OPTIONS = {"attempts": 3, "initial_delay": 1.0, "max_delay": 1.0}
+# SDK default: `jitter=0` is NOT available, and `initial_delay == max_delay` is how the wait is
+# pinned at exactly 1 s instead of drifting to 1-2 s. The retriable set is the SDK's own (408, 429,
+# 5xx, plus httpx timeouts and connect errors).
+_RETRY_OPTIONS = {"attempts": 2, "initial_delay": 1.0, "max_delay": 1.0}
 # What one call can cost before it returns, which is what every caller running on a deadline has to
 # reserve: every attempt at its own timeout, plus the waits between them. `varsel` and `meldinger`
 # restate the number rather than importing it -- both are consulted where reading this module may be

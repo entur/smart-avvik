@@ -1573,6 +1573,21 @@ def test_the_gemini_client_is_built_with_the_retry_options():
     assert llm_message._WORST_CASE_CALL_S <= 20.0, (
         "one call can now outlast the passes that reserve it"
     )
+    # And the other half of that budget, which is the half that went wrong. `X-Server-Timeout` is
+    # enforced server-side and Vertex 504s `_VERTEX_HEADER_OVERHEAD_S` BEFORE it, so the model time
+    # a call gets is the difference -- not `_TIMEOUT_S`, which is what the 8 -> 6 s change on
+    # 2026-09-20 assumed when it read "no call took over 6 s" as "6 s clips nothing". It clipped at
+    # ~3.4 s, and the 3.6-5.0 s band held 10 of dev's 77 single-attempt successes under the old
+    # header. 6.0 s is the floor because the slowest success ever MEASURED here is 4998 ms, and that
+    # distribution is censored by whatever cut was in force when it was taken -- so the margin is
+    # not decoration, it is the part of the tail no measurement so far could see. The subtraction
+    # is deliberately NOT `ceil(_TIMEOUT_S) - overhead`, which is the real cut (7.4 s at 9.5 s):
+    # the header rounds UP, so leaving the ceil out makes this a floor on the cut rather than an
+    # estimate of it, and a fractional `_TIMEOUT_S` cannot pass by rounding its way past the bar.
+    assert llm_message._TIMEOUT_S - llm_message._VERTEX_HEADER_OVERHEAD_S >= 6.0, (
+        "the per-attempt deadline now cuts inside the measured success distribution; trading "
+        "model time for another attempt is what this constant came back from"
+    )
 
 
 if __name__ == "__main__":
