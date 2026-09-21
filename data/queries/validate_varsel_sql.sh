@@ -206,7 +206,8 @@ check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PA
 # to prevent.
 #
 # Measured 2026-09-01 against ent-kixavvik-dev: settled 32.5 MB for one day, provisional 3.4 MB,
-# the day query 305 bytes. The usual caveat applies harder than the byte counts suggest -- a too-narrow
+# the day query 305 bytes. Since 2026-09-21 both carry the planned-trains term from GTFS
+# (docs/rushvarsel/04-cuts): settled 2.36 GB for a 14-day span, provisional ~0.4 GB. The usual caveat applies harder than the byte counts suggest -- a too-narrow
 # date bound drops rows SILENTLY and shows up here as a CHEAPER query, i.e. as success.
 check "togvarsel_outcomes_settled.sql" "$API/togvarsel_outcomes_settled.sql" \
   --parameter=from_date:DATE:2026-08-28 --parameter=to_date:DATE:2026-08-28

@@ -96,7 +96,9 @@ _MIN_CALLS = 300
 # meldinger._MAX_BYTES_BILLED exists. NOT a pruning check: a too-narrow date bound reads as a
 # CHEAPER query, so cost can never detect it. Measured 32.5 MB for one settled day and 3.4 MB for a
 # provisional run, so 2 GiB is ~60x the widest expected read.
-_MAX_BYTES_BILLED = 2 * 1024**3
+# 6 GiB since 2026-09-21: the settled query reads the span plus 35 days of VYG GTFS for the
+# planned-trains term (docs/rushvarsel/04-cuts), ~2 GB per 14-day chunk where it was 32 MB a day.
+_MAX_BYTES_BILLED = 6 * 1024**3
 
 _FAIL_COOLDOWN = timedelta(minutes=15)
 _MAX_FAILS_PER_DAY = 8
@@ -105,7 +107,7 @@ _DDL = """
 CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_outcomes` (
   d DATE OPTIONS(description="Oslo date of the rush."),
   scope STRING OPTIONS(description="am (06:30-09:00) | amrest (07:00-09:00) | pm (15:00-18:00) — the window the issue's own model was trained on."),
-  trouble10 FLOAT64 OPTIONS(description="Share of calls cancelled OR >= 10 min late, over resolved calls. The product bar."),
+  trouble10 FLOAT64 OPTIONS(description="Share of calls cancelled OR >= 10 min late, over resolved calls. The product bar. Since 2026-09-21 the planned calls of trains that never ran (pulled from ET without a cancellation, or cut from the day's plan) count as cancelled on both sides — docs/rushvarsel/04-cuts."),
   level STRING OPTIONS(description="green below the scope's bar, yellow to twice the bar, red at or above. Non-green coincides exactly with the training label being true."),
   n_resolved INT64 OPTIONS(description="Calls with a known outcome — trouble10's denominator."),
   n_unresolved INT64 OPTIONS(description="Calls neither cancelled nor with an actual time."),

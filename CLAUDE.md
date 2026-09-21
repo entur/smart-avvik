@@ -2787,6 +2787,17 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
     from every rate, and why `provisional_trouble10`/`_level`/`_at` are **never overwritten** by the
     settled pass: the overnight disagreement rate is the measurement that decides whether the pass
     earns its keep, and destroying it would repeat the marker store's own defect.
+    **Both passes grade on the 2026-09-21 label rule** (docs/rushvarsel/04-cuts): the planned
+    Oslo-area calls of trains that never ran — absent from ET on a line that ran, or cut from the
+    day's plan against the standing timetable and not already cut the previous weekday — count as
+    cancelled on both sides, and the settled pass also reads an `estimated` time as no observation
+    and a silent journey's tail as cancelled (the provisional pass cannot: no snapshot time on the
+    planned table, its fifth named skew). The plan terms are computed INLINE from GTFS for the
+    span, not read from `togvarsel_plan_cut` (rebuilt monthly), which is why the settled query
+    reads ~2.4 GB per 14-day chunk and `_MAX_BYTES_BILLED` is 6 GiB. **A settled row is never
+    rewritten**, so a rule change leaves history graded on the old rule until
+    `data/queries/togvarsel/regrade_outcomes.py` re-opens a range and re-settles it through the
+    module's own path — run per environment, after the code carrying the rule is what you want.
   - **The authoritative pass's latch is keyed on the UTC DATE, and mixing the two calendars once
     cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for rewrites at
     a UTC hour, while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
