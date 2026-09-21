@@ -13,7 +13,11 @@ WITH oc AS (
   SELECT DATE(c.aimed_local) d, c.dsj, c.cancelled,
     EXTRACT(HOUR FROM c.aimed_local) + EXTRACT(MINUTE FROM c.aimed_local)/60.0 h,
     COALESCE(c.arr_delay_min, c.dep_delay_min) delay_min,
-    (c.cancelled OR c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) resolved
+    (c.cancelled OR c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) resolved,
+    -- corrected-label terms, as in 03_day_windows.sql (04-cuts)
+    (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AND NOT IFNULL(c.estimated, FALSE) observed,
+    (IFNULL(c.estimated, FALSE) AND (c.actual_arr IS NOT NULL OR c.actual_dep IS NOT NULL) AND NOT c.cancelled
+       AND c.recorded_at < TIMESTAMP_SUB(c.aimed_ts, INTERVAL 10 MINUTE)) silent
   FROM `disruptions.togvarsel_calls` c JOIN `disruptions.togvarsel_oslo_stations` USING (stop_place)
   WHERE NOT IFNULL(c.extra_journey,FALSE)
 ),
@@ -30,7 +34,10 @@ et AS (
     SAFE_DIVIDE(COUNTIF(h>=6.33 AND h<6.83 AND (cancelled OR delay_min>=5)), COUNTIF(h>=6.33 AND h<6.83 AND resolved)) et_t5_last_0700,
     -- rest of the rush (07:00-09:00): the 07:00 model's label source
     SAFE_DIVIDE(COUNTIF(h>=7 AND h<9 AND (cancelled OR delay_min>=5)), COUNTIF(h>=7 AND h<9 AND resolved)) am_t5_rest0700,
-    SAFE_DIVIDE(COUNTIF(h>=7 AND h<9 AND (cancelled OR delay_min>=10)), COUNTIF(h>=7 AND h<9 AND resolved)) am_t10_rest0700,
+    SAFE_DIVIDE(COUNTIF(h>=7 AND h<9 AND (cancelled OR delay_min>=10)), COUNTIF(h>=7 AND h<9 AND resolved)) am_t10_rest0700_raw,
+    -- corrected numerator / denominator; the planned trains that never ran are added in the final SELECT
+    COUNTIF(h>=7 AND h<9 AND (cancelled OR silent OR (observed AND delay_min>=10))) n_t10_rest_lab,
+    COUNTIF(h>=7 AND h<9 AND (cancelled OR silent OR observed)) n_res_rest_lab,
     SAFE_DIVIDE(COUNTIF(h>=7 AND h<9 AND cancelled), COUNTIF(h>=7 AND h<9)) am_cancel_rest0700,
     COUNTIF(h>=7 AND h<9) am_n_rest0700
   FROM oc GROUP BY d
@@ -112,6 +119,11 @@ sxc AS (
     COUNT(DISTINCT IF(fh < 14 AND oslo AND cls='innstilt' AND operating_date=fday AND amh BETWEEN 15 AND 18, j_ref, NULL)) sx_pmj_inn_1400
   FROM ev GROUP BY fday
 )
-SELECT f.d, et.* EXCEPT(d), sxc.* EXCEPT(d)
+SELECT f.d, et.* EXCEPT(d), sxc.* EXCEPT(d),
+  -- the 07:00 label under the corrected rule (04-cuts): removed trains and the day-before cut count
+  -- as cancelled, on both sides of the share. Raw (unrounded), as it always was.
+  SAFE_DIVIDE(et.n_t10_rest_lab + IFNULL(k.amrest_miss, 0) + IFNULL(k.amrest_cut_new, 0),
+              et.n_res_rest_lab + IFNULL(k.amrest_miss, 0) + IFNULL(k.amrest_cut_new, 0)) am_t10_rest0700
 FROM `disruptions.togvarsel_days` f
 LEFT JOIN et USING (d) LEFT JOIN sxc USING (d)
+LEFT JOIN `disruptions.togvarsel_plan_cut` k USING (d)
