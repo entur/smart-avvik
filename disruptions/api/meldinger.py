@@ -203,7 +203,7 @@ _MAX_BACKEND_ATTEMPTS = 2
 #    bound guarantees nothing.
 #
 #    Every environment pins one provider, so one subject can consume only one call's worst case --
-#    `llm_message._WORST_CASE_CALL_S`, which since 2026-09-20 is three HTTP attempts at `_TIMEOUT_S`
+#    `llm_message._WORST_CASE_CALL_S`, which since 2026-09-21 is two HTTP attempts at `_TIMEOUT_S`
 #    with a 1 s wait between them rather than a single 8 s attempt. Restated here rather than
 #    imported and pinned against the constant by the suite, as `varsel._WORST_CASE_CALL_S` is. It
 #    is reserved per app-level attempt (the `_MAX_BACKEND_ATTEMPTS` loop below rechecks it), so the
