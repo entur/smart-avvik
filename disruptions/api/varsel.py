@@ -5847,7 +5847,7 @@ def list_journeys(
     for jid, rec in mine:
         key = journey_key(rec)
         if key not in by_key:
-            by_key[key] = match_journey(rec)
+            by_key[key] = match_journey(rec, now)
             # Its OWN try, and deliberately only around the strip: a raise here costs this journey
             # its `today` and nothing else. The matcher call above has no such guard, and this one
             # is not widened to give it one.

@@ -182,7 +182,7 @@ export interface JourneyStatus {
   now: string;
   date: string;
   window: { start: string; end: string } | null;
-  reason: string | null;
+  reason: 'not_a_travel_day' | null;
   operators: string[];
   as_of: {
     plan_refreshed_at: string | null;
