@@ -69,6 +69,17 @@ test('the label names the line, the time and what is known', () => {
   assert.equal(circleLabel(train('07:03', { line: null })), 'Tog 07:03, ventet i rute');
 });
 
+test('a forecast for a train that has left reads as under way, and only a forecast does', () => {
+  const now = oslo('07:42');
+  assert.equal(
+    circleLabel(train('07:03', { level: 'yellow', delay_p50_min: 6 }), now),
+    'L1 07:03, underveis, ventet 6 min forsinket',
+  );
+  assert.equal(circleLabel(train('07:48', { level: 'yellow', delay_p50_min: 6 }), now), 'L1 07:48, ventet 6 min forsinket');
+  assert.equal(circleLabel(train('07:03', { state: 'confirmed', delay_min: 2 }), now), 'L1 07:03, kom fram 2 min forsinket');
+  assert.equal(circleLabel(train('07:03', { level: 'red', cancelled: true }), now), 'L1 07:03, meldt innstilt');
+});
+
 test('splitAtNow counts the trains at or before now', () => {
   const trains = [train('07:03'), train('07:18'), train('07:48')];
   assert.equal(splitAtNow([], oslo('07:42')), 0);
