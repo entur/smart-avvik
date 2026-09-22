@@ -80,6 +80,18 @@ test('a forecast for a train that has left reads as under way, and only a foreca
   assert.equal(circleLabel(train('07:03', { level: 'red', cancelled: true }), now), 'L1 07:03, meldt innstilt');
 });
 
+test('an unrecorded train well past its expected arrival reads as not registered, not under way', () => {
+  // Departs 09:54, due 10:37, forecast 18 min late: expected 10:55, so under way until 11:25.
+  const late = train('09:54', { level: 'red', arrival_time: oslo('10:37'), delay_p50_min: 18 });
+  assert.equal(circleLabel(late, oslo('11:20')), 'L1 09:54, underveis, fare for over 10 min forsinkelse eller innstilling');
+  assert.equal(circleLabel(late, oslo('11:26')), 'L1 09:54, ankomst ikke registrert');
+  assert.equal(circleLabel(late, oslo('21:52')), 'L1 09:54, ankomst ikke registrert');
+  // No arrival time known: never claims the arrival is missing.
+  assert.equal(circleLabel(train('07:03', { delay_p50_min: 2, level: 'green' }), oslo('21:52')), 'L1 07:03, underveis, ventet 2 min forsinket');
+  // Only forecasts: a confirmed or unknown train keeps its own wording.
+  assert.equal(circleLabel(train('07:03', { state: 'unknown', level: 'grey', arrival_time: oslo('07:40') }), oslo('21:52')), 'L1 07:03, ikke vurdert');
+});
+
 test('splitAtNow counts the trains at or before now', () => {
   const trains = [train('07:03'), train('07:18'), train('07:48')];
   assert.equal(splitAtNow([], oslo('07:42')), 0);
