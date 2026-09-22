@@ -565,6 +565,8 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
     phases = tuple(re.findall(r'_phase\(\s*"([a-z_]+)"', source))
     assert phases == (
         "rail_calls",
+        # The strip's recorded calls, right after the rebuild that produced them (plan 2026-09-22-001).
+        "rail_actuals_cache",
         "disruptions_sql",
         "categories",
         "predict_sql",
@@ -1030,6 +1032,43 @@ def test_a_failed_spine_load_keeps_the_previous_copy_and_retries_next_tick():
             pass
         assert len(client.queries) == 2, "a stamp that did not move means the next tick retries"
 
+
+def test_the_actuals_load_once_per_actuals_rebuild_every_row_tagged_recorded():
+    import journey_status
+
+    rows = [_Row(jkey="j1", lineRef="VYG:Line:L1", stop_place="NSR:StopPlace:337", stop_order=1,
+                 aimed_dep=NOON, dep_delay_min=4, call_cancelled=False)]
+    before = main._rail_calls_refreshed_at
+    try:
+        with _spine_client(rows) as client:
+            main._rail_calls_refreshed_at = None
+            main.refresh_rail_actuals()
+            assert client.queries == []
+            main._rail_calls_refreshed_at = NOON
+            main.refresh_rail_actuals()
+            main.refresh_rail_actuals()
+            assert client.queries == [main._JOURNEY_STATUS_ACTUALS_QUERY]
+            assert journey_status.actuals_refreshed_at() == NOON
+            (call,) = journey_status._actuals.by_key[("VYG", "j1")]
+            assert (call.call_source, call.dep_delay_min, call.aimed_arr) == ("recorded", 4, None)
+        with _spine_client(raises=True):
+            journey_status.set_actuals(journey_status.CallTable([], NOON))
+            main._rail_calls_refreshed_at = NOON + timedelta(minutes=15)
+            try:
+                main.refresh_rail_actuals()
+            except RuntimeError:
+                pass
+            assert journey_status.actuals_refreshed_at() == NOON, "the old copy is still served"
+    finally:
+        main._rail_calls_refreshed_at = before
+
+
+def test_the_actuals_phase_cannot_abort_the_rebuild():
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    block = source[source.index('_phase("rail_calls"') : source.index('_phase("disruptions_sql"')]
+    assert '_phase("rail_actuals_cache"' in block and "except Exception:" in block, block
 
 def test_the_spine_phase_is_isolated_from_the_predictions_it_sits_among():
     import inspect
