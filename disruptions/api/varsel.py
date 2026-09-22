@@ -218,7 +218,24 @@ _MAX_JOURNEYS = 20000
 # projected p90 rather than the p99, and the tail deliberately takes the template. Note the cost of
 # raising it is close to zero in aggregate: demand is bursty, not sustained (prd wants ~50 writes a
 # DAY), so this only ever binds on the handful of cycles it exists for.
-_MAX_LLM_CALLS_PER_CYCLE = 64
+#
+# 64 -> 128 on 2026-09-22, with the snapshot term in `notification_wording.wording_key`. The
+# paragraph above stopped describing the demand the moment a wording became reusable for one cycle
+# instead of for a situation's 12 h life: the trains it counted were the ones NEWLY pushed about,
+# and every train still standing above the gate now needs its own call every cycle too. The
+# measurement that replaces it, over 7 days of prd decisions -- wordings SELECTED per cycle, which
+# is what each one costs under the new key -- is p50 4 / p90 22 / p99 72 / max 94. So 64 would have
+# begun binding on the busiest ~1 % of cycles the day the key changed, which is exactly the shape
+# of regression that reads as "the model got worse" rather than as a cap: the p99 cycle is a bad
+# morning, and a bad morning is when the prose is worth most. 128 clears the measured max with
+# headroom rather than clearing a percentile.
+#
+# The cost of the raise is small and is not the reason to hesitate: prd draws ~318 calls a day
+# against 27 688 available across the four surfaces, and the whole switch is forecast at $40-150 a
+# month per environment (`docs/operations/gemini-tak-og-kostnad.md`). What DOES have to move with
+# it is the width -- see `_MAX_LLM_SECONDS_PER_CYCLE`, raised in the same change, because raising
+# a count without the clock just makes the poller block longer for the same number of wordings.
+_MAX_LLM_CALLS_PER_CYCLE = 128
 # Give-up point for writing one journey × situation's message when the failure is PAYLOAD-dependent
 # — the model was asked and what came back was unusable for this exact input (a refusal, an
 # over-long or unparseable reply, an invented figure). Such a write will very likely keep failing
@@ -290,7 +307,20 @@ _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY = 4
 # still taken before each one starts (now under `_WriteBudget`'s lock rather than in a single-threaded
 # loop), so the guarantee is the same one it always was -- the pass ENDS by this deadline, it does
 # not merely stop starting calls at it.
-_MAX_LLM_SECONDS_PER_CYCLE = 30.0
+#
+# 30 -> 40 s on 2026-09-22, derived from `_MAX_LLM_CALLS_PER_CYCLE` rather than chosen. A call may
+# only START while `_WORST_CASE_CALL_S` (20 s) still fits before the deadline, so the admission
+# window is this number minus 20, and at `_LLM_WORKERS` (16) x ~2.2 s a window of W seconds admits
+# about 16 x W/2.2 calls: 30 s gave a 10 s window and ~72 calls, under the new cap of 128, so the
+# clock would have been the binding constraint and the raised count would have bought nothing. 40 s
+# gives a 20 s window and ~145, which clears 128.
+#
+# Affordable because the cycle is not what sets the period: a cycle runs 50-63 s against a period
+# of ~296 s (p50, set by how often the upstream SIRI-SX ingestion timestamp moves), so ~120 s of
+# headroom absorbs this ten times over. `_LLM_WORKERS` was deliberately NOT raised instead -- 16 to
+# 32 concurrent Vertex calls is an axis nothing here has measured, and the quota is shared with
+# `/meldinger` and the journey-alert read.
+_MAX_LLM_SECONDS_PER_CYCLE = 40.0
 # How many journeys are matched at once, and how many wordings are written at once. Both passes are
 # blocking I/O on the poller thread and nothing else: a match spends its time inside up to
 # `impact._MAX_ALTERNATIVE_LOOKUPS` Journey Planner calls at ~3 s, a write inside a Vertex call at
