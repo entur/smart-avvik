@@ -274,7 +274,10 @@ def test_an_alighting_cancellation_cancels_the_trip():
     dep = _oslo(7, 48)
     _install(_train("a", dep, alight={"call_cancelled": True}), _scored("a", dep))
     t = _strip(_oslo(7, 42))["07:48"]
-    assert (t.cancelled, t.level, t.alert_worthy) == (True, "red", True)
+    assert (t.cancelled, t.level, t.alert_worthy, t.impact_probability) == (True, "red", True, 1.0)
+    # A cancellation only the spine knows about has no prediction, and still reads 1.0.
+    _install(_train("a", dep, board={"call_cancelled": True}))
+    assert _strip(_oslo(7, 42))["07:48"].impact_probability == 1.0
     # The same through the prediction cache: ET's flag on the alighting call alone.
     _install(_train("a", dep), _scored("a", dep, alight={"et_declared_cancelled": True}))
     assert _strip(_oslo(7, 42))["07:48"].cancelled
