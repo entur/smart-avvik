@@ -316,6 +316,7 @@ test("every documented 422 admits the framework's array `detail`, and constraine
   // client that reads its `detail` as a string throws on the first mistyped favourite.
   const constrained = new Set([
     "/journey-alerts|get",
+    "/journey-status|get",
     "/subscriptions|post",
     "/subscriptions|get",
     "/subscriptions/{subscription_id}|get",

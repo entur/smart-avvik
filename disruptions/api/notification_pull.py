@@ -82,6 +82,7 @@ import alert_policy
 import alternatives
 import decisions
 import impact as impact_engine
+import journey_status
 import notification_api
 import notification_auth
 import notification_events
@@ -213,6 +214,7 @@ SERVED_OPERATORS: tuple[str, ...] = tuple(sorted({*alert_policy._OPERATOR_ALERT_
 _STOP_REF_RE = re.compile(r"^NSR:StopPlace:\d+$")
 
 _ROUTE = "/journey-alerts"
+_STATUS_ROUTE = "/journey-status"
 _CACHE_CONTROL_COMPLETE = "public, max-age=60"
 _CACHE_CONTROL_INCOMPLETE = "no-store"
 
@@ -380,6 +382,17 @@ class JourneyAlertsResponse(BaseModel):
     windows: list[WindowOut]
     coverage: CoverageOut
     alerts: list[JourneyAlertOut]
+
+
+class JourneyStatusResponse(journey_status.JourneyStatus):
+    """Every train in the definition's window today, graded (plan 2026-09-22-001) -- the body
+    `/varsel`'s «I dag» strip renders, plus the echoed definition and the coverage block.
+    `coverage.operators` is `journey_status.OPERATORS`, not this read's `SERVED_OPERATORS`: the
+    timetable behind the strip is Vy rail only."""
+
+    model_config = ConfigDict(extra="forbid")
+    journey: JourneyOut
+    coverage: CoverageOut
 
 
 # ---- Validation --------------------------------------------------------------------------------
@@ -1653,6 +1666,82 @@ async def journey_alerts(
         coverage=_coverage(definition),
         alerts=alerts,
     )
+
+
+def _log_status(result: str, *, n_trains: int | None, started: float, pair_digest: str) -> None:
+    """One `notification_status` record per journey-status read (R13), under this module's R11: a
+    count, a duration and the pair's salted digest, and nothing identifying. A LITERAL dict, like
+    `_log`'s, so the contract suite's AST walk sees every field."""
+    logger.info(
+        "journey-status read: %s",
+        result,
+        extra={
+            "fields": {
+                "event": "notification_status",
+                "result": result,
+                "n_trains": n_trains,
+                "ms": round((monotonic() - started) * 1000, 1),
+                "pair_digest": pair_digest,
+            }
+        },
+    )
+
+
+# `async def` like the alerts read, although nothing here waits: the answer is a walk over memory the
+# poller already holds (`journey_status`), so it neither needs the anyio pool nor blocks the loop for
+# longer than a dict lookup per train. It spends the SAME limiter buckets as `journey-alerts` -- a
+# client reading both for one favourite spends the per-pair thirty twice as fast, which the
+# operations document states.
+@router.get(
+    _STATUS_ROUTE,
+    summary="Every train in a journey definition's window today, graded",
+    response_model=JourneyStatusResponse,
+    responses={
+        422: {"description": "A malformed definition, period or weekday list."},
+        429: {"description": "The read's own limiter, shared with journey-alerts. Retry-After is 60 s."},
+        503: {"description": "The day's timetable is not loaded yet. Retry-After."},
+    },
+)
+async def journey_status_read(
+    response: Response,
+    from_stop: str = Query(description="Boarding stop, `NSR:StopPlace:<digits>`."),
+    to_stop: str = Query(description="Alighting stop, `NSR:StopPlace:<digits>`."),
+    begin: str | None = Query(default=None, description='Period start "HH:MM" (Europe/Oslo). Both or neither.'),
+    end: str | None = Query(default=None, description='Period end "HH:MM" (Europe/Oslo), after `begin`.'),
+    days: list[int] | None = Query(
+        default=None,
+        description="Weekdays the definition travels on, 0=Monday .. 6=Sunday, as a REPEATED "
+        "parameter. Default: today's and tomorrow's weekday.",
+    ),
+) -> JourneyStatusResponse:
+    """Every Vy train in today's window on this definition, each graded: `confirmed` where the
+    outcome is known, `predicted` where the model has a figure, `unknown` otherwise.
+
+    Built per request from memory: the day's planned timetable (rebuilt hourly), the prediction
+    cache (every poller cycle) and today's recorded calls. `as_of` says how old each is. A day not
+    in `days` answers an empty list with `reason: not_a_travel_day`; a timetable not loaded yet is
+    503, never an empty list.
+    """
+    started = monotonic()
+    now = _now()
+    definition = _definition(from_stop, to_stop, begin, end, days, now)
+    pair = (definition["from_stop"], definition["to_stop"])
+    digest = alternatives.pair_digest(*pair)
+    if not _claim(pair, monotonic()):
+        _log_status("rate_limited", n_trains=None, started=started, pair_digest=digest)
+        raise HTTPException(
+            status_code=429,
+            detail="rate_limited",
+            headers={"Retry-After": str(notification_auth.RETRY_AFTER_S)},
+        )
+    status = journey_status.status_for(definition, now)
+    if status is None:
+        _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest)
+        raise _retry_later("plan_not_loaded")
+    coverage = _coverage(definition).model_copy(update={"operators": list(journey_status.OPERATORS)})
+    response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE
+    _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest)
+    return JourneyStatusResponse(**dict(status), journey=JourneyOut(**definition), coverage=coverage)
 
 
 def shutdown() -> None:

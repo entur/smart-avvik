@@ -143,7 +143,10 @@ class JsonFormatter(logging.Formatter):
 #: `/historikk-api` refuses to serve into Cloud Logging on every request. A literal here rather
 #: than an import from `notification_pull`: this module is imported before every other one in
 #: `main`, and the suite pins the two against each other instead.
-REDACTED_QUERY_PATHS = ("/notification-api/v1/journey-alerts",)
+REDACTED_QUERY_PATHS = (
+    "/notification-api/v1/journey-alerts",
+    "/notification-api/v1/journey-status",
+)
 _REDACTED_QUERY = "?<redacted>"
 
 
