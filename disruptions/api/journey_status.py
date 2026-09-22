@@ -57,8 +57,10 @@ class PlannedCall:
     """One row of `rail_calls_planned_today` (the spine) or `rail_calls_today` (the actuals).
 
     `operator` is the lineRef codespace, derived exactly as `main.refresh_call_predictions_cache`
-    derives it, so `(operator, jkey)` joins the prediction cache. `arr_delay_min` is None until the
-    SQL carries it (U4) and on every estimated call.
+    derives it, so `(operator, jkey)` joins the prediction cache. `arr_delay_min` is None today:
+    neither SQL carries it, because reading the arrival times measured +11 % on the planned rebuild
+    and +58 % on the 15-min actuals one (2026-09-22). The field stays so the grading picks the
+    arrival up the day a table carries the column; the loader reads it with getattr.
     """
 
     operator: str
@@ -276,8 +278,9 @@ def _trains(
 def _confirmed_delay(calls: tuple[PlannedCall, ...], a: PlannedCall) -> tuple[int, PlannedCall] | None:
     """The delay a recorded alighting call says, and the call it was read off.
 
-    Arrival first (U4's `arr_delay_min`); before that column exists, the departure delay at the same
-    call; at a terminus, which has no departure, the last recorded call before it (KTD6).
+    Arrival first, when a table carries `arr_delay_min` (neither does today, for cost); otherwise
+    the departure delay at the same call, within a minute or so of the arrival on a through train;
+    at a terminus, which has no departure, the last recorded call before it (KTD6).
     """
     if a.arr_delay_min is not None:
         return a.arr_delay_min, a
@@ -327,10 +330,14 @@ def _status(
         same = [p for p in preds if p.situation_number == bpred.situation_number]
         apred = _worst_prediction(same, a.stop_order) or _worst_prediction(preds, a.stop_order)
 
-    # Recorded calls: the actuals index when it knows this train, the spine's own otherwise.
-    recorded_calls = actuals.by_key.get(key) if actuals is not None else None
-    if recorded_calls is None:
-        recorded_calls = tuple(c for c in spine.by_key[key] if c.call_source == "recorded")
+    # Recorded calls: the spine's own, overlaid per stop by the actuals index, which is fresher
+    # (15 min against 60). An overlay and not a replacement: `rail_calls_today` keeps only calls
+    # with an aimed DEPARTURE, so it never holds a terminus arrival, and letting it stand alone for
+    # a train it knows would hide the spine's recorded terminus call.
+    by_order = {c.stop_order: c for c in spine.by_key[key] if c.call_source == "recorded"}
+    if actuals is not None:
+        by_order.update({c.stop_order: c for c in actuals.by_key.get(key, ())})
+    recorded_calls = tuple(by_order[o] for o in sorted(by_order))
     recorded_a = next((c for c in recorded_calls if c.stop_order == a.stop_order), None)
     recorded_b = next((c for c in recorded_calls if c.stop_order == b.stop_order), None)
 

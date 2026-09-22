@@ -296,6 +296,20 @@ def test_the_actuals_index_overrides_the_spine_and_owns_its_stamp():
     assert status.as_of.plan_refreshed_at == _oslo(7, 5)
 
 
+def test_an_actuals_index_that_lacks_the_terminus_does_not_hide_the_spines_recorded_one():
+    """`rail_calls_today` keeps calls with an aimed departure only, so it never holds a terminus
+    arrival. The spine's recorded terminus call must still confirm the train."""
+    dep = _oslo(7, 3)
+    spine = _train("a", dep, terminus=True, board={"source": "recorded", "dep_delay_min": 1},
+                   mid={"source": "recorded", "dep_delay_min": 4}, alight={"source": "recorded"})
+    actuals = [  # fresher, and graded later on the line -- but no terminus row
+        _row("a", 3, FROM, dep, None, source="recorded", dep_delay_min=1),
+        _row("a", 5, MID, dep + timedelta(minutes=10), None, source="recorded", dep_delay_min=11),
+    ]
+    _install(spine, actuals=actuals)
+    t = _strip(_oslo(7, 42))["07:03"]
+    assert (t.state, t.level, t.delay_min) == ("confirmed", "red", 11), "the actuals' MID figure wins"
+
 def test_the_worst_situation_wins_and_ties_break_on_the_situation_number():
     dep = _oslo(7, 48)
     preds = _scored("a", dep, sit="S1", p_impact_dep=0.20) + _scored("a", dep, sit="S2", p_impact_dep=0.90)

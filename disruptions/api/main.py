@@ -73,6 +73,8 @@ _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # each planned rebuild. `SELECT *` so the load survives the deploy that adds a column (U4's
 # `arr_delay_min`) before the table is rebuilt with it -- the row reader uses getattr.
 _JOURNEY_STATUS_SPINE_QUERY = "SELECT * FROM `disruptions.rail_calls_planned_today`"
+# ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild.
+_JOURNEY_STATUS_ACTUALS_QUERY = "SELECT * FROM `disruptions.rail_calls_today`"
 # Bus/GOA family (pooled_all): the bus planned call source, the bus SX source, and the bus scoring
 # query -> call_predictions_bus_today (same columns as call_predictions_today PLUS `operator`).
 _BUS_CALLS_PLANNED_QUERY = (Path(__file__).parent / "bus_calls_planned_today.sql").read_text()
@@ -423,9 +425,12 @@ _DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
 # ingestion (a disruption *text* being published) while this table reads SIRI-ET (a train actually
 # passing a stop) -- the two advance independently. And nothing live reads it: `/journey`,
 # `/impact` and every varsel push score against `rail_calls_planned_today` (predict_calls.sql), not
-# this table. Its only consumers are retrospective -- the `actual_*` columns in predict.sql and the
+# this table. Its consumers were retrospective -- the `actual_*` columns in predict.sql and the
 # impact label in disruptions_today.sql -- both measured over an onset + 12 h window that a quarter
-# of an hour cannot move.
+# of an hour cannot move. Since 2026-09-22 it has ONE live reader, `refresh_rail_actuals` (the
+# /varsel «I dag» strip), which is what the 15 min buys a traveller: a recorded arrival reaches the
+# strip within a quarter of an hour instead of the planned table's hour. It reads the table the
+# rebuild already wrote, so the cost below is unchanged.
 #
 # The ET source is DAY-partitioned and unclustered, so there is no cheap incremental read to reach
 # for; running it less often is the only lever. Cost is linear in rebuild count (~1.7 GB per run
@@ -511,6 +516,23 @@ def _planned_call(r, *, call_source: str | None = None) -> journey_status.Planne
         boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
         alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
     )
+
+
+def refresh_rail_actuals() -> None:
+    """Load `rail_calls_today` into `journey_status` when the table has been rebuilt since the copy
+    it holds -- every 15 min at most (`_RAIL_CALLS_TTL`), a no-op on the ticks between.
+
+    Every row is a recorded call (the SQL keeps nothing else), so each is tagged `recorded` here;
+    the table carries no `call_source` column. Same stamp-is-the-guard rule as the spine: a failed
+    load keeps the previous index and the next tick retries."""
+    with _rail_calls_lock:
+        built = _rail_calls_refreshed_at
+    if built is None or journey_status.actuals_refreshed_at() == built:
+        return
+    rows = bq_client.query(_JOURNEY_STATUS_ACTUALS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
+    table = journey_status.CallTable((_planned_call(r, call_source="recorded") for r in rows), built)
+    journey_status.set_actuals(table)
+    logger.info("Loaded the journey-status actuals: %d recorded calls", len(table))
 
 
 def refresh_planned_spine() -> None:
@@ -1373,6 +1395,13 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # _RAIL_CALLS_TTL old, which is what their onset + 12 h windows already tolerate.
     with _phase("rail_calls", timings):
         maybe_refresh_rail_calls()
+    # The «I dag» strip's recorded calls (journey_status). Its own try: the step above is the one
+    # whose failure aborts the rebuild, and a failed LOAD of a table it did build must not.
+    try:
+        with _phase("rail_actuals_cache", timings):
+            refresh_rail_actuals()
+    except Exception:
+        logger.exception("Journey-status actuals load failed; serving the previous copy")
     with _phase("disruptions_sql", timings):
         bq_client.query(_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
