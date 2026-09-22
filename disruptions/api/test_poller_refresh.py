@@ -571,13 +571,13 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "disruptions_cache",
         "impact_lookup",
         "svv_baselines",
+        "varsel_stops",
         "rail_planned_calls",
         "predict_calls_rail",
         "disruptions_bus_sql",
         "bus_planned_calls",
         "predict_calls_bus",
         "call_predictions_cache",
-        "varsel_stops",
         "varsel_recheck_service",
         "notification_mirror",
         "varsel_notify",
@@ -589,6 +589,16 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
     # waiting for. A slow or failing rewrite of the rollback artefact costs the artefact its
     # freshness; anywhere earlier it would cost the alerting pass its cycle.
     assert phases[-1] == "varsel_state_export", phases
+    # `varsel_stops` is BEFORE `call_predictions_cache`, and the order is the assertion (2026-09-22).
+    # That step stamps `_call_pred_refreshed_at`, which `notification_wording.wording_key` carries,
+    # so every cached wording is orphaned the instant it moves and everything between the swap and
+    # `varsel_notify` writing the new ones is a window where the in-app card and the journey-alert
+    # read serve the deterministic line in place of the model's. Measured on prd over 12 cycles,
+    # that window was ~20 s of a ~296 s period and `varsel_stops` was ~8 s of it -- for a step that
+    # reads `{rail,bus}_calls_planned_today` straight from BigQuery and touches the prediction
+    # snapshot in neither direction. Anything added between these two phases lands in that window,
+    # so add it above `varsel_stops` unless it genuinely needs the fresh snapshot.
+    assert phases.index("varsel_stops") < phases.index("call_predictions_cache"), phases
     # `notification_mirror` is BEFORE `varsel_notify`, and the order is the assertion. The pass
     # reads the store's mirror, so a mirror synced after it would serve every cycle the population
     # of the one before -- a whole cycle's lag on every create, replace and revocation, with

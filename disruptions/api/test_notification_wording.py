@@ -639,17 +639,28 @@ def test_a_pull_wording_is_charged_to_its_own_allowance_and_to_nobody_elses():
 
 
 def test_the_pull_allowance_drains_over_minutes_rather_than_in_one_burst():
-    """The pull path is the only one with a per-minute ceiling: `WORDINGS_PER_MIN` (30) under an
-    hour of `WORDINGS_PER_HOUR` (500), so a burst from a public endpoint cannot spend the whole
+    """The pull path is the only one with a per-minute ceiling: `WORDINGS_PER_MIN` (120) under an
+    hour of `WORDINGS_PER_HOUR` (2000), so a burst from a public endpoint cannot spend the whole
     hour in its first seconds. The browser and webhook policies keep the module's two numbers and
-    no per-minute ceiling at all -- a 31st call inside a minute is refused on pull and nowhere
-    else."""
+    no per-minute ceiling at all -- the call past the minute's allowance is refused on pull and
+    nowhere else.
+
+    All three moved 4x on 2026-09-22, with the snapshot term in `wording_key`: a wording is
+    reusable for one prediction cycle rather than for a situation's 12 h life, which was measured
+    at 3.93 wordings per subject against 1. The RATIO is what this pins rather than the absolute
+    numbers -- the minute has to stay a small fraction of the hour whatever the hour is, or the
+    burst protection is gone."""
     _reset()
-    assert (nw.WORDINGS_PER_MIN, nw.WORDINGS_PER_HOUR, nw.WORDINGS_PER_DAY) == (30, 500, 2000)
+    assert (nw.WORDINGS_PER_MIN, nw.WORDINGS_PER_HOUR, nw.WORDINGS_PER_DAY) == (120, 2000, 10000)
+    assert nw.WORDINGS_PER_MIN * 10 <= nw.WORDINGS_PER_HOUR <= nw.WORDINGS_PER_DAY, (
+        "a minute's allowance has grown into a sizeable share of the hour; a single burst can now "
+        "leave the rest of the hour on the template, which is what the per-minute ceiling exists "
+        "to prevent"
+    )
     t = nw.monotonic()
     for _ in range(nw.WORDINGS_PER_MIN):
         assert nw._spend(nw._PULL_PATH, now=t)
-    assert not nw._spend(nw._PULL_PATH, now=t), "the thirty-first call inside a minute"
+    assert not nw._spend(nw._PULL_PATH, now=t), "the call past the minute's allowance"
     assert nw.spent(nw._PULL_PATH)[0] == nw.WORDINGS_PER_MIN < nw.WORDINGS_PER_HOUR, (
         "the hour still has room; it is the minute that bound"
     )
@@ -756,9 +767,21 @@ class _Alt:
         self.at_risk, self.arrives_before_original = at_risk, in_time
 
 
+class _Snapshot:
+    """Stands in for the `/impact` response the alert was scored against -- `wording_key` reads
+    nothing off it but `refreshed_at`."""
+
+    def __init__(self, refreshed_at):
+        self.refreshed_at = refreshed_at
+
+
+SNAPSHOT = DEP - timedelta(minutes=20)
+
+
 class _Winner:
-    def __init__(self, situation="S1", departure=DEP, cancelled=False):
+    def __init__(self, situation="S1", departure=DEP, cancelled=False, snapshot=SNAPSHOT):
         self.situation_number, self.departure_time, self.cancelled = situation, departure, cancelled
+        self.impact = None if snapshot is None else _Snapshot(snapshot)
 
 
 def test_the_wording_key_is_the_place_pair_and_everything_the_wording_states():
@@ -772,7 +795,8 @@ def test_the_wording_key_is_the_place_pair_and_everything_the_wording_states():
     pair = ("NSR:StopPlace:A", "NSR:StopPlace:B")
     base = nw.wording_key(pair, _Winner(), None, tomorrow=False)
     assert base[0] == pair and base[1] == "S1" and base[2] == DEP.isoformat()
-    assert base[-1] == llm_message.PROMPT_VERSION, "a reworded brief is a different writer"
+    assert base[-2] == llm_message.PROMPT_VERSION, "a reworded brief is a different writer"
+    assert base[-1] == SNAPSHOT.isoformat(), "the snapshot the figures came from"
 
     for label, other in (
         ("a different pair", nw.wording_key(("NSR:StopPlace:A", "NSR:StopPlace:C"), _Winner(), None, tomorrow=False)),
@@ -781,6 +805,11 @@ def test_the_wording_key_is_the_place_pair_and_everything_the_wording_states():
         ("a declared cancellation", nw.wording_key(pair, _Winner(cancelled=True), None, tomorrow=False)),
         ("«i morgen»", nw.wording_key(pair, _Winner(), None, tomorrow=True)),
         ("an alternative", nw.wording_key(pair, _Winner(), _Alt(DEP, DEP + timedelta(minutes=30)), tomorrow=False)),
+        # 2026-09-22. The one element that is not something the sentence NAMES: it is every figure
+        # the sentence quotes. `varsel._webhook_payload` publishes `probabilities` and `delay` live
+        # beside the prose, so a wording reused across a rescoring read «89 % sjanse for
+        # innstilling» next to `cancellation: 0.1737` on the journey-alert read.
+        ("a rescoring", nw.wording_key(pair, _Winner(snapshot=SNAPSHOT + timedelta(minutes=5)), None, tomorrow=False)),
     ):
         assert other != base, f"{label} must not share a cache entry with the plain reading"
 

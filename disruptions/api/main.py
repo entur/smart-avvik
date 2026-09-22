@@ -1364,6 +1364,26 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             reisevalg.refresh_baselines()
     except Exception:
         logger.exception("SVV baselines refresh failed; reisevalg road side may be unavailable")
+    # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
+    #
+    # ABOVE the per-call block, and that placement is load-bearing rather than tidy (2026-09-22).
+    # `refresh_call_predictions_cache` below stamps `_call_pred_refreshed_at`, and since
+    # `notification_wording.wording_key` carries that stamp, every cached wording is orphaned the
+    # instant it moves -- so everything between the swap and `varsel_notify` writing the new ones is
+    # a window where the in-app card and the journey-alert read serve the deterministic line instead
+    # of the model's. This step was ~8 s of a ~20 s window (measured on prd, 12 cycles, 2026-09-22)
+    # and it has no business being in it: it reads `{rail,bus}_calls_planned_today` straight from
+    # BigQuery and neither reads the prediction snapshot nor is read by it.
+    #
+    # What it costs is that the picker list is built from the planned tables BEFORE this cycle's
+    # `maybe_refresh_*_planned_calls` may rebuild them. Those run on a 60/120 min TTL and are a
+    # no-op on most ticks, so the list is at most one cycle behind on the tick that does rebuild --
+    # and the list is which stations exist, which is not what changes between two ticks.
+    try:
+        with _phase("varsel_stops", timings):
+            refresh_varsel_stops()
+    except Exception:
+        logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
     # Per-call (per-train) predictions for /journey. Isolated so any failure here never breaks the
     # main /disruptions feed. The planned call source is rebuilt on a TTL (it scans ET); the
     # scoring + cache reload run every tick (cheap: materialized inputs + ML.PREDICT).
@@ -1390,12 +1410,6 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             refresh_call_predictions_cache()  # loads whichever of the two tables are present
     except Exception:
         logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
-    # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
-    try:
-        with _phase("varsel_stops", timings):
-            refresh_varsel_stops()
-    except Exception:
-        logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
     # Journeys flagged "no direct service" at registration: ask again, and drop the warning from any
     # that a later timetable does connect (a weekend route registered on a Friday). Costs nothing
     # when nothing is flagged, and its own failure must not touch the alerting below.

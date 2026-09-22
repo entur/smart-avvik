@@ -580,8 +580,8 @@ anonymous caller and bind silently as per-entry statuses rather than as errors: 
 allowance is spent and every caller is getting the template, a steady `queue_full` means the
 enrichment pool is saturated, `waiters` that a burst is parking more readers than
 `MAX_CONCURRENT_WAITERS` — and **`notification_wording.spent("pull")` against the hour**, the
-`(hour, day)` pair of wording calls charged to the pull path, read against `WORDINGS_PER_HOUR` (500)
-and `WORDINGS_PER_DAY` (2 000). Both are the read's own ledgers: the poller's and the webhook
+`(hour, day)` pair of wording calls charged to the pull path, read against `WORDINGS_PER_HOUR` (2 000)
+and `WORDINGS_PER_DAY` (10 000). Both are the read's own ledgers: the poller's and the webhook
 channel's are `spent("browser")` and `spent("webhook")`, and a read burst that moves either of those
 is a bug. `notification_pull` with `result="rate_limited"` is the limiter itself binding; with
 `cache="miss"` at a high rate it is the figures cost, which is the peak measurement the plan's
@@ -1569,9 +1569,9 @@ reads it — the other five are read from the account on each pass.
 | `notification_pull.WORDING_CACHE_MAX` | 10000 |
 | `notification_pull.WORDING_TTL_S` | 43200 |
 | `notification_pull.FAILURE_TTL_S` | 60 |
-| `notification_wording.WORDINGS_PER_MIN` | 30 |
-| `notification_wording.WORDINGS_PER_HOUR` | 500 |
-| `notification_wording.WORDINGS_PER_DAY` | 2000 |
+| `notification_wording.WORDINGS_PER_MIN` | 120 |
+| `notification_wording.WORDINGS_PER_HOUR` | 2000 |
+| `notification_wording.WORDINGS_PER_DAY` | 10000 |
 | `alternatives._PULL_FETCH_MAX_PER_MIN` | 30 |
 
 **The journey-keyed pull read** (plan 2026-09-10-001): the `notification_pull.*` rows are the public
