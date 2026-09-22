@@ -152,6 +152,44 @@ export interface Journey {
   // Something about the registration itself, not about today's traffic: currently only "no planned
   // trip connects these stops today", which means this journey cannot produce an alert.
   warning: string | null;
+  // Every Vy train in today's window, graded -- the «I dag» strip (plan 2026-09-22-001). Null while
+  // the server has no timetable loaded; absent from a server that predates the field. The card
+  // renders exactly as before in both cases.
+  today?: JourneyStatus | null;
+}
+
+/** One train on the strip (journey_status.TrainStatus). */
+export interface TrainStatus {
+  departure_time: string;
+  arrival_time: string | null;
+  operator: string;
+  line: string | null;
+  jkey: string;
+  /** confirmed = filled circle, predicted = ring, unknown = grey ring. */
+  state: 'confirmed' | 'predicted' | 'unknown';
+  level: 'red' | 'yellow' | 'green' | 'grey';
+  cancelled: boolean;
+  delay_min: number | null;
+  expected_departure_time: string | null;
+  delay_p50_min: number | null;
+  impact_probability: number | null;
+  alert_worthy: boolean;
+  observed_at: string | null;
+}
+
+/** journey_status.JourneyStatus. `now` is the server's instant; the «nå» marker is drawn on it. */
+export interface JourneyStatus {
+  now: string;
+  date: string;
+  window: { start: string; end: string } | null;
+  reason: string | null;
+  operators: string[];
+  as_of: {
+    plan_refreshed_at: string | null;
+    predictions_refreshed_at: string | null;
+    actuals_refreshed_at: string | null;
+  };
+  trains: TrainStatus[];
 }
 
 export interface NewJourney {
