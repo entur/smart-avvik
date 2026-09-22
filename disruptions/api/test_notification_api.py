@@ -1944,7 +1944,7 @@ def test_the_openapi_paths_are_exactly_the_routers_routes():
         if method in ("get", "post", "put", "delete", "patch")
     }
     assert routes == published, (routes - published, published - routes)
-    assert len(published) == 7
+    assert len(published) == 8
     for server in OPENAPI["servers"]:
         assert server["url"].endswith(notification_api.PREFIX)
 
@@ -2479,7 +2479,7 @@ def test_the_openapi_tags_are_the_routers_own():
         # is worth a heading of its own beside three credentialed ones.
         notification_pull.TAG,
     }
-    # Prefixed, because these seven routes sit among three dozen paths in this app.
+    # Prefixed, because these eight routes sit among three dozen paths in this app.
     assert all(tag.startswith("notification-") for tag in router_tags)
 
 
@@ -2492,15 +2492,39 @@ def test_the_public_read_overrides_the_global_security_per_operation():
     does not have -- and the read would still answer 200, so nothing at runtime would notice.
     """
     assert OPENAPI["security"] == [{"clientKey": []}]
-    operation = OPENAPI["paths"]["/journey-alerts"]["get"]
-    assert operation["security"] == []
-    assert operation["tags"] == [notification_pull.TAG]
+    public = ("/journey-alerts", "/journey-status")  # the second since plan 2026-09-22-001
+    for path in public:
+        operation = OPENAPI["paths"][path]["get"]
+        assert operation["security"] == [], path
+        assert operation["tags"] == [notification_pull.TAG], path
     # Every credentialed operation inherits the global and declares nothing of its own.
     for path, operations in OPENAPI["paths"].items():
         for method, op in operations.items():
-            if method == "parameters" or path == "/journey-alerts":
+            if method == "parameters" or path in public:
                 continue
             assert "security" not in op, (path, method)
+
+
+def test_the_journey_status_schema_matches_the_response_models_in_both_directions():
+    """`additionalProperties: false` at every level, so a field added on one side and not the other
+    is a client's generated types refusing a response this API sent."""
+    import journey_status
+
+    schemas = OPENAPI["components"]["schemas"]
+    top = schemas["JourneyStatus"]
+    assert set(notification_pull.JourneyStatusResponse.model_fields) == set(top["properties"])
+    assert set(top["required"]) == set(top["properties"])
+    train = schemas["TrainStatus"]
+    assert set(journey_status.TrainStatus.model_fields) == set(train["properties"])
+    assert set(train["required"]) == set(train["properties"])
+    as_of = top["properties"]["as_of"]
+    assert set(journey_status.AsOf.model_fields) == set(as_of["properties"]) == set(as_of["required"])
+    assert train["properties"]["state"]["enum"] == ["confirmed", "predicted", "unknown"]
+    assert train["properties"]["level"]["enum"] == ["red", "yellow", "green", "grey"]
+    # The echoed definition and the coverage block are the alerts read's own, not restatements.
+    alerts = schemas["JourneyAlerts"]["properties"]
+    assert top["properties"]["journey"] == alerts["journey"]
+    assert set(top["properties"]["coverage"]["properties"]) == set(alerts["coverage"]["properties"])
 
 
 def test_the_call_payload_promises_only_what_both_producers_emit():

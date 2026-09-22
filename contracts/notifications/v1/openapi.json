@@ -4,7 +4,7 @@
     "title": "Entur journey notification notification API",
     "version": "1.0.0",
     "summary": "Register a commuter's recurring journey; receive a signed webhook when a disruption is predicted to hit it.",
-    "description": "The authenticated surface a client BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the client's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**One operation is public.** `GET /journey-alerts` reads the alert state on a journey definition nobody registered -- what the Entur app's favourites panel asks for a saved route -- with no credential, under its own limiter, and it declares `security: []` on itself; everything else below is authenticated as described next.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the client cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated client's own records only, and `client_id` in a request body is ignored. A record belonging to another client is indistinguishable from one that does not exist: both are 404, and no response body names anything about another client.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the client is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no webhook channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential (on the public read it means the prediction cache is not loaded yet, which is the minute after a deploy).\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
+    "description": "The authenticated surface a client BFF manages its own commuter registrations through, plus the outbound event contract under `webhooks` below.\n\n**This document renders the two authored schemas rather than restating them.** `subscription.schema.json` and `event.schema.json` sit beside this file and every property here is a `$ref` into one of them: two definitions of one payload is how they drift, and the client's TypeScript types are generated from this document. OpenAPI 3.1 is JSON Schema 2020-12, so the references resolve without translation.\n\n**One property is inline rather than a `$ref`, on purpose:** `TestEventRequest.subscription_id`. A create body must carry your own reference and nothing else, while `POST /test-events` additionally accepts the opaque `subscription_id` an event carries -- so the two are genuinely different constraints, and referencing the stricter create-side one would publish a schema that refuses a value this API had itself just served. Widening the shared definition to match would be the same mistake pointing the other way.\n\n**Two operations are public.** `GET /journey-alerts` reads the alert state on a journey definition nobody registered -- what the Entur app's favourites panel asks for a saved route -- and `GET /journey-status` grades every train in that definition's window today. Both take no credential, share one limiter, and declare `security: []` on themselves; everything else below is authenticated as described next.\n\n**Authentication** is a bearer credential this app issued: `Authorization: Bearer <key-id>.<secret>`. The `key-id` is prefixed `kixn_`; the secret is 256 random bits, shown once at issue and stored here only as an HMAC-SHA256 hash under a pepper. Never a cookie: the app serves one global CORS policy allowing every origin, so a cookie would be sent from all of them. Several credentials are live at once, which is how rotation works -- a new `key-id` is issued, the client cuts over, and the old one is revoked afterwards, so nothing is taken down for a rotation.\n\n**Ownership comes from the credential.** Every route acts on the authenticated client's own records only, and `client_id` in a request body is ignored. A record belonging to another client is indistinguishable from one that does not exist: both are 404, and no response body names anything about another client.\n\n**Statuses worth knowing before you write a client.** `401` is a credential problem and carries no detail about which; `403` means the client is suspended, which is a conversation with an operator rather than a credential to rotate; `429` is a limiter tier or a quota ceiling and always carries a bounded `Retry-After`; `503` means this deployment has no webhook channel configured, or its store is briefly unavailable -- both retryable, neither a statement about your credential (on the public read it means the prediction cache is not loaded yet, which is the minute after a deploy).\n\n**`422` has two body shapes, and the one you will meet first is the array.** A refusal this application made carries a string `detail` (`Error`); a refusal the framework made before any handler ran carries an array of objects (`ValidationError`) -- an out-of-range `limit`, an unknown body property, a `pattern` violation, a missing required property, an over-long path segment. Those are the errors you hit while writing the client, so branch on `detail`'s type rather than assuming a string. Every documented `422` here says which shapes it can be.\n\n**Retention.** A subscription expires at the earlier of 180 days from creation and 60 days from your last interaction with it, and both horizons are enforced when it is read as well as by the store's own expiry -- so a subscription never keeps alerting past its published expiry. Events and delivery records are kept 7 days. A `DELETE` tombstones the subscription in one write that stops routing and then deletes its events, deliveries and alert subjects; where that has not completed the response says so and names the maximum residual window, after which expiry removes the remainder.",
     "contact": {
       "name": "Entur - Team KI-eksperimentering"
     }
@@ -43,7 +43,7 @@
     },
     {
       "name": "notification-journey-alerts",
-      "description": "The public, credential-free read of the alert state on a journey definition nobody registered -- what the Entur app's favourites panel asks for a saved route. One route, and the only operation in this document with `security: []`."
+      "description": "The public, credential-free reads on a journey definition nobody registered -- what the Entur app's favourites panel asks for a saved route: the alert-worthy trains ahead (`journey-alerts`) and every train in today's window, graded (`journey-status`). The only two operations in this document with `security: []`."
     }
   ],
   "paths": {
@@ -528,6 +528,139 @@
           },
           "503": {
             "description": "`predictions_not_loaded` -- the prediction cache has not been loaded since this process started, which is the minute after a deploy -- or `matcher_failed`. Both carry `Retry-After` and both are retryable. Neither has anything to do with the webhook channel's store or credentials, which this route never touches; an empty answer is deliberately never served for either.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/journey-status": {
+      "get": {
+        "operationId": "readJourneyStatus",
+        "tags": [
+          "notification-journey-alerts"
+        ],
+        "summary": "Every train in a journey definition's window today, graded",
+        "security": [],
+        "description": "Every Vy train in today's window on a definition nobody registered, in departure order, each graded: `confirmed` where the outcome is known (ran on time, ran late, cancelled), `predicted` where the model behind `journey-alerts` has a figure, `unknown` where nothing can be said. Built for a glanceable overview of today's commute: one circle per train, filled for a fact and a ring for a forecast.\n\n**No credential**, and the same limiter as `GET /journey-alerts` -- the SAME buckets, global and per canonical stop pair, so reading both routes for one favourite spends the thirty per pair per minute twice as fast.\n\n**The definition** is validated and canonicalized exactly as `journey-alerts` does it, and echoed in `journey`. Only today is answered.\n\n**How old each fact can be** is in `as_of`: the day's timetable (which trains exist, and a cancellation) is rebuilt hourly, the recorded calls every fifteen minutes, the forecasts every prediction cycle. `red` for a forecast is the same bar a notification fires at, so this read and `journey-alerts` never disagree about which trains are bad.\n\n**After a deploy** the timetable is not in memory for the first cycle and the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.",
+        "parameters": [
+          {
+            "name": "from_stop",
+            "in": "query",
+            "required": true,
+            "description": "Boarding stop, `NSR:StopPlace:<digits>`. Canonicalized; the echoed `journey.from_stop` is the ref the answer is about.",
+            "schema": {
+              "$ref": "./subscription.schema.json#/properties/from_stop"
+            }
+          },
+          {
+            "name": "to_stop",
+            "in": "query",
+            "required": true,
+            "description": "Alighting stop, `NSR:StopPlace:<digits>`. Must not name the same physical place as `from_stop` after canonicalization.",
+            "schema": {
+              "$ref": "./subscription.schema.json#/properties/to_stop"
+            }
+          },
+          {
+            "name": "begin",
+            "in": "query",
+            "required": false,
+            "description": "Period start, `HH:MM` in Europe/Oslo. Given together with `end` or not at all; no period means the whole day (`00:00`-`23:59`).",
+            "schema": {
+              "$ref": "./subscription.schema.json#/properties/begin"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": false,
+            "description": "Period end, `HH:MM` in Europe/Oslo, strictly after `begin`. Overnight periods are refused, as they are in `/varsel`: ask as two.",
+            "schema": {
+              "$ref": "./subscription.schema.json#/properties/end"
+            }
+          },
+          {
+            "name": "days",
+            "in": "query",
+            "required": false,
+            "description": "Weekdays the definition travels on, 0 = Monday .. 6 = Sunday, as a REPEATED parameter (`days=0&days=1`). Default: today's and tomorrow's Oslo weekday. Only TODAY is answered; a today not in `days` is an empty list with `reason: not_a_travel_day`.",
+            "style": "form",
+            "explode": true,
+            "schema": {
+              "$ref": "./subscription.schema.json#/properties/days"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The answer. Always `Cache-Control: public, max-age=60`.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "public, max-age=60"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JourneyStatus"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A malformed definition, period or weekday list, in the same two shapes as `journey-alerts`: `Error` (a string `detail`) for a refusal this application made, `ValidationError` (an array) for one the framework made -- a non-integer `days` element. A 422 is logged nowhere.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ValidationError"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The limiter shared with `journey-alerts` answered `rate_limited`. `Retry-After` is 60 s.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`plan_not_loaded` -- the day's timetable has not been loaded since this process started. Carries `Retry-After`; retryable.",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1253,6 +1386,292 @@
                 }
               }
             }
+          }
+        }
+      },
+      "JourneyStatus": {
+        "title": "Journey status",
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Every Vy train in today's window on the definition, in departure order, each graded. Built per request from memory the service already holds; nothing in it identifies a registration.",
+        "required": [
+          "now",
+          "date",
+          "window",
+          "reason",
+          "operators",
+          "as_of",
+          "trains",
+          "journey",
+          "coverage"
+        ],
+        "properties": {
+          "now": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The instant the answer was assembled at, UTC. Draw the «now» marker against this, not against the device clock."
+          },
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "The Oslo date the window is on."
+          },
+          "window": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "start",
+              "end"
+            ],
+            "properties": {
+              "start": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "end": {
+                "type": "string",
+                "format": "date-time"
+              }
+            },
+            "description": "Today's `[begin, end]` as UTC instants, the past half included; null on a day not in `days`."
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "not_a_travel_day",
+              null
+            ],
+            "description": "`not_a_travel_day` when today is not in `days`, else null."
+          },
+          "operators": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Operators whose trains are listed: `[\"VYG\"]`. A trip by any other operator is never listed."
+          },
+          "as_of": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "plan_refreshed_at",
+              "predictions_refreshed_at",
+              "actuals_refreshed_at"
+            ],
+            "description": "When each source was loaded. The day's timetable is rebuilt hourly and the recorded calls every fifteen minutes, so a cancellation or a recorded arrival can be that old.",
+            "properties": {
+              "plan_refreshed_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "The day's planned timetable."
+              },
+              "predictions_refreshed_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "The prediction cache."
+              },
+              "actuals_refreshed_at": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "Today's recorded calls; null until they are loaded, when the timetable's own recorded calls stand in."
+              }
+            }
+          },
+          "trains": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrainStatus"
+            },
+            "description": "Departure order."
+          },
+          "journey": {
+            "title": "Journey definition (echoed)",
+            "description": "The definition the answer is about, AFTER canonicalization and with the defaults filled in: both refs as the stop registry collapses them, `00:00`-`23:59` when no period was given, today's and tomorrow's Oslo weekday when no `days` were. Key your own cache on this and `refreshed_at`, never on the query string you sent -- two spellings of one place are one answer.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "from_stop",
+              "to_stop",
+              "begin",
+              "end",
+              "days"
+            ],
+            "properties": {
+              "from_stop": {
+                "$ref": "./subscription.schema.json#/properties/from_stop"
+              },
+              "to_stop": {
+                "$ref": "./subscription.schema.json#/properties/to_stop"
+              },
+              "begin": {
+                "$ref": "./subscription.schema.json#/properties/begin"
+              },
+              "end": {
+                "$ref": "./subscription.schema.json#/properties/end"
+              },
+              "days": {
+                "$ref": "./subscription.schema.json#/properties/days"
+              }
+            }
+          },
+          "coverage": {
+            "title": "Coverage",
+            "description": "What the read can and cannot say anything about. It is NOT a servability answer: nothing here says a direct trip runs between the two places today, only that each place is served by something. Render a favourite whose stop is `false` here as unverified rather than calm.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "operators",
+              "from_stop_in_timetable_today",
+              "to_stop_in_timetable_today"
+            ],
+            "properties": {
+              "operators": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "The operators this answer covers -- `[\"VYG\"]`, the same as the top-level `operators`."
+              },
+              "from_stop_in_timetable_today": {
+                "type": "boolean",
+                "description": "Whether the canonical origin appears in TODAY's planned timetable as the service knows it, checked over every ref of the physical place. Fails OPEN: when the timetable is not loaded this reads `true`, because \"we do not know\" must never be rendered as \"not served\"."
+              },
+              "to_stop_in_timetable_today": {
+                "type": "boolean",
+                "description": "The same, for the destination."
+              }
+            }
+          }
+        }
+      },
+      "TrainStatus": {
+        "title": "Train status",
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One Vy train in today's window that boards at the origin and lets you off at the destination.",
+        "required": [
+          "departure_time",
+          "arrival_time",
+          "operator",
+          "line",
+          "jkey",
+          "state",
+          "level",
+          "cancelled",
+          "delay_min",
+          "expected_departure_time",
+          "delay_p50_min",
+          "impact_probability",
+          "alert_worthy",
+          "observed_at"
+        ],
+        "properties": {
+          "departure_time": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Aimed departure from the boarding stop, UTC."
+          },
+          "arrival_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Aimed arrival at the alighting stop, UTC."
+          },
+          "operator": {
+            "type": "string",
+            "description": "Operator codespace (`VYG`)."
+          },
+          "line": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SIRI lineRef, e.g. `VYG:Line:L1`."
+          },
+          "jkey": {
+            "type": "string",
+            "description": "The dated journey ref with its codespace stripped."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "predicted",
+              "unknown"
+            ],
+            "description": "`confirmed` when the alighting call is recorded, or the train is declared cancelled and its aimed departure has passed -- draw it filled. `predicted` when the model has a figure (or the cancellation is announced but not yet due) -- draw a ring. `unknown` when nothing can be said, including a train with no operator message more than two hours out, whose score is not better than the base rate."
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "red",
+              "yellow",
+              "green",
+              "grey"
+            ],
+            "description": "`red` cancelled, 10 min or more late, or (predicted) over the same alert bar a notification fires at; `yellow` 3-9 min; `green` less; `grey` exactly when `state` is `unknown` or a confirmed train has no delay figure."
+          },
+          "cancelled": {
+            "type": "boolean",
+            "description": "The boarding or the alighting call is cancelled -- a partial cancellation that cuts your stretch counts."
+          },
+          "delay_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Confirmed delay at the alighting stop, minutes; null unless `state` is `confirmed`."
+          },
+          "expected_departure_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Aimed departure plus the typical predicted departure delay; null unless `state` is `predicted`."
+          },
+          "delay_p50_min": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Typical predicted arrival delay, minutes; null unless `state` is `predicted`."
+          },
+          "impact_probability": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a declared cancellation."
+          },
+          "alert_worthy": {
+            "type": "boolean",
+            "description": "Whether this train clears the bar a notification would fire at."
+          },
+          "observed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Aimed time of the call a confirmed figure was read off, UTC -- how old the fact is."
           }
         }
       }
