@@ -353,7 +353,9 @@ def _status(
         )
     )
 
-    impact_p = None if bpred is None else (1.0 if bpred.et_declared_cancelled else bpred.p_impact_dep)
+    # 1.0 for any cancellation, as `impact._cancelled_prediction` serves it -- including one only the
+    # spine knows about, which has no prediction to read a figure off.
+    impact_p = 1.0 if cancelled else (None if bpred is None else bpred.p_impact_dep)
     alert_worthy = cancelled or (
         bpred is not None
         and alert_policy.gate(impact_p, b.operator, has_situation=bpred.has_situation).alertworthy
