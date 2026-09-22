@@ -330,6 +330,11 @@ No credential. The alert-worthy trains ahead on a journey definition nobody regi
 the event's own `payload`. Its parameters, statuses, wait budget, caching rule and the BFF guidance
 are [The journey-keyed read](#the-journey-keyed-read) below.
 
+### `GET /journey-status` — every train today, graded
+
+No credential. Every Vy train in today's window on a definition, graded as a fact or a forecast. See
+[The journey-status read](#the-journey-status-read) below.
+
 ### Errors
 
 Every error this module raises itself is `{"detail": "<short stable string>"}`:
@@ -343,7 +348,7 @@ Every error this module raises itself is `{"detail": "<short stable string>"}`:
 | 409 | `version_conflict`, `not_a_test_subscription`, `destination_missing`, `destination_paused` |
 | 422 | `unknown_destination` |
 | 429 | `rate_limited`, `quota_exceeded`, `test_events_rate_limited` — and `rate_limited` from the public read's own limiter |
-| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public read only, `predictions_not_loaded`, `matcher_failed` |
+| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public reads only, `predictions_not_loaded`, `matcher_failed` (`journey-alerts`) and `plan_not_loaded`, `status_failed` (`journey-status`) |
 
 Validation refusals carry prose rather than a code, and it is the prose `/varsel`'s own rules produce:
 `"begin must be before end (overnight windows are not supported)"`,
@@ -675,6 +680,48 @@ definition is registered**.
   (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev and prd, off in tst today), so
   in an environment where it is off every entry reads `disabled` with the template — correct, and
   complete.
+
+## The journey-status read
+
+`GET /notification-api/v1/journey-status` answers "how does today look on this trip, all of it?":
+every Vy train in today's window that boards at the origin and lets the traveller off at the
+destination, in departure order, the ones that already ran included. It is the body behind the
+«I dag» strip on `/varsel`, and it takes the same five parameters as `journey-alerts` without `wait`
+and `limit`. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
+Only today is answered: a today not in `days` is an empty `trains` with `reason: not_a_travel_day`.
+
+Each train carries a `state` and a `level`:
+
+| `state` | means | draw it |
+|---|---|---|
+| `confirmed` | the alighting call is recorded, or the train is declared cancelled and its aimed departure has passed | filled |
+| `predicted` | the model has a figure, or a cancellation is announced but not yet due | a ring |
+| `unknown` | nothing can be said, including a train no operator message names more than two hours out | a grey ring |
+
+`level` is `red` for cancelled, 10 min or more late, or a forecast over the same bar a notification
+fires at, applied to the same pairing of a train's two calls. It is `yellow` for 3–9 min, `green`
+below that, and `grey` exactly when nothing can be said. A trip counts as cancelled when either its
+boarding or its alighting call is. That is the one place the two reads can differ: notifications
+fire on the boarding call, so a train cancelled only at the destination is red here and can be
+absent from `journey-alerts`. A forecast that no single operator message scored at both ends is
+graded yellow or green at most, with `impact_probability` null, because no notification can fire
+on it. `now` is the server's
+instant: draw the «now» marker against it, not against the device clock.
+
+**How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
+cancellation) is rebuilt hourly. The recorded calls are rebuilt every fifteen minutes; until they
+are loaded, the timetable's own recorded calls stand in. The forecasts are rebuilt every prediction
+cycle. The answer is always `Cache-Control: public, max-age=60`.
+
+**Limits.** The read spends the same global and per-pair buckets as `journey-alerts`, not buckets
+of its own. A BFF reading both routes for one favourite therefore spends the per-pair thirty a
+minute twice as fast. After a deploy the timetable is not in memory for the first poller cycle, and
+the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list. A grading failure
+is `503 status_failed`, also retryable.
+
+**Coverage.** `operators` and `coverage.operators` are `["VYG"]`: the timetable behind this read is
+Vy rail only. Render a GO-Ahead or bus trip as outside the answer, never as calm. Nothing here is
+scored on `/historikk`, and nothing here notifies anybody.
 
 ---
 
