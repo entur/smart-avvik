@@ -46,7 +46,7 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
                   <button
                     type="button"
                     className={circleClass(train)}
-                    aria-label={circleLabel(train)}
+                    aria-label={circleLabel(train, today.now)}
                     aria-pressed={selected === train.jkey}
                     onClick={() => setSelected(selected === train.jkey ? null : train.jkey)}
                   >
@@ -65,7 +65,7 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
       </p>
       {chosen && (
         <p className="dr-detail" aria-live="polite">
-          {circleLabel(chosen)}
+          {circleLabel(chosen, today.now)}
         </p>
       )}
     </section>

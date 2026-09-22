@@ -18,10 +18,17 @@ export function circleClass(train: TrainStatus): string {
 }
 
 /** What the train is and how it looks, in one line: «L1 07:48, fare for over 10 min forsinkelse
- *  eller innstilling». Doubles as the tapped circle's detail line and as its aria-label. */
-export function circleLabel(train: TrainStatus): string {
+ *  eller innstilling». Doubles as the tapped circle's detail line and as its aria-label. With the
+ *  server's `now`, a forecast for a train that has already left (under way, its arrival not yet
+ *  recorded) says so instead of reading as a train still to come. */
+export function circleLabel(train: TrainStatus, now?: string): string {
   const name = `${lineCode(train.line) ?? 'Tog'} ${fmtTime(train.departure_time)}`;
-  return `${name}, ${stateText(train)}`;
+  const underway =
+    now !== undefined &&
+    train.state === 'predicted' &&
+    !train.cancelled &&
+    Date.parse(train.departure_time) <= Date.parse(now);
+  return `${name}, ${underway ? 'underveis, ' : ''}${stateText(train)}`;
 }
 
 function stateText(train: TrainStatus): string {
