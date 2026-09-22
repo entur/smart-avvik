@@ -154,8 +154,15 @@ def test_the_morning_at_0742_reads_as_the_design():
         "08:48": ("predicted", "green", False),
     }
     assert strip["07:48"].alert_worthy and strip["07:48"].impact_probability == 0.71
+    assert strip["07:48"].arrival_time == _oslo(8, 8)
+    # Aimed 07:48 plus the typical departure delay (the regression's 1 min, no stack figure).
+    assert strip["07:48"].expected_departure_time == _oslo(7, 49)
     assert strip["07:33"].delay_min == 5
     assert strip["08:18"].delay_p50_min == 4
+    # A fact carries no forecast figures, and neither does a train nothing can be said about.
+    for hhmm in ("07:03", "07:33", "08:11"):
+        assert (strip[hhmm].impact_probability, strip[hhmm].alert_worthy) == (None, False), hhmm
+    assert strip["07:18"].expected_departure_time is None
 
 
 def test_the_same_morning_at_0610_is_all_rings_and_grey_past_the_nosx_horizon():
@@ -323,6 +330,74 @@ def test_the_worst_situation_wins_and_ties_break_on_the_situation_number():
     assert js._worst_prediction(list(reversed(tied)), 3).situation_number == "S9"
 
 
+
+def test_a_situation_that_scores_only_the_boarding_call_is_never_red():
+    """The push matcher pairs a boarding and an alighting call inside ONE situation. A situation
+    whose onset falls mid-trip scores the boarding call only (here the alighting call sits in the
+    no-SX branch), so no push fires; the strip may grade the train but not red it by the gate."""
+    dep = _oslo(7, 48)
+    board, _ = _scored("a", dep, sit="S1", p_impact_dep=0.95, dep_delay_p50_stack_min=4)
+    _, alight = _scored("a", dep, sit="KIX:NoSituation:a", has_situation=False, arr_delay_p50_stack_min=5)
+    _install(_train("a", dep), [board, alight])
+    t = _strip(_oslo(7, 42))["07:48"]
+    assert (t.state, t.level, t.alert_worthy, t.impact_probability) == ("predicted", "yellow", False, None)
+    assert t.delay_p50_min == 5, "the arrival side's figure, as a paired train's would be"
+
+
+def test_a_train_under_way_is_graded_off_its_alighting_call_once_the_boarding_one_ages_out():
+    """The cache keeps calls from 60 min back, so a long trip's boarding call leaves it while the
+    alighting call is still scored. That train is not grey."""
+    dep = _oslo(7, 3)
+    _, alight = _scored("a", dep, arr_delay_p50_stack_min=6)
+    _install(_train("a", dep), [alight])
+    t = _strip(_oslo(8, 10))["07:03"]
+    assert (t.state, t.level, t.delay_p50_min, t.expected_departure_time) == ("predicted", "yellow", 6, None)
+
+
+def test_only_a_boarding_figure_grades_off_the_departure_delay():
+    dep = _oslo(7, 48)
+    board, _ = _scored("a", dep, dep_delay_p50_stack_min=None, dep_delay_typ_min=4)
+    _install(_train("a", dep), [board])
+    t = _strip(_oslo(7, 42))["07:48"]
+    assert (t.level, t.delay_p50_min, t.alert_worthy) == ("yellow", 4, False)
+
+
+def test_a_cancellation_only_the_actuals_know_about_cancels_the_trip():
+    for end in ("board", "alight"):
+        dep = _oslo(7, 3)
+        order, stop = (3, FROM) if end == "board" else (8, TO)
+        actuals = [_row("a", order, stop, dep + timedelta(minutes=0 if end == "board" else 21), None,
+                        source="recorded", call_cancelled=True)]
+        _install(_train("a", dep), _scored("a", dep), actuals=actuals)
+        t = _strip(_oslo(7, 42))["07:03"]
+        assert (t.cancelled, t.level, t.impact_probability) == (True, "red", 1.0), end
+
+
+def test_a_recorded_call_outranks_a_stale_cancellation_so_a_reinstated_train_reads_as_run():
+    dep = _oslo(7, 3)
+    spine = _train("a", dep, board={"call_cancelled": True}, alight={"call_cancelled": True})
+    actuals = [
+        _row("a", 3, FROM, dep, None, source="recorded", dep_delay_min=2),
+        _row("a", 8, TO, dep + timedelta(minutes=21), None, source="recorded", dep_delay_min=2),
+    ]
+    _install(spine, _scored("a", dep, et_declared_cancelled=True), actuals=actuals)
+    t = _strip(_oslo(7, 42))["07:03"]
+    assert (t.cancelled, t.state, t.level, t.delay_min) == (False, "confirmed", "green", 2)
+
+
+def test_a_train_calling_the_origin_twice_boards_at_its_first_call_whatever_the_row_order():
+    dep = _oslo(7, 10)
+    loop = [
+        _row("a", 1, FROM, dep, None),
+        _row("a", 4, MID, dep + timedelta(minutes=10), dep + timedelta(minutes=9)),
+        _row("a", 6, FROM, dep + timedelta(minutes=20), dep + timedelta(minutes=19)),
+        _row("a", 9, TO, dep + timedelta(minutes=41), dep + timedelta(minutes=40)),
+    ]
+    for rows in (loop, list(reversed(loop))):
+        _install(rows)
+        (t,) = js.status_for(DEFINITION, _oslo(7, 0)).trains
+        assert t.departure_time == dep
+
 # ---- Enumeration -------------------------------------------------------------------------------
 
 
@@ -399,6 +474,42 @@ def test_the_train_set_equals_a_brute_force_walk_over_random_spines():
                     expected.add(j)
         assert got == expected
 
+
+
+def test_the_train_set_agrees_with_the_push_matchers_eligibility():
+    """The strip restates `impact._trip_cells`' eligibility on the spine's rows (board at the
+    from-stop inside the window with boarding open, alight later at the to-stop with alighting
+    open), and a restated rule is how two surfaces drift. So the SAME random trains, one situation
+    each so the matcher's per-line pick cannot hide one, go through both, and the train sets must
+    match. Trains call the origin at most once: for a loop the two knowingly differ (see `_trains`).
+    """
+    rng = random.Random(7)
+    stops = [MID, TO, "NSR:StopPlace:9"]
+    start, end = _oslo(7, 0), _oslo(9, 0)
+    for _ in range(200):
+        rows, scope = [], {}
+        for j in range(rng.randint(0, 10)):
+            t = _oslo(6, 30) + timedelta(minutes=rng.randint(0, 180))
+            calls = [FROM] + [rng.choice(stops) for _ in range(rng.randint(0, 4))]
+            rng.shuffle(calls)
+            train_rows = []
+            for order, stop in enumerate(calls, start=1):
+                t += timedelta(minutes=rng.randint(1, 15))
+                train_rows.append(_row(
+                    f"j{j}", order, stop,
+                    None if rng.random() < 0.1 else t, None if rng.random() < 0.1 else t - timedelta(minutes=1),
+                    boarding_allowed=rng.random() > 0.15, alighting_allowed=rng.random() > 0.15,
+                ))
+            rows += train_rows
+            scope[f"S{j}"] = [
+                _pred(r.jkey, r.stop_order, r.stop_place, r.aimed_dep, r.aimed_arr, sit=f"S{j}",
+                      boarding_allowed=r.boarding_allowed, alighting_allowed=r.alighting_allowed)
+                for r in train_rows
+            ]
+        _install(rows)
+        strip = {t.jkey for t in js.status_for(DEFINITION, _oslo(8, 0)).trains}
+        matcher = {c.jkey for c in impact._trip_cells(scope, FROM, TO, start, end, select="worst")}
+        assert strip == matcher, (strip, matcher)
 
 # ---- Module boundary ---------------------------------------------------------------------------
 

@@ -554,7 +554,7 @@
         ],
         "summary": "Every train in a journey definition's window today, graded",
         "security": [],
-        "description": "Every Vy train in today's window on a definition nobody registered, in departure order, each graded: `confirmed` where the outcome is known (ran on time, ran late, cancelled), `predicted` where the model behind `journey-alerts` has a figure, `unknown` where nothing can be said. Built for a glanceable overview of today's commute: one circle per train, filled for a fact and a ring for a forecast.\n\n**No credential**, and the same limiter as `GET /journey-alerts` -- the SAME buckets, global and per canonical stop pair, so reading both routes for one favourite spends the thirty per pair per minute twice as fast.\n\n**The definition** is validated and canonicalized exactly as `journey-alerts` does it, and echoed in `journey`. Only today is answered.\n\n**How old each fact can be** is in `as_of`: the day's timetable (which trains exist, and a cancellation) is rebuilt hourly, the recorded calls every fifteen minutes, the forecasts every prediction cycle. `red` for a forecast is the same bar a notification fires at, so this read and `journey-alerts` never disagree about which trains are bad.\n\n**After a deploy** the timetable is not in memory for the first cycle and the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.",
+        "description": "Every Vy train in today's window on a definition nobody registered, in departure order, each graded: `confirmed` where the outcome is known (ran on time, ran late, cancelled), `predicted` where the model behind `journey-alerts` has a figure, `unknown` where nothing can be said. Built for a glanceable overview of today's commute: one circle per train, filled for a fact and a ring for a forecast.\n\n**No credential**, and the same limiter as `GET /journey-alerts` -- the SAME buckets, global and per canonical stop pair, so reading both routes for one favourite spends the thirty per pair per minute twice as fast.\n\n**The definition** is validated and canonicalized exactly as `journey-alerts` does it, and echoed in `journey`. Only today is answered.\n\n**How old each fact can be** is in `as_of`: the day's timetable (which trains exist, and a cancellation) is rebuilt hourly, the recorded calls every fifteen minutes, the forecasts every prediction cycle. `red` for a forecast is the same bar a notification fires at, applied to the same pairing of a train's two calls. The two reads agree on which forecast trains are bad, with one stated exception: a trip is `cancelled` here when EITHER end is, while notifications fire on the boarding call, so a train cancelled only at your destination is red here and can be absent from `journey-alerts`.\n\n**After a deploy** the timetable is not in memory for the first cycle and the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.",
         "parameters": [
           {
             "name": "from_stop",
@@ -660,7 +660,7 @@
             }
           },
           "503": {
-            "description": "`plan_not_loaded` -- the day's timetable has not been loaded since this process started. Carries `Retry-After`; retryable.",
+            "description": "`plan_not_loaded` -- the day's timetable has not been loaded since this process started -- or `status_failed`. Both carry `Retry-After` and are retryable; an empty answer is never served for either.",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1616,7 +1616,7 @@
               "predicted",
               "unknown"
             ],
-            "description": "`confirmed` when the alighting call is recorded, or the train is declared cancelled and its aimed departure has passed -- draw it filled. `predicted` when the model has a figure (or the cancellation is announced but not yet due) -- draw a ring. `unknown` when nothing can be said, including a train with no operator message more than two hours out, whose score is not better than the base rate."
+            "description": "`confirmed` when the alighting call is recorded, or the train is cancelled and its aimed departure has passed; a recorded call outranks an earlier cancellation, so a reinstated train that ran reads as run -- draw it filled. `predicted` when the model has a figure (or the cancellation is announced but not yet due) -- draw a ring. `unknown` when nothing can be said, including a train with no operator message more than two hours out, whose score is not better than the base rate."
           },
           "level": {
             "type": "string",
@@ -1659,11 +1659,11 @@
               "number",
               "null"
             ],
-            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a declared cancellation."
+            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a cancellation. Null on a confirmed or unknown train, and on a forecast no single operator message scored at both ends of the trip -- notifications cannot fire on one, so neither is it red."
           },
           "alert_worthy": {
             "type": "boolean",
-            "description": "Whether this train clears the bar a notification would fire at."
+            "description": "Whether this forecast clears the bar a notification would fire at; true for a cancellation, false for every confirmed or unknown train."
           },
           "observed_at": {
             "type": [

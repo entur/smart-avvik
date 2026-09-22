@@ -2521,6 +2521,7 @@ def test_the_journey_status_schema_matches_the_response_models_in_both_direction
     assert set(journey_status.AsOf.model_fields) == set(as_of["properties"]) == set(as_of["required"])
     assert train["properties"]["state"]["enum"] == ["confirmed", "predicted", "unknown"]
     assert train["properties"]["level"]["enum"] == ["red", "yellow", "green", "grey"]
+    assert top["properties"]["reason"]["enum"] == ["not_a_travel_day", None]
     # The echoed definition and the coverage block are the alerts read's own, not restatements.
     alerts = schemas["JourneyAlerts"]["properties"]
     assert top["properties"]["journey"] == alerts["journey"]

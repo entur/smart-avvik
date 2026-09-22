@@ -9,8 +9,9 @@ so it is assembled here from three in-memory sources the poller already builds:
   trains exist (KTD3). The prediction cache cannot: it holds calls from 60 min before its build to
   12 h after, so a train cancelled before it ran is gone from it an hour after its time.
 * **the prediction cache** — read per train through `impact._lookup_journey_calls`, every scored
-  call of that train across every situation. That is deliberately not `_trip_cells`, which keeps
-  one train per line per situation and would lose two of three trains one SX message names.
+  call of that train across every situation, then paired within ONE situation as the matcher pairs
+  them (`_paired_prediction`). That is deliberately not `_trip_cells`, which keeps one train per
+  line per situation and would lose two of three trains one SX message names.
 * **the actuals** — `rail_calls_today`, loaded every 15 min (U4). Before that loads, the spine's own
   `recorded` calls stand in, up to 60 min stale.
 
@@ -126,7 +127,9 @@ class TrainStatus(BaseModel):
     )
     delay_p50_min: int | None = Field(description="Typical predicted arrival delay (predicted only).")
     impact_probability: float | None = Field(
-        description="P(cancelled OR >= 10 min late) at the boarding stop — what the push gates on."
+        description="P(cancelled OR >= 10 min late) at the boarding stop — what the push gates on. "
+        "1.0 when cancelled; null on a confirmed or unknown train, and on a forecast no single "
+        "situation scored at both ends (the push cannot fire on one)."
     )
     alert_worthy: bool
     observed_at: datetime | None = Field(
@@ -156,7 +159,7 @@ class JourneyStatus(BaseModel):
     now: datetime = Field(description="The server's instant; the client draws «nå» against it.")
     date: dt.date = Field(description="The Oslo date the window is on.")
     window: WindowSpan | None = Field(description="Today's window; null on a day not in `days`.")
-    reason: str | None = Field(description="`not_a_travel_day`, or null.")
+    reason: Literal["not_a_travel_day"] | None = Field(description="`not_a_travel_day`, or null.")
     operators: list[str] = Field(description="Operators whose trains are listed (Vy only in v1).")
     as_of: AsOf
     trains: list[TrainStatus]
@@ -250,28 +253,37 @@ def _trains(
     """(boarding, alighting) per train, in departure order — the matcher's eligibility rule on the
     spine's own rows: board at a from-ref inside the window with boarding open, alight later at a
     to-ref with alighting open. The flags are the same columns the prediction rows carry them from.
+
+    Candidates are walked earliest boarding first, so a train calling the from-place twice (a loop)
+    boards at its first usable call, whatever order the table was loaded in. `impact._trip_cells`
+    tests only its most SEVERE boarding call for an alighting call; this accepts any, which is the
+    right question for "which trains can I take" and the one place the two knowingly differ.
     """
+    candidates = [
+        b
+        for ref in from_refs
+        for b in spine.by_stop.get(ref, ())
+        if b.aimed_dep is not None and b.boarding_allowed and start <= b.aimed_dep <= end
+    ]
+    candidates.sort(key=lambda b: (b.aimed_dep, b.stop_order, b.jkey))
     found: dict[tuple[str, str], tuple[PlannedCall, PlannedCall]] = {}
-    for ref in from_refs:
-        for b in spine.by_stop.get(ref, ()):
-            if b.aimed_dep is None or not b.boarding_allowed or not (start <= b.aimed_dep <= end):
-                continue
-            key = (b.operator, b.jkey)
-            if key in found:
-                continue
-            a = next(
-                (
-                    c
-                    for c in spine.by_key[key]
-                    if c.stop_place in to_refs
-                    and c.aimed_arr is not None
-                    and c.alighting_allowed
-                    and c.stop_order > b.stop_order
-                ),
-                None,
-            )
-            if a is not None:
-                found[key] = (b, a)
+    for b in candidates:
+        key = (b.operator, b.jkey)
+        if key in found:
+            continue
+        a = next(
+            (
+                c
+                for c in spine.by_key[key]
+                if c.stop_place in to_refs
+                and c.aimed_arr is not None
+                and c.alighting_allowed
+                and c.stop_order > b.stop_order
+            ),
+            None,
+        )
+        if a is not None:
+            found[key] = (b, a)
     return sorted(found.values(), key=lambda pair: (pair[0].aimed_dep, pair[0].jkey))
 
 
@@ -313,6 +325,42 @@ def _worst_prediction(
     return max(at, key=lambda p: (impact._call_severity(p), p.situation_number))
 
 
+def _paired_prediction(
+    preds: list[impact.CallPred], board_order: int, alight_order: int
+) -> tuple[impact.CallPred, impact.CallPred] | None:
+    """The worst (boarding, alighting) pair scored by ONE situation, as the push matcher pairs them.
+
+    The matcher groups a situation's calls per train and needs both the boarding and the alighting
+    call inside that one group (`impact._trip_cells`). A situation whose onset falls mid-trip scores
+    the boarding call and not the alighting one (or the reverse, with the other end in the no-SX
+    branch), and the matcher never alerts on it for this trip. Taking the boarding figure from it
+    anyway would paint red where no push fires, which is the disagreement the gate-derived red exists
+    to rule out.
+    """
+    by_situation: dict[str, dict[int, impact.CallPred]] = {}
+    for p in preds:
+        if p.stop_order in (board_order, alight_order):
+            by_situation.setdefault(p.situation_number, {})[p.stop_order] = p
+    pairs = [
+        (calls[board_order], calls[alight_order])
+        for calls in by_situation.values()
+        if board_order in calls and alight_order in calls
+    ]
+    return max(pairs, key=lambda pr: (impact._call_severity(pr[0]), pr[0].situation_number), default=None)
+
+
+def _end_cancelled(planned: PlannedCall, recorded: PlannedCall | None, preds: list[impact.CallPred]) -> bool:
+    """Whether one end of the trip is cancelled. A recorded row for the stop is the latest fact and
+    wins either way — a train the spine and the prediction cache (built from the same hourly table)
+    still call cancelled has RUN if its call is recorded as served, which is how a reinstatement
+    shows. Without one, the spine's flag or ET's declaration on any scored call at that stop."""
+    if recorded is not None:
+        return recorded.call_cancelled
+    return planned.call_cancelled or any(
+        p.stop_order == planned.stop_order and p.et_declared_cancelled for p in preds
+    )
+
+
 def _status(
     b: PlannedCall,
     a: PlannedCall,
@@ -322,13 +370,6 @@ def _status(
 ) -> TrainStatus:
     key = (b.operator, b.jkey)
     preds = impact._lookup_journey_calls(b.operator, b.jkey)
-    bpred = _worst_prediction(preds, b.stop_order)
-    apred = None
-    if bpred is not None:
-        # The arrival from the SAME situation as the boarding pick, so the two figures describe one
-        # scoring of one train; any situation's when that one did not reach the alighting stop.
-        same = [p for p in preds if p.situation_number == bpred.situation_number]
-        apred = _worst_prediction(same, a.stop_order) or _worst_prediction(preds, a.stop_order)
 
     # Recorded calls: the spine's own, overlaid per stop by the actuals index, which is fresher
     # (15 min against 60). An overlay and not a replacement: `rail_calls_today` keeps only calls
@@ -338,68 +379,60 @@ def _status(
     if actuals is not None:
         by_order.update({c.stop_order: c for c in actuals.by_key.get(key, ())})
     recorded_calls = tuple(by_order[o] for o in sorted(by_order))
-    recorded_a = next((c for c in recorded_calls if c.stop_order == a.stop_order), None)
-    recorded_b = next((c for c in recorded_calls if c.stop_order == b.stop_order), None)
+    recorded_a = by_order.get(a.stop_order)
+    recorded_b = by_order.get(b.stop_order)
 
-    # R3: a trip is cancelled when EITHER end is. Vy cancels partial legs.
-    cancelled = any(
-        (
-            b.call_cancelled,
-            a.call_cancelled,
-            recorded_a is not None and recorded_a.call_cancelled,
-            recorded_b is not None and recorded_b.call_cancelled,
-            bpred is not None and bool(bpred.et_declared_cancelled),
-            apred is not None and bool(apred.et_declared_cancelled),
-        )
-    )
-
-    # 1.0 for any cancellation, as `impact._cancelled_prediction` serves it -- including one only the
-    # spine knows about, which has no prediction to read a figure off.
-    impact_p = 1.0 if cancelled else (None if bpred is None else bpred.p_impact_dep)
-    alert_worthy = cancelled or (
-        bpred is not None
-        and alert_policy.gate(impact_p, b.operator, has_situation=bpred.has_situation).alertworthy
-    )
     common = {
         "departure_time": b.aimed_dep,
         "arrival_time": a.aimed_arr,
         "operator": b.operator,
         "line": b.line,
         "jkey": b.jkey,
-        "impact_probability": impact_p,
-        "alert_worthy": alert_worthy,
-        "cancelled": cancelled,
+        "impact_probability": None,
+        "alert_worthy": False,
+        "expected_departure_time": None,
+        "delay_min": None,
+        "delay_p50_min": None,
+        "observed_at": None,
     }
 
-    if cancelled:
+    # R3: a trip is cancelled when EITHER end is. Vy cancels partial legs.
+    if _end_cancelled(b, recorded_b, preds) or _end_cancelled(a, recorded_a, preds):
         # A declared cancellation is an observation only once its own time has passed
         # (`impact._is_observed`'s rule): before that it is an announcement, drawn as a ring.
+        # 1.0, as `impact._cancelled_prediction` serves it, whichever source knew.
         passed = now >= b.aimed_dep
         return TrainStatus(
-            **common,
+            **{**common, "impact_probability": 1.0, "alert_worthy": True,
+               "observed_at": b.aimed_dep if passed else None},
             state="confirmed" if passed else "predicted",
             level="red",
-            delay_min=None,
-            expected_departure_time=None,
-            delay_p50_min=None,
-            observed_at=b.aimed_dep if passed else None,
+            cancelled=True,
         )
 
     if recorded_a is not None:
         read = _confirmed_delay(recorded_calls, recorded_a)
         delay, source = read if read is not None else (None, recorded_a)
         return TrainStatus(
-            **common,
+            **{**common, "delay_min": delay, "observed_at": source.aimed_arr or source.aimed_dep},
             state="confirmed",
             level=_level_for_delay(delay),
-            delay_min=delay,
-            expected_departure_time=None,
-            delay_p50_min=None,
-            observed_at=source.aimed_arr or source.aimed_dep,
+            cancelled=False,
         )
 
-    if bpred is None or (
-        not bpred.has_situation and b.aimed_dep - now > timedelta(minutes=NOSX_HORIZON_MIN)
+    pair = _paired_prediction(preds, b.stop_order, a.stop_order)
+    if pair is not None:
+        bpred, apred = pair
+    else:
+        # No situation scored both ends. Either the boarding call has aged out of the cache (the
+        # train is under way: it holds calls from 60 min back) or two situations split the trip.
+        # Whatever IS scored still says how late the train looks, but never red by the gate: the
+        # push cannot fire on an unpaired figure, so neither may the strip's forecast red.
+        bpred = _worst_prediction(preds, b.stop_order)
+        apred = _worst_prediction(preds, a.stop_order)
+    figure = bpred or apred
+    if figure is None or (
+        not figure.has_situation and b.aimed_dep - now > timedelta(minutes=NOSX_HORIZON_MIN)
     ):
         return _unknown(common)
 
@@ -408,10 +441,15 @@ def _status(
         typ = apred.arr_delay_p50_stack_min
         if typ is None:
             typ = apred.arr_delay_typ_min
-    if typ is None:
+    if typ is None and bpred is not None:
         typ = bpred.dep_delay_p50_stack_min
         if typ is None:
             typ = bpred.dep_delay_typ_min
+
+    impact_p = bpred.p_impact_dep if pair is not None else None
+    alert_worthy = pair is not None and alert_policy.gate(
+        impact_p, b.operator, has_situation=bpred.has_situation
+    ).alertworthy
     if alert_worthy:
         level: Level = "red"
     elif typ is None:
@@ -423,26 +461,17 @@ def _status(
             # a forecast (Key Decisions), so the strip may not call red what the push would not.
             level = "yellow"
     return TrainStatus(
-        **common,
+        **{**common, "impact_probability": impact_p, "alert_worthy": alert_worthy,
+           "delay_p50_min": typ,
+           "expected_departure_time": impact._expected_departure(bpred) if bpred is not None else None},
         state="predicted",
         level=level,
-        delay_min=None,
-        expected_departure_time=impact._expected_departure(bpred),
-        delay_p50_min=typ,
-        observed_at=None,
+        cancelled=False,
     )
 
 
 def _unknown(common: dict) -> TrainStatus:
-    return TrainStatus(
-        **{**common, "alert_worthy": False},
-        state="unknown",
-        level="grey",
-        delay_min=None,
-        expected_departure_time=None,
-        delay_p50_min=None,
-        observed_at=None,
-    )
+    return TrainStatus(**common, state="unknown", level="grey", cancelled=False)
 
 
 def status_for(definition: dict, now: datetime) -> JourneyStatus | None:

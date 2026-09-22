@@ -466,8 +466,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   `main.refresh_planned_spine` in phase `rail_planned_cache` after each hourly rebuild) decides WHICH
   trains exist. A declared cancellation wins, then a recorded alighting call (the spine's own,
   overlaid by `rail_calls_today`, loaded by `main.refresh_rail_actuals` in phase `rail_actuals_cache`
-  every 15 min — that table's first live reader), then the prediction cache read per train through
-  `impact._lookup_journey_calls`. Two things are easy to get backwards. The per-train lookup is
+  every 15 min — that table's first live reader; a recorded row outranks a stale cancellation, which
+  is how a reinstated train shows), then the prediction cache read per train through
+  `impact._lookup_journey_calls` and PAIRED within one situation as the matcher pairs a boarding and
+  an alighting call — a figure no single situation scored at both ends grades yellow or green at
+  most, with no probability, because no push can fire on it. `test_the_train_set_agrees_with_the_
+  push_matchers_eligibility` holds the restated eligibility rule to `_trip_cells`' own. Two things
+  are easy to get backwards. The per-train lookup is
   deliberately NOT `_trip_cells`, which keeps one train per line per situation, so enumerating
   through the matcher would show one circle where one SX message names three trains. And red for a
   forecast is `alert_policy.gate`, the push's own bar, while a no-SX figure more than 120 min out

@@ -699,9 +699,13 @@ Each train carries a `state` and a `level`:
 | `unknown` | nothing can be said, including a train no operator message names more than two hours out | a grey ring |
 
 `level` is `red` for cancelled, 10 min or more late, or a forecast over the same bar a notification
-fires at. It is `yellow` for 3–9 min, `green` below that, and `grey` exactly when nothing can be
-said. So `journey-status` and `journey-alerts` never disagree about which trains are bad. A trip
-counts as cancelled when either its boarding or its alighting call is. `now` is the server's
+fires at, applied to the same pairing of a train's two calls. It is `yellow` for 3–9 min, `green`
+below that, and `grey` exactly when nothing can be said. A trip counts as cancelled when either its
+boarding or its alighting call is. That is the one place the two reads can differ: notifications
+fire on the boarding call, so a train cancelled only at the destination is red here and can be
+absent from `journey-alerts`. A forecast that no single operator message scored at both ends is
+graded yellow or green at most, with `impact_probability` null, because no notification can fire
+on it. `now` is the server's
 instant: draw the «now» marker against it, not against the device clock.
 
 **How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
@@ -712,7 +716,8 @@ cycle. The answer is always `Cache-Control: public, max-age=60`.
 **Limits.** The read spends the same global and per-pair buckets as `journey-alerts`, not buckets
 of its own. A BFF reading both routes for one favourite therefore spends the per-pair thirty a
 minute twice as fast. After a deploy the timetable is not in memory for the first poller cycle, and
-the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.
+the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list. A grading failure
+is `503 status_failed`, also retryable.
 
 **Coverage.** `operators` and `coverage.operators` are `["VYG"]`: the timetable behind this read is
 Vy rail only. Render a GO-Ahead or bus trip as outside the answer, never as calm. Nothing here is

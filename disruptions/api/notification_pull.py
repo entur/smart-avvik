@@ -1699,7 +1699,7 @@ def _log_status(result: str, *, n_trains: int | None, started: float, pair_diges
     responses={
         422: {"description": "A malformed definition, period or weekday list."},
         429: {"description": "The read's own limiter, shared with journey-alerts. Retry-After is 60 s."},
-        503: {"description": "The day's timetable is not loaded yet. Retry-After."},
+        503: {"description": "The day's timetable is not loaded yet, or grading failed. Retry-After."},
     },
 )
 async def journey_status_read(
@@ -1734,7 +1734,16 @@ async def journey_status_read(
             detail="rate_limited",
             headers={"Retry-After": str(notification_auth.RETRY_AFTER_S)},
         )
-    status = journey_status.status_for(definition, now)
+    try:
+        status = journey_status.status_for(definition, now)
+    except Exception as exc:
+        # The embed guards the same call per journey; here a raise would be an unguarded 500 with a
+        # traceback and no record. The exception's TYPE only, as `journey_alerts` logs its matcher:
+        # its text can name a ref.
+        logger.debug("journey-status traceback for a public read", exc_info=True)
+        logger.warning("The journey-status grading failed on a public read: %s", type(exc).__name__)
+        _log_status("status_failed", n_trains=None, started=started, pair_digest=digest)
+        raise _retry_later("status_failed") from None
     if status is None:
         _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest)
         raise _retry_later("plan_not_loaded")

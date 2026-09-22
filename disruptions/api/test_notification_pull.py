@@ -1814,6 +1814,24 @@ def test_journey_status_logs_one_record_with_nothing_identifying():
     assert "NSR:" not in text and "07:" not in text
 
 
+def test_journey_status_answers_503_and_one_record_when_grading_raises(monkeypatch):
+    import journey_status
+
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+
+    def boom(definition, now):
+        raise KeyError(NSR_A)  # an exception whose TEXT names a ref
+
+    monkeypatch.setattr(journey_status, "status_for", boom)
+    with _captured() as records:
+        r = _status()
+    assert r.status_code == 503 and r.json()["detail"] == "status_failed"
+    assert r.headers["Retry-After"] == "60"
+    status = [x for x in records if getattr(x, "fields", {}).get("event") == "notification_status"]
+    assert [x.fields["result"] for x in status] == ["status_failed"]
+    shipped = [x for x in records if x.levelno >= logging.INFO]
+    assert all(NSR_A not in x.getMessage() for x in shipped), "the exception's text never reaches INFO+"
+
 def test_journey_status_response_models_forbid_unknown_fields():
     import journey_status
 
