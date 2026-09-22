@@ -348,7 +348,7 @@ Every error this module raises itself is `{"detail": "<short stable string>"}`:
 | 409 | `version_conflict`, `not_a_test_subscription`, `destination_missing`, `destination_paused` |
 | 422 | `unknown_destination` |
 | 429 | `rate_limited`, `quota_exceeded`, `test_events_rate_limited` — and `rate_limited` from the public read's own limiter |
-| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public read only, `predictions_not_loaded`, `matcher_failed` |
+| 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public reads only, `predictions_not_loaded`, `matcher_failed` (`journey-alerts`) and `plan_not_loaded`, `status_failed` (`journey-status`) |
 
 Validation refusals carry prose rather than a code, and it is the prose `/varsel`'s own rules produce:
 `"begin must be before end (overnight windows are not supported)"`,
