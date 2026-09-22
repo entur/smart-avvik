@@ -328,6 +328,32 @@ def notification_title(
 # * `tomorrow` -- «i morgen» is in the text (design review 2026-09-01, finding 48).
 # * the alternative's IDENTITY -- the replacement train is named with its departure time.
 # * the prompt version -- a reworded brief is a different writer.
+# * the PREDICTION SNAPSHOT the alert was scored against (2026-09-22). This one is different in
+#   kind from the six above: the others are things the sentence NAMES, and this is everything it
+#   quotes a number for. The wording states `innstilling_prosent` and both `forsinkelse_min`
+#   figures, which `varsel._webhook_payload` publishes live beside it as `probabilities` and
+#   `delay` -- so without this term a sentence outlived the figures it was written against and a
+#   caller read «89 % sjanse for innstilling» next to `cancellation: 0.1737`. Keying on the three
+#   figures instead was measured and refused: over 351 prd subjects it gives 3.23 wordings per
+#   subject against 3.93 for no reuse at all, with no saturation (0.76-0.88 new wordings per
+#   sampled cycle in EVERY bucket, including the subjects that live longest), so it is the cost of
+#   switching reuse off without the guarantee of having switched it off. The snapshot is the
+#   honest unit: one wording per cycle per train, agreeing with every figure in the payload rather
+#   than with the three a regex could have compared.
+#
+#   Read off `winner.impact.refreshed_at` rather than passed, because the ALERT is what both sides
+#   hold -- the pass, the in-app card and the journey-alert read all key from an alert and none of
+#   them holds the response separately. `main.refresh_call_predictions_cache` stamps it
+#   unconditionally on every rebuild, so an entry is reusable for exactly the cycle that wrote it,
+#   which is what still makes a burst of reads on one corridor cost one wording between them.
+#   A `None` snapshot keys as "" and reuses as before: an alert with no response attached carries
+#   no claim about which figures it was scored against, so there is nothing to invalidate on.
+#
+#   NOTHING SWEEPS the entries this orphans, deliberately. A key carrying a snapshot that has
+#   passed can never be read again -- the reader derives its key from the current alert -- so an
+#   orphan is memory and not a wrong answer, and the existing per-situation liveness sweep in
+#   `varsel.check_and_notify` already drops it when the situation ends. At prd's measured 9.4
+#   wordings a cycle that is a few thousand short strings a day.
 
 
 def alternative_identity(alt: Any) -> tuple:
@@ -403,6 +429,7 @@ def wording_key(
     that wrote it.
     """
     departure = getattr(winner, "departure_time", None)
+    snapshot = getattr(getattr(winner, "impact", None), "refreshed_at", None)
     return (
         tuple(pair),
         getattr(winner, "situation_number", None),
@@ -411,6 +438,7 @@ def wording_key(
         bool(tomorrow),
         alternative_identity(alternative) if alternative is not None else None,
         prompt_version(),
+        snapshot.isoformat() if snapshot is not None else "",
     )
 
 
@@ -564,9 +592,17 @@ def webhook_delivery_enabled() -> bool:
 # a traveller silently gets the template and nothing on that side says so.
 #
 # Every deployed environment pins VARSEL_LLM_PROVIDER=gemini, so one wording is at most one call.
-_MAX_CALLS_PER_PASS = 32
-_MAX_CALLS_PER_HOUR = 500
-_MAX_CALLS_PER_DAY = 2000
+#
+# RAISED 4x on 2026-09-22, with the snapshot term in `wording_key`: a wording is now reusable for
+# one cycle rather than for the situation's 12 h life, and the measured cost of that is 3.93
+# wordings per subject against 1. The ceilings are what stop a surface eating the per-project
+# Vertex quota, so they have to move with what a correct wording now costs -- left alone, this
+# channel would have spent its hour in its first few minutes and served the template for the rest.
+# 4x and not 3.93x because a ceiling is a guard rail: the point is that it does not bind on an
+# ordinary day, and prd's actual draw is ~318 calls a day against 27 688 available.
+_MAX_CALLS_PER_PASS = 128
+_MAX_CALLS_PER_HOUR = 2000
+_MAX_CALLS_PER_DAY = 10000
 _HOUR_WINDOW_S = 60.0 * 60
 _DAY_WINDOW_S = 24.0 * 60 * 60
 
@@ -584,10 +620,12 @@ _PULL_PATH = "pull"
 # The pull read's three ceilings, public so the operations document can quote them by name. The
 # per-minute one is what the other two surfaces do not have: an hour's allowance spent in its first
 # seconds by a burst of reads would leave the next fifty-nine minutes on the template, and a burst
-# is exactly what a public read path gets. 30 a minute is a sixteenth of the hour.
-WORDINGS_PER_MIN = 30
-WORDINGS_PER_HOUR = 500
-WORDINGS_PER_DAY = 2000
+# is exactly what a public read path gets. 120 a minute is a sixteenth of the hour -- the ratio
+# is kept from when these were 30/500/2000, and all three moved 4x on 2026-09-22 with the
+# snapshot term, for the reason written above `_MAX_CALLS_PER_PASS`.
+WORDINGS_PER_MIN = 120
+WORDINGS_PER_HOUR = 2000
+WORDINGS_PER_DAY = 10000
 _MINUTE_WINDOW_S = 60.0
 
 

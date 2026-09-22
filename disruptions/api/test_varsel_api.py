@@ -3504,6 +3504,49 @@ def test_an_unchanged_alternative_does_not_re_write_the_message(monkeypatch):
     assert varsel._message_meta[key]["status"] == "ok_cached"
 
 
+def test_a_rescoring_re_writes_the_wording_rather_than_reusing_it(monkeypatch):
+    """The other half of the test above, and the behavioural half of the key's own suite.
+
+    A wording quotes `innstilling_prosent` and both `forsinkelse_min` figures, and
+    `varsel._webhook_payload` publishes exactly those live beside it as `probabilities` and `delay`
+    -- so a text reused across a rescoring is a text that contradicts the numbers in its own
+    payload. That shipped: a caller of `GET /journey-alerts` read «89 % sjanse for innstilling»
+    next to `cancellation: 0.1737` and a 21-38 min delay, because the wording had been written
+    hours earlier when cancellation was still the likely outcome.
+
+    `notification_wording.wording_key` carries the prediction snapshot the alert was scored
+    against, so moving it alone is a miss -- nothing else about this train changes between the two
+    cycles here, which is what makes the snapshot the thing under test. The test above is the
+    control: same snapshot, one write, `ok_cached`.
+    """
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _numbered_messages(monkeypatch)
+    _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+
+    # The module-level provider stamps `None`, which keys as "" and reuses as it always did -- so
+    # every other suite in this file is unaffected and this is the one that moves the stamp.
+    stamp = {"value": datetime(2026, 9, 22, 6, 0, tzinfo=UTC)}
+    impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], stamp["value"]))
+    try:
+        varsel.check_and_notify(SNAPSHOT)
+        assert len(written) == 1, "the first cycle writes"
+
+        stamp["value"] += timedelta(minutes=5)
+        varsel.check_and_notify(SNAPSHOT)
+        assert len(written) == 2, (
+            "a rescored train reused a wording written against the previous snapshot; the figures "
+            "in its payload are this cycle's and the sentence quoting them is not"
+        )
+        assert all(m["status"] == "ok" for m in varsel._message_meta.values()), (
+            "a fresh write must not be filed as `ok_cached` -- that value is what /historikk and "
+            "the wording comparison read as 'the text came from an earlier input'"
+        )
+    finally:
+        impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], None))
+
+
 def test_a_message_whose_alternative_has_departed_is_replaced(monkeypatch):
     """A cached text names a specific departure time and is reused for the situation's whole life.
     Once that train has gone the text is advice to catch something that has already left -- so the

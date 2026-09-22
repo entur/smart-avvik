@@ -144,7 +144,7 @@ subscription on your next `POST` of it — the idempotent re-registration is eno
 | list page size | default 100, max 500 | `422` outside 1–500 |
 | `GET /journey-alerts`, process-wide, every anonymous caller, 60 s sliding | 3 000 req/min | `429 rate_limited`, `Retry-After: 60` |
 | `GET /journey-alerts`, per canonical stop pair, 60 s sliding | 30 req/min | `429 rate_limited`, `Retry-After: 60` |
-| `GET /journey-alerts` wordings, every anonymous caller together | 30 / min, 500 / h, 2 000 / day | the entry carries the template with `wording.status: rate_limited`; never a 429 |
+| `GET /journey-alerts` wordings, every anonymous caller together | 120 / min, 2 000 / h, 10 000 / day | the entry carries the template with `wording.status: rate_limited`; never a 429 |
 | `GET /journey-alerts` Journey Planner lookups, every anonymous caller together | 30 / min | the entry carries no alternative with `alternative.status: unanswered`; never a 429 |
 | `GET /journey-alerts` wordings per read | 4, soonest departure first | the rest carry the template with `wording.status: not_worded`, re-evaluated on every read as the trains ahead depart |
 | `GET /journey-alerts` `wait` / `limit` | 0–20 s (default 20) / 1–20 (default 10) | `422` outside those |
@@ -570,10 +570,20 @@ evidence about alert quality, because a definition nobody registered produces no
 
 Each entry carries `wording {source, status}` and `alternative {status}`:
 
-| | terminal (a wording is held for the situation's life, up to 12 h; an alternative outcome for the Journey Planner cache's 10 min) | transient (expire after ~60 s and are retried on a later read) |
+| | terminal (a wording is held for the prediction cycle it was written in — see below; an alternative outcome for the Journey Planner cache's 10 min) | transient (expire after ~60 s and are retried on a later read) |
 |---|---|---|
 | `wording.status` | `ok` (source `llm`), `rejected`, `ungrounded` (the model answered and the answer was unusable for this input — re-asking would learn nothing), `disabled` (this deployment does not deliver the model's prose on this channel, or no backend may be asked), `not_worded` (past the four-per-read wording cap in this read's soonest-first order; re-evaluated on every read as the trains ahead depart, never cached — terminal for this read only) | `pending`, `capped` (the enrichment queue was full), `rate_limited` (the read's wording allowance), `error` |
 | `alternative.status` | `offered`, `suppressed` (the selection kept the traveller on their own train), `none_found`, `not_worth_lookup` (none was issued), `not_looked_up` (past the per-read lookup cap) | `pending`, `capped`, `unanswered` (the Journey Planner did not reply: throttled, an outage, its cooldown) |
+
+**The prose and the figures in an entry are from the same scoring.** `notification.title` and
+`notification.body` quote the chance of cancellation and the delay interval, and `probabilities`,
+`delay`, `effect` and `phase` publish the same figures as numbers — so the two must agree, and since
+2026-09-22 they agree by construction: a wording is cached against the prediction snapshot it was
+written from, and a rescoring retires it rather than outliving it. Before that a wording was held
+for the situation's life, up to 12 h, and a caller could read «89 % sjanse for innstilling» beside
+`probabilities.cancellation: 0.1737` after the forecast had moved from cancellation to delay.
+**Render the numbers from the payload, not by parsing the prose** — that is what the fields are for
+— but the two will not contradict each other.
 
 `wording.source` is `llm` or `deterministic` and nothing else. **The template is the floor: render
 it.** A `deterministic` entry is a complete, correct notification in Norwegian — it is what `/varsel`
