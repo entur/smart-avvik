@@ -10,6 +10,11 @@ import { fmtTime, lineCode } from '../format.ts';
 
 /** The server grades no-SX figures only this far ahead (journey_status.NOSX_HORIZON_MIN). */
 const NOSX_HORIZON_MS = 120 * 60 * 1000;
+/** How long past its expected arrival an unrecorded train may still read as under way. Recorded
+ *  calls reach the server up to 15 min late (the actuals rebuild), so less would call a train that
+ *  arrived on time «ikke registrert» for no reason; past this the arrival is simply missing, which
+ *  is what ET does when Vy short-turns a train or never sends its last calls. */
+const ARRIVAL_GRACE_MS = 30 * 60 * 1000;
 
 /** `dr-fact` is a filled circle, `dr-ring` a coloured ring; the level picks the colour. */
 export function circleClass(train: TrainStatus): string {
@@ -19,16 +24,19 @@ export function circleClass(train: TrainStatus): string {
 
 /** What the train is and how it looks, in one line: «L1 07:48, fare for over 10 min forsinkelse
  *  eller innstilling». Doubles as the tapped circle's detail line and as its aria-label. With the
- *  server's `now`, a forecast for a train that has already left (under way, its arrival not yet
- *  recorded) says so instead of reading as a train still to come. */
+ *  server's `now`, a forecast for a train that has already left says so: under way while its
+ *  arrival is still plausibly ahead, «ankomst ikke registrert» once it is well past it. */
 export function circleLabel(train: TrainStatus, now?: string): string {
   const name = `${lineCode(train.line) ?? 'Tog'} ${fmtTime(train.departure_time)}`;
-  const underway =
-    now !== undefined &&
-    train.state === 'predicted' &&
-    !train.cancelled &&
-    Date.parse(train.departure_time) <= Date.parse(now);
-  return `${name}, ${underway ? 'underveis, ' : ''}${stateText(train)}`;
+  const t = now === undefined ? null : Date.parse(now);
+  const departed =
+    t !== null && train.state === 'predicted' && !train.cancelled && Date.parse(train.departure_time) <= t;
+  if (!departed) return `${name}, ${stateText(train)}`;
+  if (train.arrival_time !== null) {
+    const expected = Date.parse(train.arrival_time) + Math.max(train.delay_p50_min ?? 0, 0) * 60_000;
+    if (t - expected > ARRIVAL_GRACE_MS) return `${name}, ankomst ikke registrert`;
+  }
+  return `${name}, underveis, ${stateText(train)}`;
 }
 
 function stateText(train: TrainStatus): string {

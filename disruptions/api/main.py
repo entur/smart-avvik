@@ -70,11 +70,22 @@ _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.s
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
 _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # The journey-status spine (plan 2026-09-22-001): the day's planned Vy calls, read into memory after
-# each planned rebuild. `SELECT *` so the load survives the deploy that adds a column (U4's
-# `arr_delay_min`) before the table is rebuilt with it -- the row reader uses getattr.
-_JOURNEY_STATUS_SPINE_QUERY = "SELECT * FROM `disruptions.rail_calls_planned_today`"
-# ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild.
-_JOURNEY_STATUS_ACTUALS_QUERY = "SELECT * FROM `disruptions.rail_calls_today`"
+# each planned rebuild. The columns `_planned_call` reads and no others: the load is one hourly
+# phase of a cycle, and dropping `quay`, `stop_name` and `call_date` measured ~0.5 s off it (3.2 ->
+# 2.7 s for 23 365 rows, 2026-09-22) -- the rest is BigQuery's own job and transfer latency, which
+# neither a page size nor the Storage Read API moved. A column added to the table later (an arrival
+# delay, say) must be added here too: the row reader's getattr then picks it up.
+_JOURNEY_STATUS_SPINE_QUERY = (
+    "SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed"
+    " FROM `disruptions.rail_calls_planned_today`"
+)
+# ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild. Every row
+# is recorded (the loader tags it so), and the table has no arrival time or activity columns.
+_JOURNEY_STATUS_ACTUALS_QUERY = (
+    "SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, dep_delay_min, call_cancelled"
+    " FROM `disruptions.rail_calls_today`"
+)
 # Bus/GOA family (pooled_all): the bus planned call source, the bus SX source, and the bus scoring
 # query -> call_predictions_bus_today (same columns as call_predictions_today PLUS `operator`).
 _BUS_CALLS_PLANNED_QUERY = (Path(__file__).parent / "bus_calls_planned_today.sql").read_text()
