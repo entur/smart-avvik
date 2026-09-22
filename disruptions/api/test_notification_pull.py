@@ -653,6 +653,7 @@ def test_the_access_log_redacts_this_paths_query_string_and_no_other():
     import notification_api
 
     assert notification_api.PREFIX + "/journey-alerts" in logging_setup.REDACTED_QUERY_PATHS
+    assert notification_api.PREFIX + "/journey-status" in logging_setup.REDACTED_QUERY_PATHS
     formatter = logging_setup.JsonFormatter()
     lines: list[str] = []
 
@@ -696,13 +697,14 @@ def test_the_filter_leaves_any_other_record_shape_alone():
 # ---- The router (KTD1) -----------------------------------------------------------------------
 
 
-def test_the_pull_router_has_no_dependency_and_exactly_one_route_which_is_a_coroutine():
+def test_the_pull_router_has_no_dependency_and_exactly_two_routes_which_are_coroutines():
     """Pinned here rather than beside `notification_api`'s router pins. U5 (2026-09-10) widened
     `test_notification_api.test_the_openapi_paths_are_exactly_the_routers_routes` and
     `..._the_openapi_tags_are_the_routers_own` to the UNION of both routers (seven routes, four
     tags) and added `..._the_public_read_overrides_the_global_security_per_operation`; those three
     read the published document, this one reads the router, and the two claims below -- no
-    dependency, exactly one path -- are deliberately not repeated there."""
+    dependency, exactly these paths -- are deliberately not repeated there. The second path is the
+    journey-status read (plan 2026-09-22-001)."""
     import inspect
 
     import notification_api
@@ -714,10 +716,10 @@ def test_the_pull_router_has_no_dependency_and_exactly_one_route_which_is_a_coro
         for method in route.methods
         if method not in ("HEAD", "OPTIONS")
     }
-    assert routes == {("/journey-alerts", "get")}
-    (route,) = notification_pull.router.routes
-    assert inspect.iscoroutinefunction(route.endpoint)
-    assert route.dependencies == []
+    assert routes == {("/journey-alerts", "get"), ("/journey-status", "get")}
+    for route in notification_pull.router.routes:
+        assert inspect.iscoroutinefunction(route.endpoint), route.path
+        assert route.dependencies == [], route.path
 
 
 def test_the_response_models_forbid_unknown_fields():
@@ -1706,6 +1708,136 @@ def test_the_coverage_set_is_built_once_per_stop_cache_refresh_and_not_per_reque
         assert notification_pull._coverage_present is present, "and the SET was not rebuilt"
     finally:
         varsel._stops_provider = stashed
+
+
+# ---- The journey-status read (plan 2026-09-22-001, U2) ----------------------------------------
+
+STATUS_PATH = "/notification-api/v1/journey-status"
+STATUS_NOW = datetime(2026, 9, 22, 7, 42, tzinfo=_OSLO)  # a Tuesday
+
+
+def _status_train(jkey, dep, **alight):
+    """Two planned calls on one Vy train: board at NSR_A, alight at NSR_B 40 minutes later."""
+    import journey_status
+
+    common = {"operator": "VYG", "jkey": jkey, "line": "VYG:Line:L1", "dep_delay_min": None,
+              "arr_delay_min": None, "call_cancelled": False, "call_source": "estimated"}
+    return [
+        journey_status.PlannedCall(stop_place=NSR_A, stop_order=1, aimed_dep=dep, aimed_arr=None, **common),
+        journey_status.PlannedCall(**{**common, **alight}, stop_place=NSR_B, stop_order=5,
+                                   aimed_dep=None, aimed_arr=dep + timedelta(minutes=40)),
+    ]
+
+
+def _status_reset(rows=None, *, now=STATUS_NOW):
+    import journey_status
+
+    _reset(now=now)
+    journey_status.reset_state()
+    journey_status.configure(predictions_refreshed_at=lambda: LOADED_AT, place_refs=varsel.place_refs)
+    if rows is not None:
+        journey_status.set_spine(journey_status.CallTable(rows, now - timedelta(minutes=30)))
+
+
+def _status(**params):
+    return client.get(STATUS_PATH, params={"from_stop": NSR_A, "to_stop": NSR_B, **params})
+
+
+def test_journey_status_answers_every_train_in_the_window_from_memory():
+    dep = STATUS_NOW + timedelta(minutes=6)
+    _status_reset(_status_train("a", dep) + _status_train("late", dep + timedelta(hours=3)))
+    r = _status(begin="07:00", end="09:00", days=[1])
+    assert r.status_code == 200, r.text
+    assert r.headers["Cache-Control"] == "public, max-age=60"
+    body = r.json()
+    assert [t["jkey"] for t in body["trains"]] == ["a"], "the 10:48 is outside 07:00-09:00"
+    assert body["trains"][0]["state"] == "unknown", "no prediction for it: grey, never green"
+    assert body["coverage"]["operators"] == ["VYG"]
+    assert body["journey"] == {"from_stop": NSR_A, "to_stop": NSR_B, "begin": "07:00", "end": "09:00", "days": [1]}
+    assert body["as_of"]["predictions_refreshed_at"] is not None
+    assert body["reason"] is None and body["window"] is not None
+
+
+def test_journey_status_is_503_while_the_timetable_is_not_loaded():
+    _status_reset()
+    r = _status()
+    assert r.status_code == 503 and r.json()["detail"] == "plan_not_loaded"
+    assert r.headers["Retry-After"] == "60"
+
+
+def test_journey_status_on_a_day_not_travelled_is_empty_with_a_reason():
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    body = _status(days=[5, 6]).json()
+    assert body["trains"] == [] and body["reason"] == "not_a_travel_day"
+
+
+def test_journey_status_moves_a_cancelled_train_from_ring_to_fill_between_two_reads():
+    """Nothing time-dependent is cached (KTD5): two reads straddling the aimed departure of a
+    declared-cancelled train answer `predicted` then `confirmed`, and `now` moves between them."""
+    dep = STATUS_NOW + timedelta(minutes=1)
+    rows = _status_train("a", dep, call_cancelled=True)
+    _status_reset(rows)
+    first = _status(begin="07:00", end="09:00").json()
+    notification_pull._now = lambda: dep + timedelta(seconds=30)
+    second = _status(begin="07:00", end="09:00").json()
+    assert (first["trains"][0]["state"], first["trains"][0]["cancelled"]) == ("predicted", True)
+    assert second["trains"][0]["state"] == "confirmed"
+    assert first["now"] != second["now"]
+
+
+def test_journey_status_spends_the_same_per_pair_bucket_as_journey_alerts():
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    for i in range(notification_pull.PER_PAIR_PER_MIN):
+        r = _status() if i % 2 else _get(wait=0)
+        assert r.status_code == 200, (i, r.text)
+    assert _status().status_code == 429
+    assert _get(wait=0).status_code == 429
+
+
+def test_journey_status_refuses_a_malformed_definition_with_the_pull_reads_422():
+    _status_reset([])
+    assert _status(from_stop="Oslo S").status_code == 422
+    assert _status(begin="07:00").status_code == 422
+    assert _status(begin="09:00", end="07:00").status_code == 422
+
+
+def test_journey_status_logs_one_record_with_nothing_identifying():
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    with _captured() as records:
+        _status()
+    status = [r for r in records if getattr(r, "fields", {}).get("event") == "notification_status"]
+    assert len(status) == 1
+    assert set(status[0].fields) == {"event", "result", "n_trains", "ms", "pair_digest"}
+    assert status[0].fields["n_trains"] == 1
+    assert status[0].fields["pair_digest"] == alternatives.pair_digest(NSR_A, NSR_B)
+    text = status[0].getMessage() + json.dumps(status[0].fields)
+    assert "NSR:" not in text and "07:" not in text
+
+
+def test_journey_status_answers_503_and_one_record_when_grading_raises(monkeypatch):
+    import journey_status
+
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+
+    def boom(definition, now):
+        raise KeyError(NSR_A)  # an exception whose TEXT names a ref
+
+    monkeypatch.setattr(journey_status, "status_for", boom)
+    with _captured() as records:
+        r = _status()
+    assert r.status_code == 503 and r.json()["detail"] == "status_failed"
+    assert r.headers["Retry-After"] == "60"
+    status = [x for x in records if getattr(x, "fields", {}).get("event") == "notification_status"]
+    assert [x.fields["result"] for x in status] == ["status_failed"]
+    shipped = [x for x in records if x.levelno >= logging.INFO]
+    assert all(NSR_A not in x.getMessage() for x in shipped), "the exception's text never reaches INFO+"
+
+def test_journey_status_response_models_forbid_unknown_fields():
+    import journey_status
+
+    for model in (notification_pull.JourneyStatusResponse, journey_status.TrainStatus,
+                  journey_status.AsOf, journey_status.WindowSpan):
+        assert model.model_config.get("extra") == "forbid", model.__name__
 
 
 def _run():

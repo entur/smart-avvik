@@ -565,6 +565,8 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
     phases = tuple(re.findall(r'_phase\(\s*"([a-z_]+)"', source))
     assert phases == (
         "rail_calls",
+        # The strip's recorded calls, right after the rebuild that produced them (plan 2026-09-22-001).
+        "rail_actuals_cache",
         "disruptions_sql",
         "categories",
         "predict_sql",
@@ -573,6 +575,9 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "svv_baselines",
         "varsel_stops",
         "rail_planned_calls",
+        # The «I dag» strip's timetable (plan 2026-09-22-001), loaded right after the rebuild that
+        # produced it and BEFORE the prediction swap, so it adds nothing to the orphan window below.
+        "rail_planned_cache",
         "predict_calls_rail",
         "disruptions_bus_sql",
         "bus_planned_calls",
@@ -935,6 +940,142 @@ def test_the_engine_is_wired_to_the_pollers_index_and_varsel_to_the_heartbeat():
     configure = source[source.index("varsel.configure(") :]
     configure = configure[: configure.index("llm_message.configure(")]
     assert "beat=_beat" in configure, configure
+
+
+# ---- The journey-status spine (plan 2026-09-22-001, U2) ----------------------------------------
+
+
+class _Row:
+    """A BigQuery row as the spine loader reads it: attributes, and AttributeError for a column the
+    table does not carry yet -- which is what `getattr(r, "arr_delay_min", None)` is for."""
+
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def _planned_row(jkey="j1", order=1, stop="NSR:StopPlace:337"):
+    return _Row(jkey=jkey, lineRef="VYG:Line:L1", stop_place=stop, stop_order=order,
+                aimed_dep=NOON, aimed_arr=None, dep_delay_min=None, call_cancelled=False,
+                call_source="estimated", boarding_allowed=None, alighting_allowed=False)
+
+
+@contextmanager
+def _spine_client(rows=None, *, raises=False):
+    import journey_status
+
+    class _Client:
+        def __init__(self):
+            self.queries: list[str] = []
+
+        def query(self, sql, *a, **k):
+            self.queries.append(sql)
+
+            class _Job:
+                def result(self_inner, timeout=None):
+                    if raises:
+                        raise RuntimeError("bigquery is down")
+                    return list(rows or [])
+
+            return _Job()
+
+    before = main.bq_client, main._planned_refreshed_at
+    client = _Client()
+    main.bq_client = client
+    try:
+        yield client
+    finally:
+        main.bq_client, main._planned_refreshed_at = before
+        journey_status.reset_state()
+
+
+def test_the_spine_loads_once_per_planned_rebuild_and_is_stamped_with_it():
+    import journey_status
+
+    with _spine_client([_planned_row(), _planned_row(order=2, stop="NSR:StopPlace:418")]) as client:
+        main._planned_refreshed_at = None
+        main.refresh_planned_spine()
+        assert client.queries == [], "no rebuild has finished: nothing to load"
+        main._planned_refreshed_at = NOON
+        main.refresh_planned_spine()
+        main.refresh_planned_spine()
+        assert client.queries == [main._JOURNEY_STATUS_SPINE_QUERY], "a second tick is a no-op"
+        assert journey_status.spine_refreshed_at() == NOON
+        (call, _) = journey_status._spine.by_key[("VYG", "j1")]
+        # The operator is the codespace, as the prediction cache derives it; NULL activity is
+        # permission and FALSE is not; a column the table lacks yet reads None.
+        assert (call.operator, call.boarding_allowed, call.alighting_allowed) == ("VYG", True, False)
+        assert call.arr_delay_min is None
+        main._planned_refreshed_at = NOON + timedelta(hours=1)
+        main.refresh_planned_spine()
+        assert len(client.queries) == 2, "the next rebuild is loaded"
+
+
+def test_a_failed_spine_load_keeps_the_previous_copy_and_retries_next_tick():
+    import journey_status
+
+    with _spine_client([_planned_row()]):
+        main._planned_refreshed_at = NOON
+        main.refresh_planned_spine()
+    with _spine_client(raises=True) as client:
+        journey_status.set_spine(journey_status.CallTable([], NOON))
+        main._planned_refreshed_at = NOON + timedelta(hours=1)
+        try:
+            main.refresh_planned_spine()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the loader must raise for _phase to record it")
+        assert journey_status.spine_refreshed_at() == NOON, "the old copy is still served"
+        try:
+            main.refresh_planned_spine()
+        except RuntimeError:
+            pass
+        assert len(client.queries) == 2, "a stamp that did not move means the next tick retries"
+
+
+def test_the_actuals_load_once_per_actuals_rebuild_every_row_tagged_recorded():
+    import journey_status
+
+    rows = [_Row(jkey="j1", lineRef="VYG:Line:L1", stop_place="NSR:StopPlace:337", stop_order=1,
+                 aimed_dep=NOON, dep_delay_min=4, call_cancelled=False)]
+    before = main._rail_calls_refreshed_at
+    try:
+        with _spine_client(rows) as client:
+            main._rail_calls_refreshed_at = None
+            main.refresh_rail_actuals()
+            assert client.queries == []
+            main._rail_calls_refreshed_at = NOON
+            main.refresh_rail_actuals()
+            main.refresh_rail_actuals()
+            assert client.queries == [main._JOURNEY_STATUS_ACTUALS_QUERY]
+            assert journey_status.actuals_refreshed_at() == NOON
+            (call,) = journey_status._actuals.by_key[("VYG", "j1")]
+            assert (call.call_source, call.dep_delay_min, call.aimed_arr) == ("recorded", 4, None)
+        with _spine_client(raises=True):
+            journey_status.set_actuals(journey_status.CallTable([], NOON))
+            main._rail_calls_refreshed_at = NOON + timedelta(minutes=15)
+            try:
+                main.refresh_rail_actuals()
+            except RuntimeError:
+                pass
+            assert journey_status.actuals_refreshed_at() == NOON, "the old copy is still served"
+    finally:
+        main._rail_calls_refreshed_at = before
+
+
+def test_the_actuals_phase_cannot_abort_the_rebuild():
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    block = source[source.index('_phase("rail_calls"') : source.index('_phase("disruptions_sql"')]
+    assert '_phase("rail_actuals_cache"' in block and "except Exception:" in block, block
+
+def test_the_spine_phase_is_isolated_from_the_predictions_it_sits_among():
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    block = source[source.index('_phase("rail_planned_cache"') - 200 : source.index('_phase("predict_calls_rail"')]
+    assert "try:" in block and "except Exception:" in block, block
 
 
 if __name__ == "__main__":

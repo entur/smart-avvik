@@ -21,6 +21,7 @@ import deployment  # sibling module: which environment is answering (dev/tst/prd
 import feedback_contexts  # exact display snapshots for isolated /varsel feedback
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
+import journey_status  # sibling module: every train in a journey's window today, graded (the «I dag» strip)
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
@@ -68,6 +69,12 @@ _VARSEL_CONNECTIVITY_QUERY = (Path(__file__).parent / "varsel_connectivity.sql")
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
 _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
+# The journey-status spine (plan 2026-09-22-001): the day's planned Vy calls, read into memory after
+# each planned rebuild. `SELECT *` so the load survives the deploy that adds a column (U4's
+# `arr_delay_min`) before the table is rebuilt with it -- the row reader uses getattr.
+_JOURNEY_STATUS_SPINE_QUERY = "SELECT * FROM `disruptions.rail_calls_planned_today`"
+# ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild.
+_JOURNEY_STATUS_ACTUALS_QUERY = "SELECT * FROM `disruptions.rail_calls_today`"
 # Bus/GOA family (pooled_all): the bus planned call source, the bus SX source, and the bus scoring
 # query -> call_predictions_bus_today (same columns as call_predictions_today PLUS `operator`).
 _BUS_CALLS_PLANNED_QUERY = (Path(__file__).parent / "bus_calls_planned_today.sql").read_text()
@@ -418,9 +425,12 @@ _DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
 # ingestion (a disruption *text* being published) while this table reads SIRI-ET (a train actually
 # passing a stop) -- the two advance independently. And nothing live reads it: `/journey`,
 # `/impact` and every varsel push score against `rail_calls_planned_today` (predict_calls.sql), not
-# this table. Its only consumers are retrospective -- the `actual_*` columns in predict.sql and the
+# this table. Its consumers were retrospective -- the `actual_*` columns in predict.sql and the
 # impact label in disruptions_today.sql -- both measured over an onset + 12 h window that a quarter
-# of an hour cannot move.
+# of an hour cannot move. Since 2026-09-22 it has ONE live reader, `refresh_rail_actuals` (the
+# /varsel «I dag» strip), which is what the 15 min buys a traveller: a recorded arrival reaches the
+# strip within a quarter of an hour instead of the planned table's hour. It reads the table the
+# rebuild already wrote, so the cost below is unchanged.
 #
 # The ET source is DAY-partitioned and unclustered, so there is no cheap incremental read to reach
 # for; running it less often is the only lever. Cost is linear in rebuild count (~1.7 GB per run
@@ -484,6 +494,68 @@ def maybe_refresh_planned_calls() -> None:
     with _planned_lock:
         _planned_refreshed_at = now
     logger.info("Rebuilt planned call source (rail_calls_planned_today)")
+
+
+def _rail_operator(line_ref: str | None) -> str:
+    """The rail family's operator: the lineRef codespace (`VYG:Line:L1` -> `VYG`). One statement,
+    because the journey-status spine and the prediction cache must derive it alike or the strip's
+    `(operator, jkey)` join to the predictions misses silently and every train reads grey."""
+    return (line_ref or "VYG").split(":")[0]
+
+
+def _planned_call(r, *, call_source: str | None = None) -> journey_status.PlannedCall:
+    """One call-table row as the journey-status engine holds it."""
+    return journey_status.PlannedCall(
+        operator=_rail_operator(r.lineRef),
+        jkey=r.jkey,
+        line=r.lineRef,
+        stop_place=r.stop_place,
+        stop_order=r.stop_order,
+        aimed_dep=r.aimed_dep,
+        aimed_arr=getattr(r, "aimed_arr", None),
+        dep_delay_min=r.dep_delay_min,
+        arr_delay_min=getattr(r, "arr_delay_min", None),
+        call_cancelled=bool(r.call_cancelled),
+        call_source=call_source or getattr(r, "call_source", None),
+        # Fail open, like every other reader of the two activities: NULL is permission.
+        boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
+        alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
+    )
+
+
+def refresh_rail_actuals() -> None:
+    """Load `rail_calls_today` into `journey_status` when the table has been rebuilt since the copy
+    it holds -- every 15 min at most (`_RAIL_CALLS_TTL`), a no-op on the ticks between.
+
+    Every row is a recorded call (the SQL keeps nothing else), so each is tagged `recorded` here;
+    the table carries no `call_source` column. Same stamp-is-the-guard rule as the spine: a failed
+    load keeps the previous index and the next tick retries."""
+    with _rail_calls_lock:
+        built = _rail_calls_refreshed_at
+    if built is None or journey_status.actuals_refreshed_at() == built:
+        return
+    rows = bq_client.query(_JOURNEY_STATUS_ACTUALS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
+    table = journey_status.CallTable((_planned_call(r, call_source="recorded") for r in rows), built)
+    journey_status.set_actuals(table)
+    logger.info("Loaded the journey-status actuals: %d recorded calls", len(table))
+
+
+def refresh_planned_spine() -> None:
+    """Load `rail_calls_planned_today` into `journey_status` when the table has been rebuilt since
+    the copy it holds. One ~22 000-row SELECT per rebuild, i.e. hourly; a no-op on every other tick.
+
+    Stamped with `_planned_refreshed_at`, the instant the REBUILD finished, not the load: that is
+    how old the timetable the strip draws is, and it is also the guard -- a failed load leaves the
+    engine's stamp behind the table's, so the next tick tries again, while the engine keeps serving
+    the copy it had."""
+    with _planned_lock:
+        built = _planned_refreshed_at
+    if built is None or journey_status.spine_refreshed_at() == built:
+        return
+    rows = bq_client.query(_JOURNEY_STATUS_SPINE_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
+    table = journey_status.CallTable((_planned_call(r) for r in rows), built)
+    journey_status.set_spine(table)
+    logger.info("Loaded the journey-status spine: %d planned calls", len(table))
 
 
 # The bus planned scan is heavier than rail (it materialises calls for ~10 bus/local codespaces
@@ -590,7 +662,7 @@ def refresh_call_predictions_cache() -> None:
     # NSB/prod family: operator is the rail codespace of the lineRef (VYG:Line:... -> 'VYG').
     _ingest(
         bq_client.query(_CALL_PREDICTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
-        lambda r: (r.lineRef or "VYG").split(":")[0],
+        lambda r: _rail_operator(r.lineRef),
     )
     # Bus/GOA/pooled family: the table carries an explicit operator column.
     try:
@@ -1328,6 +1400,13 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # _RAIL_CALLS_TTL old, which is what their onset + 12 h windows already tolerate.
     with _phase("rail_calls", timings):
         maybe_refresh_rail_calls()
+    # The «I dag» strip's recorded calls (journey_status). Its own try: the step above is the one
+    # whose failure aborts the rebuild, and a failed LOAD of a table it did build must not.
+    try:
+        with _phase("rail_actuals_cache", timings):
+            refresh_rail_actuals()
+    except Exception:
+        logger.exception("Journey-status actuals load failed; serving the previous copy")
     with _phase("disruptions_sql", timings):
         bq_client.query(_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
@@ -1390,6 +1469,13 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     try:
         with _phase("rail_planned_calls", timings):
             maybe_refresh_planned_calls()
+        # The «I dag» strip's timetable (journey_status). Its own try: a failed load keeps the
+        # previous spine and must not cost this tick its predictions.
+        try:
+            with _phase("rail_planned_cache", timings):
+                refresh_planned_spine()
+        except Exception:
+            logger.exception("Journey-status spine load failed; serving the previous copy")
         with _phase("predict_calls_rail", timings):
             bq_client.query(_PREDICT_CALLS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
         # Bus/GOA (pooled_all) per-call predictions. Nested + isolated so any bus failure degrades
@@ -1935,6 +2021,11 @@ async def lifespan(app: FastAPI):
     # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.
     # Its stop cache and matcher come through `varsel`'s own providers, wired just above.
     notification_pull.configure(refreshed_at=_varsel_refreshed_at)
+    # The «I dag» strip's engine: the prediction stamp for `as_of`, and every ref of a place, which
+    # it may not import from `varsel` itself (it is a leaf both surfaces call).
+    journey_status.configure(
+        predictions_refreshed_at=_varsel_refreshed_at, place_refs=varsel.place_refs
+    )
     llm_message.configure(stop_name_provider=_varsel_stops)
     # The webhook channel's two Firestore-backed planes and the authenticated API over
     # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted

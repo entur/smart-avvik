@@ -54,7 +54,7 @@ os.environ.update(
 import json
 import logging
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
 import alternatives
 import impact
@@ -6746,6 +6746,92 @@ def test_recording_a_cycles_decisions_takes_the_state_lock_a_constant_number_of_
         f"the lock was taken {counting.takes} times for 50 subjects; it is O(1) by design and "
         "this is O(subjects)"
     )
+
+
+# ---- `Journey.today`, the «I dag» strip (plan 2026-09-22-001, U3) --------------------------------
+
+
+def _spine_at_noon(jkey="strip1"):
+    """A spine with one Vy train A -> B at 12:00 Oslo TODAY. Noon rather than "now + 1 h": the
+    whole-day window keeps its past half, so noon is inside it at any wall-clock instant, where a
+    now-relative fixture crosses midnight at 23:00 and the test flakes (the 2026-09-13 `DEP` lesson)."""
+    import journey_status
+
+    noon = datetime.combine(datetime.now(_OSLO).date(), time(12, 0), tzinfo=_OSLO).astimezone(UTC)
+    common = {"operator": "VYG", "jkey": jkey, "line": "VYG:Line:L1", "dep_delay_min": None,
+              "arr_delay_min": None, "call_cancelled": False, "call_source": "estimated"}
+    rows = [
+        journey_status.PlannedCall(stop_place="A", stop_order=1, aimed_dep=noon, aimed_arr=None, **common),
+        journey_status.PlannedCall(stop_place="B", stop_order=5, aimed_dep=None,
+                                   aimed_arr=noon + timedelta(minutes=40), **common),
+    ]
+    return journey_status.CallTable(rows, datetime.now(UTC))
+
+
+def test_the_journey_list_carries_today_when_the_timetable_is_loaded():
+    import journey_status
+
+    _reset_state()
+    journey_status.reset_state()
+    _register(DEVICE)
+    try:
+        journey_status.set_spine(_spine_at_noon())
+        (journey,) = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()["journeys"]
+    finally:
+        journey_status.reset_state()
+    today = journey["today"]
+    assert [t["jkey"] for t in today["trains"]] == ["strip1"]
+    assert today["operators"] == ["VYG"] and today["now"]
+
+
+def test_without_a_timetable_today_is_null_and_the_card_is_otherwise_unchanged():
+    import journey_status
+
+    _reset_state()
+    journey_status.reset_state()
+    _register(DEVICE)
+    without = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()
+    try:
+        journey_status.set_spine(_spine_at_noon())
+        with_strip = client.get("/varsel-api/journeys", params={"device_id": DEVICE}).json()
+    finally:
+        journey_status.reset_state()
+    assert without["journeys"][0]["today"] is None
+    strip = with_strip["journeys"][0].pop("today")
+    assert strip is not None
+    without["journeys"][0].pop("today")
+    for listing in (with_strip, without):  # the matcher's own wall clock, not the strip's doing
+        for alert in listing["journeys"][0]["alerts"]:
+            alert.pop("decided_at")
+    assert with_strip == without, "the strip adds one field and changes nothing else"
+
+
+def test_a_raise_while_grading_nulls_that_journeys_today_only(monkeypatch):
+    import journey_status
+
+    _reset_state()
+    journey_status.reset_state()
+    _register(DEVICE)
+    _register(DEVICE, begin="06:00", end="09:00")
+    real = journey_status.status_for
+
+    def flaky(definition, now):
+        if definition["begin"] == "06:00":
+            raise KeyError("boom")
+        return real(definition, now)
+
+    monkeypatch.setattr(journey_status, "status_for", flaky)
+    logging.getLogger("varsel").disabled = True
+    try:
+        journey_status.set_spine(_spine_at_noon())
+        r = client.get("/varsel-api/journeys", params={"device_id": DEVICE})
+    finally:
+        logging.getLogger("varsel").disabled = False
+        journey_status.reset_state()
+    assert r.status_code == 200
+    by_begin = {j["begin"]: j for j in r.json()["journeys"]}
+    assert by_begin["06:00"]["today"] is None
+    assert by_begin["00:00"]["today"] is not None and by_begin["06:00"]["alerts"] is not None
 
 
 if __name__ == "__main__":

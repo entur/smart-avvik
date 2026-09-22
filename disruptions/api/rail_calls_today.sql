@@ -16,6 +16,15 @@
 -- "Today" is by ET ingestion partition, so it captures journeys whose latest snapshot landed
 -- today. The day is only as complete as ET has ingested so far (in-progress windows give partial
 -- actuals); re-run as ET fills in.
+--
+-- ONE LIVE READER since 2026-09-22: `main.refresh_rail_actuals` loads it into memory after every
+-- rebuild for the /varsel «I dag» strip (`journey_status`), which is what brings a recorded arrival
+-- there from the planned table's 60 min to this table's 15. It tolerates the 15 min, so the cost
+-- argument in `main._RAIL_CALLS_TTL`'s comment still holds. It grades a trip by the DEPARTURE delay
+-- at the traveller's alighting call: an arrival delay was measured (2026-09-22) at +58 % on this
+-- scan (4.2 GB at 20:50, from reading `aimedArrivalTime` and `actualArrivalTime`), which is why it
+-- is not here. A call with no aimed departure (a terminus) is not in this table either; the strip
+-- reads those off the planned table instead.
 
 CREATE OR REPLACE TABLE `disruptions.rail_calls_today` AS
 WITH last_snap AS (

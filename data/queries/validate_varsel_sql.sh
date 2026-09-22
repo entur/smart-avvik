@@ -235,4 +235,11 @@ check "rushhistorikk_days.sql"      "$API/rushhistorikk_days.sql" \
 check "varsel_connectivity.sql"     "$API/varsel_connectivity.sql" \
   '--parameter=pairs:ARRAY<STRUCT<pair_id INT64, from_refs ARRAY<STRING>, to_refs ARRAY<STRING>>>:[{"pair_id":0,"from_refs":["NSR:StopPlace:337"],"to_refs":["NSR:StopPlace:548"]}]'
 
+# The two call tables the /varsel «I dag» strip reads into memory (2026-09-22, journey_status). Both
+# are CREATE OR REPLACE TABLE, which dry-runs without writing anything; the byte count printed is the
+# REBUILD's scan, not a read of the result -- ~22 GB for the planned table by mid-afternoon (two ET
+# partitions) and up to ~3.4 GB for the actuals.
+check "rail_calls_planned_today.sql" "$API/rail_calls_planned_today.sql"
+check "rail_calls_today.sql"        "$API/rail_calls_today.sql"
+
 exit "$fail"

@@ -455,6 +455,33 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   last journey's deletion and by «Slett alt», which keeps no marker. Rows before that date have
   no tombstone and read as "never turned on" in the report, so the split is meaningful only from
   2026-09-04.
+  **Each journey card carries an «I dag» strip since 2026-09-22** (plan
+  `docs/plans/2026-09-22-001-feat-journey-status-strip-plan.md`): one circle per Vy train in today's
+  window, filled for a fact (the alighting call recorded, or a declared cancellation whose time has
+  passed), a ring for a forecast and grey where nothing can be said. It is `Journey.today` on
+  `GET /varsel-api/journeys` and the same body on the public `GET /notification-api/v1/journey-status`,
+  both from the leaf module `disruptions/api/journey_status.py`, which imports `impact` and
+  `alert_policy` only, and gets `varsel.place_refs` by injection. **Three in-memory sources, one
+  precedence**: the day's planned timetable (`rail_calls_planned_today`, loaded by
+  `main.refresh_planned_spine` in phase `rail_planned_cache` after each hourly rebuild) decides WHICH
+  trains exist. A declared cancellation wins, then a recorded alighting call (the spine's own,
+  overlaid by `rail_calls_today`, loaded by `main.refresh_rail_actuals` in phase `rail_actuals_cache`
+  every 15 min — that table's first live reader; a recorded row outranks a stale cancellation, which
+  is how a reinstated train shows), then the prediction cache read per train through
+  `impact._lookup_journey_calls` and PAIRED within one situation as the matcher pairs a boarding and
+  an alighting call — a figure no single situation scored at both ends grades yellow or green at
+  most, with no probability, because no push can fire on it. `test_the_train_set_agrees_with_the_
+  push_matchers_eligibility` holds the restated eligibility rule to `_trip_cells`' own. Two things
+  are easy to get backwards. The per-train lookup is
+  deliberately NOT `_trip_cells`, which keeps one train per line per situation, so enumerating
+  through the matcher would show one circle where one SX message names three trains. And red for a
+  forecast is `alert_policy.gate`, the push's own bar, while a no-SX figure more than 120 min out
+  is `unknown` rather than green, because that layer collapses to the base rate past ~2 h. A trip is
+  cancelled when EITHER end is. Confirmed trips are graded by the DEPARTURE delay at the alighting
+  call (a terminus by the last recorded call before it): an arrival-delay column was measured at
+  +11 % on the planned rebuild and +58 % on the 15-min actuals scan and left out. Nothing is cached
+  and nothing touches BigQuery on a request. The public read spends `journey-alerts`' limiter
+  buckets and logs `notification_status`. Vy rail only, today only.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports
