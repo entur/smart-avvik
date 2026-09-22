@@ -496,12 +496,17 @@ def maybe_refresh_planned_calls() -> None:
     logger.info("Rebuilt planned call source (rail_calls_planned_today)")
 
 
+def _rail_operator(line_ref: str | None) -> str:
+    """The rail family's operator: the lineRef codespace (`VYG:Line:L1` -> `VYG`). One statement,
+    because the journey-status spine and the prediction cache must derive it alike or the strip's
+    `(operator, jkey)` join to the predictions misses silently and every train reads grey."""
+    return (line_ref or "VYG").split(":")[0]
+
+
 def _planned_call(r, *, call_source: str | None = None) -> journey_status.PlannedCall:
-    """One call-table row as the journey-status engine holds it. `operator` is the lineRef codespace,
-    derived exactly as `refresh_call_predictions_cache` derives it for the rail family, so the
-    engine's `(operator, jkey)` joins the prediction cache."""
+    """One call-table row as the journey-status engine holds it."""
     return journey_status.PlannedCall(
-        operator=(r.lineRef or "VYG").split(":")[0],
+        operator=_rail_operator(r.lineRef),
         jkey=r.jkey,
         line=r.lineRef,
         stop_place=r.stop_place,
@@ -657,7 +662,7 @@ def refresh_call_predictions_cache() -> None:
     # NSB/prod family: operator is the rail codespace of the lineRef (VYG:Line:... -> 'VYG').
     _ingest(
         bq_client.query(_CALL_PREDICTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
-        lambda r: (r.lineRef or "VYG").split(":")[0],
+        lambda r: _rail_operator(r.lineRef),
     )
     # Bus/GOA/pooled family: the table carries an explicit operator column.
     try:
