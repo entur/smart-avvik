@@ -184,8 +184,15 @@ MAX_CONCURRENT_WAITERS = 64
 #: Wording records kept, and the bound on the alternative-outcome map beside it. An entry is a
 #: short Norwegian text and a status; `/meldinger` sizes its own wording cache the same.
 WORDING_CACHE_MAX = 10_000
-#: How long a wording lives: the situation's own outer bound (12 h from onset), the same lifetime
+#: The OUTER bound on a wording's life: the situation's own (12 h from onset), the same lifetime
 #: `varsel._messages` has. The figures refresh forgets it earlier when its train drops off the list.
+#:
+#: Since 2026-09-22 it is rarely what retires an entry. `notification_wording.wording_key` carries
+#: the prediction snapshot the alert was scored against, so an entry is reachable only for the cycle
+#: that wrote it -- what this bounds is how long an unreachable one occupies a slot before
+#: `WORDING_CACHE_MAX`'s LRU or the third forget rule takes it. Left at 12 h because the cache is
+#: bounded by COUNT and the orphans are short strings; lowering it would evict nothing that matters
+#: sooner and would need its own measurement.
 WORDING_TTL_S = 43_200
 #: How long a transient outcome -- `error`, `rate_limited`, `unanswered`, a queue-full `capped` --
 #: stands before the next read resubmits the task. Sixty seconds is `/meldinger`'s number for the
