@@ -63,5 +63,24 @@ forventet nytt nivå er **1 000-3 200 kall/døgn i prd** ($38-119/mnd/miljø), f
 Én ting å forvente på første syklus etter deploy: hver `_messages`-oppføring er foreldreløs
 (nøkkelformen er ny), så den syklusen omskriver alt og kan treffe 128-taket én gang. Det er normalt.
 
-Kortet i /varsel viser malen i vinduet mellom snapshot-bytte og at pass 1c er ferdig — ~40-60 s
-av en ~296 s periode. Korrekt (malen bygges av live input), men synlig.
+## Kortvinduet (målt, ikke anslått)
+Mellom at `call_predictions_cache` stempler snapshotet og at `varsel_notify` har skrevet de nye
+ordlydene, serverer /varsel-kortet og pull-lesningen den deterministiske linja i stedet for
+modellens. Kortet går IKKE tomt: `JourneyCard.tsx` faller tilbake på operatørens sammendrag pluss
+detaljlinja «Tog L1 07:18 · 88 % sjanse for innstilling», bygget klientside av de samme tallene
+payloaden bærer — så den kan ikke motsi dem. Det er «malen er gulvet», etter planen.
+
+Målt på prd over 12 sykluser 2026-09-22 (`poller_cycle.phases`):
+`varsel_stops` + `varsel_recheck_service` + `notification_mirror` + `varsel_notify`
+= **14,5-31 s, snitt ~20 s** av en ~296 s perioode, altså ~7 % av tida.
+
+`varsel_stops` (~8 s, 40 % av vinduet) er flyttet OVER stempelet: den leser
+`{rail,bus}_calls_planned_today` rett fra BigQuery og har ingen kobling til snapshotet i noen
+retning. Vinduet er dermed ~12 s, ~4 %. Resten er `varsel_notify` selv — ordlyden kan ikke skrives
+før matchingen er gjort — og krever omstrukturering, ikke en ny nøkkel.
+
+Å nøkle på TALLENE i stedet for snapshotet ble målt og forkastet: det lukker bare 11-18 % av
+vinduet (3,93 -> 3,51 med alle tall modellen kan bære forbi `_is_grounded`, -> 3,23 med bare de tre
+prompten tillater), og koster et vedlikeholdt sett som må pinnes mot både `build_message_input` og
+`_webhook_payload` i begge retninger. I de øvrige 82 % hadde den gamle teksten faktisk motsagt de
+nye tallene, så malen er riktig svar der.
