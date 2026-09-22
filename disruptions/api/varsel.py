@@ -101,6 +101,7 @@ from zoneinfo import ZoneInfo
 import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
 import feedback
 import feedback_contexts
+import journey_status  # every train in a journey's window today, graded -- `Journey.today`
 import metrics  # sibling leaf module (no main import): the push-delivery counter (KTD11)
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
@@ -5461,6 +5462,12 @@ class Journey(BaseModel):
             "an alert. NULL when there is nothing to say."
         ),
     )
+    today: journey_status.JourneyStatus | None = Field(
+        default=None,
+        description="Every Vy train in today's window, graded -- the «I dag» strip (plan "
+        "2026-09-22-001). NULL while the day's timetable is not loaded, or when grading this journey "
+        "failed; the card then renders exactly as it did before the strip existed.",
+    )
 
 
 class JourneysResponse(BaseModel):
@@ -5834,12 +5841,24 @@ def list_journeys(
     # device at the 20-journey cap with overlapping registrations would otherwise run the full
     # matcher up to 20 times per page view, and the PWA polls this every 60 s.
     by_key: dict[str, list[Alert]] = {}
+    today_by_key: dict[str, journey_status.JourneyStatus | None] = {}
+    now = datetime.now(UTC)
     journeys = []
     for jid, rec in mine:
         key = journey_key(rec)
         if key not in by_key:
             by_key[key] = match_journey(rec)
-        journeys.append(_journey_model(jid, rec, alerts=by_key[key]))
+            # Its OWN try, and deliberately only around the strip: a raise here costs this journey
+            # its `today` and nothing else. The matcher call above has no such guard, and this one
+            # is not widened to give it one.
+            try:
+                today_by_key[key] = journey_status.status_for(rec, now)
+            except Exception:
+                logger.exception("Grading today's trains failed for one journey; serving it without")
+                today_by_key[key] = None
+        journey = _journey_model(jid, rec, alerts=by_key[key])
+        journey.today = today_by_key[key]
+        journeys.append(journey)
     journeys.sort(key=lambda j: j.created_ts)
     return JourneysResponse(journeys=journeys)
 

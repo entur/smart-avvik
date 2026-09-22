@@ -535,3 +535,168 @@ body {
 .av-personvern-fold .eds-sub-paragraph {
   color: var(--basecolors-text-subdued, var(--grey-70));
 }
+
+
+/* ---- «I dag»: every train in today's window (plan 2026-09-22-001) ----------------------------
+   Level colours are Linje validation tokens, as the Rushvarsel badges above, so ?brand=none
+   reskins them with everything else. Filled = a fact, a 3 px ring = a forecast. Yellow carries
+   dark ink: canary is too light for white text. The face is 38 px inside a 44 px hit area. */
+.dr {
+  margin-top: 0.75rem;
+}
+
+.dr-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--font-sizes-small, 0.75rem);
+}
+
+.dr-title {
+  font-weight: 600;
+}
+
+.dr-updated,
+.dr-legend,
+.dr-detail {
+  color: var(--basecolors-text-subdued, var(--grey-70));
+  font-size: var(--font-sizes-small, 0.75rem);
+}
+
+.dr-row {
+  overflow-x: auto;
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+  /* Room for the «nå» label under the track: a scroll container clips at its padding edge. */
+  padding-bottom: 1rem;
+  /* The right-edge fade says "there is more": a mask, not a colour, so no brand can miss it. */
+  mask-image: linear-gradient(to right, black calc(100% - 2rem), transparent);
+}
+
+.dr-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  list-style: none;
+  width: max-content;
+}
+
+/* The connector the circles sit on. */
+.dr-track::before {
+  content: '';
+  position: absolute;
+  left: 22px;
+  right: 22px;
+  top: 50%;
+  height: 2px;
+  background: var(--stroke-neutral, var(--basecolors-stroke-subdued));
+}
+
+.dr-stop {
+  scroll-snap-align: start;
+}
+
+.dr-circle {
+  position: relative;
+  display: block;
+  padding: 3px;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font: inherit;
+}
+
+.dr-face {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 3px solid transparent;
+  background: var(--basecolors-frame-default);
+  color: var(--colors-blues-blueMain, var(--lavender-90));
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.dr-circle:focus-visible {
+  outline: 2px solid var(--basecolors-stroke-focus-standard, var(--stroke-subdued));
+  outline-offset: -1px;
+  border-radius: 50%;
+}
+
+.dr-circle[aria-pressed='true'] .dr-face {
+  box-shadow: 0 0 0 2px var(--basecolors-frame-default), 0 0 0 4px var(--stroke-subdued);
+}
+
+.dr-ring.dr-green .dr-face { border-color: var(--stroke-success); }
+.dr-ring.dr-yellow .dr-face { border-color: var(--stroke-warning); }
+.dr-ring.dr-red .dr-face { border-color: var(--stroke-negative); }
+.dr-ring.dr-grey .dr-face {
+  border-color: var(--stroke-neutralalt);
+  color: var(--basecolors-text-subdued, var(--grey-70));
+}
+
+.dr-fact.dr-green .dr-face {
+  background: var(--fill-success-deep);
+  color: var(--basecolors-text-light);
+}
+.dr-fact.dr-yellow .dr-face { background: var(--fill-warning-deep); }
+.dr-fact.dr-red .dr-face {
+  background: var(--fill-negative-deep);
+  color: var(--basecolors-text-light);
+}
+.dr-fact.dr-grey .dr-face { background: var(--shape-neutralalt); }
+
+.dr-cancelled .dr-face {
+  text-decoration: line-through;
+}
+
+.dr-now {
+  position: relative;
+  align-self: stretch;
+  display: flex;
+  align-items: flex-end;
+  width: 2px;
+  margin: 0 4px;
+  background: var(--stroke-subdued);
+}
+
+.dr-now span {
+  position: absolute;
+  bottom: -1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--stroke-subdued);
+}
+
+.dr-legend {
+  margin: 0.25rem 0 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.25rem;
+}
+
+.dr-key {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-left: 0.25rem;
+}
+
+.dr-key-fact { background: var(--colors-blues-blueMain, var(--lavender-90)); }
+.dr-key-ring { border: 2px solid var(--colors-blues-blueMain, var(--lavender-90)); }
+
+.dr-detail {
+  margin: 0.25rem 0 0;
+  color: var(--colors-blues-blueMain, var(--lavender-90));
+}

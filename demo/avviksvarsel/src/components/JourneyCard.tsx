@@ -14,6 +14,7 @@ import {
   trainLabel,
 } from '../format';
 import AlertFeedback from './AlertFeedback';
+import DagensReise from './DagensReise';
 
 // "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
 // opposed to what is predicted. Shown with its time because the observation can be up to an hour
@@ -215,6 +216,10 @@ export default function JourneyCard({
           {journey.begin}–{journey.end}
         </span>
       </div>
+
+      {/* The «I dag» strip, between the chips and the alerts. Absent (null, or a server that
+          predates the field) the card is exactly what it was before the strip existed. */}
+      {journey.today && <DagensReise today={journey.today} />}
 
       {/* The warning replaces "ingen aktive avvik" rather than joining it: it is the reason there are
           none, and the reassuring line on its own is what let a journey watching the wrong stop look
