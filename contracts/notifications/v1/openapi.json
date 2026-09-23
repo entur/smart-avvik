@@ -1578,7 +1578,9 @@
           "delay_p50_min",
           "impact_probability",
           "alert_worthy",
-          "observed_at"
+          "observed_at",
+          "removed_from_plan",
+          "bus_for_train"
         ],
         "properties": {
           "departure_time": {
@@ -1672,6 +1674,14 @@
             ],
             "format": "date-time",
             "description": "Aimed time of the call a confirmed figure was read off, UTC -- how old the fact is."
+          },
+          "removed_from_plan": {
+            "type": "boolean",
+            "description": "The train is missing from today's timetable altogether: Vy runs it on this weekday, today's plan does not have it, and no cancellation has been published. Always `cancelled` and `red` too, drawn by the same ring-then-fill rule -- but say «tatt ut av rutetabellen» rather than «innstilt», since a traveller who checks the operator's own channels will find no cancellation."
+          },
+          "bus_for_train": {
+            "type": "boolean",
+            "description": "A removed train the operator has set up a replacement bus for; false on every other train."
           }
         }
       }

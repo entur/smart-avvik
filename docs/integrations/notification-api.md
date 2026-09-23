@@ -719,6 +719,12 @@ graded yellow or green at most, with `impact_probability` null, because no notif
 on it. `now` is the server's
 instant: draw the «now» marker against it, not against the device clock.
 
+**A train taken out of the plan** is listed too: a Vy train that runs on this weekday but is missing
+from today's timetable, with no cancellation published, carries `removed_from_plan: true` and is
+`cancelled` and `red` like any cancellation, ring before its time and filled after. Say «tatt ut av
+rutetabellen» for it rather than «innstilt»: the operator's own channels show no cancellation.
+`bus_for_train` is true when Vy has set up a replacement bus for it.
+
 **How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
 cancellation) is rebuilt hourly. The recorded calls are rebuilt every fifteen minutes; until they
 are loaded, the timetable's own recorded calls stand in. The forecasts are rebuilt every prediction

@@ -1014,6 +1014,26 @@ def test_the_spine_loads_once_per_planned_rebuild_and_is_stamped_with_it():
         assert len(client.queries) == 2, "the next rebuild is loaded"
 
 
+def test_a_removed_train_loads_into_the_spine_from_the_same_job():
+    """Plan 2026-09-23-001: one query reads both tables, so the strip never sees one without the
+    other, and a removed row keeps its source, its cancellation and its bus."""
+    import journey_status
+
+    removed = _Row(jkey="RemovedJourney:2105_2026-08-08", lineRef="VYG:Line:L1",
+                   stop_place="NSR:StopPlace:337", stop_order=1, aimed_dep=NOON, aimed_arr=None,
+                   dep_delay_min=None, call_cancelled=True, call_source="removed",
+                   boarding_allowed=True, alighting_allowed=True, bus_for_train=True)
+    with _spine_client([_planned_row(), removed]) as client:
+        main._planned_refreshed_at = NOON
+        main.refresh_planned_spine()
+        assert client.queries == [main._JOURNEY_STATUS_SPINE_QUERY]
+        assert "rail_calls_removed_today" in main._JOURNEY_STATUS_SPINE_QUERY
+        (call,) = journey_status._spine.by_key[("VYG", "RemovedJourney:2105_2026-08-08")]
+        assert (call.call_source, call.call_cancelled, call.bus_for_train) == ("removed", True, True)
+        (planned,) = journey_status._spine.by_key[("VYG", "j1")]
+        assert planned.bus_for_train is False
+
+
 def test_a_failed_spine_load_keeps_the_previous_copy_and_retries_next_tick():
     import journey_status
 
