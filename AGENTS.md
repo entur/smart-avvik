@@ -6,7 +6,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 Everything an agent needs about this repository — the project, the tooling, the BigQuery tables, the
 deployment, every front-end and API surface, and the conventions — lives in
-[`CLAUDE.md`](CLAUDE.md) at the repo root. **Read that file. Nothing is duplicated here.**
+[`CLAUDE.md`](CLAUDE.md) at the repo root and, per surface, in [`.claude/rules/`](.claude/rules/)
+(the root file's index says which file covers what). **Read `CLAUDE.md`, then the rule file for the
+surface you are working on. Nothing is duplicated here.**
 
 ### Why this is a pointer and not a second copy
 
@@ -23,4 +25,4 @@ document announces itself as stale. Re-synchronising by hand would only have res
 same failure.
 
 So: one document, one place it is edited, and this pointer. A plan that says "update `CLAUDE.md` and
-`AGENTS.md`" now means updating `CLAUDE.md` alone.
+`AGENTS.md`" now means updating `CLAUDE.md` (or the `.claude/rules/` file for that surface) alone.
