@@ -544,6 +544,115 @@ def test_a_relayed_certainty_is_marked_on_the_row():
     assert client.get("/historikk-api/decisions").json()["decisions"][0]["et_cancelled"] is None
 
 
+def test_a_train_taken_out_of_the_plan_is_its_own_segment_not_a_relayed_one():
+    """KTD10 of plan 2026-09-23-001. A `KIX:PlanRemoved:` row carries `et_cancelled = TRUE` -- that
+    is what makes `impact._cancelled_prediction` serve the certainty -- but ET published nothing:
+    the train is missing from the day's GTFS plan. Counted as `relayed` it would put a claim nobody
+    published beside facts the feed did, so it is a fourth segment. The blended figures still count
+    it, and nothing is dropped: the four segments and `n_unsegmented` add up to the blend."""
+    _reset([{
+        "n_hit": 12, "n_false_alarm": 3, "n_miss": 1, "precision": 12 / 15,
+        "n_hit_predicted": 5, "n_false_alarm_predicted": 2, "n_miss_predicted": 1,
+        "n_hit_relayed": 4, "n_hit_no_sx": 1,
+        "n_hit_removed": 2, "n_false_alarm_removed": 1, "precision_removed": 2 / 3,
+        "median_lead_min_on_hits_removed": 240, "n_hit_trains_removed": 2,
+        "n_unsegmented": 0,
+    }])
+    s = client.get("/historikk-api/summary").json()
+    assert s["removed"]["n_hit"] == 2 and s["removed"]["n_false_alarm"] == 1
+    assert s["removed"]["precision"] == 2 / 3
+    assert s["removed"]["median_lead_min_on_hits"] == 240
+    assert s["removed"]["n_hit_trains"] == 2
+    segments = ("predicted", "relayed", "no_sx", "removed")
+    assert sum(s[k]["n_hit"] for k in segments) == s["n_hit"]
+    assert sum(s[k]["n_false_alarm"] for k in segments) == s["n_false_alarm"]
+
+    # An empty window serves the segment with no rate, as every other segment does.
+    _reset([])
+    s = client.get("/historikk-api/summary").json()
+    assert s["removed"]["n_hit"] == 0 and s["removed"]["precision"] is None
+
+
+def _provenance_cases(path) -> list[str]:
+    """Every provenance CASE in a file: the CASE ... END blocks that test the no-SX prefix."""
+    code = "\n".join(re.sub(r"--.*$", "", ln) for ln in path.read_text().splitlines())
+    blocks = re.findall(r"\bCASE\b(.*?)\bEND\b", code, flags=re.DOTALL)
+    return [b for b in blocks if "'KIX:NoSituation:'" in b]
+
+
+def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
+    """The resolution order is the whole rule, and nothing else pins it. Removed rows carry
+    `et_cancelled = TRUE`, so a CASE that tests the flag first files every one of them as `relayed`
+    -- no error, the segment just stays empty. And `n_unsegmented` must count the CASE's NULL, not
+    the flag's, or the buckets stop partitioning the blend once a prefix is tested before the flag.
+    Three files spell the CASE twice each (the rates and the per-train lead time); two are checked
+    here, and `test_meldinger` pins the third."""
+    import pathlib
+
+    here = pathlib.Path(__file__).parent
+    files = (
+        here / "historikk_summary.sql",
+        here.parents[1] / "data/queries/message_wording_comparison.sql",
+    )
+    for path in files:
+        cases = _provenance_cases(path)
+        assert len(cases) == 2, f"{path.name}: expected two provenance CASEs, found {len(cases)}"
+        for case in cases:
+            assert "'KIX:PlanRemoved:'" in case, f"{path.name}: a CASE with no removed arm"
+            assert "THEN 'removed'" in case, f"{path.name}: the removed arm names no segment"
+            removed = case.index("'KIX:PlanRemoved:'")
+            assert removed < case.index("et_cancelled IS NULL"), (
+                f"{path.name}: the removed prefix must be tested before the NULL flag"
+            )
+            assert removed < case.index("et_cancelled IS TRUE"), (
+                f"{path.name}: tested after the flag, every removed row is filed as relayed"
+            )
+    code = (here / "historikk_summary.sql").read_text()
+    assert "COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented" in code
+    assert "COUNTIF(et_cancelled IS NULL AND verdict IS NOT NULL)" not in code
+
+
+def test_the_labeller_labels_removed_trains_in_their_own_branch():
+    """The nightly job's removed-train branch, pinned statically because CI executes no SQL. Each
+    assertion is a way the branch fails SILENTLY: a `labelled` that also takes the removed rows
+    writes them twice (one NULL copy from a join that can never match); a `labelled_all` that
+    drops an arm, or a final SELECT that reads `labelled`, leaves the removed segment empty; an
+    absent arm tested before the boarding call files a train Vy put back as a hit; and an absent
+    arm without the two-day guard freezes a hit the first night, before a late re-add has landed."""
+    import pathlib
+
+    path = pathlib.Path(__file__).parents[2] / "data/queries/label_varsel_decisions.sql"
+    code = "\n".join(re.sub(r"--.*$", "", ln) for ln in path.read_text().splitlines())
+    ctes = {
+        name: " ".join(body.split())
+        for name, body in re.findall(r"^(\w+) AS \(\n(.*?)^\),?$", code, flags=re.MULTILINE | re.DOTALL)
+    }
+
+    assert "WHERE NOT STARTS_WITH(COALESCE(g.situation_number, ''), 'KIX:PlanRemoved:')" in (
+        ctes["labelled"]
+    ), "without the COALESCE a row with no situation number drops out of both branches"
+    assert "WHERE STARTS_WITH(situation_number, 'KIX:PlanRemoved:')" in ctes["removed_subjects"]
+
+    cases = re.findall(r"\bCASE\b(.*?)\bEND\b", ctes["labelled_removed"], flags=re.DOTALL)
+    assert len(cases) == 2, f"expected actual_cancelled's and actual_trouble's CASE, found {len(cases)}"
+    for case in cases:
+        ran = case.index("WHEN b.trainno IS NOT NULL")
+        absent = case.index("WHEN lr.line IS NOT NULL")
+        assert ran < absent, "the boarding call must be judged before absence can call it a hit"
+        arm = case[absent : case.index("THEN", absent)]
+        assert "tr.trainno IS NULL" in arm
+        assert "g.r_od <= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)" in arm, (
+            "an absent TRUE is resolved, so NOT EXISTS freezes it: it must wait out a late re-add"
+        )
+
+    assert ctes["labelled_all"] == (
+        "SELECT * FROM labelled UNION ALL SELECT * FROM labelled_removed"
+    )
+    final = code[code.index("\nlabelled_all AS (") :]
+    final = final[re.search(r"^\)$", final, flags=re.MULTILINE).end() :]
+    assert re.search(r"\bFROM labelled_all\b", final), "the INSERT must read both branches"
+
+
 def test_summary_survives_an_empty_window():
     """A new environment has recorded nothing yet; that is zeroes, not a 500."""
     _reset([])

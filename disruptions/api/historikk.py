@@ -214,7 +214,9 @@ class Decision(BaseModel):
         description="SIRI-ET had already declared this boarding call cancelled when the decision "
         "the verdict judges was made, so the probabilities beside it are 1.0 by construction: we "
         "relayed a fact rather than predicted one. Null for decisions taken before 2026-08-05, "
-        "which cannot be placed in either segment after the fact.",
+        "which cannot be placed in either segment after the fact. Also true on a train taken out "
+        "of the day's timetable (situationNumber `KIX:PlanRemoved:`), where ET declared nothing: "
+        "/summary counts those in `removed`, never `relayed`.",
     )
     pushed_any: bool | None = Field(
         description="Whether a notification was ISSUED on any channel: a Web Push the push service "
@@ -347,10 +349,11 @@ class Segment(BaseModel):
     """One slice of the window, split on where the decision's information came from.
 
     Same four verdicts, same arithmetic, over a subset of the same rows — so a caller can put the
-    slices side by side and see what the blended figure is actually made of. There are three:
+    slices side by side and see what the blended figure is actually made of. There are four:
     `predicted` (an SX message existed and the models forecast the outcome), `relayed` (ET had
-    already declared it) and `no_sx` (nobody had published anything; the models read real-time data
-    alone). Every labelled verdict lands in exactly one, or in `n_unsegmented`.
+    already declared it), `no_sx` (nobody had published anything; the models read real-time data
+    alone) and `removed` (the train is missing from the day's plan and no cancellation was
+    published). Every labelled verdict lands in exactly one, or in `n_unsegmented`.
     """
 
     n_hit: int = Field(description="Alerted, and trouble came.")
@@ -459,6 +462,16 @@ class Summary(BaseModel):
         "data alone. Strictly less information than either segment above and its own calibration, "
         "so it is neither the models' skill on published disruptions nor a relayed fact — it is "
         "the answer to 'can we warn people the operator has not warned?'.",
+    )
+    removed: Segment = Field(
+        default_factory=lambda: Segment(
+            n_hit=0, n_false_alarm=0, n_miss=0, n_correct_reject=0,
+            precision=None, recall=None, median_lead_min_on_hits=None,
+        ),
+        description="Decisions about a train Vy took out of the day's timetable without publishing "
+        "a cancellation (situationNumber `KIX:PlanRemoved:`, since 2026-09-23). Served at 1.0 like "
+        "a relayed cancellation, but ET declared nothing: the certainty is our own reading of the "
+        "plan. Resolved ahead of `relayed`, since these rows carry et_cancelled = TRUE.",
     )
     n_unsegmented: int = Field(
         description="Labelled decisions taken before the flag existed (2026-08-05), in no "
@@ -998,5 +1011,6 @@ def summary(
         predicted=segment("predicted"),
         relayed=segment("relayed"),
         no_sx=segment("no_sx"),
+        removed=segment("removed"),
         n_unsegmented=row.get("n_unsegmented") or 0,
     )

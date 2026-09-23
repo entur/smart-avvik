@@ -36,7 +36,10 @@
 -- either, for the same reason /historikk does not accept it here.
 --
 -- Provenance resolution order matters where the buckets overlap, and it is the same order as
--- /historikk's: NULL first (its own bucket), then `relayed`, then `no_sx`, else `predicted`. A no-SX
+-- /historikk's: `removed` first, then NULL (its own bucket), then `relayed`, then `no_sx`, else
+-- `predicted`. A removed train (`KIX:PlanRemoved:`, since 2026-09-23) carries et_cancelled = TRUE
+-- although ET declared nothing, so it is tested before the flag is read; historikk_summary.sql's
+-- header has the argument, and why testing it ahead of NULL changes no existing row. A no-SX
 -- call can be declared cancelled by ET between the cycle that scored it and the cycle the verdict
 -- judges, at which point what the traveller got WAS a relayed fact. The discriminator for `no_sx` is
 -- the situationNumber prefix rather than a column, and that is a deliberate avoidance: ADDING a
@@ -99,11 +102,13 @@ joined AS (
 labelled AS (
   SELECT
     verdict, alert_lead_min, actual_trouble, et_cancelled,
-    -- Derived once so the many COUNTIFs below cannot each spell the rule slightly differently. NULL
-    -- et_cancelled still means "unsegmented", so it is tested FIRST -- a row written before the flag
-    -- existed (2026-08-05) belongs to no segment, and defaulting it to 'predicted' would be right
-    -- for most and would bury exactly the rows worth finding.
+    -- Derived once so the many COUNTIFs below cannot each spell the rule slightly differently. The
+    -- removed prefix goes first (see the header). After it, NULL et_cancelled still means
+    -- "unsegmented" -- a row written before the flag existed (2026-08-05) belongs to no segment, and
+    -- defaulting it to 'predicted' would be right for most and would bury exactly the rows worth
+    -- finding.
     CASE
+      WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
       WHEN et_cancelled IS NULL                              THEN NULL
       WHEN et_cancelled IS TRUE                              THEN 'relayed'
       WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
@@ -145,6 +150,7 @@ hits_per_train AS (
       j.alert_lead_min, j.operator, j.jkey, j.call_date, j.stop_place, j.stop_order,
       j.line, j.departure_time, j.situation_number,
       CASE
+        WHEN STARTS_WITH(j.situation_number, 'KIX:PlanRemoved:') THEN 'removed'
         WHEN j.et_cancelled IS NULL                              THEN NULL
         WHEN j.et_cancelled IS TRUE                              THEN 'relayed'
         WHEN STARTS_WITH(j.situation_number, 'KIX:NoSituation:') THEN 'no_sx'
@@ -203,7 +209,7 @@ SELECT
   (SELECT COUNT(*) FROM hits_per_train) AS n_hit_trains,
 
   -- ---- the same rows, segmented ----------------------------------------------------------------
-  -- Nothing is dropped: every labelled verdict above lands in exactly one of the three buckets below
+  -- Nothing is dropped: every labelled verdict above lands in exactly one of the four buckets below
   -- or in n_unsegmented.
   --
   -- MODEL SKILL: the trouble we actually forecast. What a threshold should be tuned on.
@@ -273,7 +279,29 @@ SELECT
    FROM hits_per_train) AS n_hit_with_30min_notice_no_sx,
   (SELECT COUNTIF(first_alert.provenance = 'no_sx') FROM hits_per_train) AS n_hit_trains_no_sx,
 
+  -- REMOVED FROM THE PLAN: missing from the day's GTFS timetable with no cancellation published, so
+  -- neither a forecast nor a relayed fact. See historikk_summary.sql's note on the same block.
+  COUNTIF(provenance = 'removed' AND verdict = 'hit')            AS n_hit_removed,
+  COUNTIF(provenance = 'removed' AND verdict = 'false_alarm')    AS n_false_alarm_removed,
+  COUNTIF(provenance = 'removed' AND verdict = 'miss')           AS n_miss_removed,
+  COUNTIF(provenance = 'removed' AND verdict = 'correct_reject') AS n_correct_reject_removed,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'removed' AND verdict = 'hit'),
+    COUNTIF(provenance = 'removed' AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_removed,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'removed' AND verdict = 'hit'),
+    COUNTIF(provenance = 'removed' AND verdict IN ('hit', 'miss'))
+  ) AS recall_removed,
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.provenance = 'removed', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_removed,
+  (SELECT COUNTIF(first_alert.provenance = 'removed' AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_removed,
+  (SELECT COUNTIF(first_alert.provenance = 'removed') FROM hits_per_train) AS n_hit_trains_removed,
+
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
-  -- Reported, not assigned.
-  COUNTIF(et_cancelled IS NULL AND verdict IS NOT NULL) AS n_unsegmented
+  -- Reported, not assigned. The CASE's NULL rather than the flag's, so a removed row -- resolved
+  -- before the flag is read -- can never be counted twice.
+  COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented
 FROM labelled

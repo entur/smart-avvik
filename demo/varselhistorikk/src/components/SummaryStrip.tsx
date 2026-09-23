@@ -93,13 +93,18 @@ function SplitRow({ label, help, segment }: { label: string; help: string; segme
  *  A third row appeared on 2026-08-20 for decisions about trains NO message named at all, scored
  *  from real-time data alone. It is neither of the other two — strictly less information than the
  *  forecasts, and nothing published to relay — and it is the row that answers whether we can warn
- *  people about something the operator has not warned them about. */
+ *  people about something the operator has not warned them about.
+ *
+ *  A fourth appeared on 2026-09-23 for trains Vy took out of the day's timetable without publishing
+ *  a cancellation. They are served at 1.0 like the relayed row, but nothing was published to relay,
+ *  so folded into it they would pass our own reading of the plan off as the feed's. */
 const rowTotal = (s: Segment | undefined) =>
   s ? s.n_hit + s.n_false_alarm + s.n_miss + s.n_correct_reject : 0;
 
 function SegmentSplit({ summary }: { summary: Summary }) {
-  const { predicted, relayed, no_sx: noSx } = summary;
-  const segmented = rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx);
+  const { predicted, relayed, no_sx: noSx, removed } = summary;
+  const segmented =
+    rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx) + rowTotal(removed);
 
   return (
     // Collapsed by default, and native <details> rather than a useState + aria-expanded button: the
@@ -144,6 +149,16 @@ function SegmentSplit({ summary }: { summary: Summary }) {
               segment={noSx}
             />
           ) : null}
+          {/* The fourth row (2026-09-23), shown on the same condition as the third. A train taken
+              out of the plan is served at 1.0 like a relayed cancellation, but nothing was
+              published, so it is not «Videreformidlet fra ET» either. */}
+          {removed && rowTotal(removed) > 0 ? (
+            <SplitRow
+              label="Tatt ut av rutetabellen"
+              help="Toget manglet i dagens rutetabell, og ingen innstilling var publisert. Vi meldte det som sikkert — ingen prøve på modellene."
+              segment={removed}
+            />
+          ) : null}
         </>
       )}
 
@@ -165,7 +180,7 @@ function SegmentSplit({ summary }: { summary: Summary }) {
         avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
         som «riktig stille». «Varslingstid» telles per avgang, ikke per melding: operatørene sender
         ofte flere meldinger om samme tog, og den reisende får ett varsel. Alle de tre samlede
-        tallene blander to ulike populasjoner og flytter seg med blandingsforholdet mellom dem —
+        tallene blander fire ulike populasjoner og flytter seg med blandingsforholdet mellom dem —
         varslingstiden aller mest, siden en innstilling ofte er meldt i sanntidsdata timer før
         avgang. Les dem sammen med oppdelingen over.
       </Paragraph>
