@@ -26,8 +26,9 @@
 -- Oslo local time. Never TIMESTAMP_ADD of 24 h multiples: DST ends 2026-10-25, inside the four
 -- weeks the standing rule looks back over, and a shifted 07:10 would read 06:10.
 --
--- LINES THAT CLOSE BOARDING OR ALIGHTING ANYWHERE MID-JOURNEY ARE LEFT OUT (F4 and RX11 on
--- 2026-09-23; R31 and RE30 carried NO_BOARDING on 2026-09-01). GTFS carries no pickup or drop-off types, so it cannot say which calls a
+-- LINES THAT CLOSE BOARDING OR ALIGHTING ANYWHERE MID-JOURNEY ARE LEFT OUT: F4 and RX11, measured
+-- on train journeys 2026-09-23 (R31's 53 and RE30's 31 trains that day had no such call; the
+-- NO_BOARDING the 2026-09-01 count found on them was their replacement buses'). GTFS carries no pickup or drop-off types, so it cannot say which calls a
 -- removed train's passengers may use, and guessing «allowed» is the 2026-09-01 F4 incident: a
 -- Bergen train pushed to Oslo S -> Drammen registrations nobody could have been aboard. Mid-journey
 -- only, because every origin is NO_ALIGHTING and every terminus NO_BOARDING in the feed.
