@@ -86,6 +86,12 @@ function withLooks(text: string, decision: Decision): string {
 const isNoSituation = (decision: Decision) =>
   decision.situation_number?.startsWith('KIX:NoSituation:') ?? false;
 
+/** A train Vy took out of the day's timetable (predict_calls.sql writes `KIX:PlanRemoved:<jkey>`).
+ *  It carries `et_cancelled = true`, which is how the certainty is served, but ET declared nothing —
+ *  so the card must not say it did. `meldinger_summary` segments these rows on the same prefix. */
+const isPlanRemoved = (decision: Decision) =>
+  decision.situation_number?.startsWith('KIX:PlanRemoved:') ?? false;
+
 /** The regenerated wording, or the reason there is none.
  *
  *  Three things this block does that /historikk's message block does not, and each of them is why
@@ -287,6 +293,7 @@ export default function DecisionCard({
 }) {
   const alerted = decision.ever_alerted === true;
   const noSituation = isNoSituation(decision);
+  const planRemoved = isPlanRemoved(decision);
   return (
     <article className={`tb-card ${alerted ? 'tb-card--alerted' : ''}`}>
       <header className="tb-card-head">
@@ -331,7 +338,18 @@ export default function DecisionCard({
               Sanntidsdata alene
             </span>
           ) : null}
-          {decision.et_cancelled ? (
+          {/* The removed tag, and the ET tag withheld on the same rows: their flag is true, but the
+              ET tag's claim — «already declared in SIRI-ET» — is the one thing a removed train is
+              not. */}
+          {planRemoved ? (
+            <span
+              className="tb-tag"
+              title="Toget går vanligvis, men manglet i dagens rutetabell, og ingen innstilling var publisert. Vi meldte det som sikkert (1,0) ut fra rutetabellen alene."
+            >
+              Tatt ut av rutetabellen
+            </span>
+          ) : null}
+          {decision.et_cancelled && !planRemoved ? (
             <span
               className="tb-tag"
               title="Avgangen var allerede meldt innstilt i sanntidsdata (SIRI-ET) da vi bestemte oss. Sannsynlighetene er 1,0 per definisjon — vi videreformidlet et faktum."

@@ -249,7 +249,7 @@ export interface Summary extends WindowFields {
 
   /** The headline figures above are BLENDED — forecasts, relayed ET cancellations and decisions
    *  about trains nobody published anything about, together — which is the honest answer to "can
-   *  the app be trusted". These three split them, because the populations behave nothing alike: a
+   *  the app be trusted". These four split them, because the populations behave nothing alike: a
    *  declared cancellation is served at probability 1.0 by construction and says nothing about
    *  whether the models saw anything coming, while a no-SX decision is taken with strictly less
    *  information than either. Quoted alone the blended number moves with the mix. */
@@ -257,6 +257,9 @@ export interface Summary extends WindowFields {
   relayed: Segment;
   /** No SX message named the train at all; the models read real-time data alone. */
   no_sx: Segment;
+  /** The train is missing from the day's timetable and no cancellation was published
+   *  (`KIX:PlanRemoved:`). Served at 1.0 like a relayed cancellation, but ET declared nothing. */
+  removed: Segment;
   /** Decided before the flag existed (2026-08-05); in no segment. */
   n_unsegmented: number;
 }

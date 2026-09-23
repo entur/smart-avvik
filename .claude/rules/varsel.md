@@ -419,11 +419,12 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   already inside the cache have a row that cycle, so one entering it later is recorded unpushed.
   The card, `/impact` and
   the pull read show them, and the pull read still words its own four soonest as it words any
-  cancellation (KTD6; the model then says «innstilt»). Two costs are not closed: a removed train is
+  cancellation (KTD6; the model then says «innstilt»). One cost is not closed: a removed train is
   alert-worthy on the card, so it competes for `impact._MAX_ALTERNATIVE_LOOKUPS` (3, soonest first)
-  with the real cancellations beside it; and until U5 gives `/historikk` a `removed` segment, its
-  decision rows count as `relayed` (they carry `et_cancelled`), which is exactly the population
-  mixing this file warns against — read `relayed` on a cut day with that in mind.
+  with the real cancellations beside it. Its decision rows carry `et_cancelled` but are NOT
+  `relayed`: since U5 (2026-09-23) `/historikk` and `/meldinger` segment them as `removed`, tested
+  ahead of the flag, and the nightly labeller judges them by train number (see
+  `.claude/rules/historikk.md`).
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

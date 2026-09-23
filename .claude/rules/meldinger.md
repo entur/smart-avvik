@@ -311,7 +311,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     So precision, recall and lead on the default view describe a handful of rows, and `/summary`
     states that as counts (`n_subjects`, `n_labelled`, `n_pending`, `n_unknown`) *before* the rates
     rather than showing confident-looking numbers. The blended-plus-segments rule is /historikk's
-    unchanged: `predicted` / `relayed` / `no_sx` beside `n_unsegmented`. `/summary` takes the
+    unchanged: `predicted` / `relayed` / `no_sx` / `removed` beside `n_unsegmented`, with `removed`
+    resolved first. See `.claude/rules/historikk.md` for why it goes ahead of the `et_cancelled` flag
+    (2026-09-23). `/summary` takes the
     **population** filters only (day, time range, operator, line, SIRI-SX summary, from/to place);
     `verdict`, `alerted_only` and `resolved_only` narrow by outcome and never reach it — filtering
     to hits would make precision read 100 % — and `sx_only` is withheld from it on the same
