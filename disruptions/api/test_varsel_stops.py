@@ -24,6 +24,7 @@ _STATE_FD, _STATE_PATH = tempfile.mkstemp(prefix="varsel_stops_state_", suffix="
 os.close(_STATE_FD)
 os.environ["VARSEL_STATE_PATH"] = _STATE_PATH
 
+import llm_message
 import main
 import varsel
 
@@ -68,9 +69,9 @@ def _bus(stop_place, stop_name, n_calls, operator_is_goa=False):
                            has_rail=operator_is_goa, has_bus=not operator_is_goa)
 
 
-def _nsr(ref, place_id, county_no=None, municipality=None, county=None):
+def _nsr(ref, place_id, county_no=None, municipality=None, county=None, name=None):
     return SimpleNamespace(id=ref, place_id=place_id, county_no=county_no,
-                           municipality=municipality, county=county)
+                           municipality=municipality, county=county, name=name)
 
 
 def _refresh(fake, monkeypatch):
@@ -117,6 +118,29 @@ def test_one_parent_with_different_names_is_not_merged(monkeypatch):
     stops = _refresh(fake, monkeypatch)
     assert set(stops) == {"337", "58366"}
     assert varsel.canonical_stop("58366") == "58366"
+
+
+def test_a_parent_ref_stands_for_every_child_and_keeps_its_name(monkeypatch):
+    """Entur's search returns the PARENT for a station (Lysaker 58856, Oslo S 59872), and a client
+    storing what its traveller picked sends it. It carries no calls, so it matched nothing: 0 alerts
+    and `in_timetable_today: false` (reported 2026-09-23). It must reach every child whatever its
+    name — «Oslo S Trelastgata» carries Vy calls too — busiest first, never itself first."""
+    fake = _FakeBQ(
+        rail=[_rail("157", "Lysaker stasjon", 407), _rail("337", "Oslo S", 727),
+              _rail("2", "Oslo S Trelastgata", 46)],
+        bus=[_bus("4377", "Lysaker stasjon", 443)],
+        registry=[_nsr("157", "58856"), _nsr("4377", "58856"), _nsr("337", "59872"),
+                  _nsr("2", "59872"), _nsr("58856", "58856", name="Lysaker stasjon"),
+                  _nsr("59872", "59872", name="Oslo S")],
+    )
+    stops = _refresh(fake, monkeypatch)
+    assert set(stops) == {"4377", "337", "2"}, "a parent is no picker row"
+    assert varsel.place_refs("58856") == ("4377", "157")
+    assert varsel.place_refs("59872") == ("337", "2")
+    assert varsel.canonical_stop("59872") == "59872", "one child cannot stand for the whole place"
+    assert varsel.place_refs("157") == ("4377", "157"), "a child keeps its own narrower place"
+    monkeypatch.setattr(llm_message, "_stop_name_provider", main._varsel_stop_names)
+    assert llm_message._canonical_stop_name("59872") == "Oslo S"
 
 
 def test_county_comes_from_the_municipality_prefix(monkeypatch):

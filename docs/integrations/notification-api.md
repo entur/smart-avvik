@@ -217,7 +217,7 @@ address the other's record.
 |---|---|---|---|
 | `subscription_id` | string | yes | 1–128 of `[A-Za-z0-9._:-]` |
 | `destination_id` | string | yes | 1–128 of `[A-Za-z0-9._:-]`; must be yours and active |
-| `from_stop` | string | yes | `^NSR:StopPlace:[0-9]+$` |
+| `from_stop` | string | yes | `^NSR:StopPlace:[0-9]+$`; a parent (multimodal) StopPlace means every stop under it |
 | `to_stop` | string | yes | `^NSR:StopPlace:[0-9]+$`, and different from `from_stop` **after canonicalisation** |
 | `begin` | string | yes | `HH:MM`, 24 h |
 | `end` | string | yes | `HH:MM`, strictly after `begin` — **overnight windows are refused**, as they are in `/varsel` |
@@ -484,6 +484,14 @@ assembly the webhook event goes through, so a receiver that renders an event ren
 `begin`/`end` come together or not at all; no period is the whole day. No `days` is today and
 tomorrow, which is every window the prediction cache can carry — a read at 22:00 with no period
 lists a 00:30 departure with `departs_tomorrow: true`.
+
+**Send the stop refs your traveller picked, parent or not** (since 2026-09-23). A parent
+(multimodal) StopPlace — what Entur's search returns for a station, `NSR:StopPlace:59872` for
+Oslo S — stands for every stop under it, whatever its name: Oslo S is 337 and «Oslo S Trelastgata»
+(2), Nationaltheatret is the rail station and every Ruter stop beside it. A child ref still
+means only itself and its same-named twins. The echoed `journey` keeps the ref you sent. Before this
+a parent matched nothing and read `in_timetable_today: false`. The same holds for `journey-status`
+and for a subscription's `from_stop`/`to_stop`.
 
 ### The answer
 

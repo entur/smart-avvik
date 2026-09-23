@@ -168,12 +168,14 @@ _VARSEL_STOP_PLACES_QUERY = """
     ),
     sp AS (
       SELECT id,
+             ANY_VALUE(name) AS name,
              COALESCE(ANY_VALUE(parentRef.ref), id) AS place_id,
              ANY_VALUE(topographicPlaceRef.ref) AS tp_ref
       FROM `ent-data-sharing-ext-prd.national_stop_registry.stop_places_last_version`
       GROUP BY id
     )
     SELECT sp.id,
+           sp.name,
            sp.place_id,
            IF(STARTS_WITH(sp.tp_ref, 'KVE:'), SUBSTR(sp.tp_ref, -4, 2), NULL) AS county_no,
            IF(tp.type = 'municipality', tp.name, NULL) AS municipality,
@@ -710,10 +712,14 @@ def refresh_call_predictions_cache() -> None:
 # varsel never imports main (no cycle). The stop list is refreshed alongside the planned sources.
 _varsel_stops_lock = threading.Lock()
 _varsel_stops_cache: list[dict] = []
+_varsel_parent_names: list[dict] = []
 
 
-def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
-    """NSR ref -> (place_id, region label). Empty when the registry cannot be read.
+def _varsel_stop_places() -> dict[str, tuple[str, str | None, str | None]]:
+    """NSR ref -> (place_id, region label, registry name). Empty when the registry cannot be read.
+
+    Covers every StopPlace, parents included: a parent carries no calls, so the registry is the only
+    place its name comes from (see `refresh_varsel_stops`).
 
     The region is the MUNICIPALITY name when the registry resolves one, else the county the
     municipality number's prefix maps to, else None — so a ref the topographic table does not know
@@ -723,7 +729,7 @@ def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
     Fails open like every other sub-query here: no registry means no grouping and no region
     labels, which is what the picker did before this existed — not an empty stop list.
     """
-    places: dict[str, tuple[str, str | None]] = {}
+    places: dict[str, tuple[str, str | None, str | None]] = {}
     try:
         for r in bq_client.query(_VARSEL_STOP_PLACES_QUERY).result(
             timeout=_POLLER_QUERY_TIMEOUT_S
@@ -734,7 +740,7 @@ def _varsel_stop_places() -> dict[str, tuple[str, str | None]]:
                 or getattr(r, "county", None)
                 or (_COUNTY_BY_MUNICIPALITY_PREFIX.get(county_no) if county_no else None)
             )
-            places[r.id] = (r.place_id, region)
+            places[r.id] = (r.place_id, region, getattr(r, "name", None))
     except Exception:
         logger.exception(
             "The national stop registry could not be read; stops keep their own place ids "
@@ -779,7 +785,7 @@ def refresh_varsel_stops() -> None:
     places = _varsel_stop_places()
     groups: dict[tuple[str, str], list[dict]] = {}
     for e in merged.values():
-        place_id, county = places.get(e["stop_place"], (e["stop_place"], None))
+        place_id, county, _ = places.get(e["stop_place"], (e["stop_place"], None, None))
         e["place_id"] = place_id
         e["region"] = county
         name = (e["stop_name"] or "").strip().casefold()
@@ -809,20 +815,54 @@ def refresh_varsel_stops() -> None:
         for e in rest:
             aliases[e["stop_place"]] = primary["stop_place"]
 
+    # A PARENT ref names the whole place (2026-09-23). It is what Entur's own search returns for a
+    # station, so a client that stores what its traveller picked sends one: Lysaker is 58856, whose
+    # rail and bus sides are 157 and 4377. It carries no calls, so it is in no group above, and it
+    # matched nothing: 0 alerts and `in_timetable_today: false`. It means EVERY child whatever its
+    # name, never one of them: measured on dev that day, 154 of the 822 served parents hold more
+    # than one named stop, and every one-child rule drops a served side somewhere — Vy's trains at
+    # Nationaltheatret (288) or Oslo lufthavn (269), RUT's buses beside them, or the 46 Vy calls at
+    # «Oslo S Trelastgata». Busiest first, because `match_journey` runs the alternative lookup on the
+    # first ref pair only, and a parent itself would put a ref with no calls there. The `not in
+    # merged` guard is for a parent that carries calls itself, which is none today (0 on dev).
+    children: dict[str, list[dict]] = {}
+    for e in merged.values():
+        if e["place_id"] != e["stop_place"] and e["place_id"] not in merged:
+            children.setdefault(e["place_id"], []).append(e)
+    parents = {
+        p: tuple(e["stop_place"] for e in sorted(kids, key=lambda e: (-e["n_calls"], e["stop_place"])))
+        for p, kids in children.items()
+    }
+    # Not picker rows (a parent and its same-named child would be two «Oslo S»), only names, so the
+    # wording says «Oslo S» for a definition that names the parent rather than quoting its ref.
+    parent_names = [
+        {"stop_place": p, "stop_name": places[p][2]} for p in parents if p in places and places[p][2]
+    ]
+
     with _varsel_stops_lock:
-        global _varsel_stops_cache
+        global _varsel_stops_cache, _varsel_parent_names
         _varsel_stops_cache = stops
-    varsel.set_stop_aliases(aliases)
+        _varsel_parent_names = parent_names
+    varsel.set_stop_aliases(aliases, parents=parents)
     logger.info(
-        "Refreshed varsel stops: %d rows (%d refs collapsed onto a co-located primary)",
+        "Refreshed varsel stops: %d rows (%d refs collapsed onto a co-located primary, "
+        "%d parent places)",
         len(stops),
         len(aliases),
+        len(parents),
     )
 
 
 def _varsel_stops() -> list[dict]:
     with _varsel_stops_lock:
         return _varsel_stops_cache
+
+
+def _varsel_stop_names() -> list[dict]:
+    """The picker rows plus a name row per parent place — what `llm_message` names a journey's ends
+    from, since a definition can name a parent that is no picker row."""
+    with _varsel_stops_lock:
+        return _varsel_stops_cache + _varsel_parent_names
 
 
 # Answers are cached: the planned tables are rebuilt on their own TTL, so re-asking about the same
@@ -2037,7 +2077,7 @@ async def lifespan(app: FastAPI):
     journey_status.configure(
         predictions_refreshed_at=_varsel_refreshed_at, place_refs=varsel.place_refs
     )
-    llm_message.configure(stop_name_provider=_varsel_stops)
+    llm_message.configure(stop_name_provider=_varsel_stop_names)
     # The webhook channel's two Firestore-backed planes and the authenticated API over
     # them. All three are wired UNCONDITIONALLY, and the flag above is deliberately not consulted
     # here: `NOTIFICATION_WEBHOOKS_ENABLED` gates the notification PASS -- whether the poller reads

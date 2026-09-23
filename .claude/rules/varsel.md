@@ -61,6 +61,16 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `topographicPlaceRef`, `KVE:` codespace only. The registry read fails open: no registry means no
   grouping and no counties, exactly as before it existed. It is readable from both environments (the
   dataset grants `allAuthenticatedUsers` READER) and costs ~3 MB per refresh.
+  **A PARENT ref expands, it is never aliased** (2026-09-23): Entur's search returns the multimodal
+  parent for a station (Lysaker 58856, Oslo S 59872), the app's favourites store it, and a parent
+  carries no calls, so it matched nothing and read `in_timetable_today: false`. `place_refs(parent)`
+  is now every served child, busiest first (the alternative lookup runs on the first pair only), and
+  `canonical_stop(parent)` stays the parent — 154 of dev's 822 served parents hold more than one
+  named stop, and every one-child rule dropped a served side (Vy at Nationaltheatret or Oslo lufthavn,
+  RUT beside them, the 46 Vy calls at «Oslo S Trelastgata»). The cost is identity: a parent route and
+  its child-ref twin are two `journey_key`s, so two matches, two wordings and two decision rows for
+  one train. Aliasing the 668 single-group parents would unify those at no coverage cost; not done.
+  The parent's registry name reaches the prompt through `main._varsel_stop_names`.
   **The client de-duplicates too, and it must use the SAME key** (2026-09-03): the picker's resolver
   (`demo/avviksvarsel/src/components/stopResolver.ts`) folds ranked matches defensively, and it did
   so on `place_id` alone — so «Nationaltheatret stasjon» (rail, 591 calls) lost to «Nationaltheatret»
