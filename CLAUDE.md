@@ -13,8 +13,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Important BigQuery tables
 
-- ent-anshar-prd:realtime.siri_realtime_sx_production: SIRI-SX (Situation Exchange), textual incident and disruption messages
-- ent-anshar-prd:realtime.siri_realtime_et_production: SIRI-ET (Estimated Timetable), real-time updates to the planned timetable
+- ent-anshar-prd.realtime.siri_realtime_sx_production: SIRI-SX (Situation Exchange), textual incident and disruption messages
+- ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded: SIRI-ET (Estimated Timetable), real-time 
+  updates to the planned timetable. Refreshed daily. The last message of a journey, providing a "trip summary". 
+  The most-used fields, with one row per stop in a journey. Orefer this for SIRI-ET data.
+- ent-anshar-prd.realtime.siri_realtime_et_production: The full SIRI-ET table, large and therefore expensive to query
 
 ## Deployment
 
