@@ -262,6 +262,36 @@ def test_a_train_taken_out_of_the_plan_is_listed_confirmed_under_its_own_situati
     assert entry["payload"]["probabilities"]["cancellation"] == 1.0
 
 
+def test_a_removed_train_is_never_worded_and_takes_no_place_under_the_wording_cap(monkeypatch):
+    """Dev, 2026-09-23: on a cut day the removed trains sat soonest-first ahead of the forecasts,
+    the read worded every one of them on every cycle (the snapshot is in the wording key), and the
+    forecasts behind them read `not_worded`. A removed train is `disabled` and spends no call, as
+    in the pass, and the cap goes to the trains after it."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    cap = notification_pull.MAX_WORDINGS_PER_READ
+    snapshot = {}
+    for i in range(cap + 1):
+        jkey = f"RemovedJourney:{2100 + i}_2026-09-10"
+        situation = f"KIX:PlanRemoved:{jkey}"
+        snapshot[situation] = _train(
+            now + timedelta(minutes=20 + i), jkey=jkey, situation=situation, et_declared_cancelled=True,
+            p_impact_dep=1.0, p_cancel=1.0, call_source="removed", has_situation=False,
+            summary="Tatt ut av dagens rutetabell",
+        )
+    for i in range(cap):
+        snapshot[f"S{i}"] = _train(now + timedelta(minutes=60 + 10 * i), jkey=f"t{i}", situation=f"S{i}", p_impact_dep=0.9)
+    _use_snapshot(snapshot)
+    words = _fake_wording(monkeypatch)
+    body = _get(limit=20).json()
+    assert [(a["situations"][0].startswith("KIX:PlanRemoved:"), a["wording"]) for a in body["alerts"]] == (
+        [(True, {"source": "deterministic", "status": "disabled"})] * (cap + 1)
+        + [(False, {"source": "llm", "status": "ok"})] * cap
+    )
+    assert sorted(c[1] for c in words) == [f"S{i}" for i in range(cap)]
+    assert body["complete"] is True
+
+
 def test_the_route_line_names_the_registry_not_the_ref():
     now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
     _reset(now=now)

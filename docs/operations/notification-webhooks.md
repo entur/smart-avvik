@@ -1580,7 +1580,8 @@ read's own numbers. The first seven are the read without enrichment (U3) — its
 per-minute ceiling and a per-stop-pair one in a map bounded at `LIMITER_KEYS_MAX`, independent of the
 credentialed tiers above), its `wait` and `limit` bounds, and the per-cycle figures cache. The next
 eight are the enrichment (U4): the wordings one read may spend (`MAX_WORDINGS_PER_READ`, soonest
-departure first; the rest carry the template under `not_worded` — a verdict derived from the
+departure first, a `KIX:PlanRemoved:` train — always `disabled`, never worded — taking no place;
+the rest carry the template under `not_worded` — a verdict derived from the
 entry's position in the read's soonest-first order and never cached, so it is re-evaluated on
 every read as the trains ahead depart or a narrower definition puts the train under the cap), the
 background pool (`WORKERS`, a queue of `QUEUE_MAX` bounded by the module itself — past
