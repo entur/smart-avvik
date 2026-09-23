@@ -3,7 +3,9 @@
 -- source that the training chain (07_features.sql), the serving query
 -- (disruptions/api/togvarsel_features_today.sql) and the rollover probe in togvarsel.py all
 -- read, replacing the twin hardcoded lists that could drift apart or silently expire (§13 of
--- the findings doc).
+-- the findings doc). Since 2026-09-23 disruptions/api/rail_calls_removed_today.sql reads the
+-- `holiday` column too: /varsel shows no removed trains on a holiday, and none on a date past
+-- `horizon` either -- so an unextended calendar silences that table as well.
 --
 -- EXTEND YEARLY: append next year's holidays and low-season ranges, bump `horizon`, re-run this
 -- file, and run data/queries/copy_runtime_to_prd.sh. Past `horizon` the serving query ERRORs

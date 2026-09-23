@@ -40,7 +40,7 @@
 -- -- and the morning digest says a bus is set up. A bus some other operator runs (the L2 closure
 -- of 2026-08-17) is not in Vy's plan and is not seen.
 --
--- TWO GUARDS. (1) No rows unless @d's GTFS partition holds Vy trains: without it every standing
+-- FOUR GUARDS. (1) No rows unless @d's GTFS partition holds Vy trains: without it every standing
 -- train reads as removed. The partition is written days ahead (2026-09-23 held 09-24..09-27 at
 -- gtfs_version 09-22), so this is a floor rather than the usual case; `gtfs_version` rides on every
 -- row so the loader can log which plan it read. (2) The build FAILS, keeping the previous table,
@@ -48,6 +48,17 @@
 -- otherwise look like a network-wide cut and push to every registration at 05:00; the worst real
 -- day so far was ~13 %. ERROR(), not an empty table, so the refusal is logged by the poller phase
 -- that ran it.
+-- (3) No rows on a public holiday, nor on a date the calendar does not cover
+-- (`disruptions.togvarsel_calendar`, Rushvarsel's, which also marks 24/12 and 31/12). Vy runs a holiday
+-- plan against a weekday standing plan: Ascension Day 2026-05-14 read 396 trains as removed, under
+-- the 50 % refusal, so all of them would have been published.
+-- (4) No rows when more than a quarter of today's train numbers are not in the standing plan: that
+-- is a new timetable period, not a cut. A cut takes trains away and adds few (5-8 % new numbers on
+-- 2026-09-19..23, 2 % on the 2026-09-01 closure); a new plan renumbers (48-66 % on Maundy Thursday,
+-- the summer timetable's first weeks and its last, when every normal-plan train is "new" against a
+-- summer standing plan). Quiet rather than ERROR(): it recurs for weeks at every timetable change.
+-- What neither guard can tell from a cut is a SEASONAL REDUCTION that keeps the numbers (Vy dropped
+-- 59-131 standing trains on 2026-06-22..25, before the summer plan): those are published as removed.
 --
 -- WHO READS IT, and who must not (KTD1). predict_calls.sql relays it as KIX:PlanRemoved:<jkey>
 -- certainties and main.refresh_planned_spine loads it into the strip's spine. The model's line
@@ -200,7 +211,14 @@ guard AS (
     (SELECT COUNT(*) FROM today) AS n_today,
     (SELECT COUNT(*) FROM standing) AS n_standing,
     (SELECT COUNT(*) FROM missing) AS n_missing,
-    (SELECT MAX(gtfs_version) FROM gtfs WHERE od = @d) AS gtfs_version
+    (SELECT MAX(gtfs_version) FROM gtfs WHERE od = @d) AS gtfs_version,
+    -- NULL, not FALSE, when the calendar has no row for @d: an unmaintained calendar fails closed.
+    (SELECT LOGICAL_OR(holiday) FROM `disruptions.togvarsel_calendar` WHERE d = @d) AS holiday,
+    (SELECT COUNT(DISTINCT trainno) FROM trips WHERE od = @d) AS n_today_trains,
+    (SELECT COUNT(DISTINCT t.trainno)
+     FROM trips AS t
+     LEFT JOIN (SELECT DISTINCT trainno FROM standing) AS s ON s.trainno = t.trainno
+     WHERE t.od = @d AND s.trainno IS NULL) AS n_new
 )
 SELECT
   CONCAT('RemovedJourney:', c.trainno, '_', FORMAT_DATE('%Y-%m-%d', @d)) AS jkey,
@@ -231,6 +249,8 @@ WHERE si.trainno IS NULL
   -- only when the build is on and the partition exists.
   AND CASE
     WHEN NOT @enabled OR g.n_today = 0 THEN FALSE
+    WHEN g.holiday IS NOT FALSE THEN FALSE
+    WHEN g.n_new > 0.25 * g.n_today_trains THEN FALSE
     WHEN g.n_missing > 0.5 * g.n_standing THEN ERROR(FORMAT(
       'rail_calls_removed_today refused: %d of %d standing trains missing from the %t plan',
       g.n_missing, g.n_standing, @d))

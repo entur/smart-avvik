@@ -243,7 +243,7 @@ check "rail_calls_planned_today.sql" "$API/rail_calls_planned_today.sql"
 check "rail_calls_today.sql"        "$API/rail_calls_today.sql"
 # The trains Vy took out of today's plan (plan 2026-09-23-001), rebuilt after the planned table it
 # anti-joins: ~0.3 GB, five GTFS partitions. It reads rail_calls_planned_today, so run this after
-# the app has built that table in the project. data/queries/replay_removed_trains.sh runs the same
+# the app has built that table in the project, and Rushvarsel's togvarsel_calendar for holidays. data/queries/replay_removed_trains.sh runs the same
 # file over past days.
 check "rail_calls_removed_today.sql" "$API/rail_calls_removed_today.sql" \
   --parameter=d:DATE:2026-09-23 --parameter=enabled:BOOL:true
