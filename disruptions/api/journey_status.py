@@ -15,6 +15,11 @@ so it is assembled here from three in-memory sources the poller already builds:
 * **the actuals** — `rail_calls_today`, loaded every 15 min (U4). Before that loads, the spine's own
   `recorded` calls stand in, up to 60 min stale.
 
+Since 2026-09-23 the spine also holds the Vy trains taken OUT of today's plan
+(`rail_calls_removed_today`, plan 2026-09-23-001): every call `call_cancelled`, `call_source`
+`removed`. They are read by the same rule as a declared cancellation, and marked `removed_from_plan`
+so the strip and the morning digest can say what happened rather than «innstilt».
+
 Precedence (KTD3): a declared cancellation, then a recorded alighting call, then a prediction, then
 unknown. Nothing here queries BigQuery; every read is a dict lookup on a swapped-whole snapshot.
 
@@ -77,6 +82,8 @@ class PlannedCall:
     call_source: str | None
     boarding_allowed: bool = True
     alighting_allowed: bool = True
+    #: A removed train's replacement bus (`rail_calls_removed_today.bus_for_train`); False elsewhere.
+    bus_for_train: bool = False
 
 
 class CallTable:
@@ -135,6 +142,11 @@ class TrainStatus(BaseModel):
     observed_at: datetime | None = Field(
         description="Aimed time of the call the confirmed figure was read off, UTC."
     )
+    removed_from_plan: bool = Field(
+        description="Missing from today's timetable: it runs on this weekday, today's plan lacks "
+        "it, and no cancellation was published. Always `cancelled` too."
+    )
+    bus_for_train: bool = Field(description="A removed train Vy has set up a replacement bus for.")
 
 
 class WindowSpan(BaseModel):
@@ -394,6 +406,8 @@ def _status(
         "delay_min": None,
         "delay_p50_min": None,
         "observed_at": None,
+        "removed_from_plan": False,
+        "bus_for_train": False,
     }
 
     # R3: a trip is cancelled when EITHER end is. Vy cancels partial legs.
@@ -402,9 +416,11 @@ def _status(
         # (`impact._is_observed`'s rule): before that it is an announcement, drawn as a ring.
         # 1.0, as `impact._cancelled_prediction` serves it, whichever source knew.
         passed = now >= b.aimed_dep
+        removed = b.call_source == "removed"
         return TrainStatus(
             **{**common, "impact_probability": 1.0, "alert_worthy": True,
-               "observed_at": b.aimed_dep if passed else None},
+               "observed_at": b.aimed_dep if passed else None,
+               "removed_from_plan": removed, "bus_for_train": removed and b.bus_for_train},
             state="confirmed" if passed else "predicted",
             level="red",
             cancelled=True,

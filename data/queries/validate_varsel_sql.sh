@@ -241,5 +241,14 @@ check "varsel_connectivity.sql"     "$API/varsel_connectivity.sql" \
 # partitions) and up to ~3.4 GB for the actuals.
 check "rail_calls_planned_today.sql" "$API/rail_calls_planned_today.sql"
 check "rail_calls_today.sql"        "$API/rail_calls_today.sql"
+# The trains Vy took out of today's plan (plan 2026-09-23-001), rebuilt after the planned table it
+# anti-joins: ~0.3 GB, five GTFS partitions. It reads rail_calls_planned_today, so run this after
+# the app has built that table in the project. data/queries/replay_removed_trains.sh runs the same
+# file over past days.
+check "rail_calls_removed_today.sql" "$API/rail_calls_removed_today.sql" \
+  --parameter=d:DATE:2026-09-23 --parameter=enabled:BOOL:true
+# The scoring query every per-call prediction comes from, and since 2026-09-23 the relay that reads
+# the table above: a missing column or a UNION out of step there fails every prediction. ~37 MB.
+check "predict_calls.sql"           "$API/predict_calls.sql"
 
 exit "$fail"

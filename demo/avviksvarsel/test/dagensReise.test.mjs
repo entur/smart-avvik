@@ -26,6 +26,8 @@ function train(hhmm, overrides = {}) {
     impact_probability: 0.05,
     alert_worthy: false,
     observed_at: null,
+    removed_from_plan: false,
+    bus_for_train: false,
     ...overrides,
   };
 }
@@ -43,6 +45,24 @@ test('every (state, level) pair maps to a fill class and a colour class', () => 
   }
   assert.equal(
     circleClass(train('07:18', { state: 'confirmed', level: 'red', cancelled: true })),
+    'dr-circle dr-fact dr-red dr-cancelled',
+  );
+});
+
+test('a train taken out of the plan says so, never «innstilt», before and after its time', () => {
+  const removed = { level: 'red', cancelled: true, removed_from_plan: true };
+  assert.equal(circleLabel(train('07:10', removed)), 'L1 07:10, tatt ut av rutetabellen');
+  assert.equal(
+    circleLabel(train('07:10', { ...removed, state: 'confirmed' })),
+    'L1 07:10, tatt ut av rutetabellen',
+  );
+  assert.equal(
+    circleLabel(train('07:10', { ...removed, bus_for_train: true })),
+    'L1 07:10, tatt ut av rutetabellen, buss for tog',
+  );
+  assert.equal(circleClass(train('07:10', removed)), 'dr-circle dr-ring dr-red dr-cancelled');
+  assert.equal(
+    circleClass(train('07:10', { ...removed, state: 'confirmed' })),
     'dr-circle dr-fact dr-red dr-cancelled',
   );
 });

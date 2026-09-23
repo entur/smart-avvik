@@ -158,7 +158,9 @@ export interface NotificationEvent {
   operator: string;
   line: string;
   /**
-   * The dated service journey reference.
+   * The dated service journey reference. A Vy train missing from today's timetable (only ever on
+   * the public journey-alerts read, never in an event) carries the synthetic
+   * `RemovedJourney:<train number>_<yyyy-mm-dd>` instead, which resolves nowhere else.
    */
   journey_ref: string;
   call_date: string;
@@ -173,6 +175,8 @@ export interface NotificationEvent {
    * collapsed to ONE event per train, so this can name more than one. A synthetic `KIX:`-prefixed
    * number means there is no operator message behind the alert: either the real-time feed declared
    * the cancellation with no situation published, or the alert rests on real-time data alone.
+   * `KIX:PlanRemoved:` (a Vy train missing from today's timetable) never appears: no event is
+   * minted for one, and the public journey-alerts read lists it instead.
    */
   situations?: string[];
   /**

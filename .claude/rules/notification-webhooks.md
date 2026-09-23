@@ -22,6 +22,12 @@ Moved verbatim from the root `CLAUDE.md` on 2026-09-23, where it was a bullet un
 "Deployment". Where the text says "above", "below", "see the … section" or "Conventions", it
 means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
 
+- **No event for a train Vy took out of the plan** (`KIX:PlanRemoved:`, 2026-09-23, plan
+  `docs/plans/2026-09-23-001-feat-removed-trains-plan.md`, R5): `varsel._observations_for_key` skips
+  it before a subject exists, so it is never minted and never withdrawn — per-train `confirmed`
+  events would spend a subscription's cap at 03:00 on a cut day. The public journey-alerts read lists
+  it as `confirmed` (it walks `alert_worthy_trains`, not the webhook subjects), and the contract says
+  both. A digest event would be a contract change; nobody has asked for one.
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
   `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the

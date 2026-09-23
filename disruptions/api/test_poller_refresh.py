@@ -16,6 +16,7 @@ checks for why the properties worth pinning are the exception-handling ones, not
 Run: uv run --with fastapi --with httpx --with pydantic python test_poller_refresh.py
 """
 
+import os
 import textwrap
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -575,6 +576,9 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "svv_baselines",
         "varsel_stops",
         "rail_planned_calls",
+        # The trains Vy took out of today's plan (plan 2026-09-23-001): after the table it
+        # anti-joins, before the spine load that reads it.
+        "rail_removed_calls",
         # The «I dag» strip's timetable (plan 2026-09-22-001), loaded right after the rebuild that
         # produced it and BEFORE the prediction swap, so it adds nothing to the orphan window below.
         "rail_planned_cache",
@@ -1010,6 +1014,26 @@ def test_the_spine_loads_once_per_planned_rebuild_and_is_stamped_with_it():
         assert len(client.queries) == 2, "the next rebuild is loaded"
 
 
+def test_a_removed_train_loads_into_the_spine_from_the_same_job():
+    """Plan 2026-09-23-001: one query reads both tables, so the strip never sees one without the
+    other, and a removed row keeps its source, its cancellation and its bus."""
+    import journey_status
+
+    removed = _Row(jkey="RemovedJourney:2105_2026-08-08", lineRef="VYG:Line:L1",
+                   stop_place="NSR:StopPlace:337", stop_order=1, aimed_dep=NOON, aimed_arr=None,
+                   dep_delay_min=None, call_cancelled=True, call_source="removed",
+                   boarding_allowed=True, alighting_allowed=True, bus_for_train=True)
+    with _spine_client([_planned_row(), removed]) as client:
+        main._planned_refreshed_at = NOON
+        main.refresh_planned_spine()
+        assert client.queries == [main._JOURNEY_STATUS_SPINE_QUERY]
+        assert "rail_calls_removed_today" in main._JOURNEY_STATUS_SPINE_QUERY
+        (call,) = journey_status._spine.by_key[("VYG", "RemovedJourney:2105_2026-08-08")]
+        assert (call.call_source, call.call_cancelled, call.bus_for_train) == ("removed", True, True)
+        (planned,) = journey_status._spine.by_key[("VYG", "j1")]
+        assert planned.bus_for_train is False
+
+
 def test_a_failed_spine_load_keeps_the_previous_copy_and_retries_next_tick():
     import journey_status
 
@@ -1076,6 +1100,168 @@ def test_the_spine_phase_is_isolated_from_the_predictions_it_sits_among():
     source = inspect.getsource(main._rebuild_all)
     block = source[source.index('_phase("rail_planned_cache"') - 200 : source.index('_phase("predict_calls_rail"')]
     assert "try:" in block and "except Exception:" in block, block
+
+
+# ---- The removed-trains table (plan 2026-09-23-001, U1) -----------------------------------------
+
+
+@contextmanager
+def _removed_client(*, raises=False, table_exists=True):
+    """bq_client for the removed build: records each query with its parameters by name."""
+
+    class _Client:
+        def __init__(self):
+            self.builds: list[dict] = []
+
+        def query(self, sql, *a, job_config=None, **k):
+            assert sql == main._RAIL_CALLS_REMOVED_QUERY, sql[:60]
+            self.builds.append({p.name: p.value for p in job_config.query_parameters})
+
+            class _Job:
+                def result(self_inner, timeout=None):
+                    if raises:
+                        raise RuntimeError("rail_calls_removed_today refused: 900 of 1036")
+                    return []
+
+            return _Job()
+
+        def get_table(self, ref):
+            assert ref == "disruptions.rail_calls_removed_today", ref
+            if not table_exists:
+                raise main.NotFound("not there")
+            return object()
+
+    before = main.bq_client, main._planned_refreshed_at, main._removed_built_for
+    env = os.environ.get("VARSEL_PLAN_REMOVED")
+    client = _Client()
+    main.bq_client = client
+    try:
+        yield client
+    finally:
+        main.bq_client, main._planned_refreshed_at, main._removed_built_for = before
+        if env is None:
+            os.environ.pop("VARSEL_PLAN_REMOVED", None)
+        else:
+            os.environ["VARSEL_PLAN_REMOVED"] = env
+
+
+def test_the_removed_table_is_built_once_per_planned_rebuild_for_the_oslo_day():
+    with _removed_client() as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main._removed_built_for = None
+        main._planned_refreshed_at = None
+        main.maybe_refresh_removed_calls()
+        assert client.builds == [], "no planned table yet: nothing to anti-join against"
+        main._planned_refreshed_at = NOON
+        main.maybe_refresh_removed_calls()
+        main.maybe_refresh_removed_calls()
+        assert len(client.builds) == 1, "a second tick on the same planned table is a no-op"
+        assert client.builds[0] == {"d": datetime.now(main._OSLO).date(), "enabled": True}
+        main._planned_refreshed_at = NOON + timedelta(hours=1)
+        main.maybe_refresh_removed_calls()
+        assert len(client.builds) == 2, "the next planned rebuild is followed"
+
+
+def test_off_builds_the_removed_table_empty_once_and_then_stops():
+    with _removed_client() as client:
+        os.environ.pop("VARSEL_PLAN_REMOVED", None)
+        main._removed_built_for = None
+        main._planned_refreshed_at = NOON
+        main.maybe_refresh_removed_calls()
+        assert client.builds == [{"d": datetime.now(main._OSLO).date(), "enabled": False}]
+        main._planned_refreshed_at = NOON + timedelta(hours=1)
+        main.maybe_refresh_removed_calls()
+        assert len(client.builds) == 1, "the environment cannot change under a running process"
+
+
+def test_a_refused_removed_build_waits_for_the_next_planned_rebuild():
+    with _removed_client(raises=True) as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main._removed_built_for = None
+        main._planned_refreshed_at = NOON
+        try:
+            main.maybe_refresh_removed_calls()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("the build must raise for _phase to record it")
+        # Refused, then emptied: the table the refusal kept was anti-joined against an older ET.
+        assert [b["enabled"] for b in client.builds] == [True, False]
+        main.maybe_refresh_removed_calls()
+        assert len(client.builds) == 2, "a refusal is not retried every tick"
+        main._planned_refreshed_at = NOON + timedelta(hours=1)
+        try:
+            main.maybe_refresh_removed_calls()
+        except RuntimeError:
+            pass
+        assert len(client.builds) == 4
+
+
+def test_any_other_removed_build_failure_is_retried_next_tick():
+    """The table may not exist yet, and predict_calls.sql reads it: a transient failure waiting an
+    hour would cost every rail and bus prediction for that hour."""
+
+    class _Transient(Exception):
+        pass
+
+    with _removed_client() as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main._removed_built_for = None
+        main._planned_refreshed_at = NOON
+        real = main._build_removed_calls
+
+        def flaky(*, enabled):
+            client.builds.append({"enabled": enabled})
+            raise _Transient("503 backend error")
+
+        main._build_removed_calls = flaky
+        try:
+            try:
+                main.maybe_refresh_removed_calls()
+            except _Transient:
+                pass
+            assert main._removed_built_for is None, "not stamped: the next tick retries"
+        finally:
+            main._build_removed_calls = real
+        main.maybe_refresh_removed_calls()
+        assert main._removed_built_for == NOON and len(client.builds) == 2
+
+
+def test_the_refusal_the_poller_recognises_is_the_one_the_sql_raises():
+    assert main._REMOVED_REFUSAL in main._RAIL_CALLS_REMOVED_QUERY
+    assert main._REMOVED_REFUSAL in "rail_calls_removed_today refused: 900 of 1036"  # the stub's
+
+
+def test_the_removed_build_cannot_abort_the_predictions_after_it():
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    block = source[source.index('_phase("rail_planned_calls"') : source.index('_phase("rail_planned_cache"')]
+    assert '_phase("rail_removed_calls"' in block and "except Exception:" in block, block
+
+
+def test_the_removed_table_is_created_empty_only_when_it_is_absent():
+    with _removed_client(table_exists=True) as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main.ensure_removed_calls_table()
+        assert client.builds == []
+    with _removed_client(table_exists=False) as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main.ensure_removed_calls_table()
+        assert [b["enabled"] for b in client.builds] == [False], "empty, whatever the flag says"
+    with _removed_client(table_exists=False, raises=True) as client:
+        main.ensure_removed_calls_table()  # logged, never raised: startup must not block on it
+        assert len(client.builds) == 1
+
+
+def test_the_removed_sql_takes_the_parameters_the_poller_passes():
+    import re
+
+    sql = main._RAIL_CALLS_REMOVED_QUERY
+    assert set(re.findall(r"@([a-z_]+)", sql)) == {"d", "enabled"}
+    # The replay swaps the ET CTE and the table name; both must stay findable exactly once.
+    assert sql.count("et_trains AS (") == 1
+    assert sql.count("CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today`") == 1
 
 
 if __name__ == "__main__":

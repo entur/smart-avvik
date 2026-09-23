@@ -80,7 +80,7 @@
     },
     "operator": { "type": "string", "description": "Codespace of the operator, e.g. VYG." },
     "line": { "type": "string" },
-    "journey_ref": { "type": "string", "description": "The dated service journey reference." },
+    "journey_ref": { "type": "string", "description": "The dated service journey reference. A Vy train missing from today's timetable (only ever on the public journey-alerts read, never in an event) carries the synthetic `RemovedJourney:<train number>_<yyyy-mm-dd>` instead, which resolves nowhere else." },
     "call_date": { "type": "string", "format": "date" },
     "stop_place": {
       "type": "string",
@@ -90,7 +90,7 @@
     "situations": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "The contributing SIRI-SX situation numbers. Several situations about one disruption are collapsed to ONE event per train, so this can name more than one. A synthetic `KIX:`-prefixed number means there is no operator message behind the alert: either the real-time feed declared the cancellation with no situation published, or the alert rests on real-time data alone."
+      "description": "The contributing SIRI-SX situation numbers. Several situations about one disruption are collapsed to ONE event per train, so this can name more than one. A synthetic `KIX:`-prefixed number means there is no operator message behind the alert: either the real-time feed declared the cancellation with no situation published, or the alert rests on real-time data alone. `KIX:PlanRemoved:` (a Vy train missing from today's timetable) never appears: no event is minted for one, and the public journey-alerts read lists it instead."
     },
     "payload": {
       "type": "object",

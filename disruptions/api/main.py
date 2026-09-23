@@ -45,6 +45,7 @@ import webhook_delivery  # sibling module: one bounded webhook attempt per pendi
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from pydantic import BaseModel, Field
 
@@ -67,6 +68,11 @@ _VARSEL_CONNECTIVITY_QUERY = (Path(__file__).parent / "varsel_connectivity.sql")
 # Per-call (per-train) serving: the planned-timetable call source and the scoring query.
 # NSB/prod family (rail): predict_calls.sql -> call_predictions_today.
 _RAIL_CALLS_PLANNED_QUERY = (Path(__file__).parent / "rail_calls_planned_today.sql").read_text()
+# ... and the Vy trains taken OUT of today's plan, which ET never carries (plan 2026-09-23-001). Its
+# own table rather than rows in the planned one, so the model's state features never see it; the
+# file's header says who reads it and who must not.
+_RAIL_CALLS_REMOVED_QUERY = (Path(__file__).parent / "rail_calls_removed_today.sql").read_text()
+_RAIL_CALLS_REMOVED_TABLE = "disruptions.rail_calls_removed_today"
 _PREDICT_CALLS_QUERY = (Path(__file__).parent / "predict_calls.sql").read_text()
 _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # The journey-status spine (plan 2026-09-22-001): the day's planned Vy calls, read into memory after
@@ -75,10 +81,19 @@ _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # 2.7 s for 23 365 rows, 2026-09-22) -- the rest is BigQuery's own job and transfer latency, which
 # neither a page size nor the Storage Read API moved. A column added to the table later (an arrival
 # delay, say) must be added here too: the row reader's getattr then picks it up.
+#
+# The trains Vy took OUT of today's plan ride in the same job (plan 2026-09-23-001): the load is
+# mostly BigQuery's job latency, so a second query would cost the phase another second an hour for
+# ~3 000 rows. One job also means one answer -- the strip never shows a removed train beside an ET
+# train it has since been put back as, or misses both.
 _JOURNEY_STATUS_SPINE_QUERY = (
     "SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
-    " call_cancelled, call_source, boarding_allowed, alighting_allowed"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, FALSE AS bus_for_train"
     " FROM `disruptions.rail_calls_planned_today`"
+    " UNION ALL"
+    " SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, bus_for_train"
+    " FROM `disruptions.rail_calls_removed_today`"
 )
 # ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild. Every row
 # is recorded (the loader tags it so), and the table has no arrival time or activity columns.
@@ -509,6 +524,90 @@ def maybe_refresh_planned_calls() -> None:
     logger.info("Rebuilt planned call source (rail_calls_planned_today)")
 
 
+def _plan_removed_enabled() -> bool:
+    """`VARSEL_PLAN_REMOVED`: whether `rail_calls_removed_today` is built with rows. Unset is off,
+    and off builds the table EMPTY rather than not at all, so turning it off is a rollback: every
+    reader is then exactly what it was before the table existed."""
+    return os.environ.get("VARSEL_PLAN_REMOVED", "").strip().lower() in llm_message._TRUTHY
+
+
+# The planned rebuild the removed table was last built after. Hourly, straight after it: the build
+# anti-joins today's ET trains out of the planned table, so a train Vy puts back leaves within the
+# hour. ~0.3 GB a build (five GTFS partitions).
+_removed_built_for: datetime | None = None
+# The text of rail_calls_removed_today.sql's own ERROR(): a verdict about today's plan, which the
+# next tick would only repeat. Pinned against the SQL by test_poller_refresh.
+_REMOVED_REFUSAL = "rail_calls_removed_today refused"
+
+
+def _build_removed_calls(*, enabled: bool) -> None:
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("d", "DATE", datetime.now(_OSLO).date()),
+            bigquery.ScalarQueryParameter("enabled", "BOOL", enabled),
+        ]
+    )
+    bq_client.query(_RAIL_CALLS_REMOVED_QUERY, job_config=job_config).result(
+        timeout=_POLLER_QUERY_TIMEOUT_S
+    )
+
+
+def maybe_refresh_removed_calls() -> None:
+    """Rebuild `rail_calls_removed_today` once per planned rebuild.
+
+    A REFUSAL is stamped like a success: the SQL refuses a day on which more than half the standing
+    trains read as removed (`ERROR()`, see its header), and retried every tick that would be ~12
+    builds an hour for a plan that will not change before the next planned rebuild. The table is
+    then rebuilt EMPTY, because a refused build keeps the previous one, and that one was anti-joined
+    against an older ET: a train Vy has since put back would show as removed beside itself running.
+    Any OTHER failure is retried next tick, because the table may not exist yet --
+    `ensure_removed_calls_table` is best-effort -- and `predict_calls.sql` reads it, so a missing
+    table costs every rail and bus prediction until it does.
+
+    Off, it builds once per process and then stops: the flag is read from the environment, which a
+    running process does not see change, so one empty build is the whole rollback.
+    """
+    global _removed_built_for
+    with _planned_lock:
+        planned = _planned_refreshed_at
+    if planned is None or planned == _removed_built_for:
+        return
+    enabled = _plan_removed_enabled()
+    if not enabled and _removed_built_for is not None:
+        return
+    try:
+        _build_removed_calls(enabled=enabled)
+    except Exception as exc:
+        if _REMOVED_REFUSAL in str(exc):
+            _removed_built_for = planned
+            try:
+                _build_removed_calls(enabled=False)
+            except Exception:
+                logger.exception("Could not empty the removed-trains table after a refusal")
+        raise
+    _removed_built_for = planned
+    logger.info("Rebuilt the removed-trains table (%s)", "on" if enabled else "off, empty")
+
+
+def ensure_removed_calls_table() -> None:
+    """Create `rail_calls_removed_today` EMPTY when it does not exist, before the first cycle.
+
+    `predict_calls.sql` reads it, and a missing table fails that query and with it every prediction
+    the cycle serves -- on the first deploy of each environment, and on any later cycle whose build
+    failed before the table was ever written. Logged, never raised: the first cycle's own build
+    creates it too."""
+    try:
+        bq_client.get_table(_RAIL_CALLS_REMOVED_TABLE)
+    except NotFound:
+        try:
+            _build_removed_calls(enabled=False)
+            logger.info("Created %s empty", _RAIL_CALLS_REMOVED_TABLE)
+        except Exception:
+            logger.exception("Could not create %s", _RAIL_CALLS_REMOVED_TABLE)
+    except Exception:
+        logger.exception("Could not check for %s", _RAIL_CALLS_REMOVED_TABLE)
+
+
 def _rail_operator(line_ref: str | None) -> str:
     """The rail family's operator: the lineRef codespace (`VYG:Line:L1` -> `VYG`). One statement,
     because the journey-status spine and the prediction cache must derive it alike or the strip's
@@ -533,6 +632,7 @@ def _planned_call(r, *, call_source: str | None = None) -> journey_status.Planne
         # Fail open, like every other reader of the two activities: NULL is permission.
         boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
         alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
+        bus_for_train=bool(getattr(r, "bus_for_train", False)),
     )
 
 
@@ -1520,6 +1620,14 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     try:
         with _phase("rail_planned_calls", timings):
             maybe_refresh_planned_calls()
+        # The trains Vy took out of today's plan (plan 2026-09-23-001), right after the table it
+        # anti-joins and before the spine load below reads it. Its own try: a failed build keeps
+        # the previous table and must not cost this tick its predictions.
+        try:
+            with _phase("rail_removed_calls", timings):
+                maybe_refresh_removed_calls()
+        except Exception:
+            logger.exception("Removed-trains build failed; serving the previous table")
         # The «I dag» strip's timetable (journey_status). Its own try: a failed load keeps the
         # previous spine and must not cost this tick its predictions.
         try:
@@ -2120,6 +2228,7 @@ async def lifespan(app: FastAPI):
     # failure path is internal (logged, never raised), so a BigQuery problem cannot block startup.
     decisions.configure(bq_client=bq_client)
     decisions.ensure_table()
+    ensure_removed_calls_table()
     feedback_contexts.configure(bq_client=bq_client)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
