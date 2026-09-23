@@ -32,6 +32,13 @@
 -- Bergen train pushed to Oslo S -> Drammen registrations nobody could have been aboard. Mid-journey
 -- only, because every origin is NO_ALIGHTING and every terminus NO_BOARDING in the feed.
 --
+-- BUS FOR TRAIN. Vy files a replacement bus under the number of the train it replaces
+-- (`ServiceJourney:BUS-2281_...` for train 2281), in GTFS and in ET alike, so `bus_for_train` is a
+-- number match and nothing looser: on 2026-09-01 all 66 removed Gjøvikbanen trains had one, on
+-- 2026-09-23 13 of 188 did. A covered train is still removed -- the traveller's train does not run
+-- -- and the morning digest says a bus is set up. A bus some other operator runs (the L2 closure
+-- of 2026-08-17) is not in Vy's plan and is not seen.
+--
 -- TWO GUARDS. (1) No rows unless @d's GTFS partition holds Vy trains: without it every standing
 -- train reads as removed. The partition is written days ahead (2026-09-23 held 09-24..09-27 at
 -- gtfs_version 09-22), so this is a floor rather than the usual case; `gtfs_version` rides on every
@@ -104,6 +111,18 @@ present AS (
   SELECT trainno FROM today
   UNION DISTINCT
   SELECT trainno FROM et_trains
+),
+-- The train numbers a Vy bus-for-train trip stands in for on @d (see the header).
+bus_numbers AS (
+  SELECT DISTINCT REGEXP_EXTRACT(trip_id, r'ServiceJourney:BUS-(\d+)_') AS trainno
+  FROM `ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1`
+  WHERE operating_date = @d AND agency_id LIKE 'VYG%'
+    AND REGEXP_CONTAINS(trip_id, r'ServiceJourney:BUS-\d+_')
+  UNION DISTINCT
+  SELECT DISTINCT REGEXP_EXTRACT(jkey, r'ServiceJourney:BUS-(\d+)_')
+  FROM `disruptions.rail_calls_planned_today`
+  WHERE SAFE.PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(jkey, r'_(\d{2}-\d{2}-\d{2})$')) = @d
+    AND REGEXP_CONTAINS(jkey, r'ServiceJourney:BUS-\d+_')
 ),
 missing AS (
   SELECT s.*
@@ -189,9 +208,11 @@ SELECT
   TRUE AS boarding_allowed,
   TRUE AS alighting_allowed,
   c.trainno,
+  bn.trainno IS NOT NULL AS bus_for_train,
   g.gtfs_version
 FROM calls AS c
 CROSS JOIN guard AS g
+LEFT JOIN bus_numbers AS bn ON bn.trainno = c.trainno
 LEFT JOIN stood_in AS si ON si.trainno = c.trainno
 LEFT JOIN restricted AS r ON r.line = c.line
 WHERE si.trainno IS NULL
