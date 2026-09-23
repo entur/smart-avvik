@@ -548,7 +548,10 @@ same object, so it is not restated here. What the envelope around it means:
   panel opened on the platform needs the next train first, and on a line suspension where every
   cancellation ties, worst-first would cut a commuter's next train.
 - **`phase` is `predicted` or `confirmed`** and there is no `withdrawn` entry: a train no longer over
-  the gate, or whose expected departure has passed, is simply absent.
+  the gate, or whose expected departure has passed, is simply absent. `confirmed` also covers a Vy
+  train missing from today's timetable altogether — it runs on this weekday, is not in today's plan,
+  and no cancellation has been published — under the situation `KIX:PlanRemoved:<journey_ref>`. This
+  read lists such trains; the webhook channel never mints an event for one.
 - **`train`** is the event's own six identity fields; an entry and an event about one train join on
   them without translation. `expected_departure_time` is the aimed time plus the typical delay
   predicted for it — the figure that decides whether the train can still be caught, and the one the
@@ -790,7 +793,8 @@ all-clear, so it is stated rather than left out.
 A `situations` entry with a `KIX:` prefix means **no operator message is behind this alert**:
 `KIX:ETCancellation:` is a cancellation the real-time feed declared with no SIRI-SX message naming it,
 `KIX:NoSituation:` is a disruption scored from real-time data alone. There is nothing to fetch for
-either.
+either. (`KIX:PlanRemoved:`, a Vy train missing from today's timetable, is never the subject of an
+event; the journey-alerts read lists it.)
 
 ### Payload
 
