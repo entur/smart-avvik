@@ -177,6 +177,13 @@ stood_in AS (
 -- under L1) carry their own activities, and on 2026-09-23 they alone would have taken L1, R12 and
 -- R13 -- 73 removed trains -- out of this table.
 -- The activity test stays in QUALIFY: in WHERE it would move each journey's first and last call.
+--
+-- PLUS THE LINES SEEN RESTRICTED BEFORE, because today's ET can only speak for a line that runs
+-- today: close F4 for the whole day and no F4 train is in ET, so the detection finds nothing and
+-- every removed F4 train comes out bookable at every call -- the 2026-09-01 incident exactly.
+-- ponytail: a fixed list (both lines the detection found on 2026-09-23); a line newly selling
+-- boarding-only stretches is caught only on days it runs. Persist the detected set with a
+-- last-seen date before the morning digest (plan U4) ships to prd.
 restricted AS (
   SELECT DISTINCT REGEXP_EXTRACT(lineRef, r'([^:]+)$') AS line
   FROM `disruptions.rail_calls_planned_today`
@@ -184,6 +191,8 @@ restricted AS (
   QUALIFY stop_order > MIN(stop_order) OVER (PARTITION BY jkey)
       AND stop_order < MAX(stop_order) OVER (PARTITION BY jkey)
       AND (NOT boarding_allowed OR NOT alighting_allowed)
+  UNION DISTINCT
+  SELECT line FROM UNNEST(['F4', 'RX11']) AS line
 ),
 guard AS (
   SELECT

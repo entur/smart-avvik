@@ -884,8 +884,9 @@ UNION ALL
 -- to be un-predicted downstream. Column order is the contract: this list must stay in step with
 -- the SELECT above it, which is what a UNION ALL checks by name-independent position.
 -- A removed train is not «Innstilt»: Vy has not cancelled it, and a traveller who checks entur.no
--- sees no cancellation, only a timetable without it. Its prefix is what /historikk segments on and
--- what varsel keeps out of the per-train pushes (the morning digest tells those travellers instead).
+-- sees no cancellation, only a timetable without it. Its prefix is what varsel keeps out of the
+-- per-train pushes and wordings, and what /historikk is to segment on (plan 2026-09-23-001, U5; until
+-- then these rows count in its `relayed` segment, since they carry et_declared_cancelled).
 SELECT
   IF(e.call_source = 'removed',
      CONCAT('KIX:PlanRemoved:', e.jkey),

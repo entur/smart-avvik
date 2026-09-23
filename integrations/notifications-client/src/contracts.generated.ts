@@ -158,7 +158,9 @@ export interface NotificationEvent {
   operator: string;
   line: string;
   /**
-   * The dated service journey reference.
+   * The dated service journey reference. A Vy train missing from today's timetable (only ever on
+   * the public journey-alerts read, never in an event) carries the synthetic
+   * `RemovedJourney:<train number>_<yyyy-mm-dd>` instead, which resolves nowhere else.
    */
   journey_ref: string;
   call_date: string;

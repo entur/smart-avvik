@@ -247,5 +247,8 @@ check "rail_calls_today.sql"        "$API/rail_calls_today.sql"
 # file over past days.
 check "rail_calls_removed_today.sql" "$API/rail_calls_removed_today.sql" \
   --parameter=d:DATE:2026-09-23 --parameter=enabled:BOOL:true
+# The scoring query every per-call prediction comes from, and since 2026-09-23 the relay that reads
+# the table above: a missing column or a UNION out of step there fails every prediction. ~37 MB.
+check "predict_calls.sql"           "$API/predict_calls.sql"
 
 exit "$fail"
