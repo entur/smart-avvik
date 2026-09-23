@@ -2198,6 +2198,10 @@ def _pending_pushes(
         alert
         for alert in one_alert_per_train(alerts)
         if alert.alertworthy
+        # A train Vy took out of the plan is never pushed per train (the morning digest covers it)
+        # and the webhook channel gets no event for it, so a wording for it would be spend no
+        # notification carries -- `_MAX_LLM_CALLS_PER_CYCLE` and the pair's cap, on the cut days.
+        and not notification_wording.is_plan_removed(alert.situation_number)
         and (
             any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
             or any(_webhook_pending(recipient, alert) for recipient in webhook_recipients)
@@ -3939,6 +3943,12 @@ def _observations_for_key(
         if train is not None:
             contributing.setdefault(train, []).append(alert)
     for winner in one_alert_per_train(alerts):
+        if notification_wording.is_plan_removed(winner.situation_number):
+            # No event for a train Vy took out of the plan in v1 (plan 2026-09-23-001, R5): per-train
+            # `confirmed` events would spend a subscription's daily cap at 03:00 exactly as the
+            # browser's would, and a digest event is a contract change nobody has asked for. The
+            # public journey-alerts read still lists it. Never minted, so never withdrawn either.
+            continue
         train = _train_key(winner)
         if train is None:
             # No train identity, so no stable `alert_id`: two different trains would share one
@@ -5127,8 +5137,17 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # SOONEST DEPARTURE FIRST, the write queue's rule (pass 1c) applied to delivery: when
             # the daily cap below binds, it must be spent on the trains the traveller can still act
             # on.
+            #
+            # NOT A TRAIN VY TOOK OUT OF THE PLAN (plan 2026-09-23-001): one push per train was 601
+            # pushes to 92 registrations on 2026-09-23, and 35 of them would have spent the day's
+            # cap below on it before 06:00. The morning digest tells them instead, in one push.
             trains = sorted(
-                (a for a in one_alert_per_train(alerts_by_key.get(key, [])) if a.alertworthy),
+                (
+                    a
+                    for a in one_alert_per_train(alerts_by_key.get(key, []))
+                    if a.alertworthy
+                    and not notification_wording.is_plan_removed(a.situation_number)
+                ),
                 key=lambda a: (
                     a.departure_time is None,
                     a.departure_time.timestamp() if a.departure_time else 0.0,

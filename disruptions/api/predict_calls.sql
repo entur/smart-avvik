@@ -35,6 +35,9 @@
 -- named. Those consult no model -- a declared cancellation is a fact about the timetable, not a
 -- forecast -- and are the reason varsel stops being blind to a train it can already see is gone.
 -- See the `et_cancelled` / `covered` / `et_only` CTEs and the UNION ALL that closes the file.
+-- Since 2026-09-23 the same branch relays the Vy trains taken OUT of today's plan
+-- (rail_calls_removed_today, KIX:PlanRemoved:<jkey>), which ET never carries at all. That table
+-- reaches this file there and nowhere else: the feature CTEs read rail_calls_planned_today only.
 --
 -- Cheap: reads the small materialized rail_calls_planned_today + today's situations + ML.PREDICT
 -- (no ET scan here -- that cost is in rail_calls_planned_today.sql, rebuilt on a TTL by main.py).
@@ -719,20 +722,36 @@ scored AS (
 -- `KIX:` prefix keeps it clear of the publisher namespaces (`ENT:`, `NSB:`) so it can never collide
 -- with a real SX ref; the cost is that GET /situation/{id} has nothing to render for one, which is
 -- the honest answer -- there is no SX message behind it.
+--
+-- AND THE TRAINS VY TOOK OUT OF TODAY'S PLAN (rail_calls_removed_today, plan 2026-09-23-001):
+-- standing trains absent from today's GTFS and from ET, every call `call_cancelled` and
+-- `call_source = 'removed'`. The same certainty, under their own prefix and wording in the SELECT
+-- at the bottom. UNIONed HERE and nowhere above: the line and network state features average
+-- `call_cancelled` over the planned table, and a removed train there would move every real
+-- train's forecast on exactly the cut days, from inputs training never saw. None of them is in the
+-- ET timetable, so the three-branch partition below still holds.
 et_cancelled AS (
   SELECT
     r.jkey, r.lineRef, r.stop_place, r.stop_name, r.stop_order,
     r.aimed_dep, r.aimed_arr, r.dep_delay_min, r.call_source,
-    r.boarding_allowed, r.alighting_allowed,
+    r.boarding_allowed, r.alighting_allowed, r.bus_for_train,
     -- The cancelled stretch, for the summary. Computed over EVERY cancelled call of the journey
     -- rather than over what the anti-join below happens to leave, so the headline describes the
     -- disruption and not the leftovers. IGNORE NULLS because stop_name arrives through a LEFT JOIN
     -- in the planned source and one missing name should not blank the headline.
     FIRST_VALUE(r.stop_name IGNORE NULLS) OVER seg AS seg_from,
     LAST_VALUE(r.stop_name IGNORE NULLS)  OVER seg AS seg_to
-  FROM `disruptions.rail_calls_planned_today` AS r
-  WHERE r.call_cancelled
-    AND (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
+  FROM (
+    SELECT jkey, lineRef, stop_place, stop_name, stop_order, aimed_dep, aimed_arr, dep_delay_min,
+           call_source, boarding_allowed, alighting_allowed, FALSE AS bus_for_train
+    FROM `disruptions.rail_calls_planned_today`
+    WHERE call_cancelled
+    UNION ALL
+    SELECT jkey, lineRef, stop_place, stop_name, stop_order, aimed_dep, aimed_arr, dep_delay_min,
+           call_source, boarding_allowed, alighting_allowed, bus_for_train
+    FROM `disruptions.rail_calls_removed_today`
+  ) AS r
+  WHERE (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
   WINDOW seg AS (
     PARTITION BY r.jkey ORDER BY r.stop_order
     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
@@ -864,14 +883,28 @@ UNION ALL
 -- `impact._cancelled_prediction` would impose on a scored row anyway, written here so nothing has
 -- to be un-predicted downstream. Column order is the contract: this list must stay in step with
 -- the SELECT above it, which is what a UNION ALL checks by name-independent position.
+-- A removed train is not «Innstilt»: Vy has not cancelled it, and a traveller who checks entur.no
+-- sees no cancellation, only a timetable without it. Its prefix is what /historikk segments on and
+-- what varsel keeps out of the per-train pushes (the morning digest tells those travellers instead).
 SELECT
-  CONCAT('KIX:ETCancellation:', e.jkey) AS situationNumber,
+  IF(e.call_source = 'removed',
+     CONCAT('KIX:PlanRemoved:', e.jkey),
+     CONCAT('KIX:ETCancellation:', e.jkey)) AS situationNumber,
   CASE
+    WHEN e.call_source = 'removed'              THEN 'Tatt ut av dagens rutetabell'
     WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Innstilt avgang'
     WHEN e.seg_from = e.seg_to                  THEN CONCAT('Innstilt fra ', e.seg_from)
     ELSE CONCAT('Innstilt ', e.seg_from, '–', e.seg_to)
   END AS summary,
-  'Avgangen er markert innstilt i operatørens sanntidsdata.' AS description,
+  CASE
+    WHEN e.call_source = 'removed' AND e.bus_for_train THEN
+      'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell. '
+      || 'Ingen innstilling er publisert. Vy har satt opp buss for tog.'
+    WHEN e.call_source = 'removed' THEN
+      'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell. '
+      || 'Ingen innstilling er publisert.'
+    ELSE 'Avgangen er markert innstilt i operatørens sanntidsdata.'
+  END AS description,
   -- No SX message means no creationTime, so there is no onset to state and nothing to measure from.
   -- NULL rather than CURRENT_TIMESTAMP(), which would be the build time -- not when anybody declared
   -- anything, and different on every rebuild. Nothing reads either column off this table (checked
