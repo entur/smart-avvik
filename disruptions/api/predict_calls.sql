@@ -897,12 +897,10 @@ SELECT
     ELSE CONCAT('Innstilt ', e.seg_from, '–', e.seg_to)
   END AS summary,
   CASE
-    WHEN e.call_source = 'removed' AND e.bus_for_train THEN
-      'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell. '
-      || 'Ingen innstilling er publisert. Vy har satt opp buss for tog.'
     WHEN e.call_source = 'removed' THEN
       'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell. '
       || 'Ingen innstilling er publisert.'
+      || IF(e.bus_for_train, ' Vy har satt opp buss for tog.', '')
     ELSE 'Avgangen er markert innstilt i operatørens sanntidsdata.'
   END AS description,
   -- No SX message means no creationTime, so there is no onset to state and nothing to measure from.

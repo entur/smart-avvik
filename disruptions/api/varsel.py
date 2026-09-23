@@ -2199,8 +2199,9 @@ def _pending_pushes(
         for alert in one_alert_per_train(alerts)
         if alert.alertworthy
         # A train Vy took out of the plan is never pushed per train (the morning digest covers it)
-        # and the webhook channel gets no event for it, so a wording for it would be spend no
-        # notification carries -- `_MAX_LLM_CALLS_PER_CYCLE` and the pair's cap, on the cut days.
+        # and the webhook channel gets no event for it, so a wording for it would spend budget on
+        # text no notification carries -- `_MAX_LLM_CALLS_PER_CYCLE` and the pair's cap, on the cut
+        # days.
         and not notification_wording.is_plan_removed(alert.situation_number)
         and (
             any(f"{jid}|{alert.situation_number}" not in notified for jid in jids)
@@ -2284,7 +2285,9 @@ def alert_worthy_trains(alerts: list[Alert]) -> list[Alert]:
     Filtering on the gate first would list that train through its published situation and tell
     a reader about a train the pass would be withdrawing. That loop is left untouched because its
     non-alert-worthy winners are its withdrawal subjects; this is the alert-worthy subset of what
-    it iterates, in the collapse's own order, which the read sorts afterwards.
+    it iterates, in the collapse's own order, which the read sorts afterwards. The browser delivery
+    loop in `check_and_notify` selects through it too (2026-09-23), so the read and the push share
+    one statement of the order rather than two.
     """
     return [alert for alert in one_alert_per_train(alerts) if alert.alertworthy]
 
@@ -5144,9 +5147,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             trains = sorted(
                 (
                     a
-                    for a in one_alert_per_train(alerts_by_key.get(key, []))
-                    if a.alertworthy
-                    and not notification_wording.is_plan_removed(a.situation_number)
+                    for a in alert_worthy_trains(alerts_by_key.get(key, []))
+                    if not notification_wording.is_plan_removed(a.situation_number)
                 ),
                 key=lambda a: (
                     a.departure_time is None,
