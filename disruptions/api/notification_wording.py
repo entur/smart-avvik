@@ -64,6 +64,21 @@ def mode_label(operator: str | None) -> str:
     return "Tog" if operator in _RAIL_CODESPACES else "Buss"
 
 
+# ---- Trains taken out of the plan (plan 2026-09-23-001) --------------------------------------------
+#: The synthetic situation `predict_calls.sql` relays a Vy train under when it is missing from today's
+#: plan (`rail_calls_removed_today`). A certainty like an ET cancellation, but never pushed per train:
+#: on 2026-09-23 one push per train would have been 601 pushes to 92 registrations, and 35 of them
+#: would have spent their whole day's cap on it before 06:00. Browser registrations get one morning
+#: digest instead; the webhook channel gets no event in v1. Here, in the leaf both of `varsel`'s
+#: channels already import, so the two cannot disagree about which trains it covers.
+PLAN_REMOVED_PREFIX = "KIX:PlanRemoved:"
+
+
+def is_plan_removed(situation_number: str | None) -> bool:
+    """Is this the situation of a train Vy took out of today's plan?"""
+    return bool(situation_number) and situation_number.startswith(PLAN_REMOVED_PREFIX)
+
+
 # ---- The template wording -----------------------------------------------------------------------
 def delay_phrase(message_input: dict) -> str | None:
     """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay

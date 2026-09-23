@@ -6834,6 +6834,102 @@ def test_a_raise_while_grading_nulls_that_journeys_today_only(monkeypatch):
     assert by_begin["00:00"]["today"] is not None and by_begin["06:00"]["alerts"] is not None
 
 
+# ---- Trains taken out of the plan (plan 2026-09-23-001, U2) -------------------------------------
+# The relay's shape (predict_calls.sql's et_only rows under KIX:PlanRemoved:): a certainty on the
+# side that exists, no model figures, no situation behind it.
+REMOVED = "KIX:PlanRemoved:RemovedJourney:2105_2026-09-23"
+
+
+def _removed_train(dep=DEP - timedelta(minutes=20), jkey="RemovedJourney:2105_2026-09-23"):
+    situation = f"KIX:PlanRemoved:{jkey}"
+    return [
+        FakeCall(jkey, "A", 1, dep, situation_number=situation, summary="Tatt ut av dagens rutetabell",
+                 et_declared_cancelled=True, p_cancel=1.0, p_impact_dep=1.0, p_dep_ge10=None,
+                 dep_delay_typ_min=None, dep_delay_p90_min=None, dep_delay_p50_stack_min=None,
+                 dep_delay_p90_stack_min=None, call_source="removed", has_situation=False),
+        FakeCall(jkey, "B", 5, None, situation_number=situation, summary="Tatt ut av dagens rutetabell",
+                 aimed_arr=dep + timedelta(minutes=40), et_declared_cancelled=True, p_cancel=1.0,
+                 p_impact_dep=None, p_impact=1.0, call_source="removed", has_situation=False),
+    ]
+
+
+def test_a_train_taken_out_of_the_plan_is_shown_and_logged_but_never_pushed_or_worded(monkeypatch):
+    """R4/R6/KTD6: the card and the decision log see a removed train like any declared cancellation,
+    while no per-train push and no wording is spent on it -- the morning digest (U4) is the push.
+    Departing FIRST, so a soonest-first cap or queue that forgot the exclusion would pick it."""
+    _reset_state()
+    snapshot = {REMOVED: _removed_train(), "S1": _cancelled_notice("S1")}
+    _use_snapshot(snapshot)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    log = _use_decision_log(monkeypatch)
+    jid = _register(DEVICE)
+
+    varsel.check_and_notify(snapshot)
+    varsel.check_and_notify(snapshot)
+
+    assert [p["title"] for p in sent] == [_expected_title("er innstilt")], "the ET cancellation only"
+    assert all(situation != REMOVED for _key, situation in written), written
+    rows = [r for r in log.rows if r["situation_number"] == REMOVED]
+    assert rows and not any(r["pushed"] for r in rows), "recorded, never pushed"
+    with varsel._state_lock:
+        assert f"{jid}|{REMOVED}" not in varsel._notified
+    listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    shown = {a["situation_number"] for a in listed[0]["alerts"]}
+    assert shown == {REMOVED, "S1"}, shown
+    _use_snapshot(SNAPSHOT)
+
+
+def test_a_journey_whose_only_alert_is_a_removed_train_writes_nothing(monkeypatch):
+    """KTD6: the write queue's card fallback (the worst train when no push is pending) must skip a
+    removed train like `_pending_pushes` does -- alone on a journey, it IS the worst train."""
+    _reset_state()
+    snapshot = {REMOVED: _removed_train()}
+    _use_snapshot(snapshot)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    _register(DEVICE)
+    varsel.check_and_notify(snapshot)
+    assert sent == [] and written == [], (sent, written)
+    listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert [a["situation_number"] for a in listed[0]["alerts"]] == [REMOVED], "still on the card"
+    _use_snapshot(SNAPSHOT)
+
+
+def test_a_train_taken_out_of_the_plan_leaves_the_daily_cap_to_the_real_alerts(monkeypatch):
+    """Six removed trains ahead of one real forecast: the forecast is still pushed, because the
+    removed ones never reach the cap's soonest-first queue."""
+    _reset_state()
+    snapshot = {"S1": SNAPSHOT["S1"]}
+    for i in range(6):
+        jkey = f"RemovedJourney:{2100 + i}_2026-09-23"
+        snapshot[f"KIX:PlanRemoved:{jkey}"] = _removed_train(DEP - timedelta(minutes=60 - i), jkey)
+    _use_snapshot(snapshot)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    varsel.check_and_notify(snapshot)
+    assert [p["title"] for p in sent] == [_expected_title()]
+    _use_snapshot(SNAPSHOT)
+
+
+def test_a_train_taken_out_of_the_plan_is_never_a_webhook_subject(monkeypatch):
+    """R5: no event about a removed train in v1, while the ET cancellation beside it is one."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    snapshot = {REMOVED: _removed_train(), "S1": _cancelled_notice("S1")}
+    _use_snapshot(snapshot)
+    outcome = varsel.check_and_notify(snapshot)
+    assert [s.situations for s in _subjects(outcome)] == [("S1",)]
+    assert all(situation != REMOVED for _key, situation in written), "nor worded for the client"
+
+    _use_snapshot(SNAPSHOT)
+
+
 if __name__ == "__main__":
     import inspect
 
