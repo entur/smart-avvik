@@ -40,6 +40,10 @@ export function circleLabel(train: TrainStatus, now?: string): string {
 }
 
 function stateText(train: TrainStatus): string {
+  // Not «innstilt»: Vy has not cancelled it, and entur.no shows no cancellation (plan 2026-09-23-001).
+  if (train.removed_from_plan) {
+    return train.bus_for_train ? 'tatt ut av rutetabellen, buss for tog' : 'tatt ut av rutetabellen';
+  }
   if (train.cancelled) return train.state === 'confirmed' ? 'innstilt' : 'meldt innstilt';
   if (train.state === 'unknown') return 'ikke vurdert';
   if (train.state === 'confirmed') {

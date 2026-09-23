@@ -175,6 +175,11 @@ export interface TrainStatus {
   impact_probability: number | null;
   alert_worthy: boolean;
   observed_at: string | null;
+  /** Missing from today's timetable (Vy runs it on this weekday, no cancellation was published).
+   *  Always `cancelled` too. */
+  removed_from_plan: boolean;
+  /** A removed train Vy has set up a replacement bus for. */
+  bus_for_train: boolean;
 }
 
 /** journey_status.JourneyStatus. `now` is the server's instant; the «nå» marker is drawn on it. */

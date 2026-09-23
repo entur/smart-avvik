@@ -476,6 +476,23 @@ def test_the_train_set_equals_a_brute_force_walk_over_random_spines():
 
 
 
+def test_a_train_taken_out_of_the_plan_is_a_red_cancellation_that_says_so():
+    """R9 of plan 2026-09-23-001: red, cancelled, a ring until its aimed departure and filled after
+    -- a declared cancellation's rule -- and marked, so the label reads «tatt ut av rutetabellen»."""
+    removed = {"source": "removed", "call_cancelled": True, "bus_for_train": True}
+    rows = _train("RemovedJourney:2105_2026-09-22", _oslo(7, 10),
+                  board=removed, mid=removed, alight=removed)
+    rows += _train("j0740", _oslo(7, 40))
+    _install(rows)
+    before = _strip(_oslo(7, 0))["07:10"]
+    assert (before.state, before.level, before.cancelled) == ("predicted", "red", True)
+    assert (before.removed_from_plan, before.bus_for_train, before.impact_probability) == (True, True, 1.0)
+    after = _strip(_oslo(7, 20))["07:10"]
+    assert (after.state, after.level, after.removed_from_plan) == ("confirmed", "red", True)
+    other = _strip(_oslo(7, 0))["07:40"]
+    assert (other.removed_from_plan, other.bus_for_train, other.cancelled) == (False, False, False)
+
+
 def test_the_train_set_agrees_with_the_push_matchers_eligibility():
     """The strip restates `impact._trip_cells`' eligibility on the spine's rows (board at the
     from-stop inside the window with boarding open, alight later at the to-stop with alighting
@@ -489,6 +506,10 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
     for _ in range(200):
         rows, scope = [], {}
         for j in range(rng.randint(0, 10)):
+            # Some trains are taken out of the plan (plan 2026-09-23-001): the spine's rows come from
+            # rail_calls_removed_today, and the relay scores them as certainties under their own
+            # situation. Eligibility must not care which table a train came from.
+            removed = rng.random() < 0.3
             t = _oslo(6, 30) + timedelta(minutes=rng.randint(0, 180))
             calls = [FROM] + [rng.choice(stops) for _ in range(rng.randint(0, 4))]
             rng.shuffle(calls)
@@ -499,11 +520,16 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
                     f"j{j}", order, stop,
                     None if rng.random() < 0.1 else t, None if rng.random() < 0.1 else t - timedelta(minutes=1),
                     boarding_allowed=rng.random() > 0.15, alighting_allowed=rng.random() > 0.15,
+                    **({"source": "removed", "call_cancelled": True} if removed else {}),
                 ))
             rows += train_rows
-            scope[f"S{j}"] = [
-                _pred(r.jkey, r.stop_order, r.stop_place, r.aimed_dep, r.aimed_arr, sit=f"S{j}",
-                      boarding_allowed=r.boarding_allowed, alighting_allowed=r.alighting_allowed)
+            sit = f"KIX:PlanRemoved:j{j}" if removed else f"S{j}"
+            certainty = {"et_declared_cancelled": True, "p_cancel": 1.0, "p_impact_dep": 1.0,
+                         "call_source": "removed", "has_situation": False} if removed else {}
+            scope[sit] = [
+                _pred(r.jkey, r.stop_order, r.stop_place, r.aimed_dep, r.aimed_arr, sit=sit,
+                      boarding_allowed=r.boarding_allowed, alighting_allowed=r.alighting_allowed,
+                      **certainty)
                 for r in train_rows
             ]
         _install(rows)

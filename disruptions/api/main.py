@@ -81,10 +81,19 @@ _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # 2.7 s for 23 365 rows, 2026-09-22) -- the rest is BigQuery's own job and transfer latency, which
 # neither a page size nor the Storage Read API moved. A column added to the table later (an arrival
 # delay, say) must be added here too: the row reader's getattr then picks it up.
+#
+# The trains Vy took OUT of today's plan ride in the same job (plan 2026-09-23-001): the load is
+# mostly BigQuery's job latency, so a second query would cost the phase another second an hour for
+# ~3 000 rows. One job also means one answer -- the strip never shows a removed train beside an ET
+# train it has since been put back as, or misses both.
 _JOURNEY_STATUS_SPINE_QUERY = (
     "SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
-    " call_cancelled, call_source, boarding_allowed, alighting_allowed"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, FALSE AS bus_for_train"
     " FROM `disruptions.rail_calls_planned_today`"
+    " UNION ALL"
+    " SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, bus_for_train"
+    " FROM `disruptions.rail_calls_removed_today`"
 )
 # ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild. Every row
 # is recorded (the loader tags it so), and the table has no arrival time or activity columns.
@@ -610,6 +619,7 @@ def _planned_call(r, *, call_source: str | None = None) -> journey_status.Planne
         # Fail open, like every other reader of the two activities: NULL is permission.
         boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
         alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
+        bus_for_train=bool(getattr(r, "bus_for_train", False)),
     )
 
 
