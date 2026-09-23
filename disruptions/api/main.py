@@ -535,6 +535,9 @@ def _plan_removed_enabled() -> bool:
 # anti-joins today's ET trains out of the planned table, so a train Vy puts back leaves within the
 # hour. ~0.3 GB a build (five GTFS partitions).
 _removed_built_for: datetime | None = None
+# The text of rail_calls_removed_today.sql's own ERROR(): a verdict about today's plan, which the
+# next tick would only repeat. Pinned against the SQL by test_poller_refresh.
+_REMOVED_REFUSAL = "rail_calls_removed_today refused"
 
 
 def _build_removed_calls(*, enabled: bool) -> None:
@@ -552,11 +555,14 @@ def _build_removed_calls(*, enabled: bool) -> None:
 def maybe_refresh_removed_calls() -> None:
     """Rebuild `rail_calls_removed_today` once per planned rebuild.
 
-    Stamped on the ATTEMPT, not on success: the SQL refuses a day on which more than half the
-    standing trains read as removed (`ERROR()`, see its header), and a refusal retried every tick
-    would be ~12 builds an hour for a day that will not change. A failure keeps the previous table,
-    which is harmless -- every row carries its own date and every reader windows on aimed time --
-    and the next planned rebuild tries again.
+    A REFUSAL is stamped like a success: the SQL refuses a day on which more than half the standing
+    trains read as removed (`ERROR()`, see its header), and retried every tick that would be ~12
+    builds an hour for a plan that will not change before the next planned rebuild. The table is
+    then rebuilt EMPTY, because a refused build keeps the previous one, and that one was anti-joined
+    against an older ET: a train Vy has since put back would show as removed beside itself running.
+    Any OTHER failure is retried next tick, because the table may not exist yet --
+    `ensure_removed_calls_table` is best-effort -- and `predict_calls.sql` reads it, so a missing
+    table costs every rail and bus prediction until it does.
 
     Off, it builds once per process and then stops: the flag is read from the environment, which a
     running process does not see change, so one empty build is the whole rollback.
@@ -571,8 +577,15 @@ def maybe_refresh_removed_calls() -> None:
         return
     try:
         _build_removed_calls(enabled=enabled)
-    finally:
-        _removed_built_for = planned
+    except Exception as exc:
+        if _REMOVED_REFUSAL in str(exc):
+            _removed_built_for = planned
+            try:
+                _build_removed_calls(enabled=False)
+            except Exception:
+                logger.exception("Could not empty the removed-trains table after a refusal")
+        raise
+    _removed_built_for = planned
     logger.info("Rebuilt the removed-trains table (%s)", "on" if enabled else "off, empty")
 
 

@@ -61,6 +61,10 @@ test('a train taken out of the plan says so, never «innstilt», before and afte
     'L1 07:10, tatt ut av rutetabellen, buss for tog',
   );
   assert.equal(circleClass(train('07:10', removed)), 'dr-circle dr-ring dr-red dr-cancelled');
+  assert.equal(
+    circleClass(train('07:10', { ...removed, state: 'confirmed' })),
+    'dr-circle dr-fact dr-red dr-cancelled',
+  );
 });
 
 test('the label names the line, the time and what is known', () => {

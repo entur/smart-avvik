@@ -242,6 +242,26 @@ def test_a_declared_cancellation_is_confirmed_certain_and_says_innstilt():
     assert entry["alternative"] == {"status": "none_found"}
 
 
+def test_a_train_taken_out_of_the_plan_is_listed_confirmed_under_its_own_situation():
+    """R4 of plan 2026-09-23-001: the read lists a removed train as it lists a declared
+    cancellation (the relay's rows carry the same certainty), and the situation names its source.
+    Only the webhook channel skips it."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    dep = now + timedelta(hours=1)
+    jkey = "RemovedJourney:2105_2026-09-10"
+    situation = f"KIX:PlanRemoved:{jkey}"
+    _use_snapshot({situation: _train(
+        dep, jkey=jkey, situation=situation, et_declared_cancelled=True, p_impact_dep=1.0,
+        p_cancel=1.0, call_source="removed", has_situation=False,
+        summary="Tatt ut av dagens rutetabell",
+    )})
+    (entry,) = _get().json()["alerts"]
+    assert entry["phase"] == "confirmed" and entry["situations"] == [situation]
+    assert entry["train"]["journey_ref"] == jkey
+    assert entry["payload"]["probabilities"]["cancellation"] == 1.0
+
+
 def test_the_route_line_names_the_registry_not_the_ref():
     now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
     _reset(now=now)

@@ -1185,14 +1185,51 @@ def test_a_refused_removed_build_waits_for_the_next_planned_rebuild():
             pass
         else:
             raise AssertionError("the build must raise for _phase to record it")
+        # Refused, then emptied: the table the refusal kept was anti-joined against an older ET.
+        assert [b["enabled"] for b in client.builds] == [True, False]
         main.maybe_refresh_removed_calls()
-        assert len(client.builds) == 1, "a refusal is not retried every tick"
+        assert len(client.builds) == 2, "a refusal is not retried every tick"
         main._planned_refreshed_at = NOON + timedelta(hours=1)
         try:
             main.maybe_refresh_removed_calls()
         except RuntimeError:
             pass
-        assert len(client.builds) == 2
+        assert len(client.builds) == 4
+
+
+def test_any_other_removed_build_failure_is_retried_next_tick():
+    """The table may not exist yet, and predict_calls.sql reads it: a transient failure waiting an
+    hour would cost every rail and bus prediction for that hour."""
+
+    class _Transient(Exception):
+        pass
+
+    with _removed_client() as client:
+        os.environ["VARSEL_PLAN_REMOVED"] = "true"
+        main._removed_built_for = None
+        main._planned_refreshed_at = NOON
+        real = main._build_removed_calls
+
+        def flaky(*, enabled):
+            client.builds.append({"enabled": enabled})
+            raise _Transient("503 backend error")
+
+        main._build_removed_calls = flaky
+        try:
+            try:
+                main.maybe_refresh_removed_calls()
+            except _Transient:
+                pass
+            assert main._removed_built_for is None, "not stamped: the next tick retries"
+        finally:
+            main._build_removed_calls = real
+        main.maybe_refresh_removed_calls()
+        assert main._removed_built_for == NOON and len(client.builds) == 2
+
+
+def test_the_refusal_the_poller_recognises_is_the_one_the_sql_raises():
+    assert main._REMOVED_REFUSAL in main._RAIL_CALLS_REMOVED_QUERY
+    assert main._REMOVED_REFUSAL in "rail_calls_removed_today refused: 900 of 1036"  # the stub's
 
 
 def test_the_removed_build_cannot_abort_the_predictions_after_it():

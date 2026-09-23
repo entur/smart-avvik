@@ -4842,8 +4842,18 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 # subscription pending for this journey. The decision is still recorded below, with the
                 # deterministic wording, and `message_status` still reads `push_disabled` for it.
                 continue
+            # Never a train Vy took out of the plan, here as in `_pending_pushes` (KTD6 of plan
+            # 2026-09-23-001): its card box reads the relay's own summary, and a wording written for
+            # it is a Vertex call no notification carries -- on a cut day the worst train on most
+            # cards is a removed one.
             subjects = pending or (
-                [a for a in one_alert_per_train(alerts) if a.alertworthy][:1] if push_on else []
+                [
+                    a
+                    for a in alert_worthy_trains(alerts)
+                    if not notification_wording.is_plan_removed(a.situation_number)
+                ][:1]
+                if push_on
+                else []
             )
             # NO PER-DEFINITION SLICE HERE any more: `_MAX_MESSAGES_PER_JOURNEY` is a PAIR's cap
             # since KTD9 and is applied below, once the corridor's definitions have all been seen.

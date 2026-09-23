@@ -80,7 +80,7 @@
     },
     "operator": { "type": "string", "description": "Codespace of the operator, e.g. VYG." },
     "line": { "type": "string" },
-    "journey_ref": { "type": "string", "description": "The dated service journey reference." },
+    "journey_ref": { "type": "string", "description": "The dated service journey reference. A Vy train missing from today's timetable (only ever on the public journey-alerts read, never in an event) carries the synthetic `RemovedJourney:<train number>_<yyyy-mm-dd>` instead, which resolves nowhere else." },
     "call_date": { "type": "string", "format": "date" },
     "stop_place": {
       "type": "string",

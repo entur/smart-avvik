@@ -6881,6 +6881,23 @@ def test_a_train_taken_out_of_the_plan_is_shown_and_logged_but_never_pushed_or_w
     _use_snapshot(SNAPSHOT)
 
 
+def test_a_journey_whose_only_alert_is_a_removed_train_writes_nothing(monkeypatch):
+    """KTD6: the write queue's card fallback (the worst train when no push is pending) must skip a
+    removed train like `_pending_pushes` does -- alone on a journey, it IS the worst train."""
+    _reset_state()
+    snapshot = {REMOVED: _removed_train()}
+    _use_snapshot(snapshot)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    written = _capture_writes(monkeypatch)
+    _register(DEVICE)
+    varsel.check_and_notify(snapshot)
+    assert sent == [] and written == [], (sent, written)
+    listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+    assert [a["situation_number"] for a in listed[0]["alerts"]] == [REMOVED], "still on the card"
+    _use_snapshot(SNAPSHOT)
+
+
 def test_a_train_taken_out_of_the_plan_leaves_the_daily_cap_to_the_real_alerts(monkeypatch):
     """Six removed trains ahead of one real forecast: the forecast is still pushed, because the
     removed ones never reach the cap's soonest-first queue."""
@@ -6902,12 +6919,14 @@ def test_a_train_taken_out_of_the_plan_is_never_a_webhook_subject(monkeypatch):
     """R5: no event about a removed train in v1, while the ET cancellation beside it is one."""
     _reset_state()
     monkeypatch.setattr(varsel, "push_enabled", lambda: False)
-    _capture_writes(monkeypatch)
+    written = _capture_writes(monkeypatch)
     _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
     snapshot = {REMOVED: _removed_train(), "S1": _cancelled_notice("S1")}
     _use_snapshot(snapshot)
     outcome = varsel.check_and_notify(snapshot)
     assert [s.situations for s in _subjects(outcome)] == [("S1",)]
+    assert all(situation != REMOVED for _key, situation in written), "nor worded for the client"
+
     _use_snapshot(SNAPSHOT)
 
 

@@ -350,7 +350,11 @@ class JourneyAlertOut(BaseModel):
         "(`varsel._alert_rank`: severity, then situation number), so a client can re-sort. A "
         "truncated answer lists the soonest trains and may therefore lack some ranks."
     )
-    phase: str = Field(description="`confirmed` when ET has declared the train cancelled, else `predicted`.")
+    phase: str = Field(
+        description="`confirmed` when ET has declared the train cancelled, or when a Vy train that "
+        "runs on this weekday is missing from today's timetable (`KIX:PlanRemoved:`), else "
+        "`predicted`."
+    )
     train: TrainOut
     aimed_departure_time: datetime
     expected_departure_time: datetime = Field(
