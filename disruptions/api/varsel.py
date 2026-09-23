@@ -621,6 +621,8 @@ _HEARTBEAT_EVERY = 64
 # until the first stop-list rebuild, and stays empty if the stop registry cannot be read — in which
 # case every ref is its own place, exactly as before this map existed.
 _stop_aliases: dict[str, str] = {}
+# NSR parent ref -> every served ref under it, busiest first (see set_stop_aliases). Same lifecycle.
+_stop_parents: dict[str, tuple[str, ...]] = {}
 
 
 def configure(
@@ -751,7 +753,9 @@ def _drain(results: Iterator[Any], total: int) -> list[Any]:
     return drained
 
 
-def set_stop_aliases(aliases: dict[str, str]) -> None:
+def set_stop_aliases(
+    aliases: dict[str, str], parents: dict[str, tuple[str, ...]] | None = None
+) -> None:
     """Publish "this ref is really that ref" for co-located stops, and heal what is stored.
 
     Called by main.refresh_varsel_stops on every stop-list rebuild with the refs it collapsed onto a
@@ -760,10 +764,15 @@ def set_stop_aliases(aliases: dict[str, str]) -> None:
     for the same place must land on ONE `journey_key`, or the same physical trip earns two /impact
     calls, two written messages and two rows in the decision log.
 
+    `parents` is the other half: an NSR parent ref -> every served ref under it. A parent is NOT
+    aliased, because it means the whole place and one child cannot stand for it — so it stays its
+    own canonical ref and only :func:`place_refs` expands it.
+
     Replaced wholesale (never mutated in place) so readers on the request path need no lock.
     """
-    global _stop_aliases
+    global _stop_aliases, _stop_parents
     _stop_aliases = dict(aliases)
+    _stop_parents = dict(parents or {})
     if aliases:
         _canonicalize_journeys()
 
@@ -1290,7 +1299,14 @@ def place_refs(ref: str) -> tuple[str, ...]:
     feed used: rail calls at Lysaker are recorded on the station ref and bus calls on the bus-side
     ref. Matching only the canonical ref would therefore hide one side's traffic behind a merged row
     — the same silent miss the merge exists to remove, moved one layer down.
+
+    An NSR PARENT ref is the exception to "canonical first": it expands to every served ref under
+    it, busiest first, and never names itself — it carries no calls, and `match_journey` runs the
+    alternative lookup on the first pair only.
     """
+    children = _stop_parents.get(ref)
+    if children:
+        return children
     primary = canonical_stop(ref)
     # Filtered against the PRIMARY, not against `ref`: filtering against `ref` dropped the caller's
     # own ref whenever it was one of the collapsed ones (a registration made before the rewrite ran,
@@ -1960,8 +1976,9 @@ def match_journey(
     worst_by_situation: dict[str, Alert] = {}
     # Ref pairs, not one pair: a stop the registry groups with others is asked about under each of
     # its refs, because each feed records its calls on its own (see place_refs). Almost every place
-    # has a single ref, so this is one pass in the ordinary case. The alternative-journey lookup runs
-    # only for the canonical pair — it is a blocking external call and the answer ("a faster way from
+    # has a single ref, so this is one pass in the ordinary case; a PARENT ref is the exception
+    # (Nationaltheatret -> Oslo S is 9 x 2 = 18 in-memory lookups). The alternative-journey lookup runs
+    # only for the first pair — it is a blocking external call and the answer ("a faster way from
     # here to there") does not vary by which ref of one place the question named.
     ref_pairs = [
         (f, t)
