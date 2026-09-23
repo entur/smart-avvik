@@ -221,8 +221,8 @@ _CACHE_CONTROL_INCOMPLETE = "no-store"
 # ---- The status vocabularies (R5) ---------------------------------------------------------------
 # `wording.status`: `ok` (source `llm`), `rejected`/`ungrounded` (the model answered and the answer
 # was unusable for THIS input -- payload-determined, so terminal for the wording's life, source
-# `deterministic`), `disabled` (no backend may be asked, or the channel does not deliver prose --
-# terminal), `not_worded` (past the per-read cap in THIS read's soonest-first order -- terminal for
+# `deterministic`), `disabled` (no backend may be asked -- a `KIX:PlanRemoved:` train, always --
+# or the channel does not deliver prose -- terminal), `not_worded` (past the per-read cap in THIS read's soonest-first order -- terminal for
 # this read, so `complete` may be true, but never cached: it is derived from the entry's position by
 # `_entry_state` on every read and re-evaluated as the list moves, see `MAX_WORDINGS_PER_READ`);
 # `pending` (a task is running), `capped` (the queue refused the task), `rate_limited` (the PULL
@@ -976,9 +976,9 @@ def _entry_state(
 
     Otherwise the read's own caches: the alternative outcome by train, then -- with the alternative
     on the alert and the message input built from it -- the wording by KTD3's key. A live record
-    wins whatever the position. Absent, the verdict is `position` -- the entry's index in the
-    definition's alive, soonest-first order (`_alive`), which every caller passes for the same
-    list the task spends its cap in: at or past `MAX_WORDINGS_PER_READ` the entry is `not_worded`
+    wins whatever the position. Absent, the verdict is `position` -- the entry's place in the
+    definition's alive, soonest-first order (`_alive`) as `_positioned` counts it, which every
+    caller passes for the same list the task spends its cap in: at or past `MAX_WORDINGS_PER_READ` the entry is `not_worded`
     for this read, with its key still set so a later task words it once it moves under the cap;
     under it, `pending`, which is what tells the route a task is owed.
     """
@@ -1002,6 +1002,21 @@ def _entry_state(
     alt = record.journey if record is not None and record.status == "offered" else None
     winner = _enriched(entry.winner, alt)
     message_input = _message_input(definition, winner, now)
+    if notification_wording.is_plan_removed(winner.situation_number):
+        # A train Vy took out of the plan is never worded -- `varsel._pending_pushes` refuses it for
+        # the pass, and this read spent the pass's reason twice over (2026-09-23): the snapshot term
+        # in the wording key re-worded every one each cycle, and on a cut day twenty-odd of them sat
+        # ahead of the forecasts in the soonest-first order and took the cap. Terminal, so no task
+        # is owed for it; the alternative is still this read's own.
+        return _EntryState(
+            winner=winner,
+            message_input=message_input,
+            text=None,
+            wording_source="deterministic",
+            wording_status="disabled",
+            alternative_status=record.status if record is not None else _PENDING,
+            wording_key=None,
+        )
     key = _wording_key(pair, winner, alt, message_input)
     wording = _cached(_wordings, key, monotonic())
     if wording is None:
@@ -1018,6 +1033,18 @@ def _entry_state(
         alternative_status=record.status if record is not None else _PENDING,
         wording_key=key,
     )
+
+
+def _positioned(entries: list[_Entry]) -> list[tuple[int, _Entry]]:
+    """Each entry with its `position` for `_entry_state`: its place in the order the wording cap is
+    spent in. A train Vy took out of the plan is never worded, so it takes no place -- counted, a
+    cut day's removed trains would push every forecast behind them past `MAX_WORDINGS_PER_READ`."""
+    positioned, position = [], 0
+    for entry in entries:
+        positioned.append((position, entry))
+        if not notification_wording.is_plan_removed(entry.winner.situation_number):
+            position += 1
+    return positioned
 
 
 def _alive(entries: tuple[_Entry, ...], now: datetime) -> list[_Entry]:
@@ -1155,7 +1182,7 @@ def _enrich_body(
 
     to_word: list[tuple[int, _Entry]] = []
     beyond = 0
-    for position, entry in enumerate(ordered):
+    for position, entry in _positioned(ordered):
         state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
         if state.wording_status == _NOT_WORDED:
             # Past the cap in this task's order and nothing cached for it: counted for the bounded
@@ -1295,9 +1322,9 @@ def _mark_unresolved(
     An entry past the wording cap in this order reads `not_worded` rather than `pending` and gets
     no wording marker either: it was owed no wording by this task, and the next read re-derives
     its position. `entries` is an alive prefix -- `_alive` itself, or the listed cut of it -- so
-    the index is the position.
+    `_positioned` over it gives the position.
     """
-    for position, entry in enumerate(entries):
+    for position, entry in _positioned(entries):
         state = _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
         if state.alternative_status == _PENDING:
             _remember_alternative(
@@ -1452,10 +1479,11 @@ def _listed_states(
 ) -> list[_EntryState]:
     """What the caches say about each listed entry, resolved once per request -- and again only
     after a wait, which is the one thing between the two reads that can move them. `listed` is a
-    prefix of the alive order, so its index is the position the wording cap is spent by."""
+    prefix of the alive order, so `_positioned` over it gives the position the wording cap is
+    spent by."""
     return [
         _entry_state(definition, journey_key, pair, entry, now, enabled=enabled, position=position)
-        for position, entry in enumerate(listed)
+        for position, entry in _positioned(listed)
     ]
 
 

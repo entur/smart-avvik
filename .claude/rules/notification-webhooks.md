@@ -27,7 +27,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   it before a subject exists, so it is never minted and never withdrawn — per-train `confirmed`
   events would spend a subscription's cap at 03:00 on a cut day. The public journey-alerts read lists
   it as `confirmed` (it walks `alert_worthy_trains`, not the webhook subjects), and the contract says
-  both. A digest event would be a contract change; nobody has asked for one.
+  both. It never WORDS one either (`notification_pull._entry_state`: `disabled`, and `_positioned`
+  gives it no place under `MAX_WORDINGS_PER_READ`) — until 2026-09-23 it did, once per cycle per train
+  because the snapshot is in the wording key, and a cut day's removed trains took the cap from the
+  forecasts behind them; a dev read waited out its whole `wait` on it and fired the p99 alert. A digest event would be a contract change; nobody has asked for one.
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
   `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the
