@@ -874,8 +874,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   differ in the one case the operations document publishes, and everywhere else the wording is the
   read's own draw or the template — and the entry never says whether the definition is
   registered. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
-  ref, name, departure time or prose, only `pair_digest`, the prompt record is suppressed in code,
-  and `logging_setup._AccessLogRedaction` strips the query string from the access log for this
+  ref, name, departure time or prose, only `pair_digest` and the caller's own `ET-Client-Name` as
+  `client_name` (a `[A-Za-z0-9._-]{1,64}` label or `invalid`, so the header cannot carry a ref in),
+  the prompt record is suppressed in code, and `logging_setup._AccessLogRedaction` strips the query string from the access log for this
   path. **A definition nobody registered is unscored** — no decision row (KTD10), the fifth KTD12
   limitation — and an empty list means no alert-worthy train among the trains the service scores,
   never all-clear. **The bad-text revert is now two switches** beside `/varsel`'s: `VARSEL_LLM_ENABLED=false`

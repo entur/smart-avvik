@@ -88,7 +88,7 @@ import notification_auth
 import notification_events
 import notification_wording
 import varsel
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -212,6 +212,12 @@ SERVED_OPERATORS: tuple[str, ...] = tuple(sorted({*alert_policy._OPERATOR_ALERT_
 #: tested BEFORE canonicalization (KTD2): a collapsed ref is still an NSR ref, and an alias map
 #: must not be able to launder an arbitrary string into one.
 _STOP_REF_RE = re.compile(r"^NSR:StopPlace:\d+$")
+#: What an `ET-Client-Name` header may put on this module's records: Entur's `<company>-<application>`
+#: label, loosely (the platform asks lowercase; the one caller that sends it today sends
+#: `entur-kix-reisefolge-prototype`). Anything else is recorded as `invalid`, so a header cannot
+#: write a ref, a name or free text into a record R11 keeps clear of them -- a colon alone rules
+#: out every NSR ref.
+_CLIENT_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 _ROUTE = "/journey-alerts"
 _STATUS_ROUTE = "/journey-status"
@@ -1479,6 +1485,14 @@ def _assemble(
     return out, len(alive), all(state.terminal for state in states)
 
 
+def _client_label(raw: str | None) -> str | None:
+    """The caller's `ET-Client-Name` as a record may carry it: absent stays None, a well-formed
+    label is kept verbatim, and anything else is `invalid` (:data:`_CLIENT_NAME_RE`)."""
+    if raw is None:
+        return None
+    return raw if _CLIENT_NAME_RE.fullmatch(raw) else "invalid"
+
+
 def _log(
     result: str,
     *,
@@ -1487,10 +1501,11 @@ def _log(
     wait_s: int,
     started: float,
     pair_digest: str | None,
+    client_name: str | None,
     level: int = logging.INFO,
     message: str = "journey-alert pull read",
 ) -> None:
-    """The one record per request (R11): these seven fields and nothing else.
+    """The one record per request (R11): these eight fields and nothing else.
 
     A field that does not apply (`cache` on a refused read, `n_alerts` on a failed one) is null
     rather than absent, so the record's shape is one shape. Written as `extra={"fields": {...}}`
@@ -1509,6 +1524,7 @@ def _log(
                 "wait_s": wait_s,
                 "ms": round((monotonic() - started) * 1000, 1),
                 "pair_digest": pair_digest,
+                "client_name": client_name,
             }
         },
     )
@@ -1582,6 +1598,13 @@ async def journey_alerts(
         "with whatever is ready; the work continues in the background either way.",
     ),
     limit: int = Query(default=DEFAULT_LIMIT, ge=1, le=MAX_LIMIT, description="Entries to return."),
+    et_client_name: str | None = Header(
+        default=None,
+        alias="ET-Client-Name",
+        description="Who is calling, as `<company>-<application>` -- the header Entur asks of every "
+        "consumer of its APIs. Recorded on this read's log record so the team can reach a caller; "
+        "optional, and never changes the answer.",
+    ),
 ) -> JourneyAlertsResponse:
     """The alert-worthy trains ahead on this journey definition, with no registration.
 
@@ -1599,11 +1622,15 @@ async def journey_alerts(
     definition = _definition(from_stop, to_stop, begin, end, days, now)
     pair = (definition["from_stop"], definition["to_stop"])
     digest = alternatives.pair_digest(*pair)
+    client = _client_label(et_client_name)
     key = varsel.journey_key(definition)
     windows = varsel.journey_windows(definition, now)
 
     if not _claim(pair, monotonic()):
-        _log("rate_limited", cache=None, n_alerts=None, wait_s=wait, started=started, pair_digest=digest)
+        _log(
+            "rate_limited", cache=None, n_alerts=None, wait_s=wait, started=started, pair_digest=digest,
+            client_name=client,
+        )
         raise HTTPException(
             status_code=429,
             detail="rate_limited",
@@ -1612,7 +1639,10 @@ async def journey_alerts(
 
     refreshed_at = _refreshed_at_provider() if _refreshed_at_provider is not None else None
     if refreshed_at is None:
-        _log("not_loaded", cache=None, n_alerts=None, wait_s=wait, started=started, pair_digest=digest)
+        _log(
+            "not_loaded", cache=None, n_alerts=None, wait_s=wait, started=started, pair_digest=digest,
+            client_name=client,
+        )
         raise _retry_later("predictions_not_loaded")
 
     cache_key = _cache_key(key, refreshed_at, now)
@@ -1634,6 +1664,7 @@ async def journey_alerts(
                 wait_s=wait,
                 started=started,
                 pair_digest=digest,
+                client_name=client,
                 level=logging.WARNING,
                 message=f"The matcher failed on a pull read: {type(exc).__name__}",
             )
@@ -1658,7 +1689,10 @@ async def journey_alerts(
 
     alerts, n_alerts, complete = _assemble(definition, alive, states, limit)
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE if complete else _CACHE_CONTROL_INCOMPLETE
-    _log("ok", cache=cache, n_alerts=n_alerts, wait_s=wait, started=started, pair_digest=digest)
+    _log(
+        "ok", cache=cache, n_alerts=n_alerts, wait_s=wait, started=started, pair_digest=digest,
+        client_name=client,
+    )
     return JourneyAlertsResponse(
         as_of=_utc(now),
         refreshed_at=_utc(refreshed_at),
@@ -1672,10 +1706,12 @@ async def journey_alerts(
     )
 
 
-def _log_status(result: str, *, n_trains: int | None, started: float, pair_digest: str) -> None:
+def _log_status(
+    result: str, *, n_trains: int | None, started: float, pair_digest: str, client_name: str | None
+) -> None:
     """One `notification_status` record per journey-status read (R13), under this module's R11: a
-    count, a duration and the pair's salted digest, and nothing identifying. A LITERAL dict, like
-    `_log`'s, so the contract suite's AST walk sees every field."""
+    count, a duration, the pair's salted digest and the caller's own label, and nothing
+    identifying. A LITERAL dict, like `_log`'s, so the contract suite's AST walk sees every field."""
     logger.info(
         "journey-status read: %s",
         result,
@@ -1686,6 +1722,7 @@ def _log_status(result: str, *, n_trains: int | None, started: float, pair_diges
                 "n_trains": n_trains,
                 "ms": round((monotonic() - started) * 1000, 1),
                 "pair_digest": pair_digest,
+                "client_name": client_name,
             }
         },
     )
@@ -1717,6 +1754,13 @@ async def journey_status_read(
         description="Weekdays the definition travels on, 0=Monday .. 6=Sunday, as a REPEATED "
         "parameter. Default: today's and tomorrow's weekday.",
     ),
+    et_client_name: str | None = Header(
+        default=None,
+        alias="ET-Client-Name",
+        description="Who is calling, as `<company>-<application>` -- the header Entur asks of every "
+        "consumer of its APIs. Recorded on this read's log record so the team can reach a caller; "
+        "optional, and never changes the answer.",
+    ),
 ) -> JourneyStatusResponse:
     """Every Vy train in today's window on this definition, each graded: `confirmed` where the
     outcome is known, `predicted` where the model has a figure, `unknown` otherwise.
@@ -1731,8 +1775,9 @@ async def journey_status_read(
     definition = _definition(from_stop, to_stop, begin, end, days, now)
     pair = (definition["from_stop"], definition["to_stop"])
     digest = alternatives.pair_digest(*pair)
+    client = _client_label(et_client_name)
     if not _claim(pair, monotonic()):
-        _log_status("rate_limited", n_trains=None, started=started, pair_digest=digest)
+        _log_status("rate_limited", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise HTTPException(
             status_code=429,
             detail="rate_limited",
@@ -1746,14 +1791,14 @@ async def journey_status_read(
         # its text can name a ref.
         logger.debug("journey-status traceback for a public read", exc_info=True)
         logger.warning("The journey-status grading failed on a public read: %s", type(exc).__name__)
-        _log_status("status_failed", n_trains=None, started=started, pair_digest=digest)
+        _log_status("status_failed", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise _retry_later("status_failed") from None
     if status is None:
-        _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest)
+        _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise _retry_later("plan_not_loaded")
     coverage = _coverage(definition).model_copy(update={"operators": list(journey_status.OPERATORS)})
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE
-    _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest)
+    _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest, client_name=client)
     return JourneyStatusResponse(**dict(status), journey=JourneyOut(**definition), coverage=coverage)
 
 
