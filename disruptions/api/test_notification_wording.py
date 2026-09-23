@@ -861,6 +861,44 @@ def test_both_surfaces_build_their_key_here_rather_than_each_keeping_a_copy():
     )
 
 
+# ---- the morning digest about trains taken out of the plan (plan 2026-09-23-001, U4) -------------
+def test_the_digest_names_the_trains_soonest_first_and_says_why_they_are_missing():
+    """R7's acceptance example, word for word: one sentence per fact, and no route line -- the
+    caller adds that, because its names are a traveller's free text."""
+    title, wording = nw.removed_digest(
+        [("R22 08:00", False), ("R23 08:06", False), ("R23 08:36", False)], weekday=2
+    )
+    assert title == "3 tog er tatt ut av rutetabellen i dag"
+    assert wording == (
+        "R22 08:00, R23 08:06 og R23 08:36 går ikke i dag. "
+        "De går vanligvis på onsdager, men finnes ikke i dagens rutetabell."
+    )
+
+
+def test_the_digest_names_six_trains_and_counts_the_rest():
+    trains = [(f"L1 {6 + i // 2:02d}:{(i % 2) * 30:02d}", False) for i in range(38)]
+    title, wording = nw.removed_digest(trains, weekday=0)
+    assert title.startswith("38 tog ")
+    assert wording.startswith(
+        "L1 06:00, L1 06:30, L1 07:00, L1 07:30, L1 08:00, L1 08:30 og 32 til går ikke i dag."
+    )
+    assert "på mandager" in wording
+
+
+def test_one_train_reads_in_the_singular_and_a_bus_is_named():
+    """The user's 2026-09-23 choice: a closure's trains are included, and the digest says when Vy
+    has set up a bus. All of them covered reads as the card's own sentence; some, by name."""
+    _title, one = nw.removed_digest([("L2 07:10", True)], weekday=6)
+    assert one == (
+        "L2 07:10 går ikke i dag. Toget går vanligvis på søndager, men finnes ikke i dagens "
+        "rutetabell. Vy har satt opp buss for tog."
+    )
+    _title, some = nw.removed_digest(
+        [("L2 07:10", True), ("R13 07:40", False), ("L2 08:10", True)], weekday=3
+    )
+    assert some.endswith("Vy har satt opp buss for L2 07:10 og L2 08:10."), some
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(

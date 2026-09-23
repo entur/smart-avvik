@@ -2441,6 +2441,85 @@ def _notification_payload(
     return payload
 
 
+# ---- The morning digest about trains Vy took out of the plan (plan 2026-09-23-001, U4) -----------
+#: Not before 05:00 Oslo (user's choice, 2026-09-23): the day's GTFS lands ~02:06 and the first
+#: removed-trains build after it runs by ~03:10, and a push at 03:00 wakes nobody usefully.
+_DIGEST_FROM = time(5, 0)
+
+
+def _digest_due(now: datetime) -> bool:
+    """The 05:00 gate, in Oslo time like the day it latches on (`oslo_today`, the cap's day key)."""
+    return now.astimezone(_OSLO).time() >= _DIGEST_FROM
+
+
+def _digest_tag(journey_id: str, oslo_day: str) -> str:
+    """One digest notification per registration per Oslo day, so a later one REPLACES it on the
+    lock screen and is exempt from the cap. `<journey_id>|` first, like `_notification_tag`: the blob
+    ledger finds a registration's tags by that prefix."""
+    return f"{journey_id}|plan-removed|{oslo_day}"
+
+
+@dataclass(frozen=True)
+class _Digest:
+    """One pending digest push, queued in loop 2 beside the per-train alerts."""
+
+    journey_id: str
+    subscription: dict
+    journey: dict
+    key: str
+    brand: str
+    replaces: bool
+    tag: str
+    trains: tuple[journey_status.TrainStatus, ...]
+
+    @property
+    def situations(self) -> tuple[str, ...]:
+        return tuple(notification_wording.plan_removed_situation(t.jkey) for t in self.trains)
+
+
+def _removed_trains(journey: dict, now: datetime) -> list[journey_status.TrainStatus]:
+    """The strip's removed trains in today's window still to depart, soonest first (KTD5): the
+    digest's set is the strip's by construction, and the day's rather than the prediction cache's,
+    which at 05:00 reaches only to ~17:00."""
+    status = journey_status.status_for(journey, now)
+    if status is None:
+        return []
+    return [t for t in status.trains if t.removed_from_plan and t.departure_time > now]
+
+
+def _digest_text(digest: _Digest, *, now: datetime) -> tuple[str, str]:
+    """The digest's (title, wording) -- the payload's and the decision rows' one source, so a row
+    never has to split the wording back out of a body whose route line is free text."""
+    return notification_wording.removed_digest(
+        [
+            (
+                _train_label(None, _local_line_code(t.line), _local_hhmm(t.departure_time)),
+                t.bus_for_train,
+            )
+            for t in digest.trains
+        ],
+        weekday=now.astimezone(_OSLO).weekday(),
+    )
+
+
+def _digest_payload(digest: _Digest, *, now: datetime) -> dict:
+    """The digest's Web Push payload; `_notification_payload`'s shape with the digest's wording."""
+    journey = digest.journey
+    title, wording = _digest_text(digest, now=now)
+    from_name = journey.get("from_name") or journey["from_stop"]
+    to_name = journey.get("to_name") or journey["to_stop"]
+    assets = _BRAND_ASSETS[normalize_brand(digest.brand)]
+    url = assets["url"]
+    separator = "&" if "?" in url else "?"
+    return {
+        "title": _tag_environment(title),
+        "body": f"{from_name} → {to_name}\n{wording}",
+        "url": f"{url}{separator}{urlencode({'journey': digest.journey_id})}",
+        "icon": assets["icon"],
+        "tag": digest.tag,
+    }
+
+
 def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     """Send one Web Push. Returns ``(result, error_detail)``: result is 'sent', 'gone' (404/410 —
     drop the device) or 'error' (retry); error_detail is None on success, else the failure's
@@ -2524,7 +2603,7 @@ def _log_push(
     ``push_error_*`` fields — the audit is symmetric (R11), and this record is the ONLY line."""
     fields = {
         "event": "push",
-        "push_kind": kind,  # "alert" (journey×situation match) or "test"
+        "push_kind": kind,  # "alert" (journey×situation match), "digest" (removed trains) or "test"
         "result": result,  # "sent", "gone" or "error"
         "device_id": device_id,
         "journey_id": journey_id,
@@ -3042,6 +3121,7 @@ def _record_decisions(
     webhook_llm: bool = False,
     now: datetime | None = None,
     closing_rows: list[tuple[tuple[str, str, str], dict]] | None = None,
+    digest_messages: Mapping[tuple[str, str, str], str] | None = None,
 ) -> None:
     """Append this cycle's alert decisions to the decision log.
 
@@ -3265,6 +3345,10 @@ def _record_decisions(
                     webhook_llm if recipients.channel == "webhook" else delivery_on
                 ) else None
                 message = delivered or deterministic
+                if digest_messages and decision_key in digest_messages:
+                    # The morning digest pushed this train (plan 2026-09-23-001, R8): its text is
+                    # what the traveller got, and it is a template's.
+                    delivered, message = None, digest_messages[decision_key]
                 row = decisions.build_row(
                     journey,
                     alert,
@@ -4470,7 +4554,7 @@ class _WriteBudget(reserved_budget.ReservedBudget):
             return True
 
 
-def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
+def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = None) -> PassOutcome:
     """Send a push for every registered journey × newly alert-worthy situation.
 
     Called at the end of main's ingestion-change rebuild with the freshly-refreshed per-call
@@ -4533,6 +4617,11 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     recipient means no write at all, delivery off means write but send the template.
     """
     push_on = push_enabled()
+    # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
+    # differently for two journeys scored a few seconds apart. `now` is the tests' clock.
+    cycle_now = now or datetime.now(UTC)
+    # Where the spine's trains Vy took out of today's plan call: the morning digest's pre-filter.
+    removed_stops = journey_status.removed_today()
     # Read once for the whole cycle: whether a Notification event carries the model's prose. It decides
     # both whether a webhook-only definition is written for at all and which wording its event
     # carries, and one pass must not answer that two ways.
@@ -4546,10 +4635,10 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # still being advised as delayed-but-catchable keeps its entry), and the daily ledger
         # forgets yesterday. All three are the seam's, because all three are registration state --
         # the caches below are this process's own and stay here.
-        oslo_today = datetime.now(_OSLO).date().isoformat()
+        oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
         stale_marks = _registrations.prune(
             live_situations=live,
-            trains_gone_by=datetime.now(UTC) - _WINDOW_CATCH_UP,
+            trains_gone_by=cycle_now - _WINDOW_CATCH_UP,
             oslo_today=oslo_today,
         )
         for key in [k for k in _messages if k[1] not in live]:
@@ -4638,9 +4727,6 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # one pass cannot each have their own, while the count is a property of the surface, and merging
     # them would let a busy client morning silently retire the browser wordings.
     webhook_budget = _LockedPassBudget()
-    # One instant for the whole cycle, so "has this alternative departed?" cannot be answered
-    # differently for two journeys scored a few seconds apart.
-    cycle_now = datetime.now(UTC)
 
     # ---- Pass 1a: match every journey, CONCURRENTLY -------------------------------------------
     #
@@ -5126,7 +5212,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
     # WITHIN one; the worker/timeout rationale lives on that helper, which the togvarsel rounds
     # share. One broad situation produces one send per registration in a single cycle.
     with _span("varsel_deliver", registrations=len(journeys) if push_on else 0):
-        per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool]]] = {}
+        per_device: dict[str, list[tuple[str, dict, dict, Alert, str, str, bool] | _Digest]] = {}
         oslo_today = cycle_now.astimezone(_OSLO).date().isoformat()
         # Pushes this cycle will attempt per registration, so the daily cap is judged against what is
         # about to go out as well as what has gone: without the reservation a cycle with five cancelled
@@ -5139,6 +5225,25 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # to. Ordering it this way makes the reads bounded by what is about to be PUSHED rather than
         # by the population, and one multi-get then costs one round trip for all of them.
         candidates: list[tuple[str, dict, str, list[Alert]]] = []
+        # THE MORNING DIGEST (plan 2026-09-23-001, U4): one push per registration per Oslo day
+        # naming the trains Vy took out of today's plan, from 05:00, instead of one per train. Its
+        # set is the strip's (`_removed_trains`), asked once per journey DEFINITION like the match
+        # (it reads nothing a registration adds), and only for definitions whose from-place a
+        # removed train calls at, so a day without a cut walks nobody.
+        removed_by_key: dict[str, list[journey_status.TrainStatus]] = {}
+        if push_on and removed_stops and _digest_due(cycle_now):
+            for key, journey in by_journey_key.items():
+                try:
+                    if removed_stops.isdisjoint(place_refs(journey["from_stop"])):
+                        continue
+                    trains = _removed_trains(journey, cycle_now)
+                except Exception:
+                    # The strip's own guard (`list_journeys`): one bad definition costs its digest,
+                    # never the cycle's pushes.
+                    logger.warning("Could not read today's removed trains for %s", key, exc_info=True)
+                    continue
+                if trains:
+                    removed_by_key[key] = trains
         for jid, journey in journeys if push_on else []:
             key = journey_key(journey)
             # One push per train, not per SX message. Two situations about one cancelled departure
@@ -5165,9 +5270,21 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                     a.departure_time.timestamp() if a.departure_time else 0.0,
                 ),
             )
-            if trains:
+            if trains or key in removed_by_key:
                 candidates.append((jid, journey, key, trains))
         devices = _registrations.devices_for(j["device_id"] for _jid, j, _k, _t in candidates)
+
+        def _take_slot(jid: str, sent_today: int, replaces: bool) -> bool:
+            """The daily cap, spent as pushes are queued; a replacement neither needs nor spends a
+            slot."""
+            if replaces:
+                return True
+            if sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY:
+                capped[jid] = capped.get(jid, 0) + 1
+                return False
+            reserved[jid] = reserved.get(jid, 0) + 1
+            return True
+
         for jid, journey, key, trains in candidates:
             with _state_lock:
                 if _registrations.get_journey(jid) is None:  # deleted while iterating
@@ -5186,6 +5303,19 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # and `reserved` carries what THIS cycle is about to spend.
             ledger = _registrations.push_ledger(jid)
             sent_today = ledger.sent_today if ledger.day == oslo_today else 0
+            removed = removed_by_key.get(key)
+            if removed and not ledger.notified.issuperset(
+                notification_wording.plan_removed_situation(t.jkey) for t in removed
+            ):
+                # FIRST, so it takes its slot of the cap before the per-train alerts do. It names
+                # EVERY removed train still to depart, not only the new ones: a later digest the
+                # same day replaces the first under one tag, and is then exempt from the cap.
+                tag = _digest_tag(jid, oslo_today)
+                replaces = tag in ledger.pushed_trains
+                if _take_slot(jid, sent_today, replaces):
+                    per_device.setdefault(journey["device_id"], []).append(
+                        _Digest(jid, device, journey, key, brand, replaces, tag, tuple(removed))
+                    )
             for alert in trains:
                 if alert.situation_number in ledger.notified:
                     continue
@@ -5194,14 +5324,8 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
                 # this registration: the new one replaces it on the lock screen under the same tag,
                 # so it is not counted against the cap and its title may say «Bekreftet:».
                 replaces = tag is not None and tag in ledger.pushed_trains
-                if (
-                    not replaces
-                    and sent_today + reserved.get(jid, 0) >= _MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
-                ):
-                    capped[jid] = capped.get(jid, 0) + 1
+                if not _take_slot(jid, sent_today, replaces):
                     continue
-                if not replaces:
-                    reserved[jid] = reserved.get(jid, 0) + 1
                 per_device.setdefault(journey["device_id"], []).append(
                     (jid, device, journey, alert, key, brand, replaces)
                 )
@@ -5225,7 +5349,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             )
 
         def _prepare_alert(
-            item: tuple[str, dict, dict, Alert, str, str, bool],
+            item: tuple[str, dict, dict, Alert, str, str, bool] | _Digest,
         ) -> tuple[dict, dict] | None:
             """One pending alert → (subscription, payload), run on the fan-out's worker thread.
 
@@ -5238,6 +5362,14 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             the latest point that still precedes the network call. It takes `_state_lock` for two dict
             lookups and never across `_send_push`.
             """
+            if isinstance(item, _Digest):
+                with _state_lock:
+                    if (
+                        _registrations.get_journey(item.journey_id) is None
+                        or _registrations.get_device(item.journey["device_id"]) is None
+                    ):
+                        return None
+                return item.subscription, _digest_payload(item, now=cycle_now)
             jid, device, journey, alert, key, brand, replaces = item
             with _state_lock:
                 if (
@@ -5265,10 +5397,53 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
         # registrations on one corridor share while their pushes differ. See the note on the
         # `pushed=` argument there.
         pushed_keys: set[tuple[str, str, str]] = set()
+        # The digest's text for the decision rows of the trains it covered (R8), without its route
+        # line, as every other row records the wording without it.
+        digest_messages: dict[tuple[str, str, str], str] = {}
         if per_device:
             for _device_id, item, result, payload, error_detail in deliver_to_devices(
                 per_device, _prepare_alert
             ):
+                if isinstance(item, _Digest):
+                    _log_push(
+                        "digest", result, item.journey["device_id"], payload,
+                        journey_id=item.journey_id, error_detail=error_detail,
+                    )
+                    if result == "sent":
+                        situations = item.situations
+                        with _state_lock:
+                            if _registrations.get_journey(item.journey_id) is not None:
+                                # Every train it named or counted, in one write, so the same set
+                                # never re-sends; a failed send marks nothing and re-offers it all.
+                                _registrations.mark_notified(item.journey_id, *situations)
+                                changed = True
+                                _registrations.record_push(
+                                    item.journey_id,
+                                    tag=item.tag,
+                                    # The day's end, not the last train's: the blob prunes a tag
+                                    # 90 min after its departure, so a short morning digest's
+                                    # would be gone by the time a grown one came to replace it,
+                                    # and that one would spend a slot. The store ignores this.
+                                    departure=datetime.combine(
+                                        cycle_now.astimezone(_OSLO).date() + timedelta(days=1),
+                                        time(0, 0),
+                                        tzinfo=_OSLO,
+                                    ),
+                                    oslo_day=oslo_today,
+                                    charge_cap=not item.replaces,
+                                )
+                        # Only the covered trains already inside the prediction cache have a row
+                        # this cycle; one that enters it later is recorded unpushed (KTD5).
+                        _title, wording = _digest_text(item, now=cycle_now)
+                        for alert in alerts_by_key.get(item.key, []):
+                            if alert.situation_number in situations:
+                                decision_key = _decision_key(item.key, alert)
+                                pushed_keys.add(decision_key)
+                                digest_messages[decision_key] = wording
+                    elif result == "gone":
+                        if handle_gone_device(item.journey["device_id"]):
+                            changed = True
+                    continue
                 jid, _device, journey, alert, _key, _brand, replaces = item
                 _log_push(
                     "alert",
@@ -5321,6 +5496,7 @@ def check_and_notify(by_situation: dict[str, list]) -> PassOutcome:
             # otherwise measure it from an instant nothing else in the cycle shares.
             now=cycle_now,
             closing_rows=closing_subjects,
+            digest_messages=digest_messages,
         )
 
     if changed:

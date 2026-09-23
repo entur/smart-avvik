@@ -6930,6 +6930,292 @@ def test_a_train_taken_out_of_the_plan_is_never_a_webhook_subject(monkeypatch):
     _use_snapshot(SNAPSHOT)
 
 
+# ---- The morning digest (plan 2026-09-23-001, U4) ----------------------------------------------
+# Every cycle here runs at a FIXED instant today (`now=`), so no fixture crosses midnight.
+_WEEKDAYS = ("mandager", "tirsdager", "onsdager", "torsdager", "fredager", "lørdager", "søndager")
+
+
+def _at(h: int, m: int = 0) -> datetime:
+    return datetime.combine(datetime.now(_OSLO).date(), time(h, m), tzinfo=_OSLO).astimezone(UTC)
+
+
+def _removed_jkey(i: int) -> str:
+    return f"RemovedJourney:{2100 + i}_{datetime.now(_OSLO).date().isoformat()}"
+
+
+def _removed_spine(*deps: tuple[int, int], bus: tuple[int, ...] = ()):
+    """The strip's spine with one removed Vy train A -> B per `(h, m)`, the i-th under
+    `_removed_jkey(i)`, and a replacement bus behind the ones listed in `bus`."""
+    import journey_status
+
+    rows = []
+    for i, (h, m) in enumerate(deps):
+        common = {"operator": "VYG", "jkey": _removed_jkey(i), "line": "VYG:Line:L1",
+                  "dep_delay_min": None, "arr_delay_min": None, "call_cancelled": True,
+                  "call_source": "removed", "bus_for_train": i in bus}
+        rows += [
+            journey_status.PlannedCall(stop_place="A", stop_order=1, aimed_dep=_at(h, m),
+                                       aimed_arr=None, **common),
+            journey_status.PlannedCall(stop_place="B", stop_order=5, aimed_dep=None,
+                                       aimed_arr=_at(h, m) + timedelta(minutes=40), **common),
+        ]
+    return journey_status.CallTable(rows, _at(3, 10))
+
+
+@contextmanager
+def _spine(table, snapshot=None):
+    """The spine for the body, and the matcher's snapshot (empty unless given: the suite's default
+    one carries a real forecast, which would be pushed beside the digest)."""
+    import journey_status
+
+    journey_status.reset_state()
+    journey_status.set_spine(table)
+    _use_snapshot(snapshot or {})
+    try:
+        yield
+    finally:
+        journey_status.reset_state()
+        _use_snapshot(SNAPSHOT)
+
+
+def _real_train(i: int, dep: datetime) -> list:
+    """An ordinary alert-worthy forecast about train t<i> under situation S<i>."""
+    return [
+        FakeCall(f"t{i}", "A", 1, dep, situation_number=f"S{i}", p_cancel=0.82, p_impact_dep=0.9),
+        FakeCall(f"t{i}", "B", 5, None, situation_number=f"S{i}", aimed_arr=dep + timedelta(minutes=40)),
+    ]
+
+
+def _digests(sent):
+    return [p for p in sent if "plan-removed" in (p.get("tag") or "")]
+
+
+def test_the_digest_gate_opens_at_five_oslo_time():
+    assert not varsel._digest_due(_at(4, 59))
+    assert varsel._digest_due(_at(5, 0)) and varsel._digest_due(_at(23, 30))
+
+
+def test_three_removed_trains_are_one_push_at_five_that_spends_one_slot(monkeypatch):
+    """R7/R8: nothing at 04:59, one push at 05:00 naming all three, nothing on the next cycle. The
+    snapshot is EMPTY, so no removed train is inside the prediction cache: the second cycle is also
+    the blob prune's test (its `live` set is the cache's)."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    jid = _register(DEVICE)
+    with _spine(_removed_spine((7, 10), (7, 40), (8, 11))):
+        varsel.check_and_notify({}, now=_at(4, 59))
+        assert sent == [], "not before 05:00"
+        varsel.check_and_notify({}, now=_at(5, 0))
+        varsel.check_and_notify({}, now=_at(5, 5))
+    (push,) = sent
+    assert push["title"] == "3 tog er tatt ut av rutetabellen i dag"
+    route, _, text = push["body"].partition("\n")
+    assert route == "Oslo S → Lillehammer"
+    weekday = _WEEKDAYS[_at(5, 0).astimezone(_OSLO).weekday()]
+    assert text == (
+        f"L1 07:10, L1 07:40 og L1 08:11 går ikke i dag. De går vanligvis på {weekday}, men finnes "
+        "ikke i dagens rutetabell."
+    )
+    today = datetime.now(_OSLO).date().isoformat()
+    assert push["tag"] == f"{jid}|plan-removed|{today}"
+    assert push["url"] == f"/varsel/?journey={jid}"
+    ledger = varsel._registrations.push_ledger(jid)
+    assert ledger.sent_today == 1, "one slot of the cap"
+    assert {f"KIX:PlanRemoved:{_removed_jkey(i)}" for i in range(3)} <= ledger.notified
+
+
+def test_the_digest_carries_the_environment_and_names_the_bus(monkeypatch):
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    with _spine(_removed_spine((7, 10), (7, 40), bus=(1,))), _deployed_as("ent-kixavvik-dev"):
+        varsel.check_and_notify({}, now=_at(6, 0))
+    (push,) = sent
+    assert push["title"] == "[dev] 2 tog er tatt ut av rutetabellen i dag"
+    assert "[dev]" not in push["body"]
+    assert push["body"].endswith("Vy har satt opp buss for L1 07:40."), push["body"]
+
+
+def test_a_departed_removed_train_is_not_named(monkeypatch):
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    with _spine(_removed_spine((5, 30), (7, 10))):
+        varsel.check_and_notify({}, now=_at(6, 0))
+    (push,) = sent
+    assert push["title"] == "1 tog er tatt ut av rutetabellen i dag"
+    assert "05:30" not in push["body"] and "L1 07:10 går ikke i dag. Toget går" in push["body"]
+
+
+def test_a_failed_digest_is_reoffered_whole_and_a_grown_set_replaces_it_for_free(monkeypatch):
+    """R8: a failed send marks nothing, so the next cycle offers the same set. A train Vy removes
+    later sends a NEW digest naming every train still to come, under the same tag and outside the
+    cap: it replaces the first on the lock screen."""
+    _reset_state()
+    results = iter(["error", "sent", "sent"])
+    sent = []
+    monkeypatch.setattr(
+        varsel, "_send_push", lambda sub, payload: sent.append(payload) or next(results)
+    )
+    jid = _register(DEVICE)
+    with _spine(_removed_spine((7, 10), (7, 40))):
+        varsel.check_and_notify({}, now=_at(5, 0))
+        varsel.check_and_notify({}, now=_at(5, 5))
+    with _spine(_removed_spine((7, 10), (7, 40), (8, 11))):
+        varsel.check_and_notify({}, now=_at(6, 0))
+        varsel.check_and_notify({}, now=_at(6, 5))
+    assert [p["title"].split(" ")[0] for p in sent] == ["2", "2", "3"], [p["title"] for p in sent]
+    assert len({p["tag"] for p in sent}) == 1, "one notification on the lock screen"
+    assert varsel._registrations.push_ledger(jid).sent_today == 1, "the replacement is free"
+
+
+def test_each_registration_gets_its_own_digest(monkeypatch):
+    """A registration created after the first digest went out is told too, and the first is not
+    told again."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    first = _register(DEVICE)
+    with _spine(_removed_spine((7, 10))):
+        varsel.check_and_notify({}, now=_at(5, 0))
+        second = _register("dev-later-0001")
+        varsel.check_and_notify({}, now=_at(5, 5))
+    assert [p["url"].rsplit("=", 1)[-1] for p in sent] == [first, second]
+
+
+def test_the_digest_takes_its_slot_first_and_the_fourth_real_alert_is_capped(monkeypatch):
+    """The acceptance example's second half: the digest leaves three of the day's four for the
+    real forecasts, soonest first."""
+    _reset_state()
+    snapshot = {}
+    for i in range(4):
+        snapshot.update({f"S{i}": _real_train(i, _at(7, 10 * i))})
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+    with _spine(_removed_spine((8, 30)), snapshot):
+        varsel.check_and_notify(snapshot, now=_at(6, 0))
+    assert len(_digests(sent)) == 1 and sent[0] is _digests(sent)[0], "the digest goes first"
+    assert [p["title"] for p in sent[1:]] == [
+        f"Tog R10 07:{m:02d} kan bli innstilt" for m in (0, 10, 20)
+    ], "the 07:30 forecast is capped"
+
+
+def test_the_digest_against_the_store_marks_every_train_and_replaces_itself_for_free(monkeypatch):
+    """dev's and prd's backend: the marks land on the journey DOCUMENT in one write, the next cycle
+    sees them through the mirror, and a grown set finds the tag there and is not charged."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    with _spine(_removed_spine((7, 10), (7, 40))):
+        varsel.check_and_notify({}, now=_at(5, 0))
+        varsel.check_and_notify({}, now=_at(5, 5))
+    stored = fake.doc(varsel_state.notification_store.SUBSCRIPTIONS, jid)
+    assert {f"KIX:PlanRemoved:{_removed_jkey(i)}" for i in range(2)} <= set(stored["notified"])
+    with _spine(_removed_spine((7, 10), (7, 40), (8, 11))):
+        varsel.check_and_notify({}, now=_at(6, 0))
+    assert [p["title"].split(" ")[0] for p in sent] == ["2", "3"]
+    stored = fake.doc(varsel_state.notification_store.SUBSCRIPTIONS, jid)
+    assert sum(stored["daily_pushes"].values()) == 1, stored["daily_pushes"]
+
+
+def test_the_digest_marks_its_trains_pushed_in_the_decision_log_with_its_own_text(monkeypatch):
+    """R8: a covered train already in the prediction cache records `pushed` with the digest's text
+    -- the /historikk card quotes the first pushed row, and the per-train template is text nobody
+    received. The one beyond the cache has no row this cycle (KTD5)."""
+    _reset_state()
+    in_cache = f"KIX:PlanRemoved:{_removed_jkey(0)}"
+    snapshot = {in_cache: _removed_train(dep=_at(7, 10), jkey=_removed_jkey(0))}
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    with _spine(_removed_spine((7, 10), (19, 40)), snapshot):
+        varsel.check_and_notify(snapshot, now=_at(6, 0))
+    (push,) = sent
+    (row,) = [r for r in log.rows if r["situation_number"] == in_cache]
+    assert row["pushed"] is True
+    assert row["message"] == _wording(push)
+    assert row["message_source"] == "deterministic"
+
+
+def test_a_short_morning_digest_is_still_replaced_for_free_once_its_trains_have_left(monkeypatch):
+    """The blob prunes a push tag 90 min after the departure it was recorded under. A 05:00 digest
+    about the 05:30 and 05:40 is recorded under the day's end, not the 05:40, so at 08:00 a grown
+    set still finds the tag and replaces it rather than spending a second slot of the four."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    jid = _register(DEVICE)
+    with _spine(_removed_spine((5, 30), (5, 40))):
+        varsel.check_and_notify({}, now=_at(5, 0))
+    with _spine(_removed_spine((5, 30), (5, 40), (9, 0))):
+        varsel.check_and_notify({}, now=_at(8, 0))
+    digests = _digests(sent)
+    assert [p["title"].split(" ")[0] for p in digests] == ["2", "1"], [p["title"] for p in digests]
+    assert len({p["tag"] for p in digests}) == 1, "one notification on the lock screen"
+    assert varsel._registrations.push_ledger(jid).sent_today == 1, "the replacement is free"
+
+
+def test_a_spine_that_is_briefly_unloaded_or_empty_does_not_resend_the_digest(monkeypatch):
+    """The blob's prune keeps today's digest marks without asking the spine: an unloaded spine, or
+    a refused build that rebuilds the removed-trains table empty for an hour, lists no removed
+    train, and a prune that trusted it would sweep the marks and re-send the same digest the moment
+    the trains came back."""
+    import journey_status
+
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE)
+    table = _removed_spine((7, 10))
+    with _spine(table):
+        varsel.check_and_notify({}, now=_at(5, 0))
+        journey_status.reset_state()
+        varsel.check_and_notify({}, now=_at(5, 5))
+        journey_status.set_spine(journey_status.CallTable([], _at(5, 6)))
+        varsel.check_and_notify({}, now=_at(5, 7))
+        journey_status.set_spine(table)
+        varsel.check_and_notify({}, now=_at(5, 10))
+    assert len(_digests(sent)) == 1, [p["title"] for p in sent]
+
+
+def test_one_definitions_failed_removed_trains_read_costs_only_its_own_digest(monkeypatch):
+    """The digest scan's guard: a definition whose removed-trains read raises loses its own digest,
+    and the other definition's digest and the cycle both go ahead."""
+    _reset_state()
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _register(DEVICE, begin="05:00", end="09:00")
+    evening = _register("dev-evening-0001", begin="09:00", end="23:59")
+    real = varsel._removed_trains
+
+    def flaky(journey, now):
+        if journey["begin"] == "05:00":
+            raise KeyError("boom")
+        return real(journey, now)
+
+    monkeypatch.setattr(varsel, "_removed_trains", flaky)
+    logging.getLogger("varsel").disabled = True
+    try:
+        with _spine(_removed_spine((7, 10), (19, 40))):
+            varsel.check_and_notify({}, now=_at(6, 0))
+    finally:
+        logging.getLogger("varsel").disabled = False
+    (push,) = _digests(sent)
+    assert push["url"].endswith(f"journey={evening}"), push["url"]
+    assert "L1 19:40 går ikke i dag" in push["body"] and "07:10" not in push["body"]
+
+
 if __name__ == "__main__":
     import inspect
 

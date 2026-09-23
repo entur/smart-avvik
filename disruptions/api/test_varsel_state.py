@@ -413,6 +413,13 @@ def test_an_erasure_takes_the_marks_of_the_journeys_it_deletes_and_no_others(_mp
 
 
 # ---------------------------------------------------------------- the push ledger
+def test_one_call_marks_several_situations(_mp):
+    """The morning digest's shape: every train it covers is marked in one call."""
+    store = _reset()
+    store.mark_notified("j1", "S1", "S2")
+    assert store.push_ledger("j1").notified == {"S1", "S2"}
+
+
 def test_one_registrations_ledger_carries_its_own_marks_and_no_neighbours(_mp):
     """Three questions per push, answered in ONE read because the store answers them from one
     journey document. A ledger that leaked a sibling registration's marks would suppress a push the

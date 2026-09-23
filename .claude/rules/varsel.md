@@ -390,8 +390,34 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   **Never pushed per train, never worded by the poller, never a webhook event**
   (`notification_wording.is_plan_removed`, checked in `_pending_pushes`, the write queue's card
   fallback, loop 2's collect and `_observations_for_key`): one push per train was 601 pushes to 92
-  registrations on 2026-09-23, and 35 of them would have spent the daily cap on it before 06:00. The
-  morning digest that tells those travellers is the plan's U4, not yet built. The card, `/impact` and
+  registrations on 2026-09-23, and 35 of them would have spent the daily cap on it before 06:00.
+  **They get ONE morning digest instead** (U4, 2026-09-23): from 05:00 Oslo (`_digest_due`, on the
+  cycle's own clock like `oslo_today`), each browser registration with removed trains still to
+  depart in today's window, not all already notified, gets «N tog er tatt ut av rutetabellen i dag»
+  (`notification_wording.removed_digest`, deterministic, six named then «og K til», a sentence naming
+  the trains Vy has set up a bus for). Its set is the STRIP's (`_removed_trains` →
+  `journey_status.status_for`), never the prediction cache's, which at 05:00 reaches only ~17:00; and
+  only registrations whose from-place a removed train calls at are asked (`journey_status.
+  removed_today`). It is queued in loop 2 ahead of the per-train alerts, so it takes its slot of the
+  four first; its tag is `<journey_id>|plan-removed|<oslo day>` (the `<journey_id>|` prefix is what
+  the blob ledger finds tags by), so a later digest the same day — a grown set — names every train
+  still to come, replaces the first on the lock screen and costs no slot. The tag is recorded as
+  departing at the next Oslo midnight, not with its last train: the blob prunes a tag 90 min after
+  its departure, so a short morning digest's would be gone before a grown one came to replace it,
+  and that one would be charged a slot. A send marks every covered
+  situation in ONE write (`mark_notified(jid, *situations)`; per-train transactions were ~40 serial
+  Firestore round trips per registration on a cut day), a failure marks nothing, and the push log
+  says `push_kind="digest"`. Two traps it had to avoid: the blob's `prune` sweeps marks whose
+  situation is not in the prediction cache, so it never sweeps a `KIX:PlanRemoved:` mark dated
+  today (`…_<Oslo day>`), whatever the cache says — or a 17:30 train's mark is swept and the digest
+  re-sent every cycle. It first kept them by adding the spine's removed trains to `live`, which
+  failed the same way whenever the spine was unloaded or a refused build rebuilt the table empty for
+  an hour: the marks went, and the digest was re-sent when the trains came back. Earlier days' marks
+  go as before, and the store prunes at write time and never met it. The other: the covered trains'
+  decision rows record `pushed` with the digest's text as `message`
+  (`digest_messages`), since the /historikk card quotes the first pushed row — but only the trains
+  already inside the cache have a row that cycle, so one entering it later is recorded unpushed.
+  The card, `/impact` and
   the pull read show them, and the pull read still words its own four soonest as it words any
   cancellation (KTD6; the model then says «innstilt»). Two costs are not closed: a removed train is
   alert-worthy on the card, so it competes for `impact._MAX_ALTERNATIVE_LOOKUPS` (3, soonest first)

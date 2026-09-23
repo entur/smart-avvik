@@ -5338,13 +5338,13 @@ def test_a_mark_on_an_erased_journey_raises_and_creates_nothing():
     _install(client)
     try:
         _journey_rows(client, ["j1"])
-        notification_store.mark_notified(subscription_id="j1", situation_number="ENT:S:1")
+        notification_store.mark_notified(subscription_id="j1", situation_numbers=("ENT:S:1",))
         assert client.doc(notification_store.SUBSCRIPTIONS, "j1")["notified"]
         client.docs[f"{notification_store.SUBSCRIPTIONS}/j1"]["status"] = "deleted"
         for call in (
-            lambda: notification_store.mark_notified(subscription_id="j1", situation_number="ENT:S:2"),
+            lambda: notification_store.mark_notified(subscription_id="j1", situation_numbers=("ENT:S:2",)),
             lambda: notification_store.record_push(subscription_id="j1", train_ref="VYG:L1:07:18"),
-            lambda: notification_store.mark_notified(subscription_id="gone", situation_number="x"),
+            lambda: notification_store.mark_notified(subscription_id="gone", situation_numbers=("x",)),
         ):
             try:
                 call()
@@ -5353,6 +5353,23 @@ def test_a_mark_on_an_erased_journey_raises_and_creates_nothing():
             else:
                 raise AssertionError("an erased registration must not be written to")
         assert client.doc(notification_store.SUBSCRIPTIONS, "gone") is None
+    finally:
+        _uninstall()
+
+
+def test_several_situations_are_marked_in_one_transaction():
+    """The morning digest covers every removed train in a window at once (plan 2026-09-23-001, U4):
+    one call, one transaction, every mark written."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        _journey_rows(client, ["j1"])
+        notification_store.mark_notified(subscription_id="j1", situation_numbers=("ENT:S:1",))
+        notification_store.mark_notified(
+            subscription_id="j1", situation_numbers=("KIX:PlanRemoved:a", "KIX:PlanRemoved:b")
+        )
+        marks = client.doc(notification_store.SUBSCRIPTIONS, "j1")["notified"]
+        assert set(marks) == {"ENT:S:1", "KIX:PlanRemoved:a", "KIX:PlanRemoved:b"}, marks
     finally:
         _uninstall()
 
@@ -5369,10 +5386,10 @@ def test_the_two_mark_bodies_are_idempotent_under_one_clock():
         _journey_rows(client, ["j1"])
         refs = notification_store._Refs(client)
         first = notification_store._mark_notified_body(
-            _Txn(), refs, subscription_id="j1", situation_number="ENT:S:1", now=NOW
+            _Txn(), refs, subscription_id="j1", situation_numbers=("ENT:S:1",), now=NOW
         )
         second = notification_store._mark_notified_body(
-            _Txn(), refs, subscription_id="j1", situation_number="ENT:S:1", now=NOW
+            _Txn(), refs, subscription_id="j1", situation_numbers=("ENT:S:1",), now=NOW
         )
         assert first["notified"] == second["notified"]
         a = notification_store._record_push_body(
