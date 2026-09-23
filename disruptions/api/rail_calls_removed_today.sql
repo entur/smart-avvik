@@ -55,7 +55,7 @@
 -- exactly the cut days, count each cut twice, and call a pair only removed trains serve «served».
 --
 -- @enabled FALSE (VARSEL_PLAN_REMOVED=off) builds the table with no rows, so every reader is
--- exactly as it was before the table existed. Cost ~0.2 GB per build (five GTFS partitions).
+-- exactly as it was before the table existed. Cost ~0.3 GB per build (five GTFS partitions; 0.29 GB dry-run 2026-09-23).
 CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today` AS
 WITH
 gtfs AS (
@@ -113,11 +113,12 @@ present AS (
   SELECT trainno FROM et_trains
 ),
 -- The train numbers a Vy bus-for-train trip stands in for on @d (see the header).
+-- Vy's bus-for-train trips are `route_type = 'Train'` in GTFS (all 3 480 of them, 2026-08-24..09-27),
+-- so they are in `gtfs` already.
 bus_numbers AS (
   SELECT DISTINCT REGEXP_EXTRACT(trip_id, r'ServiceJourney:BUS-(\d+)_') AS trainno
-  FROM `ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1`
-  WHERE operating_date = @d AND agency_id LIKE 'VYG%'
-    AND REGEXP_CONTAINS(trip_id, r'ServiceJourney:BUS-\d+_')
+  FROM gtfs
+  WHERE od = @d AND REGEXP_CONTAINS(trip_id, r'ServiceJourney:BUS-\d+_')
   UNION DISTINCT
   SELECT DISTINCT REGEXP_EXTRACT(jkey, r'ServiceJourney:BUS-(\d+)_')
   FROM `disruptions.rail_calls_planned_today`
@@ -153,12 +154,14 @@ calls AS (
   JOIN gtfs AS g ON g.od = lt.last_od AND g.trip_id = lt.trip_id
   WINDOW trip AS (PARTITION BY lt.trainno)
 ),
--- Trains in @d's plan that are not standing: the retimed and renumbered stand-ins.
+-- Trains in @d's plan that are not standing: the retimed and renumbered stand-ins. TRAINS: a
+-- bus-for-train trip has no train number (`BUS-2281_...`) and must not net the train it replaces
+-- out of the table -- that train is removed, and `bus_for_train` is how the digest says so.
 new_calls AS (
   SELECT g.line, g.direction_id, g.parent_station, g.departure_time
   FROM gtfs AS g
   LEFT JOIN (SELECT DISTINCT trainno FROM standing) AS s ON s.trainno = g.trainno
-  WHERE g.od = @d AND s.trainno IS NULL
+  WHERE g.od = @d AND g.trainno IS NOT NULL AND s.trainno IS NULL
 ),
 stood_in AS (
   SELECT DISTINCT c.trainno
@@ -173,17 +176,14 @@ stood_in AS (
 -- bounds. Trains only: the bus-for-train journeys Vy files under a train line (`BUS-2279_...`
 -- under L1) carry their own activities, and on 2026-09-23 they alone would have taken L1, R12 and
 -- R13 -- 73 removed trains -- out of this table.
+-- The activity test stays in QUALIFY: in WHERE it would move each journey's first and last call.
 restricted AS (
-  SELECT DISTINCT REGEXP_EXTRACT(p.lineRef, r'([^:]+)$') AS line
-  FROM `disruptions.rail_calls_planned_today` AS p
-  JOIN (
-    SELECT jkey, MIN(stop_order) AS lo, MAX(stop_order) AS hi
-    FROM `disruptions.rail_calls_planned_today`
-    GROUP BY jkey
-  ) AS b USING (jkey)
-  WHERE REGEXP_CONTAINS(p.jkey, r'ServiceJourney:\d+[-_]')
-    AND p.stop_order > b.lo AND p.stop_order < b.hi
-    AND (NOT p.boarding_allowed OR NOT p.alighting_allowed)
+  SELECT DISTINCT REGEXP_EXTRACT(lineRef, r'([^:]+)$') AS line
+  FROM `disruptions.rail_calls_planned_today`
+  WHERE REGEXP_CONTAINS(jkey, r'ServiceJourney:\d+[-_]')
+  QUALIFY stop_order > MIN(stop_order) OVER (PARTITION BY jkey)
+      AND stop_order < MAX(stop_order) OVER (PARTITION BY jkey)
+      AND (NOT boarding_allowed OR NOT alighting_allowed)
 ),
 guard AS (
   SELECT
