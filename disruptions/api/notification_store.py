@@ -56,7 +56,7 @@ import logging
 import re
 import secrets
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -3861,9 +3861,14 @@ def _web_push_journey(transaction: Any, refs: _Refs, subscription_id: str) -> di
 
 
 def _mark_notified_body(
-    transaction: Any, refs: _Refs, *, subscription_id: str, situation_number: str, now: datetime
+    transaction: Any,
+    refs: _Refs,
+    *,
+    subscription_id: str,
+    situation_numbers: Sequence[str],
+    now: datetime,
 ) -> dict[str, Any]:
-    """Record that this registration has been pushed about one SITUATION.
+    """Record that this registration has been pushed about these SITUATIONS, in one write.
 
     Per situation, not per train, and the difference is `/varsel`'s own and unchanged: a browser is
     pushed once per situation (`varsel._notified`), while a webhook recipient's `delivered` marks
@@ -3876,7 +3881,7 @@ def _mark_notified_body(
     """
     stored = _web_push_journey(transaction, refs, subscription_id)
     marks = dict(stored.get("notified") or {})
-    marks[situation_number] = now + timedelta(days=HISTORY_DAYS)
+    marks.update(dict.fromkeys(situation_numbers, now + timedelta(days=HISTORY_DAYS)))
     patch = {"notified": _prune_marks(marks, now), "updated_at": now}
     transaction.update(refs.subscription(subscription_id), patch)
     return {**stored, **patch}
@@ -3929,8 +3934,15 @@ def _record_push_body(
     return {**stored, **patch}
 
 
-def mark_notified(*, subscription_id: str, situation_number: str, now: datetime | None = None) -> None:
-    """Record a browser push about one situation. Raises :class:`NotFound` on an erased journey.
+def mark_notified(
+    *, subscription_id: str, situation_numbers: Sequence[str], now: datetime | None = None
+) -> None:
+    """Record a browser push about these situations, in ONE transaction. Raises :class:`NotFound`
+    on an erased journey.
+
+    Several for the morning digest (plan 2026-09-23-001, U4): one push covers every train Vy took out
+    of the registration's window, up to ~40 on a cut day, and a transaction per train would be ~40
+    serial round trips per registration on the poller thread.
 
     The commit is applied to the subscription mirror, which is what makes the next cycle's dedup
     exact rather than a cycle behind: this body does not stamp `MIRROR_FIELD` (one push on a busy
@@ -3946,7 +3958,7 @@ def mark_notified(*, subscription_id: str, situation_number: str, now: datetime 
                 txn,
                 refs,
                 subscription_id=subscription_id,
-                situation_number=situation_number,
+                situation_numbers=situation_numbers,
                 now=instant,
             )
         )

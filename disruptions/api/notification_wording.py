@@ -79,6 +79,53 @@ def is_plan_removed(situation_number: str | None) -> bool:
     return bool(situation_number) and situation_number.startswith(PLAN_REMOVED_PREFIX)
 
 
+def plan_removed_situation(jkey: str) -> str:
+    """The situation `predict_calls.sql` relays a removed train's `RemovedJourney:` jkey under."""
+    return PLAN_REMOVED_PREFIX + jkey
+
+
+#: How many trains the digest names before it counts the rest («og 32 til»).
+DIGEST_NAMED_MAX = 6
+_WEEKDAYS_PLURAL = ("mandager", "tirsdager", "onsdager", "torsdager", "fredager", "lørdager", "søndager")
+
+
+def _listed(labels: list[str]) -> str:
+    """«a, b og c», at most :data:`DIGEST_NAMED_MAX` named and «og K til» for the rest."""
+    named, rest = labels[:DIGEST_NAMED_MAX], len(labels) - DIGEST_NAMED_MAX
+    if rest > 0:
+        return f"{', '.join(named)} og {rest} til"
+    return named[0] if len(named) == 1 else f"{', '.join(named[:-1])} og {named[-1]}"
+
+
+def removed_digest(trains: list[tuple[str, bool]], *, weekday: int) -> tuple[str, str]:
+    """The morning push about a registration's trains Vy took out of today's plan (R7), as
+    `(title, wording)`.
+
+    `trains` is `(label, bus_for_train)` soonest first, the label as `train_label` names a departure
+    («L1 07:10»); `weekday` is today's, Monday 0. Deterministic and never written by a model: it
+    states a count and a list, and the reason is the same for every train in it. The title carries
+    no environment tag and the wording no route line -- the caller adds both, as for every other
+    push, and the route's names are a traveller's free text, which may hold a newline of its own.
+    """
+    labels = [label for label, _bus in trains]
+    buses = [label for label, bus in trains if bus]
+    sentences = [
+        f"{_listed(labels)} går ikke i dag.",
+        (
+            f"{'Toget' if len(labels) == 1 else 'De'} går vanligvis på {_WEEKDAYS_PLURAL[weekday]}, "
+            "men finnes ikke i dagens rutetabell."
+        ),
+    ]
+    if buses:
+        # The card's own sentence when every train has one (`predict_calls.sql`'s description).
+        sentences.append(
+            "Vy har satt opp buss for tog."
+            if len(buses) == len(labels)
+            else f"Vy har satt opp buss for {_listed(buses)}."
+        )
+    return f"{len(labels)} tog er tatt ut av rutetabellen i dag", " ".join(sentences)
+
+
 # ---- The template wording -----------------------------------------------------------------------
 def delay_phrase(message_input: dict) -> str | None:
     """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay
