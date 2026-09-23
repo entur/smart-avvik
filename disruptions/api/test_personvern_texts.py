@@ -458,12 +458,12 @@ def _pinned(path: Path, key: str) -> str | None:
 # The only two values that keep «Varselteksten skrives av en språkmodell hos Google i EU» honest.
 #
 # `gemini` makes it true. `off` is admitted because it can only ever make the sentence
-# OVER-disclose: no backend is asked at all (`llm_message.generation_enabled()` is False, every
-# push carries the deterministic template), so the published claim describes egress that is not
-# happening — a reader is told more than occurs, never less. And `off` is the documented egress
-# kill switch (CLAUDE.md: "«egress» must stop → VARSEL_LLM_PROVIDER=off"). A guard that turned red
-# the moment somebody pulled it would be exactly backwards: it would make the incident response
-# fail CI, which is when nobody has attention to spare for arguing with a test.
+# OVER-disclose: no backend is asked at all (`llm_message.generation_enabled()` is False, every push
+# carries the deterministic template), so the published claim describes egress that is not happening
+# — a reader is told more than occurs, never less. And `off` is the documented egress kill switch
+# (.claude/rules/varsel.md: "«egress» must stop → VARSEL_LLM_PROVIDER=off"). A guard that turned red
+# the moment somebody pulled it would be exactly backwards: it would make the incident response fail
+# CI, which is when nobody has attention to spare for arguing with a test.
 #
 # `auto` and `claude` stay out. Both can reach Anthropic — served through Vertex at
 # `VERTEX_LOCATION`, which dev and prd set to `global` — so either makes the sentence name the

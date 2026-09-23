@@ -4877,10 +4877,11 @@ def test_the_channel_only_fields_are_absent_one_way_and_an_empty_string_the_othe
     `device_id` -- and a Firestore equality does not match a document that lacks a field, which is
     what makes `device_journeys` unable to return a client's subscription as a property of the DATA.
     `destination_id` is written by `_new_subscription_doc` itself, outside that helper, so a
-    web_push document carries it as `""`. CLAUDE.md, the operations document and the helper's own
-    docstring all generalised the first half into "each channel's fields are absent on the other";
-    dev's webhook documents happened to agree, because they predate the `device_id` field entirely,
-    and prd's 275 imported registrations are what showed the other half was never true.
+    web_push document carries it as `""`. `.claude/rules/notification-webhooks.md`, the operations
+    document and the helper's own docstring all generalised the first half into "each channel's
+    fields are absent on the other"; dev's webhook documents happened to agree, because they predate
+    the `device_id` field entirely, and prd's 275 imported registrations are what showed the other
+    half was never true.
 
     The half that MATTERS is asserted here too, and it is the one the security argument rests on: a
     non-empty `destination_id` is refused on this channel, so no web_push document can name a real
