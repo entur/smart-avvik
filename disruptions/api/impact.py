@@ -1790,7 +1790,8 @@ def invalidate_generation() -> None:
     new `refreshed_at` under one lock, which the generation check sees on both counts. Test suites
     do (`_snapshot.clear(); _snapshot.update(...)` under a fixed stamp), and a stale index there is
     not a performance bug but a wrong answer, so this is part of every such suite's reset — the same
-    rule CLAUDE.md states for every module-level cache `check_and_notify`'s stale sweep covers.
+    rule `.claude/rules/historikk.md` states for every module-level cache `check_and_notify`'s stale
+    sweep covers.
     """
     global _index_generation
     with _index_lock:
