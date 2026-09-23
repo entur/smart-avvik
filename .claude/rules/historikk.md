@@ -213,7 +213,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     otherwise. The view holds the grouping shared by the nightly job and the API, so the two cannot
     drift apart.
   - Outcomes come from `data/queries/label_varsel_decisions.sql` (scheduled query
-    `varsel-label-daily`, 04:00 UTC, ~$0.01/run measured; **registered in both dev and prd** —
+    `varsel-label-daily`, 04:00 UTC, ~$0.015/run measured (2.30 GB, 2026-09-23); **registered in both dev and prd** —
     register it per environment with the `bq mk --transfer_config` recipe in
     `label_varsel_decisions.sh`, which needs `--service_account_name` or it blocks on an
     interactive OAuth prompt. Each config holds a **copy** of the SQL, so a schema change is one
@@ -227,6 +227,34 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     thin, so some calls never resolve; counting them as correct rejections would manufacture
     precision. The API keeps `venter` (too recent to label) distinct from `ukjent` (labelled, no
     call found) for the same reason.
+  - **Removed trains are labelled by train number, and only where the line ran** (2026-09-23, U5 /
+    KTD9 of `docs/plans/2026-09-23-001-feat-removed-trains-plan.md`). A `KIX:PlanRemoved:` subject
+    has none of the existing join keys: its jkey is `RemovedJourney:<n>_<operating date>`, its
+    `stop_order` is GTFS `stop_sequence` and its `stop_place` the boarding parent, so the
+    `(operator, jkey, stop_order)` join matched nothing and every such row stayed NULL.
+    `label_varsel_decisions.sql` sends them (on the `situation_number` prefix, the one the `removed`
+    segment uses) to a branch of their own. It looks the number up in `last_recorded` on the jkey's
+    operating date, under either of a through train's two numbers as `rail_calls_removed_today.sql`
+    matches them, and finds the boarding call by line code, number and parent stop place (the quay
+    through `quays_last_version`; when two ET journeys share that key, an ExtraJourney beside
+    the train, the one whose aimed departure is nearest the subject's is used). TRUE when ET ran the line's trains that day and has no journey
+    with that number; TRUE/FALSE on the boarding call's cancellation or ≥ 10 min delay when the
+    train ran after all; NULL otherwise, and above all when ET did not carry the line. Lines compare
+    on the code (`last_recorded` sometimes files `L1` bare), and "the line ran" counts
+    `vehicleMode = 'rail'` only, so a line carried by replacement buses alone labels NULL, not a
+    hit. Replayed over 2026-09-19..22 (one synthetic subject per removed train at its first call):
+    94/94, 127/127, 149/151 and 131/131 verdicts; the two NULLs are RX20, absent from ET that day.
+    The replay can only yield TRUE or NULL, because its trains were built by excluding every number
+    `last_recorded` held that day, so the FALSE and delay arms were proven on 942 trains that did
+    run (830 FALSE, 68 cancelled, 41 late, 6 NULL with no recorded departure). **One asymmetry the
+    rule creates, and the guard that closes it:** an unmatched row in the old branch stays NULL and
+    is retried for ten nights, but an "absent" TRUE is resolved and so frozen by the NOT EXISTS
+    guard, which would make a re-added train whose ET rows land after the 04:00 UTC run a permanent
+    hit (0-37 VYG rail rows a day arrived after that hour on 19-22 Sept, apparently tail calls of
+    trains already present), so the absent arm decides only once the operating date is two days
+    old: the first night leaves it NULL and retries it, the second decides. The
+    columns did not change, so there is no ALTER; the two registered copies still need
+    `bq update --transfer_config` in the same sitting.
   - Recall on this page is recall **among SX-flagged calls on registered journeys** — the models
     never score a call no SX message flagged — and the UI says so next to the number.
   - **The headline precision is blended, and the page shows what it is made of** (2026-08-05).
@@ -252,6 +280,34 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
       has wrong column count; Has 35, expected 36". The INSERT now names its columns, and new
       columns still go **last** in the CREATE so a fresh environment and an ALTERed one agree on
       order. Applying the DDL and updating the config are one operation, not two.
+  - **Four segments since 2026-09-23: `predicted`, `relayed`, `no_sx` and `removed`** (plan
+    2026-09-23-001, KTD10). `removed` is a train Vy took out of the day's timetable without
+    publishing a cancellation (`KIX:PlanRemoved:<jkey>`, relayed by `predict_calls.sql`'s `et_only`
+    branch). Its rows carry `et_cancelled = TRUE`, because that is what makes
+    `impact._cancelled_prediction` serve the certainty, but ET declared nothing. So `relayed`, which
+    means "the feed had already said so", is the wrong home for them. The discriminator is the
+    prefix, as with `no_sx`, and **it is tested first, ahead of `et_cancelled IS NULL` as well as
+    `IS TRUE`**: tested after the flag, every removed row lands in `relayed` with no error and the
+    segment stays empty. Ahead of NULL moves no row, because a removed row cannot predate the flag:
+    the prefix is from 2026-09-23 and the column from 2026-08-05 (dev on 2026-09-23: 1 355 removed
+    rows, all TRUE). `n_unsegmented` now counts `provenance IS NULL`, not `et_cancelled IS NULL`, so
+    the four segments and it still partition the labelled rows by construction. The CASE is spelled
+    twice in each of `historikk_summary.sql`, `meldinger_summary.sql` and
+    `message_wording_comparison.sql` (the rates, and the per-train lead time). All six copies must
+    move together. `test_a_removed_train_is_resolved_before_the_et_cancelled_flag` in both suites
+    pins the order. The blended figures still count these rows, since they are real decisions. On
+    the card, a removed row gets the «Tatt ut av rutetabellen» tag, and the «Allerede meldt i
+    SIRI-ET» tag is **withheld** although its flag is true, because that tag's claim is the one
+    thing a removed train is not. The strip shows the fourth row only once it has rows, like
+    `no_sx`. Two things this does not do. It leaves `historikk_decisions.sql` alone apart from a
+    comment: `sx_only` already cuts on the whole `KIX:` namespace. And it does not collapse the
+    removed summary into its own `/meldinger` SIRI-SX option, because it is one fixed text («Tatt ut
+    av dagens rutetabell»), so it is one option already, the way the ET relay's texts always have
+    been. Group it in `meldinger_filters.sql` if that wording ever changes. Read `pushed_any` with
+    care on these rows: they reach the traveller in the morning digest rather than a per-train push,
+    and a train that entered the prediction cache after the digest went out can show
+    `pushed_any = false` («ikke levert») although the digest covered it. That is a known limitation
+    of the digest's bookkeeping, not of the segment.
   - **The from/to filters are a deliberate narrowing of the privacy claim** (2026-08-21). The page
     has five dropdowns now — Utfall, Operatør, **Linje, Fra, Til** — populated by
     `GET /historikk-api/filters` (`historikk_filters.sql`) over the whole window, never from the

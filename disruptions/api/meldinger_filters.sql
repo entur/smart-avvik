@@ -120,6 +120,12 @@ SELECT
   -- The API labels this option "Ingen"; the SQL deliberately does not, because `no_sx` is a fact
   -- about the data and the wording is a UI decision (format.ts holds every other such label).
   --
+  -- Only the no-SX namespace is collapsed. The two other synthetic kinds keep their own text as the
+  -- option, as the ET relay's «Innstilt avgang» always has: a train taken out of the plan
+  -- (`KIX:PlanRemoved:`, 2026-09-23) writes ONE fixed summary, «Tatt ut av dagens rutetabell», so
+  -- it is one option already and reads as what it is. Group it here too if that wording ever
+  -- changes, or the log's two texts become two options for one answer.
+  --
   -- THE CAP COUNTS OPTIONS, not stored values, which is why the grouping happens here and not in
   -- the API: capping raw strings first would spend two of the thirty slots on one option. It is
   -- still the only TRUNCATED vocabulary here -- a summary outside the top 30 sits on cards the page
