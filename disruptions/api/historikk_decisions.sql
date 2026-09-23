@@ -110,10 +110,12 @@ WHERE o.call_date BETWEEN @from_date AND @to_date
   AND (NOT @resolved_only OR o.actual_trouble IS NOT NULL)
   -- "Only what an operator published about" -- cut on the NAMESPACE, not on a list of the synthetic
   -- kinds. Every situation number this codebase mints starts with `KIX:` precisely to stay clear of
-  -- the publisher namespaces (`ENT:`, `NSB:`, ...), so this one predicate covers today's two
-  -- (`KIX:NoSituation:` scored from real-time data, `KIX:ETCancellation:` relayed from the feed)
-  -- and whatever a third turns out to be. Enumerating the prefixes instead would leave a future
-  -- kind quietly included in a population the checkbox promises has operator text behind it.
+  -- the publisher namespaces (`ENT:`, `NSB:`, ...), so this one predicate covers today's three
+  -- (`KIX:NoSituation:` scored from real-time data, `KIX:ETCancellation:` relayed from the feed,
+  -- `KIX:PlanRemoved:` missing from the day's plan) and whatever a fourth turns out to be -- the
+  -- third arrived on 2026-09-23 and needed no change here. Enumerating the prefixes instead would
+  -- leave a future kind quietly included in a population the checkbox promises has operator text
+  -- behind it. The card reads the same prefixes to tag its row; the segment is historikk_summary's.
   AND (NOT @sx_only OR NOT STARTS_WITH(o.situation_number, 'KIX:'))
 
 UNION ALL

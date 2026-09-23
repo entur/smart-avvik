@@ -959,6 +959,40 @@ def test_summary_splits_provenance_and_keeps_unsegmented_its_own_bucket():
     assert s["n_unsegmented"] == 7
 
 
+def test_a_train_taken_out_of_the_plan_is_its_own_segment_not_a_relayed_one():
+    """/historikk's fourth segment, mirrored (KTD10 of plan 2026-09-23-001): a `KIX:PlanRemoved:`
+    row carries `et_cancelled = TRUE` but ET published nothing, so it is not `relayed`. The blend
+    still counts it, and the four segments add up to it."""
+    _reset([{
+        "n_hit": 7, "n_false_alarm": 1, "precision": 7 / 8,
+        "n_hit_predicted": 3, "n_hit_relayed": 2, "n_hit_no_sx": 0,
+        "n_hit_removed": 2, "n_false_alarm_removed": 1, "precision_removed": 2 / 3,
+        "n_unsegmented": 0,
+    }])
+    s = client.get("/meldinger-api/summary").json()
+    assert s["removed"]["n_hit"] == 2 and s["removed"]["precision"] == 2 / 3
+    segments = ("predicted", "relayed", "no_sx", "removed")
+    assert sum(s[k]["n_hit"] for k in segments) == s["n_hit"]
+
+
+def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
+    """Removed rows carry `et_cancelled = TRUE`, so a CASE testing the flag first files them all as
+    `relayed` with no error. Both CASEs in the summary test the prefix first, and `n_unsegmented`
+    counts the CASE's NULL rather than the flag's, so the buckets still partition the blend."""
+    body = _uncommented(_QUERIES["summary"])
+    cases = [
+        b for b in re.findall(r"\bCASE\b(.*?)\bEND\b", body, flags=re.DOTALL)
+        if "'KIX:NoSituation:'" in b
+    ]
+    assert len(cases) == 2, f"expected two provenance CASEs, found {len(cases)}"
+    for case in cases:
+        assert "THEN 'removed'" in case
+        removed = case.index("'KIX:PlanRemoved:'")
+        assert removed < case.index("et_cancelled IS NULL")
+        assert removed < case.index("et_cancelled IS TRUE")
+    assert "COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented" in body
+
+
 def test_summary_survives_an_empty_window():
     """A window with no decisions in it is zeroes, not a 500."""
     _reset([])

@@ -86,10 +86,12 @@ const rowTotal = (s: Segment | undefined) =>
  *  The third row is decisions about trains NO message named at all, scored from real-time data
  *  alone — strictly less information than the forecasts, and nothing published to relay. It is the
  *  row that answers whether we can warn people about something the operator has not warned them
- *  about. */
+ *  about. The fourth (2026-09-23) is trains Vy took out of the day's timetable without publishing a
+ *  cancellation: served at 1.0 like the relayed row, with nothing published to relay. */
 function SegmentSplit({ summary }: { summary: Summary }) {
-  const { predicted, relayed, no_sx: noSx } = summary;
-  const segmented = rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx);
+  const { predicted, relayed, no_sx: noSx, removed } = summary;
+  const segmented =
+    rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx) + rowTotal(removed);
 
   return (
     // Collapsed by default, and native <details> rather than a useState + aria-expanded button: the
@@ -133,6 +135,16 @@ function SegmentSplit({ summary }: { summary: Summary }) {
               segment={noSx}
             />
           ) : null}
+          {/* The fourth row (2026-09-23), shown on the same condition as the third. A train taken
+              out of the plan is served at 1.0 like a relayed cancellation, but nothing was
+              published, so it is not «Videreformidlet fra ET» either. */}
+          {rowTotal(removed) > 0 ? (
+            <SplitRow
+              label="Tatt ut av rutetabellen"
+              help="Toget manglet i dagens rutetabell, og ingen innstilling var publisert. Vi meldte det som sikkert — ingen prøve på modellene."
+              segment={removed}
+            />
+          ) : null}
         </>
       )}
 
@@ -152,7 +164,7 @@ function SegmentSplit({ summary }: { summary: Summary }) {
         avvik. «Ukjent» betyr at vi ikke fant igjen avgangen i sanntidsdata; den telles bevisst ikke
         som «riktig stille». «Varslingstid» telles per avgang, ikke per melding, og er
         hentet for hele avgjørelsens levetid — som varslingstiden på kortene nå også er. Alle de
-        samlede tallene blander tre ulike populasjoner og flytter seg med
+        samlede tallene blander fire ulike populasjoner og flytter seg med
         blandingsforholdet mellom dem. Les dem sammen med oppdelingen over — og med hvor mange av
         avgjørelsene som i det hele tatt har fasit.
       </Paragraph>

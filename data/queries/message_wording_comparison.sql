@@ -74,6 +74,12 @@
 --      cuts at 0.85 rather than 0.65 (`alert_policy._NOSX_ALERT_THRESHOLD`), so it produces far
 --      fewer alert-worthy decisions per day than its share of the timetable suggests.
 --
+--   7. A FOURTH PROVENANCE SINCE 2026-09-23: `removed`, a train Vy took out of the day's timetable
+--      (`KIX:PlanRemoved:`). It carries `et_cancelled = TRUE` although ET declared nothing, so the
+--      CASE tests the prefix FIRST, ahead of the flag -- the same order as `historikk_summary.sql`.
+--      Expect it empty or near it: varsel keeps these trains out of the per-train pushes and the
+--      writing pass (they reach the traveller in one morning digest), so few of them carry a pair.
+--
 -- Also worth pinning before drawing a conclusion: `prompt_version` (a prompt edit mid-window makes
 -- rows incomparable -- that is what the column is for) and `llm_provider` (dev has been answering
 -- on Gemini with Claude latched off, so a result there is not a verdict on Sonnet).
@@ -111,10 +117,12 @@ subjects AS (
 )
 SELECT
   -- `et_cancelled` comes from the VIEW, never re-derived here (trap 5); the prefix test is the
-  -- same one historikk_summary.sql spells, in the same resolution order -- NULL first (unsegmented),
-  -- then `relayed`, which wins over `no_sx` because a no-SX call declared cancelled between the
-  -- scoring cycle and the judged cycle DID reach the traveller as a relayed fact (trap 6).
+  -- same one historikk_summary.sql spells, in the same resolution order -- `removed` first (trap 7:
+  -- its flag is TRUE with nothing declared), then NULL (unsegmented), then `relayed`, which wins
+  -- over `no_sx` because a no-SX call declared cancelled between the scoring cycle and the judged
+  -- cycle DID reach the traveller as a relayed fact (trap 6).
   CASE
+    WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
     WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
     WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
@@ -184,6 +192,7 @@ SELECT
   -- before reading two texts against each other: a `no_sx` pair and a `predicted` pair were
   -- written from structurally different inputs (trap 6).
   CASE
+    WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
     WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
     WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'

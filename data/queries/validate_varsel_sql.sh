@@ -125,6 +125,8 @@ PY
 
 check_each_statement "create_varsel_decisions.sql" "$API/create_varsel_decisions.sql"
 check "label_varsel_decisions.sql"  "$ROOT/queries/label_varsel_decisions.sql"
+# Two independent queries over the same view, so a whole-file dry run would check only the first.
+check_each_statement "message_wording_comparison.sql" "$ROOT/queries/message_wording_comparison.sql"
 check "historikk_decisions.sql"     "$API/historikk_decisions.sql" "${DECISION_PARAMS[@]}"
 check "historikk_summary.sql"       "$API/historikk_summary.sql"   "${SUMMARY_PARAMS[@]}"
 # The filter vocabulary and its stop-place names: both feed /historikk-api and neither was checked
