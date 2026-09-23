@@ -4,7 +4,8 @@ paths:
   - "disruptions/api/test_varsel*"
   - "disruptions/api/{impact,alternatives,llm_message,journey_status,alert_policy,notification_wording,gen_vapid}.py"
   - "disruptions/api/test_{impact,alternatives,llm_message,journey_status,alert_policy,personvern_texts}.py"
-  - "disruptions/api/{predict_calls,predict_calls_bus,rail_calls_planned_today,bus_calls_planned_today,rail_calls_today}.sql"
+  - "disruptions/api/{predict_calls,predict_calls_bus,rail_calls_planned_today,bus_calls_planned_today,rail_calls_today,rail_calls_removed_today}.sql"
+  - "data/queries/replay_removed_trains.sh"
   - "demo/avviksvarsel/**"
   - "scripts/{make_device_report,bench_matcher,bench_cycle}.py"
 ---
@@ -351,6 +352,38 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   +11 % on the planned rebuild and +58 % on the 15-min actuals scan and left out. Nothing is cached
   and nothing touches BigQuery on a request. The public read spends `journey-alerts`' limiter
   buckets and logs `notification_status`. Vy rail only, today only.
+  **Trains Vy took OUT of the plan are cancellations too** (2026-09-23, plan
+  `docs/plans/2026-09-23-001-feat-removed-trains-plan.md`). From 2026-09-19 Vy has been removing
+  trains from the day's timetable instead of cancelling them — 188 standing trains on 2026-09-23
+  against 5 proper cancellations — and such a train never enters SIRI-ET, so nothing above could see
+  it. `disruptions/api/rail_calls_removed_today.sql` is the strike reports' rule: a train number in
+  GTFS on ≥ 3 of the 4 previous same weekdays, absent from today's GTFS **and** from ET (either of a
+  through train's two numbers, RE20's `382-110`), not stood in for by a new train at its origin
+  within 15 min; its calls are its last run's, moved by whole Oslo days (DST). Four things are easy
+  to get wrong. The restricted-line rule looks at **trains only** — bus-for-train journeys filed
+  under a train line (`BUS-2279_...` under L1) carry their own activities and alone took L1, R12
+  and R13 out on the first run. `bus_for_train` is a NUMBER match (`ServiceJourney:BUS-<n>_`), 66 of
+  66 on the 2026-09-01 Gjøvikbanen closure. The GTFS partition for a day exists days AHEAD, so the
+  missing-partition guard rarely fires, and the build instead FAILS (`ERROR()`, previous table kept)
+  when more than half the standing trains read as removed. And planned engineering closures ARE
+  removals (L2 week of 2026-08-17, R31/RE30, Bergen L4): they truly do not run, and they are included by
+  choice (2026-09-23), the morning digest to say when Vy has set up a bus. Built hourly after the planned rebuild (`_phase("rail_removed_calls")`, ~0.3 GB,
+  stamped on the attempt so a refusal is not retried every tick), behind `VARSEL_PLAN_REMOVED` (on in
+  dev, off in prd; off builds the table EMPTY, which is the rollback), created empty at startup
+  when absent because `predict_calls.sql` reads it. `data/queries/replay_removed_trains.sh FIRST
+  LAST` is the same file over past days (it swaps only the ET CTE for `last_recorded`); on
+  2026-09-14..18 it found zero removed trains on registered journeys and 29/67/84/108/159 on the
+  cut days 19-23 Sept, against the reports' 39/67/~86/~107/147 — the 19th's gap is R22 trains the
+  reports counted that ran in ET. **Two readers, and the model is not one** (KTD1): the relay in
+  `predict_calls.sql` (`KIX:PlanRemoved:<jkey>`, «Tatt ut av dagens rutetabell», 1.0 and no figures)
+  and the strip's spine (one UNION query, `TrainStatus.removed_from_plan` / `bus_for_train`, labelled
+  «tatt ut av rutetabellen» rather than «innstilt» — Vy's own channels show no cancellation).
+  **Never pushed per train, never worded, never a webhook event** (`notification_wording.
+  is_plan_removed`, checked in `_pending_pushes`, loop 2's collect and `_observations_for_key`): one
+  push per train was 601 pushes to 92 registrations on 2026-09-23, and 35 of them would have spent
+  the daily cap on it before 06:00. The card, `/impact` and the pull read show them. One cost is not
+  closed: a removed train is alert-worthy on the card, so it competes for
+  `impact._MAX_ALTERNATIVE_LOOKUPS` (3, soonest first) with the real cancellations beside it.
   Install steps for phones are in `demo/avviksvarsel/README.md`. Env vars beyond the base deploy:
   - `VAPID_PRIVATE_KEY` / `VAPID_PUBLIC_KEY` (raw base64url) + `VAPID_SUBJECT` (`mailto:`) — the
     Web Push keypair. When unset, push is disabled gracefully (`/varsel-api/config` reports

@@ -214,6 +214,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   still reads the same live `ML.WEIGHTS` blocks, while the no-SX half joins the materialized
   `nosx_platt_weights` (45 rows, `gen_nosx_platt_weights.py`). **That table is a snapshot** — a
   Platt refit that does not rebuild it serves last quarter's calibration, silently.
+  **`et_only` has a second source since 2026-09-23**: `rail_calls_removed_today`, the Vy trains
+  missing from the day's GTFS plan and from ET (`KIX:PlanRemoved:<jkey>`, see
+  `.claude/rules/varsel.md`). It is UNIONed into `et_cancelled` and nowhere else — the state
+  features average `call_cancelled` over `rail_calls_planned_today`, and a removed row there would
+  move every real train's forecast on exactly the cut days.
 - **A no-SX alert is cut HIGHER than a published one — 0.85, not 0.65** (`alert_policy`), which is
   the opposite of what a 12x-lower base rate suggests. Without a message the only signal is the last
   hour of observation (`own_prev_delay`, `line_now_*`), so the probability decays with the ask
