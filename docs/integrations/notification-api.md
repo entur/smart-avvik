@@ -480,6 +480,7 @@ assembly the webhook event goes through, so a receiver that renders an event ren
 | `days` | no | **repeated** parameter, `days=0&days=1`, integers 0–6, 0 = Monday. A comma-separated list is a 422 | today's and tomorrow's Oslo weekday |
 | `wait` | no | 0–20 seconds to wait for the wording and the alternative | 20 |
 | `limit` | no | 1–20 entries | 10 |
+| `ET-Client-Name` (header) | no, but send it | `<company>-<application>`, lowercase, no spaces — the header Entur asks of every API consumer. We record it on the read's log record so we can reach you about your traffic; a value outside `[A-Za-z0-9._-]{1,64}` is recorded as `invalid`. It never changes the answer or the limits | — |
 
 `begin`/`end` come together or not at all; no period is the whole day. No `days` is today and
 tomorrow, which is every window the prediction cache can carry — a read at 22:00 with no period
@@ -698,7 +699,7 @@ definition is registered**.
 every Vy train in today's window that boards at the origin and lets the traveller off at the
 destination, in departure order, the ones that already ran included. It is the body behind the
 «I dag» strip on `/varsel`, and it takes the same five parameters as `journey-alerts` without `wait`
-and `limit`. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
+and `limit`, and the same `ET-Client-Name` header. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
 Only today is answered: a today not in `days` is an empty `trains` with `reason: not_a_travel_day`.
 
 Each train carries a `state` and a `level`:
