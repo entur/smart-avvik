@@ -272,7 +272,7 @@ _MAX_TRANSIENT_ATTEMPTS = 12
 _PAYLOAD_FAILURES = frozenset({"rejected", "ungrounded"})
 _TRANSIENT_FAILURES = frozenset({"error", "truncated"})
 # Written messages per PLACE PAIR per cycle -- per JOURNEY DEFINITION until KTD9 (2026-09-12), and
-# the name is kept because it is referenced from CLAUDE.md, the operations document and several
+# the name is kept because it is referenced from .claude/rules/, the operations document and several
 # suites. The cycle cap above bounds the poller thread; this one stops a single corridor spending
 # all of it. Per definition it multiplied by the number of registrations on that corridor, which is
 # precisely the number the 100 000-commuter plan scales: five hundred registrations between Asker
