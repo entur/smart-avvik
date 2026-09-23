@@ -467,6 +467,9 @@
               "maximum": 20,
               "default": 10
             }
+          },
+          {
+            "$ref": "#/components/parameters/ET-Client-Name"
           }
         ],
         "responses": {
@@ -602,6 +605,9 @@
             "schema": {
               "$ref": "./subscription.schema.json#/properties/days"
             }
+          },
+          {
+            "$ref": "#/components/parameters/ET-Client-Name"
           }
         ],
         "responses": {
@@ -1793,6 +1799,17 @@
               "$ref": "#/components/schemas/Error"
             }
           }
+        }
+      }
+    },
+    "parameters": {
+      "ET-Client-Name": {
+        "name": "ET-Client-Name",
+        "in": "header",
+        "required": false,
+        "description": "Who is calling, as `<company>-<application>` (lowercase, no spaces) -- the header Entur asks of every consumer of its APIs. The public reads record it on their log record so the team can reach a caller about its traffic; a value outside `[A-Za-z0-9._-]{1,64}` is recorded as `invalid`. It never changes the answer or the rate limits.",
+        "schema": {
+          "type": "string"
         }
       }
     }

@@ -619,12 +619,12 @@ def _captured():
         log.setLevel(before)
 
 
-ALLOWED_FIELDS = {"event", "result", "cache", "n_alerts", "wait_s", "ms", "pair_digest"}
+ALLOWED_FIELDS = {"event", "result", "cache", "n_alerts", "wait_s", "ms", "pair_digest", "client_name"}
 
 
 def test_no_log_record_carries_a_ref_a_name_a_departure_or_prose():
     """R11 over a full read: a cold miss, a warm hit, and a refusal. Every `notification_pull`
-    record's field set is within the allowed seven, the digest is `alternatives.pair_digest`'s,
+    record's field set is within the allowed eight, the digest is `alternatives.pair_digest`'s,
     and no message or field carries a ref, a stop name, a departure time or the wording."""
     now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
     _reset(now=now)
@@ -646,6 +646,34 @@ def test_no_log_record_carries_a_ref_a_name_a_departure_or_prose():
     for record in records:
         text = record.getMessage() + " " + str(getattr(record, "fields", {}))
         assert not any(token in text for token in forbidden), text
+
+
+def test_both_reads_record_the_callers_et_client_name_and_nothing_else_the_header_says():
+    """Entur asks every API consumer for `ET-Client-Name`, and the two reads record it so a caller
+    can be found -- dev's 2026-09-23 poller sent `User-Agent: node` and could not be. A well-formed
+    label is kept, an absent one is null, and anything else (a stop ref, an empty value) is
+    `invalid`: the header is no way around R11."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot({"S1": _train(now + timedelta(hours=1), p_impact_dep=0.9)})
+    sent = ["entur-kix-reisefolge-prototype", None, NSR_A, ""]
+    expected = ["entur-kix-reisefolge-prototype", None, "invalid", "invalid"]
+    query = {"from_stop": NSR_A, "to_stop": NSR_B}
+    with _captured() as records:
+        for name in sent:
+            headers = {} if name is None else {"ET-Client-Name": name}
+            assert client.get(PATH, params={**query, "wait": 0}, headers=headers).status_code == 200
+    pulls = [r.fields["client_name"] for r in records if getattr(r, "fields", {}).get("event") == "notification_pull"]
+    assert pulls == expected
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    with _captured() as records:
+        for name in sent:
+            headers = {} if name is None else {"ET-Client-Name": name}
+            assert client.get(STATUS_PATH, params=query, headers=headers).status_code == 200
+    status = [r.fields["client_name"] for r in records if getattr(r, "fields", {}).get("event") == "notification_status"]
+    assert status == expected
+    for record in records:
+        assert "NSR:" not in record.getMessage() + json.dumps(getattr(record, "fields", {})), record.getMessage()
 
 
 def test_an_unparseable_ref_logs_nothing():
@@ -1827,7 +1855,7 @@ def test_journey_status_logs_one_record_with_nothing_identifying():
         _status()
     status = [r for r in records if getattr(r, "fields", {}).get("event") == "notification_status"]
     assert len(status) == 1
-    assert set(status[0].fields) == {"event", "result", "n_trains", "ms", "pair_digest"}
+    assert set(status[0].fields) == {"event", "result", "n_trains", "ms", "pair_digest", "client_name"}
     assert status[0].fields["n_trains"] == 1
     assert status[0].fields["pair_digest"] == alternatives.pair_digest(NSR_A, NSR_B)
     text = status[0].getMessage() + json.dumps(status[0].fields)
