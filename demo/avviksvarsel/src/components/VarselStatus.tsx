@@ -13,6 +13,7 @@ import {
   getExistingSubscription,
   isIOS,
   isPushSupported,
+  isSamsungBrowser,
   isStandalone,
   subscribePush,
 } from '../push';
@@ -388,6 +389,17 @@ export default function VarselStatus({
       {state === 'denied' && (
         <SmallAlertBox variant="warning" title="Varsler er blokkert" width="fluid">
           Skru dem på igjen i nettleser- eller systeminnstillingene for å få varsel.
+        </SmallAlertBox>
+      )}
+
+      {/* Push works in Samsung Internet; installing from it does not (see isSamsungBrowser). Only
+          where push can work, so «virker rett fra» is true, and not inside an install that got
+          through. Chrome is another browser with its own device id, hence the re-register clause. */}
+      {(state === 'default' || state === 'granted') && isSamsungBrowser() && !isStandalone() && (
+        <SmallAlertBox variant="information" width="fluid">
+          Du trenger ikke installere appen — varsler virker rett fra Samsung Internet. Installerer du
+          den herfra, blokkerer Google Play Protect den på grunn av en feil hos Samsung. Vil du ha
+          appen på startskjermen, installer den fra Chrome og registrer reisene dine der på nytt.
         </SmallAlertBox>
       )}
 

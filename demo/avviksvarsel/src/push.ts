@@ -15,6 +15,14 @@ export function isIOS(): boolean {
   return /iphone|ipad|ipod/i.test(navigator.userAgent);
 }
 
+// Samsung Internet mints its installed-app package with an outdated targetSdkVersion, so Android
+// 14+ and Google Play Protect block the install as «laget for en eldre versjon av Android»
+// (SamsungInternet/support#123, open since 2026-04; reported by a traveller on 2026-09-15). Chrome
+// on a Samsung phone does not carry this token and installs cleanly.
+export function isSamsungBrowser(): boolean {
+  return /SamsungBrowser/i.test(navigator.userAgent);
+}
+
 export function isStandalone(): boolean {
   return (
     window.matchMedia('(display-mode: standalone)').matches ||
