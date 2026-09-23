@@ -368,7 +368,13 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   66 on the 2026-09-01 Gjøvikbanen closure. The GTFS partition for a day exists days AHEAD, so the
   missing-partition guard rarely fires, and the build instead FAILS (`ERROR()`) when more than half
   the standing trains read as removed; the poller then rebuilds the table EMPTY, since the one the
-  refusal kept was anti-joined against an older ET. And planned engineering closures ARE
+  refusal kept was anti-joined against an older ET. Two quiet guards come before it (2026-09-23):
+  no rows on a holiday in `disruptions.togvarsel_calendar` or a date it does not cover (Ascension
+  Day read 396 removals, under the refusal), and none when more than 25 % of the day's train numbers
+  are new against the standing plan, which is a new timetable rather than a cut (cuts ran 2-8 %
+  new, Easter and the summer plan's edges 48-66 %). What they cannot tell from a cut is a seasonal
+  reduction that keeps its numbers (22-25 June 2026, 57-131 trains), nor a real closure inside a
+  timetable swap (the L2 closure of 20 August is hidden). And planned engineering closures ARE
   removals (L2 week of 2026-08-17, R31/RE30, Bergen L4): they truly do not run, and they are included by
   choice (2026-09-23), the morning digest to say when Vy has set up a bus. Built hourly after the planned rebuild (`_phase("rail_removed_calls")`, ~0.3 GB,
   a refusal waits for the next planned rebuild, any other failure is retried next tick), behind `VARSEL_PLAN_REMOVED` (on in
