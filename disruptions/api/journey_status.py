@@ -225,6 +225,24 @@ def actuals_refreshed_at() -> datetime | None:
         return _actuals.refreshed_at if _actuals is not None else None
 
 
+def removed_today() -> frozenset[str]:
+    """The stop places the spine's trains Vy took out of today's plan call at; empty while unloaded.
+
+    `varsel`'s morning digest reads them to walk only registrations whose from-place a removed
+    train calls at, so a day without a cut costs one scan of the spine and nothing per registration.
+    """
+    with _lock:
+        spine = _spine
+    if spine is None:
+        return frozenset()
+    return frozenset(
+        c.stop_place
+        for calls in spine.by_key.values()
+        for c in calls
+        if c.call_source == "removed" and c.stop_place is not None
+    )
+
+
 def reset_state() -> None:
     """Test-only: forget both tables and the wiring."""
     global _spine, _actuals, _predictions_refreshed_at, _place_refs

@@ -493,6 +493,21 @@ def test_a_train_taken_out_of_the_plan_is_a_red_cancellation_that_says_so():
     assert (other.removed_from_plan, other.bus_for_train, other.cancelled) == (False, False, False)
 
 
+def test_the_spine_says_where_its_removed_trains_call():
+    """The digest's pre-filter reads this: a day with no removed train must answer an empty set,
+    and so must an unloaded spine (never a raise)."""
+    js.reset_state()
+    assert js.removed_today() == frozenset()
+    removed = {"source": "removed", "call_cancelled": True}
+    rows = _train("RemovedJourney:2105_2026-09-22", _oslo(7, 10), board=removed, mid=removed,
+                  alight=removed)
+    _install(rows)
+    stops = js.removed_today()
+    assert FROM in stops and TO in stops
+    _install(_train("j0740", _oslo(7, 40)))
+    assert js.removed_today() == frozenset(), "a train that runs is not a removed one"
+
+
 def test_the_train_set_agrees_with_the_push_matchers_eligibility():
     """The strip restates `impact._trip_cells`' eligibility on the spine's rows (board at the
     from-stop inside the window with boarding open, alight later at the to-stop with alighting

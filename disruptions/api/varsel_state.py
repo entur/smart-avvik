@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import notification_store  # the store backend's collections (U12); never `varsel`
+import notification_wording  # a stdlib-only leaf: which marks are the morning digest's
 
 logger = logging.getLogger("kix.varsel_state")
 
@@ -154,7 +155,7 @@ class RegistrationStore(Protocol):
     # ---- the push side
     def notified_snapshot(self, journey_ids: Iterable[str]) -> set[str]: ...
     def push_ledger(self, journey_id: str) -> PushLedger: ...
-    def mark_notified(self, journey_id: str, situation_number: str) -> None: ...
+    def mark_notified(self, journey_id: str, *situation_numbers: str) -> None: ...
     def record_push(
         self,
         journey_id: str,
@@ -187,7 +188,7 @@ _devices: dict[
 _journeys: dict[str, dict] = {}  # journey_id -> journey record (see POST /journeys)
 _notified: set[str] = (
     set()
-)  # {"journey_id|situationNumber"} — dedup, pruned when a situation ends
+)  # {"journey_id|situationNumber"} — dedup, pruned when a situation ends (a digest's: its day)
 # Why a device record went away while its journeys stayed (2026-09-04):
 # device_id -> {"reason": "expired" | "turned_off", "ts": iso, "created_ts": <the record's original
 # signup>, "journeys": <count left behind>}. Two writers, `_drop_device` (the push service answered
@@ -799,9 +800,9 @@ class BlobRegistrations:
                 sent_today=count,
             )
 
-    def mark_notified(self, journey_id: str, situation_number: str) -> None:
+    def mark_notified(self, journey_id: str, *situation_numbers: str) -> None:
         with lock:
-            _notified.add(f"{journey_id}|{situation_number}")
+            _notified.update(f"{journey_id}|{situation}" for situation in situation_numbers)
 
     def record_push(
         self,
@@ -851,9 +852,22 @@ class BlobRegistrations:
         Returns how many notified marks went, which is the only part of this that is PERSISTED: the
         caller saves on a non-zero answer and skips the blob upload otherwise. The two in-memory
         ledgers are rebuilt by the next push and never reach the blob at all.
+
+        One exception to "ended": a morning-digest mark (`KIX:PlanRemoved:…_<Oslo day>`) is kept for
+        the whole of its day, whatever `live_situations` says. The digest covers the day's removed
+        trains while the prediction cache reaches ~12 h ahead, and the spine that lists them can be
+        unloaded or rebuilt empty for an hour — sweeping on either read would re-send the same
+        digest the moment the trains came back. Earlier days' marks go as before.
         """
+        today_suffix = f"_{oslo_today}"
+
+        def _ended(situation: str) -> bool:
+            if notification_wording.is_plan_removed(situation) and situation.endswith(today_suffix):
+                return False
+            return situation not in live_situations
+
         with lock:
-            stale = {k for k in _notified if k.split("|", 1)[1] not in live_situations}
+            stale = {k for k in _notified if _ended(k.split("|", 1)[1])}
             _notified.difference_update(stale)
             for tag in [t for t, departed in _pushed_trains.items() if departed < trains_gone_by]:
                 _pushed_trains.pop(tag, None)
@@ -1220,10 +1234,10 @@ class StoreRegistrations:
             )
         return out
 
-    def mark_notified(self, journey_id: str, situation_number: str) -> None:
+    def mark_notified(self, journey_id: str, *situation_numbers: str) -> None:
         try:
             notification_store.mark_notified(
-                subscription_id=journey_id, situation_number=situation_number
+                subscription_id=journey_id, situation_numbers=situation_numbers
             )
         except notification_store.NotFound:
             # The journey was erased between the delivery loop's re-check and this write. Nothing
