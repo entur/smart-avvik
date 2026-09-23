@@ -1259,6 +1259,8 @@ def test_the_removed_sql_takes_the_parameters_the_poller_passes():
 
     sql = main._RAIL_CALLS_REMOVED_QUERY
     assert set(re.findall(r"@([a-z_]+)", sql)) == {"d", "enabled"}
+    # The holiday guard's source, which copy_runtime_to_prd.sh carries to prd.
+    assert "`disruptions.togvarsel_calendar`" in sql
     # The replay swaps the ET CTE and the table name; both must stay findable exactly once.
     assert sql.count("et_trains AS (") == 1
     assert sql.count("CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today`") == 1
