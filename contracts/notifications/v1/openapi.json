@@ -1634,7 +1634,7 @@
               "green",
               "grey"
             ],
-            "description": "`red` cancelled, 10 min or more late, or (predicted) over the same alert bar a notification fires at; `yellow` 3-9 min; `green` less; `grey` exactly when `state` is `unknown` or a confirmed train has no delay figure."
+            "description": "`red` cancelled, 10 min or more late, or (predicted) over the same alert bar a notification fires at; `yellow` 5-9 min; `green` less; `grey` exactly when `state` is `unknown` or a confirmed train has no delay figure."
           },
           "cancelled": {
             "type": "boolean",
