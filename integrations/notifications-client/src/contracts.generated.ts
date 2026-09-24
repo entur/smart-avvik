@@ -224,7 +224,14 @@ export interface NotificationEvent {
     delay?: { [key: string]: unknown } | null;
     effect?: string | null;
     /**
-     * The contributing situations with their operator-authored summaries and source timestamps.
+     * The contributing situations, each with `situation_number`, the Norwegian `summary` and
+     * `description`, their English `summary_en` and `description_en`, `en_machine_translated` and
+     * `has_situation`. The English is the operator's own where they published one (Vy does on
+     * every situation), the service's own for a `KIX:` situation (whose Norwegian it also wrote),
+     * and otherwise a machine translation of the Norwegian, with `en_machine_translated` true --
+     * present that as a translation, not as the operator's words. A translation can land a poller
+     * cycle after the situation first appears, and until one does all three English fields are
+     * null.
      */
     situations?: { [key: string]: unknown }[];
     /**

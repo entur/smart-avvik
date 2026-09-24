@@ -154,6 +154,21 @@ suite rather than left to be discovered.
 Note also that client prose inherits `/varsel`'s egress kill switch: `VARSEL_LLM_PROVIDER=off` stops
 a model being asked on **both** surfaces.
 
+**The situations' English is a third model use, and only the kill switch reaches it** (2026-09-24,
+`disruptions/api/situation_english.py`). `payload.situations[]` carries `summary_en` and
+`description_en` beside the Norwegian: the operator's own English where the SIRI-SX message has one
+(`disruptions_today.sql` and its bus twin read it from the same first version), our own for a `KIX:`
+row (`predict_calls.sql` writes it beside its Norwegian), and otherwise a Gemini translation of the
+Norwegian, flagged `en_machine_translated: true`. The translation is submitted when the poller swaps
+its prediction cache and runs on the module's own four-wide pool, at most
+`MAX_TRANSLATIONS_PER_UPDATE` (25) new or in flight at once, cached on the Norwegian text and never
+re-asked for an hour after a failure — so it adds nothing to a cycle's wall clock, and a situation's
+first cycle can mint an event with the three fields null. Its volume is the operators that publish
+no English (about 400 bus situations a day in September 2026; Vy's rail needs none). It follows
+`VARSEL_LLM_PROVIDER` alone: the two wording switches choose which prose is SENT, and an operator's
+public message sent to Vertex for translation is not a traveller's data. `off` leaves the operator's
+English and ours in place and stops only the translations.
+
 ### One more, and it must never appear in a chart
 
 `KIX_ALLOW_WEBHOOK_NETWORK` is the outbound test fence in `webhook_sender`. Unset means "allowed
@@ -508,6 +523,7 @@ silently.
 | `webhook_worker` | the delivery worker PROCESS, not its rounds — those stay `webhook_delivery_round` | `result`: `started` (with `health_port`), `stopping` (with the `signal`), `stopped` (with `rounds`), `unconfigured` (with `missing` — the worker exits non-zero, so this line is followed by a rolled-back release rather than by a running pod) and `error` (a round raised, which `deliver_pending` documents it never does; the loop continues) |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
+| `situation_english` | the situations' English (not a `notification_*` event: it serves the payload, not the channel) | `submitted` and `missing` when a prediction swap handed translations to the pool; `result=error` with the exception class when one failed. Never the text |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
 | `notification_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
 | `notification_admin` | an operator action | `action`, `result`, `actor`, `client_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |

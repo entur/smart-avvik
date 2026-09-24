@@ -63,6 +63,9 @@ sit AS (
     -- alongside the summary. Joined back at the final SELECT rather than threaded through `base`,
     -- so this free text never widens the ML.PREDICT inputs.
     d.description,
+    -- The operator's English, served only and joined back through `sd` like the description.
+    d.summary_en,
+    d.description_en,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -860,12 +863,20 @@ SELECT
   -- the wording and /historikk's segmentation all need it, and inferring it from a
   -- `situationNumber LIKE 'KIX:%'` prefix would make a naming convention load-bearing for
   -- alerting policy.
-  s.has_situation
+  s.has_situation,
+  -- The operator's English where one was published. A no-SX row's Norwegian is this file's own
+  -- text (`nosx`'s 'Mulig avvik' and the description above), so its English is written here too.
+  IF(s.has_situation, sd.summary_en, 'Possible disruption') AS summary_en,
+  IF(s.has_situation, sd.description_en,
+     'No situation message has been published for this departure. The assessment is based on '
+     || "real-time data: the train's own delay upstream and the state of the line.") AS description_en
 FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
-  SELECT situationNumber, ANY_VALUE(description) AS description FROM sit GROUP BY situationNumber
+  SELECT situationNumber, ANY_VALUE(description) AS description,
+         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en
+  FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
 JOIN wch  ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
 JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket AND wdh.has_situation = s.has_situation
@@ -950,5 +961,20 @@ SELECT
   -- the two apart on the situationNumber prefix, which is what segments "relayed a fact" from
   -- "predicted an outcome"; this column answers the different question of whether an SX message
   -- existed at all.
-  FALSE                 AS has_situation
+  FALSE                 AS has_situation,
+  -- English beside the Norwegian, written here for the same reason the Norwegian is: no operator
+  -- published either. Stop names stay as ET gives them.
+  CASE
+    WHEN e.call_source = 'removed'              THEN "Removed from today's timetable"
+    WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Cancelled departure'
+    WHEN e.seg_from = e.seg_to                  THEN CONCAT('Cancelled from ', e.seg_from)
+    ELSE CONCAT('Cancelled ', e.seg_from, '–', e.seg_to)
+  END AS summary_en,
+  CASE
+    WHEN e.call_source = 'removed' THEN
+      "The train usually runs on this weekday, but is not in today's timetable. "
+      || 'No cancellation has been published.'
+      || IF(e.bus_for_train, ' Vy has set up rail replacement buses.', '')
+    ELSE "The departure is marked as cancelled in the operator's real-time data."
+  END AS description_en
 FROM et_only AS e;

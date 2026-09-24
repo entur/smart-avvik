@@ -31,6 +31,15 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   gives it no place under `MAX_WORDINGS_PER_READ`) — until 2026-09-23 it did, once per cycle per train
   because the snapshot is in the wording key, and a cut day's removed trains took the cap from the
   forecasts behind them; a dev read waited out its whole `wait` on it and fired the p99 alert. A digest event would be a contract change; nobody has asked for one.
+- **Every `payload.situations[]` entry carries English beside the Norwegian** (2026-09-24,
+  `situation_english.py`): `summary_en`, `description_en` and `en_machine_translated`, built in
+  `varsel._webhook_situations`, so the event, the journey-alerts read and the test event all carry
+  them. Operator English comes off the SX rows through `predict_calls*.sql` (Vy 100 %, Ruter ~99 %),
+  the `KIX:` rows' English is written in SQL beside their Norwegian, and only the rest — GCO, MOR,
+  NOR, FIN, TRO, ~400 a day — goes to Gemini, submitted from `refresh_call_predictions_cache` onto
+  the module's own pool and never waited for. It is looked up by situation number and never enters
+  `message_input` (that is the wording key: English there would re-word every train). Gated on
+  `VARSEL_LLM_PROVIDER` alone, not on the wording switches.
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
   `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the

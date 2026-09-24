@@ -34,6 +34,7 @@ import notification_servability  # sibling module: R6's freshness half, re-asked
 import notification_store  # sibling module: durable webhook subscriptions, events and deliveries
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
+import situation_english  # the English beside each situation's Norwegian text
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
@@ -774,11 +775,18 @@ def refresh_call_predictions_cache() -> None:
     by_situation: dict[str, list[impact_engine.CallPred]] = {}
     by_jkey_index: dict[str, set[str]] = {}
     by_stop_ref: dict[str, list[tuple[str, impact_engine.CallPred]]] = {}
+    # One text per situation (it is the situation's first version on every row). getattr for the
+    # rollout rule `_call_pred_from_row` states: a table built before the English columns has none.
+    texts: dict[str, tuple] = {}
 
     def _ingest(rows, operator_of: Callable[..., str]) -> None:
         for r in rows:
             op = operator_of(r)
             pred = _call_pred_from_row(r, op)
+            texts.setdefault(
+                r.situationNumber,
+                (r.summary, r.description, getattr(r, "summary_en", None), getattr(r, "description_en", None)),
+            )
             by_key.setdefault((op, r.jkey), []).append(pred)
             by_situation.setdefault(r.situationNumber, []).append(pred)
             by_jkey_index.setdefault(r.jkey, set()).add(op)
@@ -814,6 +822,11 @@ def refresh_call_predictions_cache() -> None:
         _call_pred_by_situation = by_situation
         _call_pred_by_stop_ref = by_stop_ref
         _call_pred_refreshed_at = datetime.now(UTC)
+    try:
+        situation_english.update(texts)
+    except Exception:
+        # English is an addition to the payload, never a reason to keep last cycle's predictions.
+        logger.exception("Could not update the situations' English text")
     logger.info(
         "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations, "
         "%d stop refs",
@@ -2325,6 +2338,7 @@ async def lifespan(app: FastAPI):
         # The pull read's enrichment pool: stop it without waiting, so a task parked on a Vertex or
         # Journey Planner call cannot hold the process open past the poller's own five seconds.
         notification_pull.shutdown()
+        situation_english.shutdown()
 
 
 
