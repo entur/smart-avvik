@@ -378,7 +378,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   removals (L2 week of 2026-08-17, R31/RE30, Bergen L4): they truly do not run, and they are included by
   choice (2026-09-23), the morning digest to say when Vy has set up a bus. Built hourly after the planned rebuild (`_phase("rail_removed_calls")`, ~0.3 GB,
   a refusal waits for the next planned rebuild, any other failure is retried next tick), behind `VARSEL_PLAN_REMOVED` (on in
-  dev, off in prd; off builds the table EMPTY, which is the rollback), created empty at startup
+  dev, and in prd since 2026-09-24; off builds the table EMPTY, which is the rollback), created empty at startup
   when absent because `predict_calls.sql` reads it. `data/queries/replay_removed_trains.sh FIRST
   LAST` is the same file over past days (it swaps only the ET CTE for `last_recorded`); on
   2026-09-14..18 it found zero removed trains on registered journeys and 29/67/84/108/159 on the
