@@ -4,7 +4,8 @@
 -- create_disruptions_initial.sql does the full 2-year build of disruptions.disruptions_initial
 -- (the training population). This script applies the SAME first-version feature snapshot and
 -- reopening/impact labelling, but scoped to today's SIRI-SX partitions only
--- (DATE(_PARTITIONTIME) = CURRENT_DATE(), participantRef = 'NSB'). It is a plain CREATE OR
+-- (DATE(_PARTITIONTIME) = CURRENT_DATE() plus the unpartitioned streaming buffer, participantRef =
+-- 'NSB'). It is a plain CREATE OR
 -- REPLACE over today's partition — no EXECUTE IMMEDIATE, no 2-year scan, no dedup against the
 -- training table.
 --
@@ -30,7 +31,8 @@ WITH all_versions AS (
     COALESCE(SAFE.TIMESTAMP(versionedAtTime), ingestionTime) AS event_ts,
     severity, planned, reportType, priority, validityPeriods, summaries, descriptions, affects
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
-  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE()
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
+  WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
     AND participantRef = 'NSB'
 ),
 -- First version = feature snapshot AND clock start (onset).

@@ -48,9 +48,16 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   quietly turn "bus predictions failed, serve NSB-only" into a success
   (`test_poller_refresh.py` pins this). Baseline measured in prd that evening, ~44 registered
   journeys: **cycle 50-63 s**, of which `predict_calls_*` ~32-37 s, `disruptions_sql` ~9 s,
-  `varsel_stops` ~6 s and `varsel_notify` **1.3-1.7 s**. The cycle *period* is ~177 s (p50) and is
-  set by how often the upstream SIRI-SX ingestion timestamp moves, not by this work — so there is
-  ~120 s of headroom, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
+  `varsel_stops` ~6 s and `varsel_notify` **1.3-1.7 s**. The cycle *period* was ~177 s (p50) then
+  and ~296 s by 2026-09-08, and until 2026-09-24 it was set by how often BigQuery flushed its
+  streaming buffer into today's SIRI-SX partition — the probe filtered on `_PARTITIONTIME` and
+  freshly written rows have it NULL for a few minutes, which read as "anshar batching" until
+  `docs/operations/pubsub-vs-bigquery-poll-2026-09-24.md` measured it. Since then the probe reads
+  the buffer too, the ingestion timestamp moves on almost every tick, and the period is set by
+  `POLLER_MIN_REBUILD_SPACING_S` (120 s from rebuild start; with a 60 s tick and a 50-63 s cycle
+  that is a 120-185 s period, 470-720 rebuilds/day, against ~250 before) — a floor at all because
+  each rebuild bills ~0.9 GB of `ML.PREDICT`, so the rebuild count is the cost knob. There is
+  still ≥60 s of headroom per period, and BigQuery owns ~97 % of what is spent. The corollary matters when sizing
   anything user-facing: **the expensive part of a cycle does not scale with registrations**, and
   what does — `varsel_notify` — is 3 % of it.
   **Two notification phases exist since 2026-09-08**, `notification_webhooks` and — since 2026-09-09 —

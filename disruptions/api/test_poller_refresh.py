@@ -1266,6 +1266,96 @@ def test_the_removed_sql_takes_the_parameters_the_poller_passes():
     assert sql.count("CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today`") == 1
 
 
+class _Ticks:
+    """Duck-types the stop_event: poll_for_changes runs exactly `n` loop iterations."""
+
+    def __init__(self, n: int) -> None:
+        self.left = n
+
+    def wait(self, interval: float) -> bool:
+        self.left -= 1
+        return self.left <= 0
+
+
+@contextmanager
+def _quiet_ticks(script):
+    """Drive poll_for_changes hermetically. `script` is one (ingestion_value, monotonic_seconds)
+    per tick: the probe stub returns the value and moves the fake clock to that time, and every
+    monotonic() read in the loop — the spacing check, the rebuild stamp, `_beat` — sees the same
+    frozen `now`, so the test does not depend on how many times the loop consults the clock. The
+    per-tick side jobs (togvarsel, outcomes, labelling freshness) are stubbed to no-ops."""
+    ticks = iter(script)
+    now = [0.0]
+
+    def _probe():
+        value, now[0] = next(ticks)
+        return value
+
+    before = (
+        main.get_last_ingestion_time,
+        main.monotonic,
+        main.togvarsel.refresh,
+        main.togvarsel_notify.evaluate,
+        main.togvarsel_outcomes.refresh,
+        main.decisions.check_labelling_freshness,
+        main._poller_heartbeat_monotonic,
+    )
+    main.get_last_ingestion_time = _probe
+    main.monotonic = lambda: now[0]
+    main.togvarsel.refresh = lambda: None
+    main.togvarsel_notify.evaluate = lambda: None
+    main.togvarsel_outcomes.refresh = lambda: None
+    main.decisions.check_labelling_freshness = lambda: None
+    try:
+        yield
+    finally:
+        (
+            main.get_last_ingestion_time,
+            main.monotonic,
+            main.togvarsel.refresh,
+            main.togvarsel_notify.evaluate,
+            main.togvarsel_outcomes.refresh,
+            main.decisions.check_labelling_freshness,
+            main._poller_heartbeat_monotonic,
+        ) = before
+
+
+def test_a_change_inside_the_rebuild_spacing_is_held_not_lost():
+    """Since the probe reads the streaming buffer, the ingestion timestamp moves on almost every
+    tick; the floor keeps that from becoming a rebuild per tick. What it must NOT do is drop the
+    change: a held tick leaves `last_seen` alone, so the next tick past the floor rebuilds with the
+    value it held. Three ticks: t=0 first observation (rebuilds), t=30 a new value inside the
+    120 s floor (held), t=200 the same value (rebuilds)."""
+    calls: list[str] = []
+    with _quiet_ticks([("a", 0.0), ("b", 30.0), ("b", 200.0)]), _spacing(120):
+        main.poll_for_changes(calls.append, _Ticks(3))
+    assert calls == ["a", "b"], calls
+
+
+def test_a_zero_spacing_rebuilds_on_every_change():
+    calls: list[str] = []
+    with _quiet_ticks([("a", 0.0), ("b", 1.0), ("c", 2.0)]), _spacing(0):
+        main.poll_for_changes(calls.append, _Ticks(3))
+    assert calls == ["a", "b", "c"], calls
+
+
+def test_an_unchanged_value_never_rebuilds_whatever_the_spacing():
+    calls: list[str] = []
+    with _quiet_ticks([("a", 0.0), ("a", 1.0), ("a", 2.0)]), _spacing(0):
+        main.poll_for_changes(calls.append, _Ticks(3))
+    assert calls == ["a"], calls
+
+
+@contextmanager
+def _spacing(seconds: int):
+    before = main._MIN_REBUILD_SPACING_S
+    main._MIN_REBUILD_SPACING_S = seconds
+    try:
+        yield
+    finally:
+        main._MIN_REBUILD_SPACING_S = before
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

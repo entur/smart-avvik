@@ -264,6 +264,17 @@ _disruptions_refreshed_at: datetime | None = None
 # Request-path queries (disruptions_as_of, /demo-api) deliberately keep unbounded waits.
 _POLLER_QUERY_TIMEOUT_S = 240
 
+# Minimum seconds between two rebuild STARTS (2026-09-24). Since the probe reads BigQuery's
+# streaming buffer (last_ingestion_time.sql), the ingestion timestamp moves on almost every tick:
+# all-operator SIRI-SX lands every ~37 s. Without a floor the loop would rebuild once per
+# tick + cycle (~750/day against ~250 before), and each rebuild bills ~0.9 GB of ML.PREDICT.
+# With a 60 s tick the probe after a rebuild runs at ~110-124 s (cycle 50-63 s), so 120 s
+# holds it when the cycle was short and lets it through when the cycle was long: a period of
+# 120-185 s, i.e. 470-720 rebuilds/day. 150 s would hold that first tick always (a steadier
+# ~175-185 s) at the price of latency. A change is never LOST either way — a held tick leaves
+# `last_seen` untouched so the next tick sees it again. 0 disables the floor.
+_MIN_REBUILD_SPACING_S = int(os.environ.get("POLLER_MIN_REBUILD_SPACING_S", "120"))
+
 
 def _row_to_cached(r) -> _CachedDisruption:
     """Map one BigQuery row (active_disruptions.sql / disruptions_as_of.sql share the same
@@ -2759,6 +2770,10 @@ def poll_for_changes(
 ) -> None:
     """Poll get_last_ingestion_time() once per minute, calling on_change when it changes.
 
+    A change seen less than `_MIN_REBUILD_SPACING_S` after the previous rebuild STARTED is held,
+    not dropped: `last_seen` is left as it was, so the next tick sees the same difference and
+    rebuilds once the floor has passed. The first observation always rebuilds.
+
     Pass a stop_event to interrupt the loop cleanly between polls (used for shutdown).
 
     Each poll (and its on_change rebuild) is wrapped: a failure — e.g. a transient
@@ -2768,6 +2783,7 @@ def poll_for_changes(
     """
     last_seen = None
     seen_any = False
+    last_rebuild_started: float | None = None
     while True:
         # Liveness heartbeat for /health (R1): unconditional, at the TOP of the iteration —
         # before anything that can fail — so a broken upstream reads as the logged per-tick
@@ -2778,9 +2794,21 @@ def poll_for_changes(
         try:
             current = get_last_ingestion_time()
             if not seen_any or current != last_seen:
-                last_seen = current
-                seen_any = True
-                on_change(current)
+                since_last = (
+                    None if last_rebuild_started is None else monotonic() - last_rebuild_started
+                )
+                if since_last is not None and since_last < _MIN_REBUILD_SPACING_S:
+                    logger.info(
+                        "Ingestion moved %.0f s after the last rebuild started; holding until %d s",
+                        since_last,
+                        _MIN_REBUILD_SPACING_S,
+                        extra={"fields": {"event": "poller_rebuild_held", "since_s": since_last}},
+                    )
+                else:
+                    last_seen = current
+                    seen_any = True
+                    last_rebuild_started = monotonic()
+                    on_change(current)
         except Exception:
             logger.exception("Ingestion poll failed; retrying on next tick")
         _beat()
