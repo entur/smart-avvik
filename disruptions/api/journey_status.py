@@ -50,9 +50,10 @@ OPERATORS: tuple[str, ...] = ("VYG",)
 #: message the only signal is the last hour of observation, and beyond ~2 h the no-SX layer collapses
 #: to the base rate — a green there would be the manufactured all-clear this codebase refuses.
 NOSX_HORIZON_MIN = 120
-#: The product bar (`alert_policy.TROUBLE_DELAY_MIN`) and the 2026-09-01 review's yellow floor.
+#: The product bar (`alert_policy.TROUBLE_DELAY_MIN`) and the yellow floor: under 5 min is green
+#: (the 2026-09-01 review set 3; raised to 5 on 2026-09-24).
 RED_DELAY_MIN = alert_policy.TROUBLE_DELAY_MIN
-YELLOW_DELAY_MIN = 3
+YELLOW_DELAY_MIN = 5
 
 State = Literal["confirmed", "predicted", "unknown"]
 Level = Literal["red", "yellow", "green", "grey"]
@@ -125,7 +126,7 @@ class TrainStatus(BaseModel):
     )
     level: Level = Field(
         description="`red` cancelled, >= 10 min late, or (predicted) over the alert gate; `yellow` "
-        "3-9 min; `green` below; `grey` when nothing can be said."
+        "5-9 min; `green` below; `grey` when nothing can be said."
     )
     cancelled: bool
     delay_min: int | None = Field(description="Confirmed delay at the alighting stop, minutes.")

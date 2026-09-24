@@ -711,7 +711,7 @@ Each train carries a `state` and a `level`:
 | `unknown` | nothing can be said, including a train no operator message names more than two hours out | a grey ring |
 
 `level` is `red` for cancelled, 10 min or more late, or a forecast over the same bar a notification
-fires at, applied to the same pairing of a train's two calls. It is `yellow` for 3–9 min, `green`
+fires at, applied to the same pairing of a train's two calls. It is `yellow` for 5–9 min, `green`
 below that, and `grey` exactly when nothing can be said. A trip counts as cancelled when either its
 boarding or its alighting call is. That is the one place the two reads can differ: notifications
 fire on the boarding call, so a train cancelled only at the destination is red here and can be
