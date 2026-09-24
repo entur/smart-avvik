@@ -41,8 +41,10 @@ WITH last_snap AS (
     cancellation AS journey_cancelled,
     recordedCalls, estimatedCalls
   FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
-  WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY)
-                                 AND CURRENT_DATE('Europe/Oslo')
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
+  WHERE (DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY)
+                                  AND CURRENT_DATE('Europe/Oslo')
+         OR _PARTITIONTIME IS NULL)
     AND lineRef LIKE 'VYG:%'
     AND datedVehicleJourneyRef IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
@@ -112,8 +114,9 @@ WITH scored AS (
      WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
      LIMIT 1) AS no_description
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
-  WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY)
-                                 AND CURRENT_DATE('Europe/Oslo')
+  WHERE (DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE('Europe/Oslo'), INTERVAL 1 DAY)
+                                  AND CURRENT_DATE('Europe/Oslo')
+         OR _PARTITIONTIME IS NULL)
     AND participantRef IN ('NSB', 'VYG')
 ),
 latest AS (
