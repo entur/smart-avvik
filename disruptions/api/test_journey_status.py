@@ -123,7 +123,7 @@ def _morning():
     rows += _train("t0811", _oslo(8, 11), line="VYG:Line:R13")  # no figure at all
     rows += _train("t0818", _oslo(8, 18))
     preds += _scored("t0818", _oslo(8, 18), sit="KIX:NoSituation:t0818", has_situation=False,
-                     arr_delay_p50_stack_min=4)
+                     arr_delay_p50_stack_min=6)
     for jkey, h, m in (("t0833", 8, 33), ("t0848", 8, 48)):
         rows += _train(jkey, _oslo(h, m))
         preds += _scored(jkey, _oslo(h, m), sit=f"KIX:NoSituation:{jkey}", has_situation=False)
@@ -158,7 +158,7 @@ def test_the_morning_at_0742_reads_as_the_design():
     # Aimed 07:48 plus the typical departure delay (the regression's 1 min, no stack figure).
     assert strip["07:48"].expected_departure_time == _oslo(7, 49)
     assert strip["07:33"].delay_min == 5
-    assert strip["08:18"].delay_p50_min == 4
+    assert strip["08:18"].delay_p50_min == 6
     # A fact carries no forecast figures, and neither does a train nothing can be said about.
     for hhmm in ("07:03", "07:33", "08:11"):
         assert (strip[hhmm].impact_probability, strip[hhmm].alert_worthy) == (None, False), hhmm
@@ -272,9 +272,15 @@ def test_the_arrival_delay_wins_over_the_departure_delay():
 
 
 def test_before_the_arrival_column_the_departure_delay_at_the_alighting_call_grades():
-    rows = _train("a", _oslo(7, 3), alight={"source": "recorded", "dep_delay_min": 4})
+    rows = _train("a", _oslo(7, 3), alight={"source": "recorded", "dep_delay_min": 6})
     _install(rows)
     assert _strip(_oslo(7, 42))["07:03"].level == "yellow"
+
+
+def test_under_five_minutes_late_is_green_five_is_yellow_ten_is_red():
+    for delay, level in ((4, "green"), (5, "yellow"), (9, "yellow"), (10, "red")):
+        _install(_train("a", _oslo(7, 3), alight={"source": "recorded", "dep_delay_min": delay}))
+        assert _strip(_oslo(7, 42))["07:03"].level == level, delay
 
 
 def test_an_alighting_cancellation_cancels_the_trip():
@@ -356,10 +362,10 @@ def test_a_train_under_way_is_graded_off_its_alighting_call_once_the_boarding_on
 
 def test_only_a_boarding_figure_grades_off_the_departure_delay():
     dep = _oslo(7, 48)
-    board, _ = _scored("a", dep, dep_delay_p50_stack_min=None, dep_delay_typ_min=4)
+    board, _ = _scored("a", dep, dep_delay_p50_stack_min=None, dep_delay_typ_min=6)
     _install(_train("a", dep), [board])
     t = _strip(_oslo(7, 42))["07:48"]
-    assert (t.level, t.delay_p50_min, t.alert_worthy) == ("yellow", 4, False)
+    assert (t.level, t.delay_p50_min, t.alert_worthy) == ("yellow", 6, False)
 
 
 def test_a_cancellation_only_the_actuals_know_about_cancels_the_trip():
