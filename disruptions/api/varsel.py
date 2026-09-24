@@ -106,6 +106,7 @@ import metrics  # sibling leaf module (no main import): the push-delivery counte
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
+import situation_english  # the English beside each situation's Norwegian text
 import varsel_state  # where a registration lives: the seam and today's blob backend (U13)
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
@@ -3814,11 +3815,18 @@ def _webhook_situations(alerts: list[Alert]) -> list[dict]:
         if number in seen:
             continue
         seen.add(number)
+        english = situation_english.english(number, alert.summary, alert.description)
         out.append(
             {
                 "situation_number": number,
                 "summary": alert.summary,
                 "description": alert.description,
+                # The operator's English where they published one (ours for a `KIX:` row), else a
+                # Gemini translation once one has landed -- all three null until then. The flag says
+                # which, for `has_situation`'s reason below: a machine's words are not the operator's.
+                "summary_en": english.summary if english else None,
+                "description_en": english.description if english else None,
+                "en_machine_translated": english.machine_translated if english else None,
                 # False means no SX message named this train at all, so `summary` is text this
                 # codebase wrote rather than an operator's. A receiver presenting it as an
                 # operator's statement would be making the 2026-08-20 mistake one layer out.

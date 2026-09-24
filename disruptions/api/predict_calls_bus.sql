@@ -39,6 +39,9 @@ sit AS (
     d.summary,
     -- Carried for serving only (never a feature) -- see the same column in predict_calls.sql.
     d.description,
+    -- The operator's English, served only -- see the same columns in predict_calls.sql.
+    d.summary_en,
+    d.description_en,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -415,12 +418,16 @@ SELECT
   IF(s.is_terminal, NULL, ROUND(s.pc_cal + (1 - s.pc_cal) * s.cd10, 4)) AS p_impact_dep,
   IF(s.is_origin,   NULL, ROUND(s.ca10, 4)) AS p_arr_ge10_h,
   IF(s.is_terminal, NULL, ROUND(s.cd10, 4)) AS p_dep_ge10_h,
-  s.lead_bucket AS platt_lead_bucket
+  s.lead_bucket AS platt_lead_bucket,
+  sd.summary_en,
+  sd.description_en
 FROM curve AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
-  SELECT situationNumber, ANY_VALUE(description) AS description FROM sit GROUP BY situationNumber
+  SELECT situationNumber, ANY_VALUE(description) AS description,
+         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en
+  FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
 -- dep p90: operator row (clamped to operator bounds), else global '*' row (clamped to '*' bounds)
 LEFT JOIN bnd_op AS bo_dep ON bo_dep.side='dep' AND bo_dep.operator=s.operator
@@ -492,5 +499,13 @@ SELECT
   CAST(NULL AS FLOAT64) AS p_dep_ge10_h,
   -- No model was scored, so no platt layer calibrated anything. Naming a bucket would claim a
   -- calibration that never ran.
-  CAST(NULL AS STRING)  AS platt_lead_bucket
+  CAST(NULL AS STRING)  AS platt_lead_bucket,
+  -- English beside the Norwegian, written here for the same reason the Norwegian is: no operator
+  -- published either. Stop names stay as ET gives them.
+  CASE
+    WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Cancelled departure'
+    WHEN e.seg_from = e.seg_to                  THEN CONCAT('Cancelled from ', e.seg_from)
+    ELSE CONCAT('Cancelled ', e.seg_from, '–', e.seg_to)
+  END AS summary_en,
+  "The departure is marked as cancelled in the operator's real-time data." AS description_en
 FROM et_only AS e;
