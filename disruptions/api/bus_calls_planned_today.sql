@@ -39,7 +39,8 @@ WITH last_snap AS (
     recordedCalls,
     estimatedCalls
   FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
-  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE()
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
+  WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
     AND COALESCE(datedVehicleJourneyRef, framedVehicleJourneyRef.datedVehicleJourneyRef) IS NOT NULL
     AND REGEXP_EXTRACT(COALESCE(datedVehicleJourneyRef, framedVehicleJourneyRef.datedVehicleJourneyRef),
                        r'^([A-Za-z]+):')

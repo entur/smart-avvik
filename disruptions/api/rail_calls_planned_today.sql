@@ -64,7 +64,9 @@ WITH last_snap AS (
   -- was scored against no trains at all until ET touched them again.
   -- Cost: about one more day's rail partition per rebuild (measured 14.1 -> 22.2 GB at 16:00).
   -- togvarsel_features_today.sql has read both partitions since it existed, for the same reason.
-  WHERE DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AND CURRENT_DATE()
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
+  WHERE (DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AND CURRENT_DATE()
+         OR _PARTITIONTIME IS NULL)
     AND lineRef LIKE 'VYG:%'
     AND datedVehicleJourneyRef IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
