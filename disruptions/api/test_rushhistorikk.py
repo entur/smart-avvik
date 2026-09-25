@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 from contextlib import contextmanager
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -328,6 +328,22 @@ def test_a_rate_over_an_empty_denominator_is_null_never_zero():
     assert total["n_ikke_vurdert"] == 1 and total["varsler_sendt"] == 0
 
 
+def test_the_trend_is_the_total_row_per_iso_week():
+    """One point per Monday-started week, each the total row over that week's issues alone."""
+    prior = MONDAY - timedelta(days=7)
+    _reset([
+        _row(),
+        # The week before: a yellow push on a green morning, so not justified.
+        _row(d=prior, am_level="green", am_trouble10=0.03, amrest_level="green",
+             computed_at=datetime(2026, 8, 24, 4, 30, tzinfo=UTC),
+             decided_at=datetime(2026, 8, 24, 4, 31, tzinfo=UTC)),
+    ])
+    trend = _days().json()["trend"]
+    assert [p["week_start"] for p in trend] == [prior.isoformat(), MONDAY.isoformat()]
+    assert [(p["presisjon_num"], p["presisjon_den"]) for p in trend] == [(0, 1), (1, 1)]
+    assert [p["presisjon"] for p in trend] == [0.0, 1.0]
+
+
 def test_the_matrix_and_the_verdict_agree_on_one_scored_day():
     _reset()
     body = _days().json()
@@ -376,7 +392,7 @@ def test_the_response_carries_exactly_the_expected_keys():
     """The whole key set, pinned: a field added to the response fails HERE rather than shipping."""
     _reset()
     body = _days().json()
-    assert set(body) == {"days_window", "from_date", "days", "stats", "recording_started"}
+    assert set(body) == {"days_window", "from_date", "days", "stats", "trend", "recording_started"}
     assert set(body["days"][0]) == {
         "d", "issues", "am_level", "am_trouble10", "amrest_level", "pm_level", "pm_trouble10",
         "am_provisional_level", "pm_provisional_level", "eligible",
