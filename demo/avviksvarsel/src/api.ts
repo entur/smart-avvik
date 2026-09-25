@@ -48,6 +48,8 @@ export interface AlternativeLeg {
   mode: string | null;
   line: string | null;
   public_code: string | null;
+  /** Where the vehicle terminates (its front text): «Hamar». */
+  destination?: string | null;
   from_name: string | null;
   to_name: string | null;
   start_time: string | null;
@@ -80,6 +82,7 @@ export interface Alert {
   operator: string | null;
   mode: string; // 'Tog' | 'Buss' — vehicle noun for the UI
   line: string | null;
+  destination?: string | null; // where the train terminates: «Hamar»
   departure_time: string | null;
   // ET has already declared this departure cancelled: a fact, not a forecast. When true the card
   // says "Innstilt" and never a percentage — cancel_probability is 1.0 by construction.
@@ -165,6 +168,8 @@ export interface TrainStatus {
   operator: string;
   line: string | null;
   jkey: string;
+  /** Where the train terminates: «Hamar». */
+  destination?: string | null;
   /** confirmed = filled circle, predicted = ring, unknown = grey ring. */
   state: 'confirmed' | 'predicted' | 'unknown';
   level: 'red' | 'yellow' | 'green' | 'grey';

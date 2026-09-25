@@ -149,3 +149,10 @@ test('the caption counts trains, or says when the model starts saying anything',
   assert.equal(caption(status(grey, oslo('07:42'))), 'Vurderes fra 12:03');
   assert.equal(caption(status(grey, oslo('14:30'))), '2 avganger', 'a window already under way is counted');
 });
+
+test('a train is named by its line and destination, like the push', async () => {
+  const { trainLabel } = await import('../src/format.ts');
+  assert.equal(circleLabel(train('08:33', { destination: 'Hamar' })), 'L1 Hamar 08:33, ventet i rute');
+  assert.equal(trainLabel('Tog', 'VYG:Line:RE10', null, 'Hamar'), 'Tog RE10 Hamar ');
+  assert.equal(trainLabel('Tog', null, null, 'Hamar'), 'Tog kl ');
+});

@@ -274,7 +274,8 @@ Regler:
 - Bruk KUN tall, tider, stoppesteder og linjenavn som finnes i dataene. Du skal aldri gjette, \
 regne ut nye tall eller finne på detaljer.
 - Omtal avgangen med linje og avgangstid, slik det står på et avgangsskilt: \
-«<transportmiddel> <linje> <avgang_kl>», f.eks. «tog L1 09:24» eller «buss 31 09:24». Skriv \
+«<transportmiddel> <linje> <avgang_kl>», f.eks. «tog L1 09:24» eller «buss 31 09:24». Finnes \
+`destinasjon`, står den etter linja: «tog RE10 Hamar 09:24». Skriv \
 aldri «toget kl. 09:24» eller «bussen din» uten linje – den reisende har som regel flere linjer \
 å velge mellom, og klokkeslettet alene sier ikke hvilket tog det gjelder. Hvis `linje` mangler i \
 dataene, skriv «<transportmiddel> kl <avgang_kl>» og finn aldri på et linjenummer.
@@ -1092,6 +1093,11 @@ def build_message_input(
     alert_line_code = line_code(_bounded_text(alert_line, _NAME_MAX_CHARS))
     if alert_line_code:
         payload["linje"] = alert_line_code
+        # Where the train ends, «Hamar»: with the line it is what the board says, and RE10 ends at
+        # Hamar or Lillehammer depending on the departure. Only beside a line, as the label uses it.
+        destination = _bounded_text(getattr(alert, "destination", None), _NAME_MAX_CHARS)
+        if destination:
+            payload["destinasjon"] = destination
     # Present only when true, like every optional key here: a `"i_morgen": false` is a key the
     # model can quote and the template must guard. `now` is injectable for tests; the poller reads
     # the clock.
@@ -1163,6 +1169,11 @@ def build_message_input(
                     "linje": _bounded_text(leg.public_code or leg.line, _NAME_MAX_CHARS),
                     "fra": _bounded_text(leg.from_name, _NAME_MAX_CHARS),
                     "til": _bounded_text(leg.to_name, _NAME_MAX_CHARS),
+                    **(
+                        {"destinasjon": dest}
+                        if (dest := _bounded_text(getattr(leg, "destination", None), _NAME_MAX_CHARS))
+                        else {}
+                    ),
                 }
                 for leg in (alt.legs or [])
                 if leg.mode != "foot"

@@ -573,6 +573,22 @@ def test_the_module_imports_only_impact_alert_policy_pydantic_and_the_stdlib():
     assert local == {"impact", "alert_policy", "pydantic"}, local
 
 
+def test_a_train_is_named_by_its_terminus_and_only_a_real_terminus():
+    """«RE10 Hamar»: the last call's name, «stasjon» dropped, and nothing when the table's last call
+    for the train still has a departure (a journey held only in part) or the train is unknown."""
+    dep = _oslo(7, 3)
+    whole = _train("a", dep, terminus=True, alight={"destination": "Hamar stasjon"})
+    cut = _train("b", dep, alight={"destination": "Hamar stasjon"})
+    js.set_spine(js.CallTable(whole + cut, dep))
+    try:
+        assert js.destination("VYG", "a") == "Hamar"
+        assert js.destination("VYG", "b") is None
+        assert js.destination("VYG", "nope") is None
+        assert js.destination(None, "a") is None
+    finally:
+        js.reset_state()
+
+
 def _run():
     tests = sorted((n, f) for n, f in globals().items() if n.startswith("test_") and callable(f))
     for name, fn in tests:

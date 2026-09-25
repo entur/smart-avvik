@@ -102,7 +102,7 @@ def removed_digest(trains: list[tuple[str, bool]], *, weekday: int) -> tuple[str
     `(title, wording)`.
 
     `trains` is `(label, bus_for_train)` soonest first, the label as `train_label` names a departure
-    («L1 07:10»); `weekday` is today's, Monday 0. Deterministic and never written by a model: it
+    («L1 Spikkestad 07:10»); `weekday` is today's, Monday 0. Deterministic and never written by a model: it
     states a count and a list, and the reason is the same for every train in it. The title carries
     no environment tag and the wording no route line -- the caller adds both, as for every other
     push, and the route's names are a traveller's free text, which may hold a newline of its own.
@@ -139,8 +139,10 @@ def delay_phrase(message_input: dict) -> str | None:
     return f"Typisk {p90 or p50} min forsinket"
 
 
-def train_label(mode: str | None, line: str | None, hhmm: str) -> str:
-    """Which departure this is, as a departure board names it: "Tog L1 09:24".
+def train_label(
+    mode: str | None, line: str | None, hhmm: str, destination: str | None = None
+) -> str:
+    """Which departure this is, as a departure board names it: "Tog RE10 Hamar 09:24".
 
     The line is what makes the label identify *their* train rather than *a* train: a registered
     journey routinely matches several lines at once, so "Tog kl 09:24" leaves the reader to work out
@@ -160,8 +162,14 @@ def train_label(mode: str | None, line: str | None, hhmm: str) -> str:
     was unknown, and a leg can carry a mode this codebase has no noun for. Inventing either would be
     the one failure worse than saying too little. Note the line-less form keeps "kl" and the line
     form drops it — "Tog 09:24" alone reads as a quantity, "Tog L1 09:24" as a line and a time.
+
+    `destination` rides with the line and only with it, as on the board: "RE10 Hamar". RE10 ends at
+    Hamar on some departures and at Lillehammer on others, so the line alone does not say which
+    train either.
     """
     if line:
+        if destination:
+            line = f"{line} {destination}"
         return f"{mode} {line} {hhmm}" if mode else f"{line} {hhmm}"
     return f"{mode} kl {hhmm}" if mode else f"kl {hhmm}"
 
@@ -201,7 +209,12 @@ def train_label_from_input(message_input: dict) -> str | None:
     hhmm = message_input.get("avgang_kl")
     if not hhmm:
         return None
-    label = train_label(message_input.get("transportmiddel"), message_input.get("linje"), hhmm)
+    label = train_label(
+        message_input.get("transportmiddel"),
+        message_input.get("linje"),
+        hhmm,
+        message_input.get("destinasjon"),
+    )
     return f"{label} i morgen" if message_input.get("i_morgen") else label
 
 
@@ -229,7 +242,12 @@ def _first_leg_label(alternative: dict, hhmm: str) -> str:
     through to the time alone — the wording this had before it named any line.
     """
     leg = next(iter(alternative.get("reisevei") or []), {})
-    return train_label(_LEG_MODE_NOUN.get(leg.get("transportmiddel")), leg.get("linje"), hhmm)
+    return train_label(
+        _LEG_MODE_NOUN.get(leg.get("transportmiddel")),
+        leg.get("linje"),
+        hhmm,
+        leg.get("destinasjon"),
+    )
 
 
 def alternative_phrase(message_input: dict) -> str | None:
@@ -543,6 +561,7 @@ class DepartureWordingFacts:
     description: str | None = None
     operator: str | None = None
     line: str | None = None
+    destination: str | None = None
     departure_time: datetime | None = None
     cancelled: bool = False
     cancel_probability: float = 0.0

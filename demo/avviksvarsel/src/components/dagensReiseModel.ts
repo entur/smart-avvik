@@ -6,7 +6,7 @@
 // server's `togvarsel._LEVEL_TEXT`, and a fourth level there fails `test_togvarsel`.
 
 import type { JourneyStatus, TrainStatus } from '../api';
-import { fmtTime, lineCode } from '../format.ts';
+import { fmtTime, lineCode, withDestination } from '../format.ts';
 
 /** The server grades no-SX figures only this far ahead (journey_status.NOSX_HORIZON_MIN). */
 const NOSX_HORIZON_MS = 120 * 60 * 1000;
@@ -27,7 +27,7 @@ export function circleClass(train: TrainStatus): string {
  *  server's `now`, a forecast for a train that has already left says so: under way while its
  *  arrival is still plausibly ahead, «ankomst ikke registrert» once it is well past it. */
 export function circleLabel(train: TrainStatus, now?: string): string {
-  const name = `${lineCode(train.line) ?? 'Tog'} ${fmtTime(train.departure_time)}`;
+  const name = `${withDestination(lineCode(train.line), train.destination) ?? 'Tog'} ${fmtTime(train.departure_time)}`;
   const t = now === undefined ? null : Date.parse(now);
   const departed =
     t !== null && train.state === 'predicted' && !train.cancelled && Date.parse(train.departure_time) <= t;
