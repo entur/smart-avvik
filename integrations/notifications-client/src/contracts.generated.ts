@@ -224,6 +224,13 @@ export interface NotificationEvent {
     delay?: { [key: string]: unknown } | null;
     effect?: string | null;
     /**
+     * Where the train terminates, as a departure board names it (`Drammen`), and the same value
+     * `notification.title` names the train with: «Tog R14 Drammen 14:59». Null when we do not know
+     * it, which today is every train but Vy's and every bus. Absent from an event minted before
+     * the field existed.
+     */
+    destination?: string | null;
+    /**
      * The contributing situations, each with `situation_number`, the Norwegian `summary` and
      * `description`, their English `summary_en` and `description_en`, `en_machine_translated` and
      * `has_situation`. The English is the operator's own where they published one (Vy does on
