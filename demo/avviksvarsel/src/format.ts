@@ -61,6 +61,11 @@ export function lineCode(line: string | null): string | null {
   return parts[parts.length - 1] || null;
 }
 
+/** «RE10» -> «RE10 Hamar»; the code alone without a destination, null without a code. */
+export function withDestination(code: string | null, destination?: string | null): string | null {
+  return code && destination ? `${code} ${destination}` : code;
+}
+
 const osloDay = new Intl.DateTimeFormat('en-CA', {
   timeZone: 'Europe/Oslo',
   year: 'numeric',
@@ -77,12 +82,18 @@ export function departsTomorrow(iso: string | null, now: Date = new Date()): boo
   return osloDay.format(new Date(iso)) === osloDay.format(tomorrow);
 }
 
-/** "Tog L1 09:24" — which train the alert is about, as a departure board names it. Word for word
- *  varsel.py's `_train_label`, "kl"-less line form and all: the card sits under the notification
- *  this text came from, so a difference between them reads as two different trains. Gains
- *  «i morgen» when the departure is tomorrow, exactly as the push wording does. */
-export function trainLabel(mode: string | null, line: string | null, iso: string | null): string {
-  const code = lineCode(line);
+/** "Tog RE10 Hamar 09:24" — which train the alert is about, as a departure board names it. Word
+ *  for word varsel.py's `_train_label`, "kl"-less line form and all: the card sits under the
+ *  notification this text came from, so a difference between them reads as two different trains.
+ *  The destination rides with the line only. Gains «i morgen» when the departure is tomorrow,
+ *  exactly as the push wording does. */
+export function trainLabel(
+  mode: string | null,
+  line: string | null,
+  iso: string | null,
+  destination?: string | null,
+): string {
+  const code = withDestination(lineCode(line), destination);
   const label = code ? `${mode ?? 'Tog'} ${code} ${fmtTime(iso)}` : `${mode ?? 'Tog'} kl ${fmtTime(iso)}`;
   return departsTomorrow(iso) ? `${label} i morgen` : label;
 }

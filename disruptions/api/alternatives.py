@@ -312,7 +312,10 @@ _TRIP_QUERY = """
         datedServiceJourney { id }
         fromPlace { name quay { stopPlace { id } } }
         toPlace { name quay { stopPlace { id } } }
-        fromEstimatedCall { cancellation realtime aimedDepartureTime expectedDepartureTime }
+        fromEstimatedCall {
+          cancellation realtime aimedDepartureTime expectedDepartureTime
+          destinationDisplay { frontText }
+        }
         toEstimatedCall { cancellation aimedArrivalTime expectedArrivalTime }
       }
     }
@@ -331,6 +334,9 @@ class AlternativeLeg(BaseModel):
     )
     from_name: str | None = Field(default=None, description="Where this leg starts.")
     to_name: str | None = Field(default=None, description="Where this leg ends.")
+    destination: str | None = Field(
+        default=None, description="Where the vehicle terminates, its front text: 'Hamar'."
+    )
     start_time: datetime | None = Field(default=None, description="Expected start of the leg.")
     end_time: datetime | None = Field(default=None, description="Expected end of the leg.")
 
@@ -1147,6 +1153,9 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
                 public_code=_as_dict(leg.get("line")).get("publicCode"),
                 from_name=_as_dict(leg.get("fromPlace")).get("name"),
                 to_name=_as_dict(leg.get("toPlace")).get("name"),
+                destination=_as_dict(
+                    _as_dict(leg.get("fromEstimatedCall")).get("destinationDisplay")
+                ).get("frontText"),
                 start_time=_parse_ts(leg.get("expectedStartTime")),
                 end_time=_parse_ts(leg.get("expectedEndTime")),
             )
