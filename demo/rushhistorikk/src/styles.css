@@ -405,3 +405,86 @@ body {
 .rh-empty {
   margin: 1.5rem 0;
 }
+/* ---- trend chart -------------------------------------------------------------------------- */
+/* Presisjon solid dark, Dekning dashed orange: told apart by lightness and dash, not hue alone. */
+.rh-trend {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--basecolors-frame-subdued, #ededed);
+}
+
+.rh-trend-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 0.75rem 1.5rem;
+}
+
+.rh-trend-title {
+  margin: 0;
+  font-size: 1.05rem;
+}
+
+.rh-trend-help {
+  margin: 0.25rem 0 0;
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.rh-trend-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  font-size: 0.875rem;
+}
+
+.rh-trend-legend span {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.rh-trend-readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  align-items: baseline;
+  min-height: 1.4rem;
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.875rem;
+}
+
+.rh-trend-readout strong {
+  font-weight: 600;
+}
+
+.rh-trend-muted {
+  color: var(--basecolors-text-subdued, #6b6b6b);
+}
+
+.rh-trend-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.rh-trend-grid { stroke: #eaeaf1; stroke-width: 1; }
+.rh-trend-pending { fill: #f6f6f9; }
+.rh-trend-axis { font-size: 12px; fill: var(--basecolors-text-subdued, #626493); }
+.rh-trend-axis.is-selected { fill: currentColor; font-weight: 600; }
+.rh-trend-bar { fill: #d9dae8; }
+.rh-trend-bar.is-selected { fill: #9ea0bd; }
+.rh-trend-cursor { stroke: #8284ab; stroke-width: 1; stroke-dasharray: 2 3; }
+.rh-trend-precision { fill: none; stroke: #181c56; stroke-width: 2.5; stroke-linejoin: round; }
+.rh-trend-precision-dot { fill: #181c56; }
+.rh-trend-recall {
+  fill: none;
+  stroke: #ca825b;
+  stroke-width: 2.5;
+  stroke-dasharray: 6 4;
+  stroke-linejoin: round;
+}
+.rh-trend-recall-dot { fill: #fff; stroke: #ca825b; stroke-width: 2; }
+.rh-trend-hit { fill: transparent; cursor: crosshair; outline: none; }
+.rh-trend-hit:focus-visible { fill: rgba(24, 28, 86, 0.06); }

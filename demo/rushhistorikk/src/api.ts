@@ -168,6 +168,20 @@ export interface StatsRow {
   matrix: MatrixRow[];
 }
 
+/** One ISO week of the total row, for the trend chart. */
+export interface TrendPoint {
+  /** Monday of the week. The window's first and last weeks can be partial. */
+  week_start: string;
+  presisjon: number | null;
+  presisjon_num: number;
+  presisjon_den: number;
+  /** Per RUSH, like the total row's. */
+  dekning: number | null;
+  dekning_num: number;
+  dekning_den: number;
+  n_venter: number;
+}
+
 export interface DaysResponse {
   days_window: number;
   from_date: string;
@@ -175,6 +189,8 @@ export interface DaysResponse {
   days: DayRow[];
   /** The total row first, then one per issue slot. */
   stats: StatsRow[];
+  /** The total row per ISO week, oldest first. Optional: absent before 2026-09-25. */
+  trend?: TrendPoint[];
   /** The earliest day a notification round was ever recorded. A reconstructed round BEFORE this is
    *  the expected pre-launch backlog; one after it can only mean a lost write or a closed gate. */
   recording_started: string | null;
