@@ -86,13 +86,18 @@ _CALL_PREDICTIONS_QUERY = "SELECT * FROM `disruptions.call_predictions_today`"
 # mostly BigQuery's job latency, so a second query would cost the phase another second an hour for
 # ~3 000 rows. One job also means one answer -- the strip never shows a removed train beside an ET
 # train it has since been put back as, or misses both.
+#
+# `stop_name` is back on the TERMINUS call only, as `destination`: every notification names a train
+# «RE10 Hamar», and a NULL on every other row keeps the transfer the dropped column saved.
 _JOURNEY_STATUS_SPINE_QUERY = (
     "SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
-    " call_cancelled, call_source, boarding_allowed, alighting_allowed, FALSE AS bus_for_train"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, FALSE AS bus_for_train,"
+    " IF(aimed_dep IS NULL, stop_name, NULL) AS destination"
     " FROM `disruptions.rail_calls_planned_today`"
     " UNION ALL"
     " SELECT jkey, lineRef, stop_place, stop_order, aimed_dep, aimed_arr, dep_delay_min,"
-    " call_cancelled, call_source, boarding_allowed, alighting_allowed, bus_for_train"
+    " call_cancelled, call_source, boarding_allowed, alighting_allowed, bus_for_train,"
+    " IF(aimed_dep IS NULL, stop_name, NULL) AS destination"
     " FROM `disruptions.rail_calls_removed_today`"
 )
 # ... and its actuals half: today's recorded Vy calls, after each 15-min actuals rebuild. Every row
@@ -633,6 +638,7 @@ def _planned_call(r, *, call_source: str | None = None) -> journey_status.Planne
         boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
         alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
         bus_for_train=bool(getattr(r, "bus_for_train", False)),
+        destination=getattr(r, "destination", None),
     )
 
 

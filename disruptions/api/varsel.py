@@ -57,8 +57,8 @@ Design notes
   The in-app list shows every match an operator PUBLISHED regardless, flagged with
   ``alertworthy``; a match no SX message named is shown only once it crosses that gate
   (:func:`_card_alerts`), since a sub-threshold one carries no operator text to read.
-* **What the push says** — which train (``notification_wording.train_label``: "Tog L1 09:24", the
-  line included because a journey matches several of them and a time alone does not say which),
+* **What the push says** — which train (``notification_wording.train_label``: "Tog RE10 Hamar 09:24", the
+  line and destination included because a journey matches several and a time alone does not say which),
   then the *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse),
   then whichever driver dominates (likely cancellation, or the exceedance-stack delay interval).
   Never the raw ``dep_delay_typ_min`` regression: for today's alert-worthy boardings its median is
@@ -1848,6 +1848,11 @@ class Alert(BaseModel):
         "which segment the decision lands in on /historikk.",
     )
     line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
+    destination: str | None = Field(
+        default=None,
+        description="Where that train terminates, as a departure board names it: 'Hamar'. Null "
+        "when the plan does not say (every bus, and a Vy train before the spine loads).",
+    )
     departure_time: datetime | None = Field(
         description="Aimed departure from the boarding stop of the worst affected train (UTC).",
     )
@@ -2079,6 +2084,7 @@ def _collect_alerts(
             has_situation=sit.has_situation,
             mode=mode_label(sit.operator),
             line=sit.line,
+            destination=journey_status.destination(sit.operator, sit.jkey),
             departure_time=dep.scheduled_time,
             jkey=sit.jkey,
             stop_place=dep.stop_place,
@@ -2493,7 +2499,9 @@ def _digest_text(digest: _Digest, *, now: datetime) -> tuple[str, str]:
     return notification_wording.removed_digest(
         [
             (
-                _train_label(None, _local_line_code(t.line), _local_hhmm(t.departure_time)),
+                _train_label(
+                    None, _local_line_code(t.line), _local_hhmm(t.departure_time), t.destination
+                ),
                 t.bus_for_train,
             )
             for t in digest.trains
@@ -2960,6 +2968,8 @@ def _message_input_from_alert(alert: Alert) -> dict:
     # the key, and the two wording sources must not disagree about whether this train has a line.
     if line := _local_line_code(alert.line):
         body["linje"] = line
+        if alert.destination:
+            body["destinasjon"] = alert.destination
     if _departs_tomorrow(alert.departure_time):
         body["i_morgen"] = True
     if not alert.has_situation:
@@ -6016,6 +6026,7 @@ def _feedback_detail(alert: Alert) -> str:
             alert.mode,
             _local_line_code(alert.line),
             _local_hhmm(alert.departure_time) or "",
+            alert.destination,
         )
         if _departs_tomorrow(alert.departure_time):
             train = f"{train} i morgen"
