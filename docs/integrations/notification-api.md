@@ -559,8 +559,8 @@ same object, so it is not restated here. What the envelope around it means:
   «Tog L1 07:18 er innstilt, 2 til kan bli forsinket» — unless another train shares the worst
   outcome, when the counts stand alone: «4 tog er innstilt, 1 kan bli innstilt og 3 kan bli
   forsinket». A single train is its title alone. A confirmed
-  and a forecast train never share a verb, and tomorrow's trains are counted apart («… og 1 i
-  morgen»). It is built from the figures, so it is final at `wait=0` and never waits for wording.
+  and a forecast train never share a verb, and tomorrow's trains are counted apart, with «i dag» said exactly when
+  «i morgen» is («14 tog er innstilt i dag og 2 i morgen»). It is built from the figures, so it is final at `wait=0` and never waits for wording.
   `null` when there is nothing to say — which is never all-clear, for the same reason `n_alerts` of
   zero is not (see `coverage` below).
 - **`phase` is `predicted` or `confirmed`** and there is no `withdrawn` entry: a train no longer over
