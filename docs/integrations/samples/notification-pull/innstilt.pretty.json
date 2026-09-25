@@ -39,6 +39,7 @@
     "from_stop_in_timetable_today": true,
     "to_stop_in_timetable_today": true
   },
+  "summary": "Tog L2 15:49 er innstilt, 1 til er innstilt",
   "alerts": [
     {
       "severity": 2,

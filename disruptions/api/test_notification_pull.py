@@ -438,6 +438,77 @@ def test_a_late_evening_read_lists_tomorrows_train_and_says_so():
     assert " i morgen " in entry["payload"]["notification"]["title"], entry["payload"]["notification"]
 
 
+
+def test_the_summary_counts_every_alive_train_whatever_the_limit():
+    """The favourites sentence is over `n_alerts`, so `limit=1` and the full answer say the same
+    thing -- the proof that it counts `alive` and not the listed entries. Two operator texts that
+    differ fall back to naming the worst train, which here is the LATER one."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot({
+        "S1": _train(now + timedelta(hours=1), p_cancel=0.3, p_impact_dep=0.70),
+        "S2": _train(now + timedelta(hours=2), jkey="t2", situation="S2", et_declared_cancelled=True,
+                     summary="Innstilt Drammen-Skøyen"),
+    })
+    full = _get(wait=0).json()
+    cut = _get(limit=1, wait=0).json()
+    assert cut["truncated"] is True and cut["alerts"][0]["train"]["journey_ref"] == "t1"
+    assert full["summary"] == cut["summary"] == "Tog R10 08:00 er innstilt, 1 til kan bli forsinket", full["summary"]
+    assert full["summary"].startswith(full["alerts"][1]["payload"]["notification"]["title"])
+
+
+def test_operator_text_every_train_carries_leads_the_summary_and_a_placeholder_never_does():
+    """The matcher keeps one train per situation (`select="worst"`: two trains under one key here
+    would answer ONE entry), so the cause is the operator text the trains' own situations share."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    dep = now + timedelta(hours=1)
+    _use_snapshot({
+        "S1": _train(dep, jkey="t1", summary="Signalfeil ved Asker", p_cancel=0.3, p_impact_dep=0.9),
+        "S2": _train(dep + timedelta(minutes=30), jkey="t2", situation="S2", summary="Signalfeil ved Asker.",
+                     p_cancel=0.3, p_impact_dep=0.9),
+    })
+    assert _get(wait=0).json()["summary"] == "Signalfeil ved Asker: 2 tog kan bli forsinket"
+
+    # Two trains Vy took out of the plan: each under its own `KIX:PlanRemoved:` situation, and the
+    # summary text on both is this codebase's placeholder (`has_situation` False), so the worst
+    # train is named instead and «Tatt ut av dagens rutetabell» never leads.
+    removed = {}
+    for n, jkey in enumerate(("RemovedJourney:2105_2026-09-10", "RemovedJourney:2107_2026-09-10")):
+        situation = f"KIX:PlanRemoved:{jkey}"
+        removed[situation] = _train(
+            dep + timedelta(minutes=30 * n), jkey=jkey, situation=situation, et_declared_cancelled=True,
+            p_impact_dep=1.0, p_cancel=1.0, call_source="removed", has_situation=False,
+            summary="Tatt ut av dagens rutetabell",
+        )
+    _reset(now=now)  # the figures are cached per cycle, so a new snapshot needs a new generation
+    _use_snapshot(removed)
+    body = _get(wait=0).json()
+    assert body["n_alerts"] == 2
+    # The two tie on severity, so `varsel._alert_rank`'s situation-number tie-break leads with 2107.
+    assert body["summary"] == "Tog R10 07:30 er innstilt, 1 til er innstilt", body["summary"]
+
+    # Nothing alert-worthy: null, and the contract says that is not all-clear.
+    _reset(now=now)
+    _use_snapshot({"S_under": _train(dep, p_impact_dep=0.5)})
+    body = _get(wait=0).json()
+    assert body["n_alerts"] == 0 and body["summary"] is None
+
+
+def test_the_summary_carries_the_environment_tag_exactly_as_the_titles_do():
+    """A partner reading dev would otherwise hold one untagged string beside entries whose titles
+    all lead with «[dev] »."""
+    from test_varsel_api import _deployed_as
+
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    _use_snapshot({"S1": _train(now + timedelta(hours=1), p_cancel=0.3, p_impact_dep=0.9)})
+    with _deployed_as("ent-kixavvik-dev"):
+        body = _get(wait=0).json()
+    assert body["summary"] == body["alerts"][0]["payload"]["notification"]["title"]
+    assert body["summary"].startswith("[dev] Tog R10 07:00 "), body["summary"]
+
+
 # ---- Freshness and failure (KTD8, R6) --------------------------------------------------------
 
 

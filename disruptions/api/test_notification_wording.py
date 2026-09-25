@@ -923,6 +923,140 @@ def test_a_train_label_names_the_destination_beside_the_line_and_only_there():
     assert nw.notification_title(message_input, "Oslo S", "Hamar").startswith("Tog RE10 Hamar 08:00")
 
 
+# ---- The one-sentence summary (the favourites row, 2026-09-25) ------------------------------------
+
+
+def _mi(hhmm, *, line="L1", verb="delay", tomorrow=False, mode="Tog"):
+    """A message input as `llm_message.build_message_input` shapes it, by the title's own branches."""
+    mi = {"transportmiddel": mode, "linje": line, "avgang_kl": hhmm}
+    if verb == "cancelled":
+        mi["innstilt"] = True
+    elif verb == "likely":
+        mi["innstilling_prosent"] = 80
+    elif verb == "delay":
+        mi["forsinkelse_min"] = {"typisk": 8, "verstefall": 20}
+    if tomorrow:
+        mi["i_morgen"] = True
+    return mi
+
+
+def _sit(number, summary="Signalfeil ved Asker", has_situation=True):
+    """One of the payload's `situations`, as `varsel._webhook_situations` builds it."""
+    return {"situation_number": number, "summary": summary, "description": None, "has_situation": has_situation}
+
+
+def test_the_summary_leads_with_a_cause_every_train_names_and_counts_per_outcome():
+    """The cause is operator TEXT every train carries: the matcher keeps one train per situation,
+    so the numbers differ by construction and only the operator repeating itself can be shared."""
+    trains = [
+        (_mi("07:18", verb="cancelled"), [_sit("S1")]),
+        (_mi("07:48", verb="cancelled"), [_sit("S2"), _sit("S6", "Ta neste tog")]),
+        (_mi("08:18", verb="likely"), [_sit("S3")]),
+        (_mi("08:48"), [_sit("S4")]),
+        (_mi("09:18", verb="none"), [_sit("S5")]),
+    ]
+    assert nw.alerts_summary(trains) == (
+        "Signalfeil ved Asker: 2 tog er innstilt, 1 kan bli innstilt, 1 kan bli forsinket og 1 med mulig avvik"
+    )
+
+
+def test_without_a_shared_cause_the_worst_train_is_named_and_the_rest_counted():
+    # The operator said something different about the third train, so no text is every train's,
+    # and the lead is the WORST (first in the order handed in), not the soonest.
+    trains = [
+        (_mi("08:18", verb="cancelled"), [_sit("S2")]),
+        (_mi("07:18"), [_sit("S1")]),
+        (_mi("07:48"), [_sit("S3", "Ta neste tog")]),
+    ]
+    assert nw.alerts_summary(trains) == "Tog L1 08:18 er innstilt, 2 til kan bli forsinket"
+    trains = [
+        (_mi("08:18", verb="cancelled"), [_sit("S2")]),
+        (_mi("07:18", verb="likely"), [_sit("S1")]),
+        (_mi("07:48"), [_sit("S3", "Ta neste tog")]),
+        (_mi("09:48", verb="none"), [_sit("S4")]),
+    ]
+    assert nw.alerts_summary(trains) == (
+        "Tog L1 08:18 er innstilt, 1 til kan bli innstilt, 1 kan bli forsinket og 1 med mulig avvik"
+    )
+
+
+def test_a_placeholder_summary_never_leads_and_a_long_or_partial_one_falls_back():
+    # A synthetic situation every train names: its summary is ours, and `has_situation` says so.
+    placeholder = _sit("KIX:NoSituation:VYG:L1", "Mulig avvik", has_situation=False)
+    trains = [(_mi("07:18", verb="none"), [placeholder]), (_mi("07:48", verb="none"), [placeholder])]
+    assert nw.alerts_summary(trains) == "Tog L1 07:18: mulig avvik, 1 til med mulig avvik"
+    # Over the length bound the cause is not cut, it is not used.
+    long = "x" * (nw.CAUSE_MAX_CHARS + 1)
+    trains = [(_mi("07:18"), [_sit("S1", long)]), (_mi("07:48"), [_sit("S1", long)])]
+    assert nw.alerts_summary(trains) == "Tog L1 07:18 kan bli forsinket, 1 til kan bli forsinket"
+    at_bound = [(_mi("07:18"), [_sit("S1", "x" * nw.CAUSE_MAX_CHARS)]), (_mi("07:48"), [_sit("S2", "x" * nw.CAUSE_MAX_CHARS)])]
+    assert nw.alerts_summary(at_bound) == "x" * nw.CAUSE_MAX_CHARS + ": 2 tog kan bli forsinket"
+    # The first text on EVERY train leads, in the worst train's payload order; a trailing full
+    # stop is dropped so the colon follows the cause. A placeholder on one train beside operator
+    # text (a no-SX reading collapsed under a published one) neither leads nor blocks.
+    trains = [
+        (_mi("07:18"), [_sit("S_only_here", "Ta neste tog"), _sit("S1", "Signalfeil ved Asker.")]),
+        (_mi("07:48"), [_sit("KIX:NoSituation:VYG:t2", "Mulig avvik", has_situation=False),
+                        _sit("S2", "Signalfeil ved Asker")]),
+    ]
+    assert nw.alerts_summary(trains) == "Signalfeil ved Asker: 2 tog kan bli forsinket"
+
+
+def test_advice_and_status_phrases_never_lead_as_a_cause():
+    """Vy attaches «Ta neste tog» beside the cancellation message of each train it cancels, so it is
+    the text two cancelled trains most often share -- and «Ta neste tog: 2 tog er innstilt» puts
+    the advice before the fact. The stop-list drops it whole, case and full stop aside, and the
+    next shared text still leads."""
+    advice = _sit("S_advice", "Ta neste tog.")
+    trains = [
+        (_mi("07:18", verb="cancelled"), [_sit("S1", "Innstilt Stabekk–Ski"), advice]),
+        (_mi("07:48", verb="cancelled"), [_sit("S2", "Innstilt Lysaker–Ski"), _sit("S_advice2", "TA NESTE TOG")]),
+    ]
+    assert nw.alerts_summary(trains) == "Tog L1 07:18 er innstilt, 1 til er innstilt"
+    for phrase in nw.CAUSE_STOP_PHRASES:
+        assert phrase == phrase.lower().strip().rstrip("."), phrase  # stored normalized, or never matched
+        shared = [(_mi("07:18"), [_sit("S1", phrase.capitalize())]), (_mi("07:48"), [_sit("S2", phrase)])]
+        assert nw.alerts_summary(shared) == "Tog L1 07:18 kan bli forsinket, 1 til kan bli forsinket", phrase
+    # A replacement-transport notice is not advice and does lead.
+    trains = [
+        (_mi("07:18", verb="cancelled"), [_sit("S1", "Buss for tog"), advice]),
+        (_mi("07:48", verb="cancelled"), [_sit("S2", "Buss for tog"), advice]),
+    ]
+    assert nw.alerts_summary(trains) == "Buss for tog: 2 tog er innstilt"
+
+
+def test_tomorrows_trains_are_counted_apart_and_the_noun_follows_the_mode():
+    trains = [
+        (_mi("07:18", verb="cancelled"), [_sit("S1")]),
+        (_mi("07:18", verb="cancelled", tomorrow=True), [_sit("S1")]),
+        (_mi("07:48", tomorrow=True), [_sit("S1")]),
+    ]
+    assert nw.alerts_summary(trains) == "Signalfeil ved Asker: 1 tog er innstilt og 2 i morgen"
+    assert nw.alerts_summary(trains[1:]) == (
+        "Signalfeil ved Asker: 1 tog er innstilt og 1 kan bli forsinket i morgen"
+    )
+    assert nw.alerts_summary([(_mi("08:18", verb="cancelled"), [_sit("S2", "Ta neste tog")]), trains[2]]) == (
+        "Tog L1 08:18 er innstilt, 1 til kan bli forsinket i morgen"
+    )
+    bus = [(_mi("07:18", mode="Buss", line="31"), [_sit("S1")]), (_mi("07:48", mode="Buss", line="31"), [_sit("S1")])]
+    assert nw.alerts_summary(bus) == "Signalfeil ved Asker: 2 busser kan bli forsinket"
+    assert nw.alerts_summary([trains[0], bus[1]]) == "Signalfeil ved Asker: 1 avgang er innstilt og 1 kan bli forsinket"
+    one_bus = (_mi("07:18", mode="Buss", line="31", verb="cancelled"), [_sit("S1")])
+    assert nw.alerts_summary([one_bus, bus[1]]) == "Signalfeil ved Asker: 1 buss er innstilt og 1 kan bli forsinket"
+
+
+def test_one_train_is_its_own_title_and_no_train_is_nothing_to_say():
+    """The counts and the entries' titles come from one branch (`outcome_verb`), so a client
+    rendering both never sees a summary count a train under a verb its title does not use."""
+    assert nw.alerts_summary([]) is None
+    for mi in (_mi("07:18", verb="cancelled"), _mi("07:18", verb="likely"), _mi("07:18"), _mi("07:18", verb="none"),
+               _mi("07:18", tomorrow=True)):
+        title = nw.notification_title(mi, "A", "B")
+        assert nw.outcome_verb(mi) in title, title
+        assert nw.alerts_summary([(mi, [_sit("S1")])]) == title
+    assert nw.alerts_summary([(_mi("07:18", tomorrow=True), [_sit("S1")])]) == "Tog L1 07:18 i morgen kan bli forsinket"
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(
