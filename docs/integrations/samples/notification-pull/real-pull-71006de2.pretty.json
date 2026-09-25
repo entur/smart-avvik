@@ -82,6 +82,7 @@
     ],
     "to_stop_in_timetable_today": true
   },
+  "summary": "[dev] Tog F4 22:06 kan bli forsinket",
   "journey": {
     "begin": "21:00",
     "days": [

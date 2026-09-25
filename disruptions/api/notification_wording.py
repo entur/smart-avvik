@@ -369,18 +369,155 @@ def notification_title(
     Only a cancellation earns it -- a second forecast about the same train is an update, not a
     confirmation of anything.
     """
-    train = train_label_from_input(message_input)
-    if train is None:
+    title = _train_title(message_input)
+    if title is None:
         return f"{from_name} → {to_name}"
+    return f"Bekreftet: {title}" if confirmed and message_input.get("innstilt") else title
+
+
+def outcome_verb(message_input: dict) -> str:
+    """What the input says happens to the train, as the title's own verb phrase: «er innstilt»
+    (ET has declared it), «kan bli innstilt» (cancellation is the most likely outcome, so
+    `innstilling_prosent` is present), «kan bli forsinket» (a delay figure), else «mulig avvik».
+
+    One branch for the title and for :func:`alerts_summary`'s counts: a summary saying «2 kan bli
+    innstilt» beside an entry whose title says «kan bli forsinket» would be two readings of one
+    figure, and a count that put a forecast under a confirmed verb would state it as fact.
+    """
     if message_input.get("innstilt"):
-        title = f"{train} er innstilt"
-        return f"Bekreftet: {title}" if confirmed else title
+        return "er innstilt"
     if message_input.get("innstilling_prosent") is not None:
-        return f"{train} kan bli innstilt"
+        return "kan bli innstilt"
     delay = message_input.get("forsinkelse_min") or {}
     if delay.get("typisk") or delay.get("verstefall"):
-        return f"{train} kan bli forsinket"
-    return f"{train}: mulig avvik"
+        return "kan bli forsinket"
+    return "mulig avvik"
+
+
+def _train_title(message_input: dict) -> str | None:
+    """«Tog L1 07:18 er innstilt», «Tog L1 07:18: mulig avvik»; None when no departure is named."""
+    train = train_label_from_input(message_input)
+    if train is None:
+        return None
+    verb = outcome_verb(message_input)
+    return f"{train}: {verb}" if verb == "mulig avvik" else f"{train} {verb}"
+
+
+# ---- The one-sentence summary of several alerts (the favourites row, 2026-09-25) ----------------
+#: An operator summary longer than this does not lead the sentence: the counts after it would fall
+#: off a favourites row, and cutting operator text changes what it says (the 2026-08-20 rule), so
+#: the sentence names the worst train instead.
+CAUSE_MAX_CHARS = 60
+#: Operator text that never leads as a cause, matched whole after `_normalized`. From the most
+#: repeated Norwegian rail summaries of the 120 days to 2026-09-25 (one count per situation): the
+#: per-train ADVICE Vy attaches beside its cancellation message («Ta neste tog», 2 690 situations,
+#: is the second most common summary there is, and «Ta neste tog: 2 tog er innstilt» puts the advice
+#: before the fact), and the STATUS words that only restate what the counts already say or, for
+#: «Toget kjører igjen», contradict them. Replacement-transport notices («Buss for tog», «Planlegger
+#: minibuss for tog», «Vy kjører maxitaxi på strekningen») are deliberately NOT here: leading with
+#: what the operator has arranged is what a glance at a favourites row is for.
+CAUSE_STOP_PHRASES = frozenset({
+    "ta neste tog",
+    "ta andre tog",
+    "ta ruters buss",
+    "ta ruters t-bane",
+    "bruk de forreste vognene",
+    "forsinket",
+    "forsinkelse forventes",
+    "toget står",
+    "toget kjører igjen",
+})
+_VERB_ORDER = ("er innstilt", "kan bli innstilt", "kan bli forsinket", "mulig avvik")
+#: (singular, plural) by the message input's `transportmiddel`; anything else counts «avganger».
+_NOUNS = {"tog": ("tog", "tog"), "buss": ("buss", "busser")}
+_ANY_NOUN = ("avgang", "avganger")
+
+
+def _counted(inputs: list[dict], noun: tuple[str, str]) -> str:
+    """«4 tog er innstilt, 2 kan bli forsinket og 1 i morgen»: one count per outcome, worst first,
+    the noun on the first count only, in that count's number. Tomorrow's trains are one trailing
+    count, so today's verbs count today's trains alone; all tomorrow, the counts carry « i morgen»
+    instead."""
+    today = [t for t in inputs if not t.get("i_morgen")]
+    tomorrow = [t for t in inputs if t.get("i_morgen")]
+    parts: list[str] = []
+    for verb in _VERB_ORDER:
+        n = sum(1 for t in (today or tomorrow) if outcome_verb(t) == verb)
+        if n:
+            head = f"{n} {noun[0] if n == 1 else noun[1]}" if not parts else str(n)
+            parts.append(f"{head} med {verb}" if verb == "mulig avvik" else f"{head} {verb}")
+    if today and tomorrow:
+        parts.append(f"{len(tomorrow)} i morgen")
+    return _listed(parts) if today else f"{_listed(parts)} i morgen"
+
+
+def _operator_texts(situations: list[dict]) -> list[str]:
+    """The operator-written summaries among a train's situations, in payload order, less the
+    phrases on :data:`CAUSE_STOP_PHRASES`.
+
+    `has_situation` is the gate, not the situation number's shape: False means the summary is text
+    this codebase wrote (a `KIX:` placeholder such as «Mulig avvik» or «Tatt ut av dagens
+    rutetabell»), and leading with it would present our own words as an operator's cause.
+    """
+    return [
+        text
+        for situation in situations
+        if situation.get("has_situation")
+        if (text := (situation.get("summary") or "").strip().rstrip("."))
+        if text.lower() not in CAUSE_STOP_PHRASES
+    ]
+
+
+def _shared_cause(trains: list[tuple[dict, list[dict]]]) -> str | None:
+    """Operator text EVERY train's situations carry, chosen in the worst train's payload order.
+
+    Text, not a situation number: the matcher keeps one train per situation (`impact.for_trip`'s
+    `select="worst"`, folded by `varsel._collect_alerts`), so two entries never name the same
+    number and a guard on it would be a branch that cannot fire. What two trains can share is the
+    operator saying the same thing about each -- a per-journey message repeated down a line -- and
+    that is the one case a cause may be stated for all of them.
+    """
+    common = set.intersection(*(set(_operator_texts(situations)) for _, situations in trains))
+    for text in _operator_texts(trains[0][1]):
+        if text in common and len(text) <= CAUSE_MAX_CHARS:
+            return text
+    return None
+
+
+def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
+    """One sentence over every alert-worthy train on a definition, for a favourites row that is
+    skimmed rather than read. `trains` is `(message_input, payload situations)` in WORST-FIRST
+    order over every alive train and not only the listed ones, so a truncated answer reads the
+    same as a full one.
+
+    The operator's own cause leads when every train's situations carry the same operator text
+    (:func:`_shared_cause`): «Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket».
+    Otherwise the worst train is named as its own title names it and the rest are counted: «Tog
+    L1 07:18 er innstilt, 2 til kan bli forsinket» -- but only while it is the ONLY train with that
+    outcome. When another train shares the worst outcome, naming one of them says nothing the
+    others do not, so the counts stand alone: «4 tog er innstilt, 1 kan bli innstilt og 3 kan bli
+    forsinket» (2026-09-25). A single train is its title alone. The counts are per
+    :func:`outcome_verb`, so a confirmed and a forecast train never share a verb, and tomorrow's
+    trains are counted apart.
+
+    `None` for no trains: "nothing to say", never all-clear -- an empty list means no alert-worthy
+    train among the trains the service scores.
+    """
+    if not trains:
+        return None
+    inputs = [message_input for message_input, _ in trains]
+    lead = _train_title(inputs[0])
+    if len(trains) == 1:
+        return lead
+    modes = {(t.get("transportmiddel") or "").lower() for t in inputs}
+    noun = _NOUNS.get(modes.pop(), _ANY_NOUN) if len(modes) == 1 else _ANY_NOUN
+    cause = _shared_cause(trains)
+    if cause:
+        return f"{cause}: {_counted(inputs, noun)}"
+    worst = outcome_verb(inputs[0])
+    if lead is None or sum(1 for t in inputs if outcome_verb(t) == worst) > 1:
+        return _counted(inputs, noun)
+    return f"{lead}, {_counted(inputs[1:], ('til', 'til'))}"
 
 
 # ---- What a wording is keyed on (KTD9) ----------------------------------------------------------

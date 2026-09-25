@@ -39,6 +39,7 @@
     "from_stop_in_timetable_today": true,
     "to_stop_in_timetable_today": true
   },
+  "summary": "2 tog er innstilt",
   "alerts": [
     {
       "severity": 2,

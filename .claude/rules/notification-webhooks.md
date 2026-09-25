@@ -885,7 +885,21 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   byte for byte; the figures are live where the event's were its mint snapshot, the alternative can
   differ in the one case the operations document publishes, and everywhere else the wording is the
   read's own draw or the template — and the entry never says whether the definition is
-  registered. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
+  registered. **`summary` is one sentence over every ALIVE train, never the listed ones** (2026-09-25,
+  `notification_wording.alerts_summary`, for the favourites row): the operator's cause leads when
+  every train's situations carry the same operator TEXT (`has_situation`, so a `KIX:` placeholder
+  never leads; text and not a number, because `select="worst"` keeps one train per situation, so two
+  entries never share one) within `CAUSE_MAX_CHARS` and not on `CAUSE_STOP_PHRASES` — the per-train
+  advice and status words Vy repeats, «Ta neste tog» first among them, listed from the 120-day
+  summary census of 2026-09-25 — else the worst train as its own title
+  names it plus the rest counted per `outcome_verb` (the counts alone when another train shares the
+  worst outcome — the owner's call, 2026-09-25) — the title's own branch, factored out so the
+  counts and the entries' titles cannot disagree — with tomorrow's trains counted apart. Built from
+  the figures, so `wait=0` serves it final; an unlisted entry's message input is built off an
+  `_enriched(winner, None)`, for the reason that helper's docstring gives; tagged through
+  `varsel._tag_environment` as every title is. `null` for no trains, which is not all-clear. The
+  captured samples under `docs/integrations/samples/notification-pull/` carry the value derived from
+  their own entries (2026-09-25), not a re-capture. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
   ref, name, departure time or prose, only `pair_digest` and the caller's own `ET-Client-Name` as
   `client_name` (a `[A-Za-z0-9._-]{1,64}` label or `invalid`, so the header cannot carry a ref in),
   the prompt record is suppressed in code, and `logging_setup._AccessLogRedaction` strips the query string from the access log for this
