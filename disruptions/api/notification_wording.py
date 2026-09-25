@@ -433,11 +433,13 @@ _NOUNS = {"tog": ("tog", "tog"), "buss": ("buss", "busser")}
 _ANY_NOUN = ("avgang", "avganger")
 
 
-def _counted(inputs: list[dict], noun: tuple[str, str]) -> str:
-    """«4 tog er innstilt, 2 kan bli forsinket og 1 i morgen»: one count per outcome, worst first,
-    the noun on the first count only, in that count's number. Tomorrow's trains are one trailing
-    count, so today's verbs count today's trains alone; all tomorrow, the counts carry « i morgen»
-    instead."""
+def _counted(inputs: list[dict], noun: tuple[str, str], *, beside_tomorrow: bool = False) -> str:
+    """«4 tog er innstilt, 2 kan bli forsinket i dag og 1 i morgen»: one count per outcome, worst
+    first, the noun on the first count only, in that count's number. Tomorrow's trains are one
+    trailing count, so today's verbs count today's trains alone; all tomorrow, the counts carry
+    « i morgen» instead. Today's counts say « i dag» only when the sentence mentions «i morgen» --
+    here, or in the named train these counts follow (`beside_tomorrow`) -- since a sentence about
+    one day needs no day (the owner's call, 2026-09-25)."""
     today = [t for t in inputs if not t.get("i_morgen")]
     tomorrow = [t for t in inputs if t.get("i_morgen")]
     parts: list[str] = []
@@ -446,6 +448,8 @@ def _counted(inputs: list[dict], noun: tuple[str, str]) -> str:
         if n:
             head = f"{n} {noun[0] if n == 1 else noun[1]}" if not parts else str(n)
             parts.append(f"{head} med {verb}" if verb == "mulig avvik" else f"{head} {verb}")
+    if today and (tomorrow or beside_tomorrow):
+        parts[-1] += " i dag"
     if today and tomorrow:
         parts.append(f"{len(tomorrow)} i morgen")
     return _listed(parts) if today else f"{_listed(parts)} i morgen"
@@ -498,7 +502,8 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
     others do not, so the counts stand alone: «4 tog er innstilt, 1 kan bli innstilt og 3 kan bli
     forsinket» (2026-09-25). A single train is its title alone. The counts are per
     :func:`outcome_verb`, so a confirmed and a forecast train never share a verb, and tomorrow's
-    trains are counted apart.
+    trains are counted apart -- «14 tog er innstilt i dag og 2 i morgen», with «i dag» said only
+    when «i morgen» is.
 
     `None` for no trains: "nothing to say", never all-clear -- an empty list means no alert-worthy
     train among the trains the service scores.
@@ -517,7 +522,13 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
     worst = outcome_verb(inputs[0])
     if lead is None or sum(1 for t in inputs if outcome_verb(t) == worst) > 1:
         return _counted(inputs, noun)
-    return f"{lead}, {_counted(inputs[1:], ('til', 'til'))}"
+    # The named train and the counts are one sentence, so «i dag» follows the same rule across
+    # both: the lead says it when the rest mentions tomorrow, the rest says it when the lead does.
+    lead_tomorrow = bool(inputs[0].get("i_morgen"))
+    rest_tomorrow = any(t.get("i_morgen") for t in inputs[1:])
+    if rest_tomorrow and not lead_tomorrow:
+        lead = f"{lead} i dag"
+    return f"{lead}, {_counted(inputs[1:], ('til', 'til'), beside_tomorrow=lead_tomorrow)}"
 
 
 # ---- What a wording is keyed on (KTD9) ----------------------------------------------------------
