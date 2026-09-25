@@ -6122,6 +6122,23 @@ def test_every_definition_in_a_pass_is_matched_at_the_cycles_own_instant(monkeyp
     assert len(set(seen)) == 1, f"the pass matched at {len(set(seen))} different instants"
 
 
+class _InlineExecutor:
+    """`ThreadPoolExecutor` without threads, for the one shape `varsel` uses (`with ... as pool:
+    pool.map(...)`). The builtin `map` is lazy, so each call runs as its result is consumed."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def map(self, fn, *iterables):
+        return map(fn, *iterables)
+
+
 def test_the_match_pass_beats_the_heartbeat_before_it_finishes(monkeypatch):
     """A pass long enough to look wedged must not BE wedged as far as /health is concerned.
 
@@ -6135,9 +6152,16 @@ def test_the_match_pass_beats_the_heartbeat_before_it_finishes(monkeypatch):
 
     So the beat is per CHUNK of definitions, and this pins it where it matters: beats land while
     definitions are still being matched, not only after the last one.
+
+    The pass runs on `_InlineExecutor` here, not on sixteen threads. `_drain` beats per chunk of
+    results CONSUMED, while `matched` counts matches the workers FINISHED, and with real threads the
+    workers can run every match before the consumer drains its first chunk, so every beat read 129
+    (CI, 2026-09-13 and 2026-09-25: `[129, 129, 129, 129]`). Inline, a match runs as its result is
+    consumed, so the two counts are one and the chunk boundaries are exact.
     """
     _reset_state()
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    monkeypatch.setattr(varsel, "ThreadPoolExecutor", _InlineExecutor)
     matched: list[str] = []
     beats: list[int] = []
     real = varsel.match_journey
@@ -6163,7 +6187,9 @@ def test_the_match_pass_beats_the_heartbeat_before_it_finishes(monkeypatch):
     assert len(matched) == definitions, f"{len(matched)} of {definitions} definitions matched"
     assert beats, "the pass never beat the heartbeat"
     mid_pass = [n for n in beats if 0 < n < definitions]
-    assert mid_pass, f"every beat landed outside the match pass: {beats}"
+    assert mid_pass == [varsel._HEARTBEAT_EVERY, 2 * varsel._HEARTBEAT_EVERY], (
+        f"the match pass should beat once per {varsel._HEARTBEAT_EVERY} definitions: {beats}"
+    )
 
 
 def test_a_broken_heartbeat_seam_never_takes_the_cycle(monkeypatch):
