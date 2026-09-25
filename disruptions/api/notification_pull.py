@@ -391,6 +391,14 @@ class JourneyAlertsResponse(BaseModel):
     journey: JourneyOut
     windows: list[WindowOut]
     coverage: CoverageOut
+    summary: str | None = Field(
+        description="One sentence over every alert-worthy train ahead (`n_alerts`, not only the "
+        "listed ones), for a favourites row: the operator's own cause when every train's situations "
+        "carry the same operator text («Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli "
+        "forsinket»), else the worst train as its own title names it and the rest counted per "
+        "outcome («Tog L1 07:18 er innstilt, 2 til kan bli forsinket»). Built from the figures "
+        "alone, so it is complete at `wait=0`. `null` when there is nothing to say, never all-clear."
+    )
     alerts: list[JourneyAlertOut]
 
 
@@ -1494,23 +1502,41 @@ def _listed_states(
 
 
 def _assemble(
-    definition: dict, alive: list[_Entry], states: list[_EntryState], limit: int
-) -> tuple[list[JourneyAlertOut], int, bool]:
-    """The answer's list from the figures and their resolved states: the rank, the cut, `complete`.
+    definition: dict, alive: list[_Entry], states: list[_EntryState], limit: int, now: datetime
+) -> tuple[list[JourneyAlertOut], int, bool, str | None]:
+    """The answer's list from the figures and their resolved states: the rank, the cut, `complete`,
+    and the one-sentence `summary`.
 
     `alive` is the departure cut already applied against THIS request's clock (`_alive`), because
     `catchable_after` is match time and a cached figure can outlive a departure by a cycle.
     `severity` is the 1-based position in the worst-first order over every train that survived the
     cut, assigned before `limit` so a truncated answer's ranks still mean the same thing.
     `complete` is over the LISTED entries: it describes the answer a cache would hold.
+
+    `summary` is over ALIVE, in the worst-first order, so `limit` cannot change what it counts. A
+    listed entry lends its state's message input; an unlisted one gets its own build, off an
+    `_enriched` winner with no alternative -- the label and the verb read neither, and building it
+    off the raw winner would let a warmed winner's alternative into the input (see `_enriched`).
     """
     by_rank = sorted(alive, key=lambda e: varsel._alert_rank(e.winner), reverse=True)
     rank = {id(e): position for position, e in enumerate(by_rank, start=1)}
+    inputs = {id(e): state.message_input for e, state in zip(alive[:limit], states, strict=True)}
     out = [
         _assembled_entry(definition, entry, state, rank[id(entry)])
         for entry, state in zip(alive[:limit], states, strict=True)
     ]
-    return out, len(alive), all(state.terminal for state in states)
+    summary = notification_wording.alerts_summary([
+        (
+            inputs[id(e)] if id(e) in inputs else _message_input(definition, _enriched(e.winner, None), now),
+            varsel._webhook_situations(list(e.contributing)),
+        )
+        for e in by_rank
+    ])
+    # Tagged as every title is (`varsel._tag_environment`, `[dev] ` leading): a partner reading dev
+    # would otherwise hold one string without the tag beside entries that all carry it.
+    return out, len(alive), all(state.terminal for state in states), (
+        varsel._tag_environment(summary) if summary else None
+    )
 
 
 def _client_label(raw: str | None) -> str | None:
@@ -1715,7 +1741,7 @@ async def journey_alerts(
         elif await _wait_for_enrichment(future, wait, digest):
             states = _listed_states(definition, key, pair, listed, now, enabled=enabled)
 
-    alerts, n_alerts, complete = _assemble(definition, alive, states, limit)
+    alerts, n_alerts, complete, summary = _assemble(definition, alive, states, limit, now)
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE if complete else _CACHE_CONTROL_INCOMPLETE
     _log(
         "ok", cache=cache, n_alerts=n_alerts, wait_s=wait, started=started, pair_digest=digest,
@@ -1730,6 +1756,7 @@ async def journey_alerts(
         journey=JourneyOut(**definition),
         windows=[WindowOut(start=s, end=e) for s, e in windows],
         coverage=_coverage(definition),
+        summary=summary,
         alerts=alerts,
     )
 

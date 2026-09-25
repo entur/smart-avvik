@@ -509,6 +509,7 @@ and for a subscription's `from_stop`/`to_stop`.
               {"start": "2026-09-11T04:30:00+00:00", "end": "2026-09-11T07:00:00+00:00"}],
   "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "TRO", "VYG"],
                "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true},
+  "summary": "Tog L1 07:45 er innstilt",
   "alerts": [
     {
       "severity": 1,
@@ -548,6 +549,18 @@ same object, so it is not restated here. What the envelope around it means:
   worst first and a truncated answer may lack some ranks. Soonest-first is the list order because a
   panel opened on the platform needs the next train first, and on a line suspension where every
   cancellation ties, worst-first would cut a commuter's next train.
+- **`summary` is one sentence over every alert-worthy train** — `n_alerts` of them, not only the
+  listed ones, so a truncated answer reads the same as a full one — for a favourites row that is
+  skimmed rather than read. When every train's `payload.situations` carry the same operator-written
+  summary (`has_situation` true; a synthetic `KIX:` summary is never quoted as a cause, nor is
+  per-train advice such as «Ta neste tog» or a bare status such as «Forsinket») it leads:
+  «Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket». Otherwise the worst train is
+  named as its own `payload.notification.title` names it and the rest are counted per outcome:
+  «Tog L1 07:18 er innstilt, 2 til kan bli forsinket». A single train is its title alone. A confirmed
+  and a forecast train never share a verb, and tomorrow's trains are counted apart («… og 1 i
+  morgen»). It is built from the figures, so it is final at `wait=0` and never waits for wording.
+  `null` when there is nothing to say — which is never all-clear, for the same reason `n_alerts` of
+  zero is not (see `coverage` below).
 - **`phase` is `predicted` or `confirmed`** and there is no `withdrawn` entry: a train no longer over
   the gate, or whose expected departure has passed, is simply absent. `confirmed` also covers a Vy
   train missing from today's timetable altogether — it runs on this weekday, is not in today's plan,
