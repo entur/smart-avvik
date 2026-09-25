@@ -308,14 +308,17 @@ def _row_to_cached(r) -> _CachedDisruption:
     )
 
 
-def refresh_disruptions_cache() -> None:
-    """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL)."""
+def refresh_disruptions_cache(built: datetime | None = None) -> None:
+    """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL).
+
+    `built` is when the table was written, given by the startup warm load
+    (:func:`warm_caches_from_last_build`); the poller omits it and stamps the load instant."""
     rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     disruptions = [_row_to_cached(r) for r in rows]
     with _disruptions_lock:
         global _disruptions_cache, _disruptions_refreshed_at
         _disruptions_cache = disruptions
-        _disruptions_refreshed_at = datetime.now(UTC)
+        _disruptions_refreshed_at = built or datetime.now(UTC)
     logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
 
 
@@ -654,15 +657,16 @@ def _planned_call(r, *, call_source: str | None = None) -> journey_status.Planne
     )
 
 
-def refresh_rail_actuals() -> None:
+def refresh_rail_actuals(built: datetime | None = None) -> None:
     """Load `rail_calls_today` into `journey_status` when the table has been rebuilt since the copy
     it holds -- every 15 min at most (`_RAIL_CALLS_TTL`), a no-op on the ticks between.
 
     Every row is a recorded call (the SQL keeps nothing else), so each is tagged `recorded` here;
     the table carries no `call_source` column. Same stamp-is-the-guard rule as the spine: a failed
-    load keeps the previous index and the next tick retries."""
-    with _rail_calls_lock:
-        built = _rail_calls_refreshed_at
+    load keeps the previous index and the next tick retries. `built` as for the spine."""
+    if built is None:
+        with _rail_calls_lock:
+            built = _rail_calls_refreshed_at
     if built is None or journey_status.actuals_refreshed_at() == built:
         return
     rows = bq_client.query(_JOURNEY_STATUS_ACTUALS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
@@ -671,16 +675,18 @@ def refresh_rail_actuals() -> None:
     logger.info("Loaded the journey-status actuals: %d recorded calls", len(table))
 
 
-def refresh_planned_spine() -> None:
+def refresh_planned_spine(built: datetime | None = None) -> None:
     """Load `rail_calls_planned_today` into `journey_status` when the table has been rebuilt since
     the copy it holds. One ~22 000-row SELECT per rebuild, i.e. hourly; a no-op on every other tick.
 
     Stamped with `_planned_refreshed_at`, the instant the REBUILD finished, not the load: that is
     how old the timetable the strip draws is, and it is also the guard -- a failed load leaves the
     engine's stamp behind the table's, so the next tick tries again, while the engine keeps serving
-    the copy it had."""
-    with _planned_lock:
-        built = _planned_refreshed_at
+    the copy it had. `built` overrides the stamp for the startup warm load, which knows the table's
+    own modified time but must not set `_planned_refreshed_at` (that would skip the first rebuild)."""
+    if built is None:
+        with _planned_lock:
+            built = _planned_refreshed_at
     if built is None or journey_status.spine_refreshed_at() == built:
         return
     rows = bq_client.query(_JOURNEY_STATUS_SPINE_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
@@ -764,13 +770,14 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
     )
 
 
-def refresh_call_predictions_cache() -> None:
+def refresh_call_predictions_cache(built: datetime | None = None) -> None:
     """Reload the per-call predictions cache from BOTH the NSB (call_predictions_today) and the
     bus/GOA (call_predictions_bus_today) tables, keyed by (operator, jkey).
 
     NSB rows are tagged with the lineRef codespace ('VYG'); bus rows carry an explicit `operator`
     column. The bus load is isolated so a missing/failing bus table (e.g. before the first bus
-    predict runs) never blocks NSB serving."""
+    predict runs) never blocks NSB serving. `built` as for `refresh_disruptions_cache`: set under
+    the same lock as the indexes, so they and the stamp still publish as one generation."""
     by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
     by_situation: dict[str, list[impact_engine.CallPred]] = {}
     by_jkey_index: dict[str, set[str]] = {}
@@ -821,7 +828,7 @@ def refresh_call_predictions_cache() -> None:
         _call_pred_by_jkey_index = by_jkey_index
         _call_pred_by_situation = by_situation
         _call_pred_by_stop_ref = by_stop_ref
-        _call_pred_refreshed_at = datetime.now(UTC)
+        _call_pred_refreshed_at = built or datetime.now(UTC)
     try:
         situation_english.update(texts)
     except Exception:
@@ -834,6 +841,50 @@ def refresh_call_predictions_cache() -> None:
         len(by_situation),
         len(by_stop_ref),
     )
+
+
+# How old a prediction table may be and still be served by a fresh process: `/health`'s own
+# default staleness. Older than that, the previous process had stopped rebuilding (or SIRI-SX was
+# quiet for a while), and a 503 until the first cycle is the honest answer, as it was before
+# 2026-09-25. The spine and the actuals use their rebuild TTLs instead, since a healthy poller
+# leaves those tables up to an hour and a quarter of an hour old respectively.
+_WARM_PREDICTIONS_MAX_AGE = timedelta(minutes=10)
+
+
+def warm_caches_from_last_build() -> None:
+    """Load the serving caches from the tables the previous process last built, before the port
+    opens.
+
+    Without this a new pod served ~95 s of empty caches after every deploy (measured in dev
+    2026-09-25): journey-alerts answered 503 `predictions_not_loaded` and journey-status 503
+    `plan_not_loaded` until the first poller cycle had rebuilt tables that already existed, which
+    was enough to fire the 5xx alert. The pod being replaced was serving these same tables seconds
+    earlier, and the first cycle replaces every copy anyway.
+
+    Each cache is stamped with its table's modified time, never the load time, so `refreshed_at`
+    and `as_of` say how old the snapshot really is. The rebuild stamps (`_planned_refreshed_at`,
+    `_rail_calls_refreshed_at`) are deliberately left unset: they gate the ET rebuilds, and the
+    first cycle after a deploy must still rebuild those tables, since the deploy may have changed
+    their SQL. Each load stands alone. A missing, stale or unreadable table (a first deploy, an old
+    schema) leaves that one cache cold, exactly as before, for the first cycle to fill.
+    """
+    now = datetime.now(UTC)
+    for table, load, max_age in (
+        ("disruptions.predictions_today", refresh_disruptions_cache, _WARM_PREDICTIONS_MAX_AGE),
+        ("disruptions.call_predictions_today", refresh_call_predictions_cache, _WARM_PREDICTIONS_MAX_AGE),
+        ("disruptions.rail_calls_planned_today", refresh_planned_spine, _PLANNED_TTL),
+        ("disruptions.rail_calls_today", refresh_rail_actuals, _RAIL_CALLS_TTL),
+    ):
+        try:
+            built = bq_client.get_table(table).modified
+            if built is None or now - built > max_age:
+                logger.info("Warm start skipped %s: built %s, older than %s", table, built, max_age)
+                continue
+            load(built)
+        except NotFound:
+            logger.info("Warm start skipped %s: not built yet", table)
+        except Exception:
+            logger.exception("Warm start could not load %s; the first poller cycle will", table)
 
 
 # ---- Avviksvarsel providers ------------------------------------------------------------------
@@ -1311,7 +1362,8 @@ def _impact_stop_ref_index() -> (
 
 
 def _varsel_refreshed_at() -> datetime | None:
-    """When the per-call prediction cache was last loaded, or None before the poller's first load.
+    """When the per-call prediction table was built, or None before anything has loaded it (the
+    startup warm load, or failing that the poller's first cycle).
 
     The freshness provider for the journey-keyed public read on `/notification-api/v1`
     (2026-09-10): a cache nobody has loaded yet has no situations in it, and a read that answered
@@ -2318,6 +2370,10 @@ async def lifespan(app: FastAPI):
     # whole surface until the first rush resolves — which is every environment on the day it ships.
     togvarsel_outcomes.configure(bq_client=bq_client)
     togvarsel_outcomes.ensure_table()
+    # The prediction caches and the «I dag» timetable, from the tables the previous process built,
+    # so a deploy does not serve ~95 s of 503s. Before the poller starts, so its first cycle's loads
+    # always land after these (~12 s of BigQuery reads, measured 2026-09-25).
+    warm_caches_from_last_build()
     stop_event = threading.Event()
     thread = threading.Thread(
         target=poll_for_changes,

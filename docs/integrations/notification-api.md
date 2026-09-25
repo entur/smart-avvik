@@ -189,11 +189,13 @@ gating onboarding on the flag that needs onboarding is circular. Two consequence
   of its own below.
   **tst answers this today; dev and prd have had the pepper since 2026-09-10**: the database name ships in the base chart and is
   inherited everywhere, so the pepper is the only discriminator and it exists in dev and prd. Any other store fault answers **503 `store_unavailable`**.
-- **The public read has a 503 of its own, and you will meet it after every deploy**: **503
-  `{"detail": "predictions_not_loaded"}`** with `Retry-After: 60` for about a minute after the
-  process starts, until the poller's first load. It is deliberately never an empty list — an empty
-  list off an empty cache would report an empty process as a calm day. Your own cache carries the
-  panel across it. A failed match answers **503 `matcher_failed`**, likewise retryable.
+- **The public read has a 503 of its own**: **503 `{"detail": "predictions_not_loaded"}`** with
+  `Retry-After: 60` while the process has no predictions loaded. It is deliberately never an empty
+  list — an empty list off an empty cache would report an empty process as a calm day. Since
+  2026-09-25 a new process loads the predictions the previous one built before it takes requests, so
+  an ordinary deploy no longer produces it; you meet it when those were missing or more than ten
+  minutes old (a first deploy, or after the service was down), for about a minute and a half, until
+  the first poller cycle. Your own cache carries the panel across it. A failed match answers **503 `matcher_failed`**, likewise retryable.
 
 `NOTIFICATION_WEBHOOKS_ENABLED` gates the *notification pass* — whether the poller matches
 subscriptions and delivers events — not the API. With it off you can register watches and read them
@@ -759,8 +761,9 @@ cycle. The answer is always `Cache-Control: public, max-age=60`.
 
 **Limits.** The read spends the same global and per-pair buckets as `journey-alerts`, not buckets
 of its own. A BFF reading both routes for one favourite therefore spends the per-pair thirty a
-minute twice as fast. After a deploy the timetable is not in memory for the first poller cycle, and
-the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list. A grading failure
+minute twice as fast. When the process has no timetable in memory (a first deploy, or one whose last
+timetable is more than an hour old) the read answers `503 plan_not_loaded` with `Retry-After` until
+the first poller cycle, never an empty list. A grading failure
 is `503 status_failed`, also retryable.
 
 **Coverage.** `operators` and `coverage.operators` are `["VYG"]`: the timetable behind this read is

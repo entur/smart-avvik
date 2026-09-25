@@ -40,6 +40,12 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the module's own pool and never waited for. It is looked up by situation number and never enters
   `message_input` (that is the wording key: English there would re-word every train). Gated on
   `VARSEL_LLM_PROVIDER` alone, not on the wording switches.
+- **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
+  lifespan loads the prediction caches and the «I dag» timetable from the tables the previous pod
+  built (`main.warm_caches_from_last_build`), so the public reads' 503s are left for a first deploy
+  or a table past its age bound (10 min for predictions, the rebuild TTLs for the spine and the
+  actuals). The 503 contract is unchanged. Before this, every deploy's cold window could fire dev's
+  5xx rule at dev's traffic, and it did when two deploys landed minutes apart that day.
 - **Where the train terminates rides beside the title** (2026-09-25): `payload.destination` (built
   in `varsel._webhook_payload` from `Alert.destination`, so the event, the journey-alerts read and
   the test event carry it) and the read's `train.destination`. It is in the PAYLOAD, not the
