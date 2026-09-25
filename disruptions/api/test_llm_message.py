@@ -1269,6 +1269,26 @@ def test_a_discarded_reply_is_returned_beside_the_status_that_rejected_it():
     assert result.model == llm_message._CLAUDE_MODEL
 
 
+def test_a_rejected_reply_says_why_and_how_long():
+    """`too_long` was indistinguishable from an empty reply in the logs; the record now names it."""
+    cases = [
+        (json.dumps({"melding": "x" * 301}), "too_long", 301),
+        ("", "empty", 0),
+        ('{"melding": "Det er 93 % sjan', "malformed", len('{"melding": "Det er 93 % sjan')),
+    ]
+    for reply, reason, chars in cases:
+        _reset(provider="claude")
+        llm_message._BACKENDS["claude"] = lambda body, reply=reply: reply
+        try:
+            fields = _log_fields_of(lambda: llm_message.write_message_detailed({"a": 1}))
+        finally:
+            llm_message._BACKENDS["claude"] = llm_message._claude_write
+        rejected = [f for f in fields if f.get("result") == "rejected"]
+        assert len(rejected) == 1, fields
+        assert (rejected[0]["reason"], rejected[0]["chars"]) == (reason, chars), rejected[0]
+    assert llm_message._parse_reply(json.dumps({"melding": "x" * 300}))[1:] == (None, 300)
+
+
 def test_a_successful_call_discards_nothing():
     _reset(provider="claude")
     llm_message._BACKENDS["claude"] = lambda body: '{"melding":"Toget er innstilt."}'
