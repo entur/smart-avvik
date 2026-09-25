@@ -485,8 +485,8 @@ def test_operator_text_every_train_carries_leads_the_summary_and_a_placeholder_n
     _use_snapshot(removed)
     body = _get(wait=0).json()
     assert body["n_alerts"] == 2
-    # The two tie on severity, so `varsel._alert_rank`'s situation-number tie-break leads with 2107.
-    assert body["summary"] == "Tog R10 07:30 er innstilt, 1 til er innstilt", body["summary"]
+    # Both are cancelled, so no single train is worth naming: the count stands alone.
+    assert body["summary"] == "2 tog er innstilt", body["summary"]
 
     # Nothing alert-worthy: null, and the contract says that is not all-clear.
     _reset(now=now)

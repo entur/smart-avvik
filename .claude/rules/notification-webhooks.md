@@ -892,7 +892,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   entries never share one) within `CAUSE_MAX_CHARS` and not on `CAUSE_STOP_PHRASES` — the per-train
   advice and status words Vy repeats, «Ta neste tog» first among them, listed from the 120-day
   summary census of 2026-09-25 — else the worst train as its own title
-  names it plus the rest counted per `outcome_verb` — the title's own branch, factored out so the
+  names it plus the rest counted per `outcome_verb` (the counts alone when another train shares the
+  worst outcome — the owner's call, 2026-09-25) — the title's own branch, factored out so the
   counts and the entries' titles cannot disagree — with tomorrow's trains counted apart. Built from
   the figures, so `wait=0` serves it final; an unlisted entry's message input is built off an
   `_enriched(winner, None)`, for the reason that helper's docstring gives; tagged through

@@ -978,17 +978,30 @@ def test_without_a_shared_cause_the_worst_train_is_named_and_the_rest_counted():
     assert nw.alerts_summary(trains) == (
         "Tog L1 08:18 er innstilt, 1 til kan bli innstilt, 1 kan bli forsinket og 1 med mulig avvik"
     )
+    # A second train with the worst outcome: naming one of them says nothing the other does not,
+    # so the counts stand alone (the owner's example, 2026-09-25).
+    trains = [
+        (_mi("11:33", verb="cancelled"), [_sit("S1")]),
+        (_mi("07:03", verb="cancelled"), [_sit("S2", "Innstilt Asker–Skøyen")]),
+        (_mi("07:42", verb="cancelled"), [_sit("S3", "Ta andre tog")]),
+        (_mi("09:35", verb="cancelled"), [_sit("S4", "Buss for tog")]),
+        (_mi("09:50", verb="likely"), [_sit("S5", "Innstilt Skøyen–Asker")]),
+        (_mi("09:05"), [_sit("S6", "Forsinkelser på Drammenbanen")]),
+        (_mi("10:20"), [_sit("S7", "Toget står")]),
+        (_mi("13:20"), [_sit("S8", "Minibuss for tog")]),
+    ]
+    assert nw.alerts_summary(trains) == "4 tog er innstilt, 1 kan bli innstilt og 3 kan bli forsinket"
 
 
 def test_a_placeholder_summary_never_leads_and_a_long_or_partial_one_falls_back():
     # A synthetic situation every train names: its summary is ours, and `has_situation` says so.
     placeholder = _sit("KIX:NoSituation:VYG:L1", "Mulig avvik", has_situation=False)
     trains = [(_mi("07:18", verb="none"), [placeholder]), (_mi("07:48", verb="none"), [placeholder])]
-    assert nw.alerts_summary(trains) == "Tog L1 07:18: mulig avvik, 1 til med mulig avvik"
+    assert nw.alerts_summary(trains) == "2 tog med mulig avvik"
     # Over the length bound the cause is not cut, it is not used.
     long = "x" * (nw.CAUSE_MAX_CHARS + 1)
-    trains = [(_mi("07:18"), [_sit("S1", long)]), (_mi("07:48"), [_sit("S1", long)])]
-    assert nw.alerts_summary(trains) == "Tog L1 07:18 kan bli forsinket, 1 til kan bli forsinket"
+    trains = [(_mi("07:18"), [_sit("S1", long)]), (_mi("07:48", verb="none"), [_sit("S1", long)])]
+    assert nw.alerts_summary(trains) == "Tog L1 07:18 kan bli forsinket, 1 til med mulig avvik"
     at_bound = [(_mi("07:18"), [_sit("S1", "x" * nw.CAUSE_MAX_CHARS)]), (_mi("07:48"), [_sit("S2", "x" * nw.CAUSE_MAX_CHARS)])]
     assert nw.alerts_summary(at_bound) == "x" * nw.CAUSE_MAX_CHARS + ": 2 tog kan bli forsinket"
     # The first text on EVERY train leads, in the worst train's payload order; a trailing full
@@ -1012,11 +1025,11 @@ def test_advice_and_status_phrases_never_lead_as_a_cause():
         (_mi("07:18", verb="cancelled"), [_sit("S1", "Innstilt Stabekk–Ski"), advice]),
         (_mi("07:48", verb="cancelled"), [_sit("S2", "Innstilt Lysaker–Ski"), _sit("S_advice2", "TA NESTE TOG")]),
     ]
-    assert nw.alerts_summary(trains) == "Tog L1 07:18 er innstilt, 1 til er innstilt"
+    assert nw.alerts_summary(trains) == "2 tog er innstilt"
     for phrase in nw.CAUSE_STOP_PHRASES:
         assert phrase == phrase.lower().strip().rstrip("."), phrase  # stored normalized, or never matched
-        shared = [(_mi("07:18"), [_sit("S1", phrase.capitalize())]), (_mi("07:48"), [_sit("S2", phrase)])]
-        assert nw.alerts_summary(shared) == "Tog L1 07:18 kan bli forsinket, 1 til kan bli forsinket", phrase
+        shared = [(_mi("07:18"), [_sit("S1", phrase.capitalize())]), (_mi("07:48", verb="none"), [_sit("S2", phrase)])]
+        assert nw.alerts_summary(shared) == "Tog L1 07:18 kan bli forsinket, 1 til med mulig avvik", phrase
     # A replacement-transport notice is not advice and does lead.
     trains = [
         (_mi("07:18", verb="cancelled"), [_sit("S1", "Buss for tog"), advice]),

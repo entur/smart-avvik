@@ -556,7 +556,9 @@ same object, so it is not restated here. What the envelope around it means:
   per-train advice such as «Ta neste tog» or a bare status such as «Forsinket») it leads:
   «Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket». Otherwise the worst train is
   named as its own `payload.notification.title` names it and the rest are counted per outcome:
-  «Tog L1 07:18 er innstilt, 2 til kan bli forsinket». A single train is its title alone. A confirmed
+  «Tog L1 07:18 er innstilt, 2 til kan bli forsinket» — unless another train shares the worst
+  outcome, when the counts stand alone: «4 tog er innstilt, 1 kan bli innstilt og 3 kan bli
+  forsinket». A single train is its title alone. A confirmed
   and a forecast train never share a verb, and tomorrow's trains are counted apart («… og 1 i
   morgen»). It is built from the figures, so it is final at `wait=0` and never waits for wording.
   `null` when there is nothing to say — which is never all-clear, for the same reason `n_alerts` of

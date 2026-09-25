@@ -396,7 +396,9 @@ class JourneyAlertsResponse(BaseModel):
         "listed ones), for a favourites row: the operator's own cause when every train's situations "
         "carry the same operator text («Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli "
         "forsinket»), else the worst train as its own title names it and the rest counted per "
-        "outcome («Tog L1 07:18 er innstilt, 2 til kan bli forsinket»). Built from the figures "
+        "outcome («Tog L1 07:18 er innstilt, 2 til kan bli forsinket»), or the counts alone when "
+        "another train shares the worst outcome («4 tog er innstilt, 1 kan bli innstilt og 3 kan bli "
+        "forsinket»). Built from the figures "
         "alone, so it is complete at `wait=0`. `null` when there is nothing to say, never all-clear."
     )
     alerts: list[JourneyAlertOut]
