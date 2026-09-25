@@ -128,6 +128,10 @@
           "description": "Delay figures, or null for a confirmed cancellation."
         },
         "effect": { "type": ["string", "null"] },
+        "destination": {
+          "type": ["string", "null"],
+          "description": "Where the train terminates, as a departure board names it (`Drammen`), and the same value `notification.title` names the train with: «Tog R14 Drammen 14:59». Null when we do not know it, which today is every train but Vy's and every bus. Absent from an event minted before the field existed."
+        },
         "situations": {
           "type": "array",
           "items": { "type": "object" },

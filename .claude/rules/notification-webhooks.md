@@ -40,6 +40,13 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the module's own pool and never waited for. It is looked up by situation number and never enters
   `message_input` (that is the wording key: English there would re-word every train). Gated on
   `VARSEL_LLM_PROVIDER` alone, not on the wording switches.
+- **Where the train terminates rides beside the title** (2026-09-25): `payload.destination` (built
+  in `varsel._webhook_payload` from `Alert.destination`, so the event, the journey-alerts read and
+  the test event carry it) and the read's `train.destination`. It is in the PAYLOAD, not the
+  envelope, on purpose: the envelope is `additionalProperties: false` and `notifications-client`'s
+  `parseEvent` refuses an unknown top-level field, so an envelope field would have failed every
+  existing receiver on every event. It mints nothing when it changes, and journey-status's trains
+  already had it (#234).
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
   `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the

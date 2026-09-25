@@ -176,6 +176,25 @@ def test_two_alert_worthy_trains_answer_two_entries_soonest_first():
     assert body["alerts"][0]["train"]["journey_ref"] == "t1"
 
 
+def test_the_train_carries_the_destination_its_notification_title_names(monkeypatch):
+    """«R10 Drammen 07:00» in the title and `train.destination` are one value; null for a train the
+    spine has no terminus for, whose title then names the line alone."""
+    import journey_status
+
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    monkeypatch.setattr(journey_status, "destination", lambda operator, jkey: {"t1": "Drammen"}.get(jkey))
+    _use_snapshot({
+        "S1": _train(now + timedelta(hours=1), p_cancel=0.9, p_impact_dep=0.95),
+        "S2": _train(now + timedelta(hours=2), jkey="t2", situation="S2", p_cancel=0.9, p_impact_dep=0.95),
+    })
+    body = _get().json()
+    trains = [(a["train"]["destination"], a["payload"]["notification"]["title"]) for a in body["alerts"]]
+    assert [d for d, _title in trains] == ["Drammen", None], trains
+    assert "R10 Drammen 07:00" in trains[0][1] and "R10 08:00" in trains[1][1], trains
+    assert [a["payload"]["destination"] for a in body["alerts"]] == ["Drammen", None], "the event's field too"
+
+
 def test_the_selection_is_the_collapse_then_the_gate_and_nothing_the_card_adds():
     """R2/KTD7. Three things absent that other surfaces show: a published situation UNDER the gate
     (the card shows every published one through `has_situation`); the U2 collapse-then-gate case

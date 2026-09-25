@@ -5455,6 +5455,26 @@ def test_a_declared_cancellation_carries_no_delay_figures_in_its_payload(monkeyp
     assert subject.payload["effect"] == "cancelled"
 
 
+def test_the_event_payload_carries_the_destination_its_title_names(monkeypatch):
+    """`payload.destination` is the value the title names the train with, and null when the spine
+    has no terminus for it -- the same field the journey-alerts read carries, from one builder."""
+    import journey_status
+
+    for destination in ("Drammen", None):
+        _reset_state()
+        monkeypatch.setattr(varsel, "push_enabled", lambda: False)
+        monkeypatch.setattr(journey_status, "destination", lambda operator, jkey, d=destination: d)
+        _capture_writes(monkeypatch)
+        _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+        cancelled = {"S1": _cancelled_notice("S1")}
+        _use_snapshot(cancelled)
+
+        [subject] = _subjects(varsel.check_and_notify(cancelled))
+        assert subject.payload["destination"] == destination
+        assert (" Drammen " in subject.payload["notification"]["title"]) == (destination is not None)
+    _use_snapshot(SNAPSHOT)
+
+
 def test_a_webhook_delivery_can_never_enter_pushed_keys(monkeypatch):
     """U6 scenario 5 / KTD10's second leak, closed structurally rather than by care.
 

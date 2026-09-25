@@ -1211,7 +1211,7 @@ def _synthetic_event(
                 # Norwegian, like every traveller-facing string in this repo, and marked as a test
                 # in the text itself -- the same choice `/togmelding`'s test round makes, so a
                 # notification that reaches a real lock screen during integration says so.
-                "title": "Testvarsel: Tog L1 er innstilt",
+                "title": "Testvarsel: Tog L1 Lillestrøm er innstilt",
                 "body": (
                     f"{sub.from_stop} → {sub.to_stop}\n"
                     "Dette er et testvarsel fra Entur. Ingen virkelige avganger er berørt."
@@ -1248,6 +1248,8 @@ def _synthetic_event(
             # Null, because every delay figure meant "if it runs".
             "delay": None,
             "effect": "cancelled",
+            # The title's own, as on a real event.
+            "destination": "Lillestrøm",
             "situations": [
                 {
                     "situation_number": situation_number,

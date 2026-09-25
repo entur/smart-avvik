@@ -321,7 +321,8 @@ class CoverageOut(BaseModel):
 
 
 class TrainOut(BaseModel):
-    """The train's identity, in `notification_store.TrainRef`'s shape (the webhook's own)."""
+    """The train's identity, in `notification_store.TrainRef`'s shape (the webhook's own), plus
+    where it terminates -- display only, never part of the identity."""
 
     model_config = ConfigDict(extra="forbid")
     operator: str
@@ -330,7 +331,8 @@ class TrainOut(BaseModel):
     call_date: str
     stop_place: str
     stop_order: int
-
+    # The same value `payload.notification.title` names the train with («R14 Drammen 14:59»).
+    destination: str | None
 
 class WordingOut(BaseModel):
     """Where `payload.notification`'s text came from: `llm` or `deterministic`, and why."""
@@ -677,6 +679,7 @@ def _figures_from_alerts(
                     call_date=ref.call_date,
                     stop_place=ref.stop_place,
                     stop_order=ref.stop_order,
+                    destination=winner.destination,
                 ),
                 train_key=train_key,
                 expected_departure=expected,

@@ -217,7 +217,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   about the train** («Tog L1 07:18 er innstilt», `varsel._notification_title`; since 2026-09-24
   «Tog RE10 Hamar 07:18» — the destination rides beside the line, from the journey-status spine's
   terminus call via `journey_status.destination`, as `destinasjon` in the message input and
-  `destination` on the Alert, TrainStatus and the alternative's legs (JP front text); null for
+  `destination` on the Alert, TrainStatus, the journey-alerts read's `train`, the webhook payload
+  (`payload.destination`) and the alternative's legs (JP front text); null for
   bus and before the spine loads, and the label is then unchanged) and the **body
   leads with the route** on its own line, then the wording — the wording itself is unchanged, so
   `/historikk`'s `message` and every wording comparison are untouched, but anything reading a push
