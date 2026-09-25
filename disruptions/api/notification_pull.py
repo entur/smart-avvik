@@ -83,12 +83,13 @@ import alternatives
 import decisions
 import impact as impact_engine
 import journey_status
+import metrics
 import notification_api
 import notification_auth
 import notification_events
 import notification_wording
 import varsel
-from fastapi import APIRouter, Header, HTTPException, Query, Response
+from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -1637,6 +1638,7 @@ router = APIRouter(prefix=notification_api.PREFIX, tags=[TAG])
     },
 )
 async def journey_alerts(
+    request: Request,
     response: Response,
     from_stop: str = Query(description="Boarding stop, `NSR:StopPlace:<digits>`."),
     to_stop: str = Query(description="Alighting stop, `NSR:StopPlace:<digits>`."),
@@ -1675,6 +1677,10 @@ async def journey_alerts(
     (`00:00`-`23:59`); no days means today's and tomorrow's Oslo weekday.
     """
     started = monotonic()
+    # Time this read spends waiting is time the caller asked for, so the HTTP metrics middleware
+    # files it apart from ordinary latency (rule 11 excludes it). Keyed on the parsed `wait`, which
+    # defaults to MAX_WAIT_S -- a read without the parameter waits the longest.
+    request.scope[metrics.LONG_POLL_SCOPE_KEY] = wait > 0
     now = _now()
     definition = _definition(from_stop, to_stop, begin, end, days, now)
     pair = (definition["from_stop"], definition["to_stop"])

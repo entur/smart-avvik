@@ -155,8 +155,10 @@ LOG_RECORDS_TOTAL = Counter(
 HTTP_REQUEST_DURATION = Histogram(
     "kix_http_request_duration_seconds",
     "Wall-clock duration of requests on the public app port, by method and first path segment "
-    "(allowlisted below, else `other`).",
-    ["method", "path"],
+    "(allowlisted below, else `other`). `long_poll` is `true` for a request whose handler waits "
+    "as long as the caller asked (journey-alerts with `wait` > 0), so latency alerting can leave "
+    "caller-chosen waits out.",
+    ["method", "path", "long_poll"],
 )
 HTTP_REQUESTS_TOTAL = Counter(
     "kix_http_requests_total",
@@ -210,6 +212,11 @@ KNOWN_PATH_SEGMENTS = frozenset(
 _KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"})
 
 
+#: Scope key a handler sets to True when its duration is a wait the caller asked for. The handler
+#: sets it, not this middleware, because only the handler knows the parsed value and its default.
+LONG_POLL_SCOPE_KEY = "kix.long_poll"
+
+
 def _path_label(path: str) -> str:
     segment = path.lstrip("/").split("/", 1)[0]
     return segment if segment in KNOWN_PATH_SEGMENTS else "other"
@@ -251,7 +258,8 @@ class HTTPMetrics:
             # response start seen means exactly that case; the server answers 500 for it, so 5xx.
             elapsed = time.perf_counter() - started
             status = f"{status_code // 100}xx" if status_code is not None else "5xx"
-            HTTP_REQUEST_DURATION.labels(method=method, path=path).observe(elapsed)
+            long_poll = "true" if scope.get(LONG_POLL_SCOPE_KEY) else "false"
+            HTTP_REQUEST_DURATION.labels(method=method, path=path, long_poll=long_poll).observe(elapsed)
             HTTP_REQUESTS_TOTAL.labels(method=method, path=path, status=status).inc()
 
 
