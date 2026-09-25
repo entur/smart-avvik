@@ -52,8 +52,8 @@ Bounds this module owns, each a number so it can be checked, and each published 
   a definition is free to mint -- three hundred periods on one pair are one bucket.
 * **A figures cache per definition per poller cycle** (KTD3, R8): keyed on `(journey_key,
   refreshed_at, Oslo day)` with single-flight per key, so a warm read within a cycle runs no matcher.
-* **A cold cache is a 503, never an empty list** (KTD8, R6): a cache the poller has not loaded has no
-  situations in it, and "no disruptions" off it would report an empty process as a calm day.
+* **A cold cache is a 503, never an empty list** (KTD8, R6): a cache nothing has loaded (neither the
+  startup warm load, `main.warm_caches_from_last_build`, nor the poller) has no situations in it, and "no disruptions" off it would report an empty process as a calm day.
 * **The enrichment pool** (KTD5): `WORKERS` threads, a queue of `QUEUE_MAX` bounded BY THIS MODULE
   (a `ThreadPoolExecutor` queues without limit), `WORDING_WORKERS` wide inside a task, the wording
   cap per read, the waiter ceiling, and the two cache lifetimes.
