@@ -90,6 +90,16 @@ export interface Segment {
   n_hit_trains: number;
 }
 
+/** One operating day of the blended figures. Days with no labelled decision are absent. */
+export interface DailyPoint {
+  call_date: string;
+  n_hit: number;
+  n_false_alarm: number;
+  n_miss: number;
+  precision: number | null;
+  recall: number | null;
+}
+
 export interface Summary {
   from_date: string;
   to_date: string;
@@ -127,6 +137,9 @@ export interface Summary {
   /** Decided before the flag existed; in neither segment. While this dominates, the split covers
    *  only a slice of the window. */
   n_unsegmented: number;
+  /** Oldest first, same rows and filters as the totals. Absent from responses served before
+   *  2026-09-25, hence optional. */
+  daily?: DailyPoint[];
 }
 
 /** One entry in the "Fra"/"Til" dropdowns: one physical PLACE, not one stop ref.

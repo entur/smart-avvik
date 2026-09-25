@@ -1,6 +1,7 @@
 import { Heading3, Heading4, Paragraph, SubParagraph } from '@entur/typography';
 import type { Segment, Summary } from '../api';
 import { fmtMin, fmtPct } from '../format';
+import TrendChart from './TrendChart';
 
 /** How much of the window actually has a verdict. A rate computed over a fifth of the decisions
  *  is a different claim from one computed over almost all of them, and the reader cannot tell
@@ -225,6 +226,8 @@ export default function SummaryStrip({ summary }: { summary: Summary }) {
         <span className="vh-count vh-count--muted">Ukjent {summary.n_unknown}</span>
         <span className="vh-count vh-count--muted">Venter {summary.n_pending}</span>
       </div>
+
+      <TrendChart summary={summary} />
 
       <SegmentSplit summary={summary} />
     </section>
