@@ -394,6 +394,17 @@ class Segment(BaseModel):
     )
 
 
+class DailyPoint(BaseModel):
+    """One operating day of the blended figures, for the page's trend chart."""
+
+    call_date: date = Field(description="Operating day (Europe/Oslo).")
+    n_hit: int = Field(description="Alerted, and trouble came.")
+    n_false_alarm: int = Field(description="Alerted, no trouble.")
+    n_miss: int = Field(description="Did not alert, trouble came.")
+    precision: float | None = Field(description="hit / (hit + false_alarm). Null when nothing was alerted.")
+    recall: float | None = Field(description="hit / (hit + miss). Null when no trouble was observed.")
+
+
 class Summary(BaseModel):
     """Alerting performance over the window — counts first, rates second, coverage always.
 
@@ -477,6 +488,17 @@ class Summary(BaseModel):
         description="Labelled decisions taken before the flag existed (2026-08-05), in no "
         "segment. While this dominates, the split describes only a slice of the window.",
     )
+    daily: list[DailyPoint] = Field(
+        default_factory=list,
+        description="The blended counts per operating day, oldest first, over the same rows and "
+        "filters. A day with no labelled decision is absent rather than zero: the most recent days "
+        "are missing until the nightly labelling has run.",
+    )
+
+
+def _rate(numerator: int, denominator: int) -> float | None:
+    """A rate over nothing is None, not 0 -- 0 % would read as "everything wrong"."""
+    return numerator / denominator if denominator else None
 
 
 def _checked_operator(operator: str | None) -> str | None:
@@ -1013,4 +1035,15 @@ def summary(
         no_sx=segment("no_sx"),
         removed=segment("removed"),
         n_unsegmented=row.get("n_unsegmented") or 0,
+        daily=[
+            DailyPoint(
+                call_date=d["call_date"],
+                n_hit=d["n_hit"],
+                n_false_alarm=d["n_false_alarm"],
+                n_miss=d["n_miss"],
+                precision=_rate(d["n_hit"], d["n_hit"] + d["n_false_alarm"]),
+                recall=_rate(d["n_hit"], d["n_hit"] + d["n_miss"]),
+            )
+            for d in row.get("daily") or []
+        ],
     )
