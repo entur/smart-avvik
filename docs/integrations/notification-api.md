@@ -645,6 +645,8 @@ event":
 - it is **the notification only**: the figures are live where the event's were its mint-time
   snapshot (a revision is minted only on a lifecycle transition, so the event's numbers may be a
   cycle old), and the alternative can differ in one case the operating contract publishes;
+- the situations' **machine-translated English** can differ too: the read assembles it per request,
+  so it carries a translation that landed after the event was minted (see [the payload](#payload));
 - it is **one channel's**: identity is with the webhook event, and the browser push can differ while
   the two prose switches disagree (see the operations document);
 - everywhere else the wording is **the read's own draw from a non-deterministic model**, or the
@@ -747,7 +749,11 @@ scored on `/historikk`, and nothing here notifies anybody.
 
 **Samples**: `samples/notification-webhooks/` holds a real `journey.alert.created` event as the exact
 bytes that were signed and sent, and a `POST /test-events` request captured verbatim at a receiver
-with its three signing headers — both from dev on 2026-09-10.
+with its three signing headers — both from dev on 2026-09-10. Both, and the journey-alerts samples
+under `samples/notification-pull/`, predate the situations' English (2026-09-24), so their
+`payload.situations` entries lack `summary_en`, `description_en` and `en_machine_translated`; they
+are signed captures and are kept as sent. `contracts/notifications/v1/test-event-sample.json` has
+the current shape.
 
 `contracts/notifications/v1/event.schema.json` is the authority. `additionalProperties: false` **on
 the envelope**; the nested objects under `payload` are deliberately open.
@@ -820,7 +826,27 @@ last hour of observation and the probability decays with the ask horizon far fas
 off the event; do not assume the published per-operator cut. A `situations` entry whose
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
 (`{typical_min, worst_case_min}` or `null`), `effect`, `situations` (objects: `situation_number`,
-`summary`, `description`, `has_situation`) and `alternative_journey` (`object|null`).
+`summary`, `description`, `summary_en`, `description_en`, `en_machine_translated`, `has_situation`)
+and `alternative_journey` (`object|null`).
+
+**Every situation carries its text in English as well as Norwegian** (since 2026-09-24).
+`summary` and `description` are the Norwegian, as before; `summary_en` and `description_en` are the
+English, from one of three places, and `en_machine_translated` says which:
+
+| Source | `en_machine_translated` | When |
+|---|---|---|
+| The operator's own English, from the same SIRI-SX message as the Norwegian | `false` | Vy publishes it on every situation, Ruter on nearly every one |
+| Our own English, for a `KIX:` situation whose Norwegian we also wrote | `false` | the no-message, cancellation and removed-train rows |
+| A machine translation (Gemini, on Vertex AI in the EU) of the Norwegian | `true` | operators that publish no English — in September 2026 GCO, MOR, NOR, FIN and TRO |
+
+Present a machine translation **as** one: it is not the operator's statement, for the same reason a
+`has_situation: false` summary is not. A translation is made in the background, so it can land a
+poller cycle or two after the situation first appears; until it does, all three English fields are
+`null` and you render the Norwegian. A webhook event keeps what it was minted with (a changed text
+mints nothing), so an event minted inside that window carries no English, while the
+journey-alerts read, which assembles its payload per request, picks it up on the next read.
+`VARSEL_LLM_PROVIDER=off` stops the translations along with every other model call; the operator's
+English is unaffected.
 
 **`payload.call` carries an aimed time and never an expected one, and no boarding or alighting
 flags — both by design, and the schema now says so.** The real-time estimate for this call is what
