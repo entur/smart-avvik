@@ -293,6 +293,22 @@ class StatsRow(BaseModel):
     )
 
 
+class TrendPoint(BaseModel):
+    """One ISO week of the total row, for the page's trend chart."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    week_start: date = Field(description="Monday of the week (Oslo). The window's first and last "
+                             "weeks can be partial.")
+    presisjon: float | None = Field(description="As the total row's, over this week's issues.")
+    presisjon_num: int = Field(description="Justified pushes.")
+    presisjon_den: int = Field(description="Pushes on scored issues.")
+    dekning: float | None = Field(description="As the total row's: per RUSH, over this week.")
+    dekning_num: int = Field(description="Rushes owing a push that got a justified one.")
+    dekning_den: int = Field(description="Rushes owing a push.")
+    n_venter: int = Field(description="Issues whose outcome is not settled yet.")
+
+
 class DaysResponse(BaseModel):
     """The page: one row per day, plus the stats table over the same population."""
 
@@ -302,6 +318,11 @@ class DaysResponse(BaseModel):
     from_date: date = Field(description="First Oslo date included.")
     days: list[DayRow] = Field(description="Newest first.")
     stats: list[StatsRow] = Field(description="The total row first, then one per issue slot.")
+    trend: list[TrendPoint] = Field(
+        description="The total row's Presisjon and Dekning per ISO week, oldest first. Weekly "
+        "rather than daily because a day has at most four rounds, so a day's rate would be over "
+        "zero, one or two pushes."
+    )
     recording_started: date | None = Field(
         description="The earliest day a notification round was ever recorded. A reconstructed "
         "round BEFORE this is the expected pre-launch backlog; one after it can only mean a lost "
@@ -555,6 +576,30 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
     ]
 
 
+def _trend(issues: list[verdicts.Issue]) -> list[TrendPoint]:
+    """The total row per ISO week, from the same summarize() the table uses, so a week's figures
+    are the table's over that week and cannot be defined twice."""
+    weeks: dict[date, list[verdicts.Issue]] = {}
+    for issue in issues:
+        weeks.setdefault(issue.d - timedelta(days=issue.d.weekday()), []).append(issue)
+    points = []
+    for week_start in sorted(weeks):
+        total = verdicts.summarize(weeks[week_start]).total
+        points.append(
+            TrendPoint(
+                week_start=week_start,
+                presisjon=total.presisjon,
+                presisjon_num=total.presisjon_num,
+                presisjon_den=total.presisjon_den,
+                dekning=total.dekning,
+                dekning_num=total.dekning_num,
+                dekning_den=total.dekning_den,
+                n_venter=total.counts.n_venter,
+            )
+        )
+    return points
+
+
 router = APIRouter(prefix="/rushhistorikk-api", tags=["rushhistorikk"])
 
 
@@ -635,5 +680,6 @@ def days(
         from_date=from_date,
         days=day_rows,
         stats=_stats_rows(stats),
+        trend=_trend(issues),
         recording_started=rows[0]["first_recorded_day"] if rows else None,
     )
