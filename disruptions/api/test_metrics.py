@@ -50,7 +50,7 @@ def test_request_is_counted_with_method_path_and_status_class():
     """One request → +1 on the counter and +1 observation on the duration histogram, with the
     path collapsed to its first segment and the status to its class."""
     count_labels = {"method": "GET", "path": "demo-api", "status": "2xx"}
-    duration_labels = {"method": "GET", "path": "demo-api"}
+    duration_labels = {"method": "GET", "path": "demo-api", "long_poll": "false"}
     count_before = _sample("kix_http_requests_total", count_labels)
     duration_before = _sample("kix_http_request_duration_seconds_count", duration_labels)
     r = client.get("/demo-api/config")
@@ -208,6 +208,25 @@ def test_domain_metrics_are_declared_with_the_agreed_names_and_labels():
         before = _sample(name, labels)
         counter.labels(**labels).inc()
         assert _sample(name, labels) == before + 1, name
+
+
+def test_journey_alerts_that_may_wait_are_timed_apart_as_long_polls():
+    """A journey-alerts read with `wait` > 0 -- including no `wait` at all, which defaults to the
+    longest -- is timed under long_poll="true", so rule 11 can leave the wait the caller asked for
+    out of p99. `wait=0` answers at once and stays ordinary latency. Without a lifespan the read
+    answers 503 not_loaded, which is after the handler has marked the request."""
+    base = "/notification-api/v1/journey-alerts?from_stop=NSR:StopPlace:1&to_stop=NSR:StopPlace:2"
+
+    def count(long_poll: str) -> float:
+        labels = {"method": "GET", "path": "notification-api", "long_poll": long_poll}
+        return _sample("kix_http_request_duration_seconds_count", labels)
+
+    for query, label in (("", "true"), ("&wait=5", "true"), ("&wait=0", "false")):
+        marked, unmarked = count(label), count("false" if label == "true" else "true")
+        r = client.get(base + query)
+        assert r.status_code == 503, (query, r.status_code, r.text)
+        assert count(label) == marked + 1, query
+        assert count("false" if label == "true" else "true") == unmarked, query
 
 
 def _run():
