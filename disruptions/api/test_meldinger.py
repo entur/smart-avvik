@@ -1476,7 +1476,12 @@ def test_a_configuration_error_latches_only_the_replay_holder():
 
     with _backends(dead, gemini=dead):
         body = _messages()
-    assert set(_statuses(body)) == {"unavailable"}
+    # The subjects run on a pool, so their order is not fixed. One that reaches the backends first
+    # tries both and reports `unavailable`; one that starts after that has latched them both finds
+    # no backend left in the replay holder and reports `disabled`. Both are right; requiring
+    # `unavailable` for every subject failed CI whenever the first finished before the second began.
+    statuses = _statuses(body)
+    assert "unavailable" in statuses and set(statuses) <= {"unavailable", "disabled"}, statuses
     assert set(meldinger._replay_state.latched_off) == {"claude", "gemini"}
     assert llm_message._STATE.latched_off == {}, "the live push path's latch must be untouched"
     assert llm_message.generation_enabled() is True, "the poller can still write a wording"
