@@ -11,6 +11,7 @@ import {
   formatDays,
   LEG_MODE_NOUN,
   lineCode,
+  withDestination,
   trainLabel,
 } from '../format';
 import AlertFeedback from './AlertFeedback';
@@ -44,7 +45,7 @@ function decidedText(alert: Alert): string | null {
 // no word for (a guessed vehicle is worse than a missing one).
 function legLabel(leg: AlternativeLeg): string | null {
   const noun = leg.mode ? LEG_MODE_NOUN[leg.mode] : undefined;
-  const code = leg.public_code ?? lineCode(leg.line);
+  const code = withDestination(leg.public_code ?? lineCode(leg.line), leg.destination);
   if (noun && code) return `${noun} ${code}`;
   return code ?? noun ?? null;
 }
@@ -105,7 +106,7 @@ function AlternativeBox({ alt, toName }: { alt: AlternativeJourney; toName: stri
 // below-threshold note is phrased as a threshold rather than restated as a probability.
 function AlertLine({ alert, toName }: { alert: Alert; toName: string }) {
   const parts: string[] = [];
-  if (alert.departure_time) parts.push(trainLabel(alert.mode, alert.line, alert.departure_time));
+  if (alert.departure_time) parts.push(trainLabel(alert.mode, alert.line, alert.departure_time, alert.destination));
   // A departure ET has already declared cancelled is stated, never scored: "91 % sjanse for
   // innstilling" for a train the journey planner no longer offers sends the traveller looking for
   // it (2026-08-05). Word for word varsel.py's `_deterministic_body`, like the two below it.

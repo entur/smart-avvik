@@ -899,6 +899,30 @@ def test_one_train_reads_in_the_singular_and_a_bus_is_named():
     assert some.endswith("Vy har satt opp buss for L2 07:10 og L2 08:10."), some
 
 
+def test_a_train_label_names_the_destination_beside_the_line_and_only_there():
+    assert nw.train_label("Tog", "RE10", "08:00", "Hamar") == "Tog RE10 Hamar 08:00"
+    assert nw.train_label("Tog", "RE10", "08:00") == "Tog RE10 08:00"
+    # No line, no destination: «Tog kl 08:00», never «Tog Hamar 08:00».
+    assert nw.train_label("Tog", None, "08:00", "Hamar") == "Tog kl 08:00"
+    assert (
+        nw.train_label_from_input(
+            {"transportmiddel": "Tog", "linje": "RE10", "destinasjon": "Hamar", "avgang_kl": "08:00"}
+        )
+        == "Tog RE10 Hamar 08:00"
+    )
+    # And the fact reaches the input every surface words from -- push, pull, webhook, card.
+    message_input = nw.build_message_input(
+        nw.Route("NSR:StopPlace:337", "NSR:StopPlace:451"),
+        nw.DepartureWordingFacts(
+            situation_number="X", operator="VYG", line="VYG:Line:RE10", destination="Hamar",
+            departure_time=datetime(2026, 9, 24, 6, 0, tzinfo=UTC), cancelled=True,
+            cancel_probability=1.0,
+        ),
+    )
+    assert message_input["destinasjon"] == "Hamar"
+    assert nw.notification_title(message_input, "Oslo S", "Hamar").startswith("Tog RE10 Hamar 08:00")
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(

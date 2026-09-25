@@ -85,6 +85,8 @@ class PlannedCall:
     alighting_allowed: bool = True
     #: A removed train's replacement bus (`rail_calls_removed_today.bus_for_train`); False elsewhere.
     bus_for_train: bool = False
+    #: The stop name, on the terminus call only (the spine query nulls it everywhere else).
+    destination: str | None = None
 
 
 class CallTable:
@@ -148,6 +150,9 @@ class TrainStatus(BaseModel):
         "it, and no cancellation was published. Always `cancelled` too."
     )
     bus_for_train: bool = Field(description="A removed train Vy has set up a replacement bus for.")
+    destination: str | None = Field(
+        default=None, description="Where the train terminates, as a departure board names it: `Hamar`."
+    )
 
 
 class WindowSpan(BaseModel):
@@ -224,6 +229,29 @@ def spine_refreshed_at() -> datetime | None:
 def actuals_refreshed_at() -> datetime | None:
     with _lock:
         return _actuals.refreshed_at if _actuals is not None else None
+
+
+def _destination(calls: tuple[PlannedCall, ...]) -> str | None:
+    """The train's terminus name, «Hamar» rather than «Hamar stasjon», or None.
+
+    Read off the LAST call only (`by_key` is sorted by stop_order), and only when that call is a
+    terminus -- no aimed departure -- so a journey the table holds only part of names nothing
+    rather than a mid-route stop.
+    """
+    last = calls[-1] if calls else None
+    if last is None or last.aimed_dep is not None or not last.destination:
+        return None
+    return last.destination.removesuffix(" stasjon")
+
+
+def destination(operator: str | None, jkey: str | None) -> str | None:
+    """Where one train terminates, from the spine; None while unloaded or for an unknown train
+    (every bus: the spine is Vy only)."""
+    with _lock:
+        spine = _spine
+    if spine is None or operator is None or jkey is None:
+        return None
+    return _destination(spine.by_key.get((operator, jkey), ()))
 
 
 def removed_today() -> frozenset[str]:
@@ -419,6 +447,7 @@ def _status(
         "operator": b.operator,
         "line": b.line,
         "jkey": b.jkey,
+        "destination": _destination(spine.by_key[key]),
         "impact_probability": None,
         "alert_worthy": False,
         "expected_departure_time": None,
