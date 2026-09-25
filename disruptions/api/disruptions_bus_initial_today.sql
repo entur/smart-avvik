@@ -20,7 +20,8 @@ WITH all_versions AS (
     COALESCE(SAFE.TIMESTAMP(versionedAtTime), ingestionTime) AS event_ts,
     severity, planned, summaries, descriptions, affects
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
-  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE()
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
+  WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
     AND participantRef IN ('GOA', 'GCO', 'MOR', 'NOR', 'TRO', 'FIN', 'RUT')
 ),
 -- First version = feature snapshot AND clock start (onset).

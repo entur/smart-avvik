@@ -5,6 +5,13 @@
 --
 -- _PARTITIONTIME >= CURRENT_DATE() prunes to today's partition so the probe stays a tiny scan;
 -- ingestionTime is the per-row load time, so MAX advances every time Anshar lands new SX data.
+--
+-- `OR _PARTITIONTIME IS NULL` (2026-09-24): the table is fed by a Pub/Sub BigQuery subscription
+-- through the Storage Write API, and freshly written rows sit in the __UNPARTITIONED__ streaming
+-- buffer with a NULL _PARTITIONTIME for "typically a few minutes" (no SLA) before BigQuery
+-- assigns the partition. Without this clause the probe could not see them, which is what made
+-- the value move only every ~5 min. The buffer is a few KB, so the clause costs nothing; see
+-- docs/operations/pubsub-vs-bigquery-poll-2026-09-24.md.
 SELECT MAX(ingestionTime) AS last_ingestion_time
 FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
-WHERE DATE(_PARTITIONTIME) >= CURRENT_DATE()
+WHERE DATE(_PARTITIONTIME) >= CURRENT_DATE() OR _PARTITIONTIME IS NULL

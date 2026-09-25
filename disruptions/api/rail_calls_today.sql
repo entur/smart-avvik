@@ -32,7 +32,9 @@ WITH last_snap AS (
     REGEXP_REPLACE(datedVehicleJourneyRef, r'^[A-Za-z]+:', '') AS jkey,
     lineRef, cancellation AS journey_cancelled, recordedCalls
   FROM `ent-anshar-prd.realtime.siri_realtime_et_production`
-  WHERE DATE(_PARTITIONTIME) = CURRENT_DATE() AND lineRef LIKE 'VYG:%'
+  -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (rows land there for a few minutes
+  -- before BigQuery assigns their partition); ~23 MB, and it is where the freshest calls are.
+  WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL) AND lineRef LIKE 'VYG:%'
   QUALIFY ROW_NUMBER() OVER (PARTITION BY datedVehicleJourneyRef ORDER BY recordedAtTime DESC) = 1
 ),
 calls AS (
