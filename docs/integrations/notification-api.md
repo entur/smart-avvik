@@ -509,25 +509,27 @@ and for a subscription's `from_stop`/`to_stop`.
               {"start": "2026-09-11T04:30:00+00:00", "end": "2026-09-11T07:00:00+00:00"}],
   "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "TRO", "VYG"],
                "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true},
-  "summary": "Tog L1 07:45 er innstilt",
+  "summary": "Tog L1 Lillestrøm 07:45 er innstilt",
   "alerts": [
     {
       "severity": 1,
       "phase": "confirmed",
       "train": {"operator": "VYG", "line": "VYG:Line:L1", "journey_ref": "VYG:ServiceJourney:L1-2143-20260910",
-                "call_date": "2026-09-10", "stop_place": "NSR:StopPlace:337", "stop_order": 4},
+                "call_date": "2026-09-10", "stop_place": "NSR:StopPlace:337", "stop_order": 4,
+                "destination": "Lillestrøm"},
       "aimed_departure_time": "2026-09-10T05:45:00+00:00",
       "expected_departure_time": "2026-09-10T05:45:00+00:00",
       "situations": ["KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910"],
       "payload": {
-        "notification": {"title": "Tog L1 07:45 er innstilt",
-                         "body": "Oslo S → Lillestrøm\nToget er innstilt. Neste tog L1 går 07:55 og er fremme 08:16.",
+        "notification": {"title": "Tog L1 Lillestrøm 07:45 er innstilt",
+                         "body": "Oslo S → Lillestrøm\nToget er innstilt. Neste tog L1 Lillestrøm går 07:55 og er fremme 08:16.",
                          "action": null},
         "call": {"stop_place": "NSR:StopPlace:337", "stop_order": 4,
                  "aimed_departure_time": "2026-09-10T05:45:00+00:00", "departs_tomorrow": false},
         "probabilities": {"impact": 1.0, "cancellation": 1.0, "delay_ge10": null, "alert_threshold": 0.85},
         "delay": null,
         "effect": "cancelled",
+        "destination": "Lillestrøm",
         "situations": [{"situation_number": "KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910",
                         "summary": "Innstilt", "description": null, "has_situation": false}],
         "alternative_journey": {"...": "the best remaining way there, see the event's payload"}
@@ -569,7 +571,10 @@ same object, so it is not restated here. What the envelope around it means:
   and no cancellation has been published — under the situation `KIX:PlanRemoved:<journey_ref>`. This
   read lists such trains; the webhook channel never mints an event for one.
 - **`train`** is the event's own six identity fields; an entry and an event about one train join on
-  them without translation. `expected_departure_time` is the aimed time plus the typical delay
+  them without translation. Beside them, `destination` is where the train terminates, the same value
+  `payload.notification.title` names it with («Tog R14 Drammen 14:59»), and `null` when we do not
+  know it — today every train but Vy's, and every bus. It is for display, not part of the identity.
+  `expected_departure_time` is the aimed time plus the typical delay
   predicted for it — the figure that decides whether the train can still be caught, and the one the
   list is ordered on; equal to the aimed time for a declared cancellation.
 - **`journey` and `windows` are what the answer is about** — the canonical refs, the defaults filled
@@ -743,6 +748,10 @@ from today's timetable, with no cancellation published, carries `removed_from_pl
 rutetabellen» for it rather than «innstilt»: the operator's own channels show no cancellation.
 `bus_for_train` is true when Vy has set up a replacement bus for it.
 
+**Each train's `destination`** is where it terminates (`"Drammen"`), the same value a notification
+title and the journey-alerts read name the train with; name it `R14 Drammen 14:59`. It is `null`
+when the day's timetable does not say.
+
 **How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
 cancellation) is rebuilt hourly. The recorded calls are rebuilt every fifteen minutes; until they
 are loaded, the timetable's own recorded calls stand in. The forecasts are rebuilt every prediction
@@ -766,8 +775,9 @@ scored on `/historikk`, and nothing here notifies anybody.
 bytes that were signed and sent, and a `POST /test-events` request captured verbatim at a receiver
 with its three signing headers — both from dev on 2026-09-10. Both, and the journey-alerts samples
 under `samples/notification-pull/`, predate the situations' English (2026-09-24), so their
-`payload.situations` entries lack `summary_en`, `description_en` and `en_machine_translated`; they
-are signed captures and are kept as sent. `contracts/notifications/v1/test-event-sample.json` has
+`payload.situations` entries lack `summary_en`, `description_en` and `en_machine_translated`, and
+all of them predate `payload.destination` (2026-09-25); they are signed captures and are kept as
+sent. `contracts/notifications/v1/test-event-sample.json` has
 the current shape.
 
 `contracts/notifications/v1/event.schema.json` is the authority. `additionalProperties: false` **on
@@ -840,9 +850,15 @@ named** is scored from real-time data alone and is cut at a higher bar than a pu
 last hour of observation and the probability decays with the ask horizon far faster. Read the value
 off the event; do not assume the published per-operator cut. A `situations` entry whose
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
-(`{typical_min, worst_case_min}` or `null`), `effect`, `situations` (objects: `situation_number`,
-`summary`, `description`, `summary_en`, `description_en`, `en_machine_translated`, `has_situation`)
-and `alternative_journey` (`object|null`).
+(`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `situations` (objects:
+`situation_number`, `summary`, `description`, `summary_en`, `description_en`,
+`en_machine_translated`, `has_situation`) and `alternative_journey` (`object|null`).
+
+**`destination`** (since 2026-09-25) is where the train terminates, as a departure board names it
+(`"Drammen"`), and the same value `notification.title` names the train with («Tog R14 Drammen
+14:59»). It is `null` when we do not know it, which today is every train but Vy's and every bus, and
+absent from an event minted before the field existed. The journey-alerts read carries the same value twice
+in each entry, as `train.destination` and in its `payload`.
 
 **Every situation carries its text in English as well as Norwegian** (since 2026-09-24).
 `summary` and `description` are the Norwegian, as before; `summary_en` and `description_en` are the

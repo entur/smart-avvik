@@ -3900,6 +3900,9 @@ def _webhook_payload(
             if (alert.delay_p50_min or alert.delay_p90_min)
             else None
         ),
+        # Where the train terminates, the value the title names it with («R14 Drammen 14:59»);
+        # null while the journey-status spine is unloaded and for every train it does not hold.
+        "destination": alert.destination,
         "situations": _webhook_situations(contributing),
         "alternative_journey": dumped,
     }

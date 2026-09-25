@@ -1232,7 +1232,7 @@
           },
           "train": {
             "title": "Train",
-            "description": "The train's identity, in the webhook event's own six fields (its `alert_id` is derived from exactly these), so an entry here and an event about the same train join without a translation.",
+            "description": "The train's identity, in the webhook event's own six fields (its `alert_id` is derived from exactly these), so an entry here and an event about the same train join without a translation -- plus `destination`, which is for display and not part of that identity.",
             "type": "object",
             "additionalProperties": false,
             "required": [
@@ -1241,7 +1241,8 @@
               "journey_ref",
               "call_date",
               "stop_place",
-              "stop_order"
+              "stop_order",
+              "destination"
             ],
             "properties": {
               "operator": {
@@ -1261,6 +1262,13 @@
               },
               "stop_order": {
                 "$ref": "./event.schema.json#/properties/stop_order"
+              },
+              "destination": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the train terminates, as a departure board names it (`Drammen`), and the same value `payload.notification.title` names the train with: «Tog R14 Drammen 14:59». Null when we do not know it, which today is every train but Vy's and every bus."
               }
             }
           },
