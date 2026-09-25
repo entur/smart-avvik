@@ -484,12 +484,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -520,6 +520,56 @@
     },
     {
       "type": "timeseries",
+      "title": "8b — LLM replies rejected",
+      "description": "warning · fires above 2 for 0m\n\nMore than two live wordings in an hour were thrown away as unusable. The traveller got the deterministic template. Read jsonPayload.reason on event=\"llm_message\" result=\"rejected\": too_long (with chars) means the reply broke the 300-character cap, usually after a prompt or train-label change; empty or malformed points at the backend. VARSEL_LLM_ENABLED=false is the bad-text revert.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 40
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h]))",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h])) or vector(0)",
+          "legendFormat": "readable",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 2.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "9 — Labelling stale",
       "description": "critical · fires above 172800 for 30m\n\n48 hours without successful labelling while decisions were still being written. Unlabelled decisions become permanently unknown after 10 days. Check the varsel-label-daily scheduled query in this environment's project.",
       "datasource": {
@@ -529,7 +579,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 40
       },
       "targets": [
@@ -579,8 +629,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 40
+        "x": 0,
+        "y": 48
       },
       "targets": [
         {
@@ -629,7 +679,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 48
       },
       "targets": [
