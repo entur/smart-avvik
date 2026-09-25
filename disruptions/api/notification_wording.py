@@ -492,10 +492,13 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
 
     The operator's own cause leads when every train's situations carry the same operator text
     (:func:`_shared_cause`): «Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket».
-    Otherwise the worst train is named as its
-    own title names it and the rest are counted: «Tog L1 07:18 er innstilt, 2 til kan bli
-    forsinket». A single train is its title alone. The counts are per :func:`outcome_verb`, so a
-    confirmed and a forecast train never share a verb, and tomorrow's trains are counted apart.
+    Otherwise the worst train is named as its own title names it and the rest are counted: «Tog
+    L1 07:18 er innstilt, 2 til kan bli forsinket» -- but only while it is the ONLY train with that
+    outcome. When another train shares the worst outcome, naming one of them says nothing the
+    others do not, so the counts stand alone: «4 tog er innstilt, 1 kan bli innstilt og 3 kan bli
+    forsinket» (2026-09-25). A single train is its title alone. The counts are per
+    :func:`outcome_verb`, so a confirmed and a forecast train never share a verb, and tomorrow's
+    trains are counted apart.
 
     `None` for no trains: "nothing to say", never all-clear -- an empty list means no alert-worthy
     train among the trains the service scores.
@@ -511,7 +514,8 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
     cause = _shared_cause(trains)
     if cause:
         return f"{cause}: {_counted(inputs, noun)}"
-    if lead is None:
+    worst = outcome_verb(inputs[0])
+    if lead is None or sum(1 for t in inputs if outcome_verb(t) == worst) > 1:
         return _counted(inputs, noun)
     return f"{lead}, {_counted(inputs[1:], ('til', 'til'))}"
 
