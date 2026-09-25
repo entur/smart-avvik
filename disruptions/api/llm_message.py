@@ -1191,9 +1191,18 @@ def build_message_input(
 
 # ---- Public entry point ----------------------------------------------------------------------
 def _extract_message(raw: str) -> str | None:
-    """Pull the message out of a reply, tolerating a model that answered in plain text.
+    """The message text of a reply, or None when it is unusable -- :func:`_parse_reply`'s text."""
+    return _parse_reply(raw)[0]
 
-    A reply that *starts* like the JSON we asked for but does not parse is rejected outright rather
+
+def _parse_reply(raw: str) -> tuple[str | None, str | None, int]:
+    """`(text, reason, chars)`: the message, or None with WHY it was unusable -- ``empty``,
+    ``malformed`` or ``too_long`` -- and the length of what was judged.
+
+    The reason exists because all three used to leave the same `rejected` record, so a prompt edit
+    that pushed replies over :data:`_MAX_CHARS` looked exactly like a model returning nothing.
+
+    Tolerates a model that answered in plain text. A reply that *starts* like the JSON we asked for but does not parse is rejected outright rather
     than passed through as prose. That distinction is not pedantry: a truncated reply looks exactly
     like `{"melding": "Det er 93 % sjan` — valid-looking, unparseable, and the raw-text fallback
     would have put that fragment on a traveller's lock screen (observed 2026-07-29 before Gemini's
@@ -1201,7 +1210,7 @@ def _extract_message(raw: str) -> str | None:
     """
     text = (raw or "").strip()
     if not text:
-        return None
+        return None, "empty", 0
     if text.startswith("```"):
         # A model that ignores the schema is exactly the model that fences its JSON. Without this the
         # reply starts with a backtick, misses the JSON branch, and a short ```json {"melding": …}```
@@ -1209,19 +1218,21 @@ def _extract_message(raw: str) -> str | None:
         text = re.sub(r"^```[A-Za-z]*\s*", "", text)
         text = re.sub(r"\s*```$", "", text).strip()
         if not text:
-            return None
+            return None, "empty", 0
     if text.startswith(("{", "[")):
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            return None  # malformed JSON -- truncated or garbled, not a message
+            return None, "malformed", len(text)  # truncated or garbled JSON, not a message
         if not isinstance(parsed, dict):
-            return None
+            return None, "malformed", len(text)
         text = str(parsed.get("melding") or "").strip()
     text = text.strip().strip('"').strip()
-    if not text or len(text) > _MAX_CHARS:
-        return None
-    return text
+    if not text:
+        return None, "empty", 0
+    if len(text) > _MAX_CHARS:
+        return None, "too_long", len(text)
+    return text, None, len(text)
 
 
 # Numbers and clock times the model may use without them appearing in the payload: small counts and
@@ -1426,7 +1437,7 @@ def _write_message_detailed_inner(
         # Preserve the backend even when its reply fails a content guard below. Previously a final
         # rejection returned provider=None, hiding which model produced the unusable response.
         failed_provider = name
-        message = _extract_message(raw)
+        message, reject_reason, reply_chars = _parse_reply(raw)
         if message and not _is_grounded(message, prompt):
             logger.warning(
                 "%s invented a figure that is not in the payload; using the deterministic wording",
@@ -1465,6 +1476,10 @@ def _write_message_detailed_inner(
                     "fields": _log_fields(
                         replay, caller, event="llm_message", result="rejected",
                         **_attempt_fields(name, started, journey_key, situation_number),
+                        # Why, and how long: `too_long` against `_MAX_CHARS` is the one a prompt
+                        # edit or a longer train label produces, and it looked like `empty` before.
+                        # A reason and a count, never prose, so a client surface carries them too.
+                        reason=reject_reason or "ungrounded", chars=reply_chars,
                     )
                 },
             )
