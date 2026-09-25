@@ -89,6 +89,15 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   that still means something. Note the period quoted above is **stale**: measured again on
   2026-09-08 it is ~296 s, against which the 110 s ceiling is ~37 % of one cycle and the 28 s one
   was ~9.5 %.
+- **A deploy should be a ~55 s gap, down from ~2 min 15 s** (2026-09-25: the old figure measured in
+  dev, the new one projected from the loads' phase timings until a deploy confirms it). Recreate leaves
+  no pod for ~40 s, and the new one used to serve another ~95 s of empty caches until its first cycle
+  had rebuilt tables that already existed: journey-alerts and journey-status answered 503, and that
+  fired dev's 5xx rule. `main.warm_caches_from_last_build` now loads those caches in the lifespan
+  from the last-built tables. Each is stamped with its table's modified time and skipped past an age
+  bound. The ET rebuild gates are left unarmed, so the first cycle still rebuilds on the deployed SQL.
+  The remaining ~40 s is Recreate itself, and RollingUpdate needs a writer lease first (see
+  `docs/observability/01-review-2026-08-30.md`).
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket

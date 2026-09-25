@@ -13,7 +13,8 @@ common:
     memory: 1024
     # The chart's default tcpSocket startup probe (300 x 1s) covers the app's
     # slow start: uvicorn only binds the port after the lifespan hook has
-    # finished the initial BigQuery impact-lookup load.
+    # finished its initial BigQuery loads (the impact lookup, the stop list and,
+    # since 2026-09-25, the prediction caches from the last-built tables).
     probes:
       liveness:
         path: /health

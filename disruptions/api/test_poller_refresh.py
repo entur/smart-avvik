@@ -1356,6 +1356,129 @@ def _spacing(seconds: int):
         main._MIN_REBUILD_SPACING_S = before
 
 
+# ---- The startup warm load (2026-09-25) ---------------------------------------------------------
+
+
+@contextmanager
+def _warm_client(ages, rows=None, *, raises=()):
+    """bq_client for `warm_caches_from_last_build`: `ages` maps a table to how long ago it was
+    built (absent: NotFound), `rows` maps a query to its rows, and a query in `raises` fails."""
+    import journey_status
+
+    now = datetime.now(UTC)
+
+    class _Table:
+        def __init__(self, modified):
+            self.modified = modified
+
+    class _Client:
+        def __init__(self):
+            self.queries: list[str] = []
+
+        def get_table(self, ref):
+            if ref not in ages:
+                raise main.NotFound("not there")
+            return _Table(now - ages[ref])
+
+        def query(self, sql, *a, **k):
+            self.queries.append(sql)
+
+            class _Job:
+                def result(self_inner, timeout=None):
+                    if sql in raises:
+                        raise RuntimeError("Unrecognized name: a column the old table lacks")
+                    return list((rows or {}).get(sql, []))
+
+            return _Job()
+
+    names = (
+        "bq_client", "_disruptions_cache", "_disruptions_refreshed_at", "_call_pred_by_key",
+        "_call_pred_by_jkey_index", "_call_pred_by_situation", "_call_pred_by_stop_ref",
+        "_call_pred_refreshed_at", "_planned_refreshed_at", "_rail_calls_refreshed_at",
+    )
+    saved = {name: getattr(main, name) for name in names}
+    main.bq_client = client = _Client()
+    main._disruptions_refreshed_at = main._call_pred_refreshed_at = None
+    main._planned_refreshed_at = main._rail_calls_refreshed_at = None
+    journey_status.reset_state()
+    try:
+        yield client, now
+    finally:
+        for name, value in saved.items():
+            setattr(main, name, value)
+        journey_status.reset_state()
+
+
+_TWO_MIN = timedelta(minutes=2)
+_ALL_FRESH = {
+    "disruptions.predictions_today": _TWO_MIN,
+    "disruptions.call_predictions_today": _TWO_MIN,
+    "disruptions.rail_calls_planned_today": _TWO_MIN,
+    "disruptions.rail_calls_today": _TWO_MIN,
+}
+
+
+def test_a_new_process_serves_the_tables_the_last_one_built_stamped_with_their_age():
+    """The deploy gap: without this a new pod answered journey-alerts 503 for ~95 s, until its
+    first cycle rebuilt tables that already existed. The stamp is the TABLE's time, so `as_of` and
+    `refreshed_at` never claim a snapshot is newer than it is."""
+    import journey_status
+
+    rows = {
+        main._CALL_PREDICTIONS_QUERY: [_PredRow("j1", "S1", "NSR:StopPlace:1", 1, NOON)],
+        main._JOURNEY_STATUS_SPINE_QUERY: [_planned_row()],
+        main._JOURNEY_STATUS_ACTUALS_QUERY: [
+            _Row(jkey="j1", lineRef="VYG:Line:L1", stop_place="NSR:StopPlace:337", stop_order=1,
+                 aimed_dep=NOON, dep_delay_min=4, call_cancelled=False)
+        ],
+    }
+    with _warm_client(_ALL_FRESH, rows) as (_client, now):
+        main.warm_caches_from_last_build()
+        built = now - _TWO_MIN
+        assert main._varsel_refreshed_at() == built, "the pull read answers, stamped with the table"
+        assert set(main._impact_snapshot()[0]) == {"S1"}
+        assert main._disruptions_refreshed_at == built
+        assert journey_status.spine_refreshed_at() == built
+        assert journey_status.actuals_refreshed_at() == built
+        # The ET rebuild gates stay unarmed: the first cycle must still rebuild both tables, since
+        # the deploy may have changed their SQL -- and then load them over the warm copies.
+        assert main._planned_refreshed_at is None and main._rail_calls_refreshed_at is None
+        main._planned_refreshed_at = now
+        main.refresh_planned_spine()
+        assert journey_status.spine_refreshed_at() == now
+
+
+def test_a_missing_stale_or_unreadable_table_leaves_only_its_own_cache_cold():
+    """Each load stands alone, and none can fail the lifespan (which would fail readiness and roll
+    the release back): the cold cache it leaves is what every start had before."""
+    import journey_status
+
+    ages = {
+        # predictions_today absent: a first deploy.
+        "disruptions.call_predictions_today": main._WARM_PREDICTIONS_MAX_AGE + timedelta(minutes=1),
+        "disruptions.rail_calls_planned_today": timedelta(minutes=50),  # inside its hourly TTL
+        "disruptions.rail_calls_today": _TWO_MIN,
+    }
+    with _warm_client(
+        ages, {main._JOURNEY_STATUS_SPINE_QUERY: [_planned_row()]},
+        raises={main._JOURNEY_STATUS_ACTUALS_QUERY},
+    ) as (client, now):
+        main.warm_caches_from_last_build()
+        assert main._disruptions_refreshed_at is None
+        assert main._varsel_refreshed_at() is None, "a stale snapshot is a 503, not an old answer"
+        assert journey_status.spine_refreshed_at() == now - timedelta(minutes=50)
+        assert journey_status.actuals_refreshed_at() is None
+        assert client.queries == [main._JOURNEY_STATUS_SPINE_QUERY, main._JOURNEY_STATUS_ACTUALS_QUERY]
+
+
+def test_the_warm_load_runs_before_the_poller_starts():
+    """After it, the first cycle's loads could land first and be overwritten by an older table."""
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    assert source.index("warm_caches_from_last_build()") < source.index("thread.start()")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
