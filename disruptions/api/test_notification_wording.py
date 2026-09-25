@@ -1039,17 +1039,35 @@ def test_advice_and_status_phrases_never_lead_as_a_cause():
 
 
 def test_tomorrows_trains_are_counted_apart_and_the_noun_follows_the_mode():
+    """«i dag» is said exactly when «i morgen» is (the owner's call, 2026-09-25): a sentence about
+    one day needs no day, and one about two must name both."""
     trains = [
         (_mi("07:18", verb="cancelled"), [_sit("S1")]),
         (_mi("07:18", verb="cancelled", tomorrow=True), [_sit("S1")]),
         (_mi("07:48", tomorrow=True), [_sit("S1")]),
     ]
-    assert nw.alerts_summary(trains) == "Signalfeil ved Asker: 1 tog er innstilt og 2 i morgen"
+    assert nw.alerts_summary(trains) == "Signalfeil ved Asker: 1 tog er innstilt i dag og 2 i morgen"
     assert nw.alerts_summary(trains[1:]) == (
         "Signalfeil ved Asker: 1 tog er innstilt og 1 kan bli forsinket i morgen"
     )
+    # The owner's example: a shared worst outcome, so counts alone, today's tagged beside tomorrow's.
+    many = [(_mi(f"{6 + n // 4:02d}:{15 * (n % 4):02d}", verb="cancelled"), [_sit(f"S{n}", f"Innstilt {n}")])
+            for n in range(14)]
+    many += [(_mi("07:00", verb="cancelled", tomorrow=True), [_sit("T1", "Innstilt t1")]),
+             (_mi("08:00", verb="cancelled", tomorrow=True), [_sit("T2", "Innstilt t2")])]
+    assert nw.alerts_summary(many) == "14 tog er innstilt i dag og 2 i morgen"
+    # A named lead follows the same rule in both directions: the lead says «i dag» when the rest
+    # mentions tomorrow, and the rest says «i dag» when the lead is tomorrow's train.
     assert nw.alerts_summary([(_mi("08:18", verb="cancelled"), [_sit("S2", "Ta neste tog")]), trains[2]]) == (
-        "Tog L1 08:18 er innstilt, 1 til kan bli forsinket i morgen"
+        "Tog L1 08:18 er innstilt i dag, 1 til kan bli forsinket i morgen"
+    )
+    assert nw.alerts_summary([
+        (_mi("08:18", verb="cancelled", tomorrow=True), [_sit("S2", "Ta neste tog")]),
+        (_mi("07:18"), [_sit("S1")]),
+        (_mi("07:48"), [_sit("S3", "Ta andre tog")]),
+    ]) == "Tog L1 08:18 i morgen er innstilt, 2 til kan bli forsinket i dag"
+    assert nw.alerts_summary([(_mi("08:18", verb="cancelled"), [_sit("S2", "Ta neste tog")]), (_mi("09:18"), [_sit("S1")])]) == (
+        "Tog L1 08:18 er innstilt, 1 til kan bli forsinket"
     )
     bus = [(_mi("07:18", mode="Buss", line="31"), [_sit("S1")]), (_mi("07:48", mode="Buss", line="31"), [_sit("S1")])]
     assert nw.alerts_summary(bus) == "Signalfeil ved Asker: 2 busser kan bli forsinket"
