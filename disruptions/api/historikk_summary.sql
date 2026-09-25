@@ -76,7 +76,7 @@
 -- the buckets partition the labelled rows by construction either way.
 WITH labelled AS (
   SELECT
-    verdict, alert_lead_min, actual_trouble, et_cancelled,
+    call_date, verdict, alert_lead_min, actual_trouble, et_cancelled,
     -- Derived once here so the COUNTIFs below cannot each spell the rule slightly differently.
     -- The removed prefix goes first (see the header); after it, NULL et_cancelled still means
     -- "unsegmented".
@@ -331,5 +331,21 @@ SELECT
   -- exactly the rows worth finding — the ones where ET had already published and we stayed quiet.
   -- The CASE's NULL, not the flag's: a removed row is resolved before the flag is read, so counting
   -- the flag here could count one row twice. Identical for every other row.
-  COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented
+  COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented,
+
+  -- ---- the same rows, per operating day ----------------------------------------------------------
+  -- The blended counts again, one entry per call_date, for the page's trend chart. Counts only, so
+  -- a day's rates are derived from exactly the verdicts the totals above add up from, and a day
+  -- with few alerts can be shown with its denominator. A day with no labelled row is absent, not
+  -- zero -- the page reads a trailing gap as "not labelled yet".
+  (SELECT ARRAY_AGG(STRUCT(call_date, n_hit, n_false_alarm, n_miss) ORDER BY call_date)
+   FROM (
+     SELECT call_date,
+            COUNTIF(verdict = 'hit')         AS n_hit,
+            COUNTIF(verdict = 'false_alarm') AS n_false_alarm,
+            COUNTIF(verdict = 'miss')        AS n_miss
+     FROM labelled
+     WHERE verdict IS NOT NULL
+     GROUP BY call_date
+   )) AS daily
 FROM labelled

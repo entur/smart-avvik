@@ -653,6 +653,22 @@ def test_the_labeller_labels_removed_trains_in_their_own_branch():
     assert re.search(r"\bFROM labelled_all\b", final), "the INSERT must read both branches"
 
 
+def test_summary_serves_a_daily_series_with_its_own_rates():
+    """The trend chart's points, one per labelled day, rates derived from the day's own counts."""
+    _reset([{
+        "n_hit": 5, "n_false_alarm": 1, "n_miss": 2,
+        "daily": [
+            {"call_date": date(2026, 9, 1), "n_hit": 3, "n_false_alarm": 1, "n_miss": 1},
+            # Only correct rejections that day: nothing alerted, no trouble -- both rates unknown.
+            {"call_date": date(2026, 9, 2), "n_hit": 0, "n_false_alarm": 0, "n_miss": 0},
+        ],
+    }])
+    daily = client.get("/historikk-api/summary").json()["daily"]
+    assert [d["call_date"] for d in daily] == ["2026-09-01", "2026-09-02"]
+    assert (daily[0]["precision"], daily[0]["recall"]) == (0.75, 0.75)
+    assert daily[1]["precision"] is None and daily[1]["recall"] is None
+
+
 def test_summary_survives_an_empty_window():
     """A new environment has recorded nothing yet; that is zeroes, not a 500."""
     _reset([])
@@ -662,6 +678,7 @@ def test_summary_survives_an_empty_window():
     assert s["n_unsegmented"] == 0
     assert s["predicted"]["n_hit"] == 0 and s["predicted"]["precision"] is None
     assert s["relayed"]["n_hit"] == 0 and s["relayed"]["precision"] is None
+    assert s["daily"] == []
 
 
 def test_missing_tables_report_unavailable_not_a_traceback():
