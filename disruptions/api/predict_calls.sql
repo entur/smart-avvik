@@ -910,8 +910,7 @@ SELECT
   END AS summary,
   CASE
     WHEN e.call_source = 'removed' THEN
-      'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell. '
-      || 'Ingen innstilling er publisert.'
+      'Toget går vanligvis på denne ukedagen, men finnes ikke i dagens rutetabell.'
       || IF(e.bus_for_train, ' Vy har satt opp buss for tog.', '')
     ELSE 'Avgangen er markert innstilt i operatørens sanntidsdata.'
   END AS description,
@@ -972,8 +971,7 @@ SELECT
   END AS summary_en,
   CASE
     WHEN e.call_source = 'removed' THEN
-      "The train usually runs on this weekday, but is not in today's timetable. "
-      || 'No cancellation has been published.'
+      "The train usually runs on this weekday, but is not in today's timetable."
       || IF(e.bus_for_train, ' Vy has set up rail replacement buses.', '')
     ELSE "The departure is marked as cancelled in the operator's real-time data."
   END AS description_en
