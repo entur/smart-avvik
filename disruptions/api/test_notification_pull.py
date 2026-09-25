@@ -495,9 +495,10 @@ def test_operator_text_every_train_carries_leads_the_summary_and_a_placeholder_n
     assert body["n_alerts"] == 0 and body["summary"] is None
 
 
-def test_the_summary_carries_the_environment_tag_exactly_as_the_titles_do():
-    """A partner reading dev would otherwise hold one untagged string beside entries whose titles
-    all lead with «[dev] »."""
+def test_the_summary_carries_no_environment_tag_even_where_the_titles_do():
+    """The «[dev] » tag exists because a push lands in a tray that names no environment; a
+    favourites row is the client's own surface, so the summary is served plain (the owner's call,
+    2026-09-25) while the entries' titles keep their tag."""
     from test_varsel_api import _deployed_as
 
     now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
@@ -505,8 +506,9 @@ def test_the_summary_carries_the_environment_tag_exactly_as_the_titles_do():
     _use_snapshot({"S1": _train(now + timedelta(hours=1), p_cancel=0.3, p_impact_dep=0.9)})
     with _deployed_as("ent-kixavvik-dev"):
         body = _get(wait=0).json()
-    assert body["summary"] == body["alerts"][0]["payload"]["notification"]["title"]
-    assert body["summary"].startswith("[dev] Tog R10 07:00 "), body["summary"]
+    title = body["alerts"][0]["payload"]["notification"]["title"]
+    assert title.startswith("[dev] "), title
+    assert body["summary"] == title.removeprefix("[dev] "), body["summary"]
 
 
 # ---- Freshness and failure (KTD8, R6) --------------------------------------------------------

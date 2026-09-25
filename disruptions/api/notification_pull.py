@@ -1534,11 +1534,9 @@ def _assemble(
         )
         for e in by_rank
     ])
-    # Tagged as every title is (`varsel._tag_environment`, `[dev] ` leading): a partner reading dev
-    # would otherwise hold one string without the tag beside entries that all carry it.
-    return out, len(alive), all(state.terminal for state in states), (
-        varsel._tag_environment(summary) if summary else None
-    )
+    # Deliberately NOT tagged with the environment as the titles are (2026-09-25): the tag marks a
+    # push in a tray that names no environment, and a favourites row is the client's own surface.
+    return out, len(alive), all(state.terminal for state in states), summary
 
 
 def _client_label(raw: str | None) -> str | None:
