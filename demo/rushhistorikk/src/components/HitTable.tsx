@@ -1,6 +1,7 @@
 import { Heading3, SubParagraph } from '@entur/typography';
-import type { Level, MatrixRow, StatsRow } from '../api';
+import type { Level, MatrixRow, StatsRow, TrendPoint } from '../api';
 import { LEVEL_LABEL, SLOT_LABEL, fmtPct } from '../format';
+import TrendChart from './TrendChart';
 
 /** Level order, severity ascending — the matrix's row and column order. */
 const LEVEL_ORDER: Level[] = ['green', 'yellow', 'red'];
@@ -89,7 +90,7 @@ function RateCell({ value, title }: { value: number | null; title: string }) {
   );
 }
 
-export default function HitTable({ stats }: { stats: StatsRow[] }) {
+export default function HitTable({ stats, trend }: { stats: StatsRow[]; trend: TrendPoint[] }) {
   const total = stats.find((r) => r.slot === 'total');
   return (
     <section className="rh-summary">
@@ -226,6 +227,8 @@ export default function HitTable({ stats }: { stats: StatsRow[] }) {
           />
         </div>
       ) : null}
+
+      <TrendChart trend={trend} />
     </section>
   );
 }
