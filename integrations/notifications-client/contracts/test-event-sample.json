@@ -60,7 +60,7 @@
     ],
     "payload": {
       "notification": {
-        "title": "Testvarsel: Tog L1 er innstilt",
+        "title": "Testvarsel: Tog L1 Lillestrøm er innstilt",
         "body": "NSR:StopPlace:337 → NSR:StopPlace:59872\nDette er et testvarsel fra Entur. Ingen virkelige avganger er berørt.",
         "action": null
       },
@@ -78,6 +78,7 @@
       },
       "delay": null,
       "effect": "cancelled",
+      "destination": "Lillestrøm",
       "situations": [
         {
           "situation_number": "KIX:TestEvent:0123456789ab",
