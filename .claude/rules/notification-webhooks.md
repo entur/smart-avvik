@@ -896,8 +896,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   worst outcome — the owner's call, 2026-09-25) — the title's own branch, factored out so the
   counts and the entries' titles cannot disagree — with tomorrow's trains counted apart. Built from
   the figures, so `wait=0` serves it final; an unlisted entry's message input is built off an
-  `_enriched(winner, None)`, for the reason that helper's docstring gives; tagged through
-  `varsel._tag_environment` as every title is. `null` for no trains, which is not all-clear. The
+  `_enriched(winner, None)`, for the reason that helper's docstring gives; NOT tagged with the
+  environment as titles are (the owner's call, 2026-09-25: the tag is for a tray, the row is the
+  client's). `null` for no trains, which is not all-clear. The
   captured samples under `docs/integrations/samples/notification-pull/` carry the value derived from
   their own entries (2026-09-25), not a re-capture. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
   ref, name, departure time or prose, only `pair_digest` and the caller's own `ET-Client-Name` as
