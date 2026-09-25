@@ -56,7 +56,8 @@ Design notes
   i.e. at terminals the matcher already skips, so the old fallback could never fire on a boarding).
   The in-app list shows every match an operator PUBLISHED regardless, flagged with
   ``alertworthy``; a match no SX message named is shown only once it crosses that gate
-  (:func:`_card_alerts`), since a sub-threshold one carries no operator text to read.
+  (:func:`_card_alerts`), since a sub-threshold one carries no operator text to read. A train taken
+  out of the plan is never listed; the «I dag» strip shows it.
 * **What the push says** — which train (``notification_wording.train_label``: "Tog RE10 Hamar 09:24", the
   line and destination included because a journey matches several and a time alone does not say which),
   then the *alerting* quantity in ``/demo``'s wording: P(innstilling eller ≥ 10 min forsinkelse),
@@ -5694,7 +5695,8 @@ class Journey(BaseModel):
     alerts: list[Alert] = Field(
         description="Situations currently affecting this journey, worst first — one per "
         "train. Published (SX) matches appear whether or not they cross the push threshold; "
-        "a match no SX message named appears only if it does. See `_card_alerts`.",
+        "a match no SX message named appears only if it does, and a train taken out of the plan "
+        "(`KIX:PlanRemoved:`) never does -- `today` shows it. See `_card_alerts`.",
     )
     warning: str | None = Field(
         default=None,
@@ -5834,8 +5836,17 @@ def _card_alerts(alerts: list[Alert]) -> list[Alert]:
     Display only. `match_journey` still returns every match, so the decision log keeps its row
     (those rows are the lead-time series, and a match that stayed under the gate is exactly what a
     `miss` is made of) and the push gate is unchanged -- a sub-threshold alert was never pushed.
+
+    A train Vy took out of the plan (`KIX:PlanRemoved:`) is never on the card: the «I dag» strip
+    already shows it as «tatt ut av rutetabellen», and on a cut day a box per removed train buried
+    the real disruptions under dozens of identical ones.
     """
-    return [alert for alert in alerts if alert.has_situation or alert.alertworthy]
+    return [
+        alert
+        for alert in alerts
+        if (alert.has_situation or alert.alertworthy)
+        and not notification_wording.is_plan_removed(alert.situation_number)
+    ]
 
 
 @router.delete("/devices/{device_id}/data", summary="Delete everything stored about a device")

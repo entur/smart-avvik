@@ -6853,9 +6853,10 @@ def _removed_train(dep=DEP - timedelta(minutes=20), jkey="RemovedJourney:2105_20
     ]
 
 
-def test_a_train_taken_out_of_the_plan_is_shown_and_logged_but_never_pushed_or_worded(monkeypatch):
-    """R4/R6/KTD6: the card and the decision log see a removed train like any declared cancellation,
-    while no per-train push and no wording is spent on it -- the morning digest (U4) is the push.
+def test_a_train_taken_out_of_the_plan_is_logged_but_never_pushed_worded_or_on_the_card(monkeypatch):
+    """R4/R6/KTD6: the decision log sees a removed train like any declared cancellation, while no
+    per-train push, no wording and no card box is spent on it -- the morning digest (U4) is the push
+    and the «I dag» strip is the display.
     Departing FIRST, so a soonest-first cap or queue that forgot the exclusion would pick it."""
     _reset_state()
     snapshot = {REMOVED: _removed_train(), "S1": _cancelled_notice("S1")}
@@ -6877,7 +6878,7 @@ def test_a_train_taken_out_of_the_plan_is_shown_and_logged_but_never_pushed_or_w
         assert f"{jid}|{REMOVED}" not in varsel._notified
     listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
     shown = {a["situation_number"] for a in listed[0]["alerts"]}
-    assert shown == {REMOVED, "S1"}, shown
+    assert shown == {"S1"}, "the strip shows a removed train, the card does not"
     _use_snapshot(SNAPSHOT)
 
 
@@ -6894,7 +6895,7 @@ def test_a_journey_whose_only_alert_is_a_removed_train_writes_nothing(monkeypatc
     varsel.check_and_notify(snapshot)
     assert sent == [] and written == [], (sent, written)
     listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
-    assert [a["situation_number"] for a in listed[0]["alerts"]] == [REMOVED], "still on the card"
+    assert listed[0]["alerts"] == [] and listed[0]["warning"] is None, listed[0]
     _use_snapshot(SNAPSHOT)
 
 
