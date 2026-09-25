@@ -421,10 +421,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   decision rows record `pushed` with the digest's text as `message`
   (`digest_messages`), since the /historikk card quotes the first pushed row — but only the trains
   already inside the cache have a row that cycle, so one entering it later is recorded unpushed.
-  The card, `/impact` and
-  the pull read show them, and the pull read still words its own four soonest as it words any
-  cancellation (KTD6; the model then says «innstilt»). One cost is not closed: a removed train is
-  alert-worthy on the card, so it competes for `impact._MAX_ALTERNATIVE_LOOKUPS` (3, soonest first)
+  `/impact` and the pull read show them, and the pull read still words its own four soonest as it
+  words any cancellation (KTD6; the model then says «innstilt»). The journey card does NOT since
+  2026-09-25 (`varsel._card_alerts`): the «I dag» strip already shows each one, and on a cut day a
+  box per removed train buried the real disruptions. One cost is not closed: a removed train is
+  alert-worthy in `/impact`, so it competes for `impact._MAX_ALTERNATIVE_LOOKUPS` (3, soonest first)
   with the real cancellations beside it. Its decision rows carry `et_cancelled` but are NOT
   `relayed`: since U5 (2026-09-23) `/historikk` and `/meldinger` segment them as `removed`, tested
   ahead of the flag, and the nightly labeller judges them by train number (see
