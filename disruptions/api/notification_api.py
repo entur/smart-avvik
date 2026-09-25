@@ -1256,6 +1256,13 @@ def _synthetic_event(
                         "Syntetisk hendelse sendt fra /notification-api/v1/test-events. "
                         "Ingen virkelige avganger er berørt."
                     ),
+                    # Written here, as the Norwegian is -- not a machine's translation of it.
+                    "summary_en": "Test notification from Entur",
+                    "description_en": (
+                        "Synthetic event sent from /notification-api/v1/test-events. "
+                        "No real departures are affected."
+                    ),
+                    "en_machine_translated": False,
                     # False, and truthfully: no SX message named this train, so `summary` is text
                     # this codebase wrote rather than an operator's. A receiver presenting it as an
                     # operator statement would be making the 2026-08-20 mistake one layer out --

@@ -45,6 +45,13 @@ SELECT
   (SELECT x.value FROM UNNEST(fv.descriptions) AS x
    WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
    LIMIT 1) AS description,
+  -- The operator's own English, served only -- see the same columns in disruptions_today.sql.
+  (SELECT x.value FROM UNNEST(fv.summaries) AS x
+   WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+   LIMIT 1) AS summary_en,
+  (SELECT x.value FROM UNNEST(fv.descriptions) AS x
+   WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+   LIMIT 1) AS description_en,
   (
     SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
     FROM (
