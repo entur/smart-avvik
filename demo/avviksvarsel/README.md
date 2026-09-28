@@ -197,9 +197,15 @@ would otherwise discard feedback in silence (measured 2026-08-28 — see
 retention, deletion/subject-rights, staged rollout, reviewer usage, and rollback are documented in
 [`data/feedback/README.md`](../../data/feedback/README.md).
 
-Regenerate the PWA icons — the Entur mark for the default brand, a white bell on petrol for
-`?brand=none` — after changing the glyph:
+Regenerate the PWA icons — the lilac KI-lab tile for the default brand, a white bell on petrol
+for `?brand=none` — after changing the design (needs `npm ci` first, for the Nationale fonts):
 
 ```sh
-uv run --with pillow python scripts/make_icons.py
+uv run --with pillow --with fonttools --with svg.path python scripts/make_icons.py
+```
+
+and the default brand's colour sheet after upgrading Linje:
+
+```sh
+uv run python scripts/make_brand_css.py --brand entur
 ```
