@@ -283,7 +283,7 @@ def main() -> None:
     # The same set for the dev deployment, which main.py serves under the names above when
     # environment_label() is "dev" -- the image is shared, so the URLs have to be too.
     print("Entur, dev deployment:")
-    dev = dict(band="KI-lab dev", band_fill="#ffffff")
+    dev = {"band": "KI-lab dev", "band_fill": "#ffffff"}
     tile = entur_tile(**dev)
     write_png(ICONS / "pwa-192-dev.png", tile, 192)
     write_png(ICONS / "pwa-512-dev.png", tile, 512)
