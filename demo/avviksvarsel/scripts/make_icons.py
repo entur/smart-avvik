@@ -3,7 +3,7 @@
 DEFAULT BRAND (Entur). The «D + KI-lab» tile from the 2026-09-28 icon proposal: the service name
 «Smarte reisevarsler» where Entur's logo has «EN», Entur's coral bar under it, the sender line
 «Et [ENTUR] eksperiment» with entur.no's wordmark, and a canary «KI-lab» band across the top-right
-corner, on Linje's data lilac so it is not mistaken for the Entur app. Text is Nationale, drawn from
+corner, on the Entur logo's navy. Text is Nationale, drawn from
 its glyph outlines (fontTools) so the vector favicon needs no font, and rasterised with Pillow.
 
 BRAND "none" (?brand=none). The unbranded variant needs its own set, or an install made from it
@@ -43,10 +43,9 @@ ICONS = OUT / "icons"
 FONTS = OUT.parent / "node_modules" / "@entur" / "typography" / "fonts"
 
 # Linje colours for the Entur tile.
-LILAC = "#8e57e3"  # data-default-lilac: tells the icon apart from the Entur app's navy
 CORAL = "#ff5959"  # the Entur logo's underline
 CANARY = "#ffca28"  # the KI-lab corner band
-NAVY = "#181c56"  # Entur blue, the band's text
+NAVY = "#181c56"  # Entur blue: the tile, as on the Entur logo, and the band's text
 
 # The ENTUR wordmark from entur.no's header (viewBox 0 0 62 19; EN's baseline is y=13).
 WORDMARK = [
@@ -121,7 +120,7 @@ def entur_tile(*, sender: bool = True, band: str = "KI-lab", band_fill: str = CA
     x, w, lh, lines = 14.0, 72.0, 14.0, ("Smarte", "reisevarsler")
     block = len(lines) * lh + 4 + 3 + (12 if sender else 0)
     y = (100 - block) / 2 + 5
-    shapes: list[Shape] = [("M0 0H100V100H0Z", (1, 0, 0, 1, 0, 0), LILAC)]
+    shapes: list[Shape] = [("M0 0H100V100H0Z", (1, 0, 0, 1, 0, 0), NAVY)]
     # One size for both name lines, shrunk until the longer one fits the bar.
     size = lh * min(1.0, min(w / bold.width(t, lh) for t in lines))
     for t in lines:
