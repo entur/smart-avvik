@@ -100,6 +100,7 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 import alternatives  # the Journey Planner fetch-path vocabulary the matcher forwards
+import deployment
 import feedback
 import feedback_contexts
 import journey_status  # every train in a journey's window today, graded -- `Journey.today`
@@ -5575,6 +5576,11 @@ class ConfigResponse(BaseModel):
             "/varsel mentions rushvarsel nowhere."
         ),
     )
+    togvarsel_red_only: bool = Field(
+        default=False,
+        description="Whether rush-forecast pushes go out at red only (TOGVARSEL_NOTIFY_RED_ONLY) "
+        "rather than at yellow or red; the notice words the rule from it.",
+    )
 
 
 class StopItem(BaseModel):
@@ -5753,6 +5759,7 @@ async def config() -> ConfigResponse:
         togvarsel_notify=(
             _togvarsel_notify_provider() if _togvarsel_notify_provider is not None else False
         ),
+        togvarsel_red_only=deployment.rushvarsel_red_only(),
     )
 
 

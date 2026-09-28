@@ -28,6 +28,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import deployment
 import rushhistorikk
 import rushhistorikk_verdicts as verdicts
 from fastapi import FastAPI
@@ -350,6 +351,35 @@ def test_calibration_and_coverage_count_forecasts_and_rushes():
     assert (cal["red"]["n"], cal["red"]["mean_p"]) == (0, None)
     assert body["coverage"] == {"rushes": 2, "days": 1, "bad": 1, "bad_first": 1, "bad_late": 0,
                                 "bad_missed": 0, "calm_warned": 1, "calm_quiet": 0}
+
+
+def test_under_red_only_a_yellow_nobody_was_sent_is_not_a_warning():
+    """Coverage counts pushes as decided, not forecast levels. An unrecorded day is replayed under
+    the flag as it is set now, so its yellow 06:30 is held back and the rush is warned late, by the
+    red 07:00; its yellow afternoon is quiet. A yellow push RECORDED under the launch rule the week
+    before still counts as the warning it was."""
+    at = lambda h, m: datetime(2026, 8, 31, h, m, tzinfo=UTC)
+    week_before = date(2026, 8, 24)
+    rows = [
+        _row(issue="0630", forecast_level="yellow", computed_at=at(4, 30), **_UNRECORDED),
+        _row(issue="0700", forecast_level="red", computed_at=at(5, 0), **_UNRECORDED),
+        _row(issue="1200", forecast_level="yellow", computed_at=at(10, 0), **_UNRECORDED),
+        _row(issue="1400", forecast_level="yellow", computed_at=at(12, 0), **_UNRECORDED),
+        _row(d=week_before, first_recorded_day=week_before),  # 0630 yellow, pushed, bad morning
+    ]
+    before = deployment.rushvarsel_red_only
+    deployment.rushvarsel_red_only = lambda: True
+    try:
+        _reset(rows)
+        body = _days(days=14).json()
+    finally:
+        deployment.rushvarsel_red_only = before
+    issues = {(d["d"], i["issue"]): i for d in body["days"] for i in d["issues"]}
+    assert issues[("2026-08-31", "0630")]["reason"] == "yellow_baseline"
+    assert issues[("2026-08-31", "0700")]["kind"] == "warning"
+    assert issues[("2026-08-31", "1400")]["reason"] == "no_change"
+    assert body["coverage"] == {"rushes": 3, "days": 2, "bad": 2, "bad_first": 1, "bad_late": 1,
+                                "bad_missed": 0, "calm_warned": 0, "calm_quiet": 1}
 
 
 def test_the_matrix_and_the_verdict_agree_on_one_scored_day():
