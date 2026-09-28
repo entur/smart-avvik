@@ -1,7 +1,7 @@
 import { Heading3, SubParagraph } from '@entur/typography';
-import type { Level, MatrixRow, StatsRow, TrendPoint } from '../api';
+import type { CalibrationRow, Coverage, Level, MatrixRow, StatsRow } from '../api';
 import { LEVEL_LABEL, SLOT_LABEL, fmtPct } from '../format';
-import TrendChart from './TrendChart';
+import { Calibration, CoverageView } from './ForecastViews';
 
 /** Level order, severity ascending — the matrix's row and column order. */
 const LEVEL_ORDER: Level[] = ['green', 'yellow', 'red'];
@@ -90,7 +90,15 @@ function RateCell({ value, title }: { value: number | null; title: string }) {
   );
 }
 
-export default function HitTable({ stats, trend }: { stats: StatsRow[]; trend: TrendPoint[] }) {
+export default function HitTable({
+  stats,
+  calibration,
+  coverage,
+}: {
+  stats: StatsRow[];
+  calibration: CalibrationRow[];
+  coverage: Coverage | null;
+}) {
   const total = stats.find((r) => r.slot === 'total');
   return (
     <section className="rh-summary">
@@ -228,7 +236,10 @@ export default function HitTable({ stats, trend }: { stats: StatsRow[]; trend: T
         </div>
       ) : null}
 
-      <TrendChart trend={trend} />
+      <div className="rh-views">
+        <Calibration rows={calibration} />
+        {coverage ? <CoverageView c={coverage} /> : null}
+      </div>
     </section>
   );
 }

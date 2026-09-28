@@ -527,3 +527,14 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     muted fills do not separate across a diagonal at 24 px; a zero cell is faded rather than greyed
     so the grid keeps its structure without labels. The full rationale is at `.rh-matrix` in
     `demo/rushhistorikk/src/styles.css`.
+  - **Two views under the stats table judge the MODEL, not the push rules** (2026-09-28; they
+    replaced the weekly Presisjon/Dekning trend chart). «Når vi sa grønt, gult, rødt»
+    (`calibration`) bins every scored issue by forecast level and counts the rushes that turned
+    yellow or red, beside the mean p quoted and §14a's long-run rate. It exists because a red
+    forecast means "about a coin flip", and the matrix's red/red cell was read as the model's hit
+    rate. «Ble du varslet – og hva kostet det?» (`coverage`) counts RUSHES by their scored baseline
+    issue (06:30, 12:00): a bad rush is warned first (yellow or red at the baseline), late (only at
+    the follow-up) or missed, and a calm one is warned or quiet. It exists because Dekning folds the
+    owed friskmeldinger in (the 2026-09-25 audit: 9 of 9 bad rushes warned, yet Dekning 33 %).
+    "Warned" is the forecast level, which is the push policy's own trigger, so recorded and
+    reconstructed rounds read alike.

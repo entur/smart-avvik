@@ -168,18 +168,28 @@ export interface StatsRow {
   matrix: MatrixRow[];
 }
 
-/** One ISO week of the total row, for the trend chart. */
-export interface TrendPoint {
-  /** Monday of the week. The window's first and last weeks can be partial. */
-  week_start: string;
-  presisjon: number | null;
-  presisjon_num: number;
-  presisjon_den: number;
-  /** Per RUSH, like the total row's. */
-  dekning: number | null;
-  dekning_num: number;
-  dekning_den: number;
-  n_venter: number;
+/** One forecast level: how often a scored issue forecast at it turned into a bad rush. */
+export interface CalibrationRow {
+  level: Level;
+  n: number;
+  /** Rushes that turned yellow or red — the models' label. */
+  n_bad: number;
+  /** The mean probability those forecasts quoted; null when n is 0. */
+  mean_p: number | null;
+}
+
+/** The window per RUSH (a day's morning or afternoon, judged by its scored baseline issue). Warned
+ *  = a yellow or red forecast at the baseline, or else at the follow-up. */
+export interface Coverage {
+  rushes: number;
+  /** Distinct days, for the per-weekday price. */
+  days: number;
+  bad: number;
+  bad_first: number;
+  bad_late: number;
+  bad_missed: number;
+  calm_warned: number;
+  calm_quiet: number;
 }
 
 export interface DaysResponse {
@@ -189,8 +199,9 @@ export interface DaysResponse {
   days: DayRow[];
   /** The total row first, then one per issue slot. */
   stats: StatsRow[];
-  /** The total row per ISO week, oldest first. Optional: absent before 2026-09-25. */
-  trend?: TrendPoint[];
+  /** Green, yellow, red. Optional: absent before 2026-09-28. */
+  calibration?: CalibrationRow[];
+  coverage?: Coverage;
   /** The earliest day a notification round was ever recorded. A reconstructed round BEFORE this is
    *  the expected pre-launch backlog; one after it can only mean a lost write or a closed gate. */
   recording_started: string | null;
