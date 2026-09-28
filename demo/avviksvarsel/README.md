@@ -61,13 +61,13 @@ A brand is four things, and leaving any one of them out still reads as Entur:
 
 | | Entur (default) | `?brand=none` |
 |---|---|---|
-| colour | Linje as shipped | petrol/slate, `src/brands/none.css` |
+| colour | Linje moved to the icon's lilac, `src/brands/entur.css` | petrol/slate, `src/brands/none.css` |
 | typeface | Entur Nationale | system sans |
 | masthead | `<Logo/>` + "Smarte reisevarsler" | "Smarte reisevarsler" |
 | tab title | Entur Smarte reisevarsler | Smarte reisevarsler |
-| favicon / home screen | Entur "EN" mark | bell on petrol |
+| favicon / home screen | «Smarte reisevarsler» + «Et ENTUR eksperiment» + KI-lab band on lilac | bell on petrol |
 | manifest | `manifest.webmanifest` | `manifest-none.webmanifest`, `start_url=/varsel/?brand=none` |
-| push notification | Entur icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |
+| push notification | the lilac app icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |
 | sender line | "Tjenesten leveres av Entur AS." | **the same line** — see below |
 
 The wording of a push is deliberately **identical** across brands: it is what `/historikk` records,
