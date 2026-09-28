@@ -37,9 +37,9 @@ export type NotifyKind = 'warning' | 'update' | 'all_clear';
 
 /** Why a round decided not to push. `no_change` is the confirming follow-up: nothing was sent
  *  because the baseline's warning still stands, which is what `baseline_level` carries.
- *  `yellow_baseline` is legacy: a yellow baseline held back under the red-only rule, live from the
- *  evening of 2026-09-02 to 2026-09-03 (PR #130, reverted) — kept so a row from that window still
- *  reads; the live rule pushes at yellow. */
+ *  `yellow_baseline` is a yellow baseline held back under the red-only rule
+ *  (TOGVARSEL_NOTIFY_RED_ONLY; on in dev and prd since 2026-09-28, and for one weekday in
+ *  2026-09-02/03) — silence, graded as silence. */
 export type NotifyReason = 'untimely' | 'no_change' | 'green_baseline' | 'yellow_baseline';
 
 /** One forecast issue: what it said, what we communicated, and how the rush turned out. */
@@ -179,7 +179,8 @@ export interface CalibrationRow {
 }
 
 /** The window per RUSH (a day's morning or afternoon, judged by its scored baseline issue). Warned
- *  = a yellow or red forecast at the baseline, or else at the follow-up. */
+ *  = a warning push went out (or, for a reconstructed round, would have) at the baseline, or else
+ *  at the follow-up — under the push rule, so a yellow forecast counts only where yellow pushes. */
 export interface Coverage {
   rushes: number;
   /** Distinct days, for the per-weekday price. */

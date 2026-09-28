@@ -10,6 +10,8 @@ export interface Config {
   // Whether this deployment also sends Oslo rush-hour forecast pushes (togvarsel) to subscribed
   // devices. Optional for the same reason: an older API simply shows no notice.
   togvarsel_notify?: boolean;
+  // Whether those pushes go out at red only rather than at yellow or red; words the notice.
+  togvarsel_red_only?: boolean;
 }
 
 // One rush's current level, from GET /togmelding-api/outlook — Togmeldingen's own forecast,

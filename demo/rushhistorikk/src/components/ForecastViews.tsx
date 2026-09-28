@@ -81,8 +81,9 @@ export function CoverageView({ c }: { c: Coverage }) {
       <Heading4>Ble du varslet – og hva kostet det?</Heading4>
       <p className="rh-view-help">
         Per rush: fikk du beskjed før et dårlig rush, og hvor mange varsler fikk du om rush som gikk
-        fint? Varslet betyr gul eller rød prognose kl. 06:30 eller 12:00, ellers ved oppdateringen
-        kl. 07:00 eller 14:00.
+        fint? Varslet betyr at det gikk ut et rushvarsel kl. 06:30 eller 12:00, ellers ved
+        oppdateringen kl. 07:00 eller 14:00 – eller at det ville gått ut, der runden er
+        rekonstruert.
       </p>
       <div className="rh-cov">
         <div className="rh-cov-card">

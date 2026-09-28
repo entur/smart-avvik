@@ -60,13 +60,14 @@ common:
       TOGVARSEL_NOTIFY_ENABLED: "false"
       # Rushvarsel's MASTER gate (deployment.show_rushvarsel), above the flag just above it: while
       # this is off no rush-forecast push is sent, /togmelding and every /togmelding-api route
-      # answer 404, and /varsel mentions rushvarsel nowhere. Off in every environment since
-      # 2026-09-08 — the product is not ready to be shown, and a partner finding it would be
-      # noise. Turning it back on is this one value per environment: the per-environment
-      # TOGVARSEL_NOTIFY_ENABLED values above are deliberately left as they were, and the forecast
-      # itself keeps being issued and scored either way, so /rushhistorikk keeps measuring the
-      # model while the product is dark.
+      # answer 404, and /varsel mentions rushvarsel nowhere. Off here, the closed default; dev and
+      # prd turn it on (off everywhere 2026-09-08 to 2026-09-28). The forecast itself is issued
+      # and scored either way, so /rushhistorikk keeps measuring the model while it is off.
       SHOW_RUSHVARSEL: "false"
+      # Rush-forecast pushes at RED only (deployment.rushvarsel_red_only): a push says red or
+      # green, never yellow. Off = the launch rule, yellow or red. Same allow-list parse, unset =
+      # off. On in dev and prd since 2026-09-28.
+      TOGVARSEL_NOTIFY_RED_ONLY: "false"
       # Non-secret EU ingestion origin. Capture and review credentials stay separate.
       POSTHOG_HOST: https://eu.i.posthog.com
       # Notification webhooks. Same flag convention as the three above: only true/1/yes/on
