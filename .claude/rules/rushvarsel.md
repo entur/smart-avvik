@@ -122,33 +122,39 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
 
 - **Togvarsel push rounds** (`disruptions/api/togvarsel_notify.py`, 2026-08-30) deliver
   Rushvarsel's prognoses as /varsel Web Pushes. Each of the four weekday issues is one
-  notification *round*: the baselines (06:30, 12:00) push iff yellow or red; the follow-ups
+  notification *round*: the baselines (06:30, 12:00) push iff yellow or red (red only under
+  `TOGVARSEL_NOTIFY_RED_ONLY`, below); the follow-ups
   (07:00, 14:00) push iff the level *differs* from what their baseline pushed — a level
   transition, never a probability delta (the paired models answer different questions with
   different calibration, so raw p is not comparable across them) — and a green follow-up after a
   pushed warning is the one green that pushes: the friskmelding.
-  **Red-only was tried and reverted** (live from 2026-09-02 ~23:45 Oslo to 2026-09-03, PR #130;
-  reverted the next morning at the product owner's request). `docs/togvarsel/04-presisjon-2026-09-02.md`
+  **Red-only is a flag since 2026-09-28, ON in dev and prd** (`TOGVARSEL_NOTIFY_RED_ONLY`,
+  `deployment.rushvarsel_red_only`, allow-list parse, unset = the launch rule;
+  `togvarsel_notify.push_levels`). A push then says red or green, never yellow: a yellow baseline
+  is suppressed as `yellow_baseline`, a yellow follow-up is `no_change` whether a red stands or
+  nothing does, and `/varsel-api/config`'s `togvarsel_red_only` words the «Nytt: Rushvarsel»
+  notice. It was first a code change, live from 2026-09-02 ~23:45 Oslo to 2026-09-03 (PR #130),
+  reverted the next morning at the product owner's request. `docs/togvarsel/04-presisjon-2026-09-02.md`
   is the measurement that motivated it and it still stands: a yellow forecast (p 0.10–0.30) is
   calibrated at 15–23 % bad days and is ~70 % of pushes, so under this rule /rushhistorikk's
   Presisjon reads ~25 % on every window by construction, while red-only would read ~38 % at
   0.46 pushes a day, warning 43 % of bad rushes instead of 91 %. In its one live weekday it
   changed exactly one decision per environment: the 2026-09-03 07:00 round (red pushed at 06:30,
-  yellow at 07:00) was recorded `no_change` where this rule pushes «Oppdatert rushvarsel». A row
-  from the window may carry the reason `yellow_baseline`, which nothing emits now but the
-  vocabulary keeps so the row still reads. `rushhistorikk.reconstruct_rounds` replays the LIVE
-  policy, so reconstructions are yellow-or-red again — the rule every round before the window was
-  recorded under. Wording is deterministic
+  yellow at 07:00) was recorded `no_change` where the launch rule pushes «Oppdatert rushvarsel».
+  `rushhistorikk.reconstruct_rounds` replays the LIVE policy, so a reconstruction follows the flag
+  as it is set NOW, past days included — the gap 2026-09-08 to 2026-09-28, when the master gate
+  recorded nothing, reads as red-only. Recorded rounds keep the rule they were decided under.
+  Wording is deterministic
   Norwegian from the issue's own fields (no LLM), titled `Rushvarsel`/`Oppdatert
   rushvarsel`/`Friskmelding` so a red morning's SX push and forecast push stay tellable apart;
   entur-brand pushes click through to `/togmelding`. Delivery is gated by
   `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on since
   launch, prd on since 2026-08-30, tst off), and while off nothing is evaluated and no state
   written, so an enable-restart inside a window still delivers.
-  **`SHOW_RUSHVARSEL` is the master gate over the whole product, and it is OFF everywhere since
-  2026-09-08** (`deployment.show_rushvarsel`, allow-list parse, **unset = off**; base helm value
-  `"false"`, no environment overrides it). Rushvarsel is not ready to be seen — a partner finding
-  it would be noise — so while this is off: no rush-forecast push is sent (`main.
+  **`SHOW_RUSHVARSEL` is the master gate over the whole product** (`deployment.show_rushvarsel`,
+  allow-list parse, **unset = off**; base helm value `"false"`). It was off everywhere from
+  2026-09-08 (not ready to be seen) and is ON in dev and prd since 2026-09-28, with red-only;
+  tst inherits the base. While it is off: no rush-forecast push is sent (`main.
   _togvarsel_notify_enabled` ANDs the two flags, and that one function is the seam for all THREE
   ways rushvarsel reaches a traveller, so it also empties `/varsel-api/config`'s
   `togvarsel_notify` and with it the PWA's «Nytt: Rushvarsel» notice and its `RushOutlook` panel);
@@ -188,8 +194,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   Fatigue is the known cost: yellow-or-red fires on ≈56 % of weekday mornings (measured level
   bins), the alert-noise shape this repo has rejected before — shipped as requested, mitigated
   (the change gate caps a rush at two pushes, reasons ride in the body, delivery started dev-only;
-  red-only was tried for one weekday and reverted — above — so per-user levels are the remaining
-  documented follow-up). Audit is structured logs (one
+  red-only is the flag above, and per-user levels are the remaining documented follow-up). Audit is structured logs (one
   `togvarsel_notify_round` event per round with decision and sent/error/gone counts) +
   `disruptions.togvarsel_issued` + the persisted markers — deliberately **no `varsel_decisions`
   rows** in v1: the decision is a deterministic function of durable inputs, and adding columns to
@@ -533,8 +538,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     yellow or red, beside the mean p quoted and §14a's long-run rate. It exists because a red
     forecast means "about a coin flip", and the matrix's red/red cell was read as the model's hit
     rate. «Ble du varslet – og hva kostet det?» (`coverage`) counts RUSHES by their scored baseline
-    issue (06:30, 12:00): a bad rush is warned first (yellow or red at the baseline), late (only at
+    issue (06:30, 12:00): a bad rush is warned first (a warning push at the baseline), late (only at
     the follow-up) or missed, and a calm one is warned or quiet. It exists because Dekning folds the
     owed friskmeldinger in (the 2026-09-25 audit: 9 of 9 bad rushes warned, yet Dekning 33 %).
-    "Warned" is the forecast level, which is the push policy's own trigger, so recorded and
-    reconstructed rounds read alike.
+    "Warned" is a warning push as the round decided it (`sent`), not the forecast level: under
+    red-only a yellow nobody was sent is no warning, and the yellow pushes recorded before the flag
+    still are.

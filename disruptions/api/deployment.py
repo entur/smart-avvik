@@ -72,6 +72,16 @@ def show_rushvarsel() -> bool:
     return os.environ.get("SHOW_RUSHVARSEL", "").strip().lower() in _TRUTHY
 
 
+def rushvarsel_red_only() -> bool:
+    """Whether rush-forecast pushes go out at RED only -- ``TOGVARSEL_NOTIFY_RED_ONLY``, unset = off.
+
+    Off is the launch rule, yellow or red. On, a push says red or green and never yellow (the
+    policy is ``togvarsel_notify.decide_issue``). Here rather than in togvarsel_notify because
+    /varsel-api/config reads it too, to word the «Nytt: Rushvarsel» notice. Read at call time.
+    """
+    return os.environ.get("TOGVARSEL_NOTIFY_RED_ONLY", "").strip().lower() in _TRUTHY
+
+
 def require_rushvarsel() -> None:
     """FastAPI dependency: 404 every ``/togmelding-api`` route while :func:`show_rushvarsel` is off.
 

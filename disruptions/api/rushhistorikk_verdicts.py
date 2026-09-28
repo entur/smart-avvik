@@ -215,7 +215,7 @@ class Issue:
     sent: bool = False  # a push was ISSUED here (the policy decision, not delivery)
     kind: str | None = None  # warning | update | all_clear when sent; unmapped from the record
     reason: str | None = None  # untimely | no_change | green_baseline when suppressed; unmapped
-    # (plus yellow_baseline on rows from the red-only window, 2026-09-02/03 — see togvarsel_notify)
+    # (plus yellow_baseline under the red-only rule — see togvarsel_notify.push_levels)
     baseline_level: str | None = None  # B: the level a standing warning leaves in force
     decided_at: datetime | None = None  # when the round was evaluated — the push time
     # When the forecast was computed (togvarsel_issued.computed_at). Read by the API's

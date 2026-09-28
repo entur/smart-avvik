@@ -4,7 +4,7 @@ Togvarsel (togvarsel.py) issues four green/yellow/red prognoses per weekday: 063
 the morning rush, 1200 and 1400 for the afternoon. This module decides which of those rounds
 notify /varsel subscribers. The policy core below is pure functions over plain data — issue
 dicts, a marker map, an explicit Oslo-aware `now` — so a decision is a function of its inputs
-rather than of anything ambient. That is NOT the same as being reconstructible after the fact, and
+rather than of anything ambient, bar the push-level flag (:func:`push_levels`). That is NOT the same as being reconstructible after the fact, and
 the Round Record section below is where the difference is argued: what the markers do not preserve
 is which rounds were never evaluated at all, so every round is recorded to
 `disruptions.togvarsel_outcomes`' sibling table as it is decided.
@@ -16,24 +16,28 @@ The gates, in order, per round:
                  A restart back-fill evaluated past the deadline is recorded as suppressed and
                  never revisited. Judged at evaluation time, which subsumes togvarsel's `late`
                  flag — the policy never reads it.
-    baselines    0630 and 1200 push iff the level is yellow or red.
+    baselines    0630 and 1200 push iff the level is one of :func:`push_levels`.
     follow-ups   0700 and 1400 push iff the level differs from the EFFECTIVE baseline: the level
                  their baseline round pushed, or green when it pushed nothing (not issued,
-                 suppressed, or green). A significant change is a level transition, never a
-                 probability delta — the paired models answer different questions with different
-                 calibration, so raw p is not comparable across them; the level is. A green
-                 follow-up after a pushed yellow/red baseline is the one green that pushes: the
-                 all-clear ("friskmelding"), the trust-building update after a warning.
+                 suppressed, or green) — and is green or one of the push levels. A significant
+                 change is a level transition, never a probability delta — the paired models
+                 answer different questions with different calibration, so raw p is not
+                 comparable across them; the level is. A green follow-up after a pushed warning
+                 is the one green that pushes: the all-clear ("friskmelding"), the
+                 trust-building update after a warning.
 
-A RED-ONLY variant of the two level gates (baselines push iff red; a push says red or green,
-never yellow) was live from the evening of 2026-09-02 until 2026-09-03 (PR #130) and was reverted
-at the product owner's request the next morning. The measurement behind it stands —
+The push levels are yellow and red (the launch rule), or red alone under
+`TOGVARSEL_NOTIFY_RED_ONLY` (deployment.rushvarsel_red_only). Red-only means a push says red or
+green, never yellow: a yellow baseline is suppressed as `yellow_baseline`, and a yellow follow-up
+is `no_change` whether a red stands or nothing does — a yellow "downgrade" push would read as a
+false alarm nine times in ten (21 of 23 such rushes turned green in the rolling replay). It was
+first live for one weekday as a code change (2026-09-02/03, PR #130) and reverted; it is a flag
+since 2026-09-28, on in dev and prd. The measurement behind it is
 docs/togvarsel/04-presisjon-2026-09-02.md: under yellow-or-red /rushhistorikk's Presisjon reads
 ~25 % by construction (a yellow forecast is calibrated at 15-23 % bad days and is ~70 % of the
 pushes), red-only ~38 % at a quarter of the volume while warning 43 % of bad rushes instead of
-91 % — and is what to reach for if the noise question returns. Rows recorded in that window may
-carry the reason `yellow_baseline`; nothing here emits it now, and /rushhistorikk keeps the token
-so such a row still reads.
+91 %. /rushhistorikk replays decide_issue for rounds nobody recorded, so its reconstructions
+follow the flag as it is set NOW, including for past days.
 
 Round markers `{issue: {"level": ..., "pushed": ...}}` are the single state primitive: dedup (at
 most one evaluation per round, ever) and the follow-up baseline in one. The caller owns date
@@ -106,6 +110,11 @@ _OSLO = ZoneInfo("Europe/Oslo")
 # togvarsel's level vocabulary; anything else is a malformed round and is refused loudly.
 _LEVELS = ("green", "yellow", "red")
 
+
+def push_levels() -> frozenset[str]:
+    """The levels a warning push can say: red alone under the red-only flag, else yellow and red."""
+    return frozenset({"red"}) if deployment.rushvarsel_red_only() else frozenset({"yellow", "red"})
+
 # Blast-radius bound on the round-record MERGE, matching rushhistorikk._MAX_BYTES_BILLED.
 _MAX_BYTES_BILLED = 2 * 1024**3
 
@@ -137,9 +146,10 @@ _SPEC_BY_KEY = {s.key: s for s in NOTIFY_SPECS}
 @dataclass(frozen=True)
 class Decision:
     """One round's outcome. `push` with kind "warning" | "update" | "all_clear", or suppression
-    with reason "untimely" | "no_change" | "green_baseline". `marker` is the entry the round
-    commits either way: {"level": ..., "pushed": ...} — its presence is what makes the round
-    never re-evaluated, so even a suppressed round records one."""
+    with reason "untimely" | "no_change" | "green_baseline" | "yellow_baseline" (red-only).
+    `marker` is the entry the round commits either way: {"level": ..., "pushed": ...} — its
+    presence is what makes the round never re-evaluated, so even a suppressed round records one.
+    Under red-only "update" is unreachable (no yellow is ever pushed to escalate from)."""
 
     issue: str
     level: str
@@ -168,8 +178,10 @@ def _effective_baseline(spec: _NotifySpec, markers: Mapping[str, Any]) -> str:
 
 
 def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: datetime) -> Decision:
-    """The per-round policy as a pure function; mutates nothing. Raises on a malformed round
-    (unknown issue key or level) — decide_rounds turns that into "no marker, retry next tick"."""
+    """The per-round policy; mutates nothing, and reads nothing ambient but :func:`push_levels`.
+    Raises on a malformed round (unknown issue key or level) — decide_rounds turns that into "no
+    marker, retry next tick"."""
+    levels = push_levels()
     key = str(issue["issue"])
     spec = _SPEC_BY_KEY.get(key)
     if spec is None:
@@ -196,14 +208,16 @@ def decide_issue(issue: Mapping[str, Any], markers: Mapping[str, Any], now: date
         )
 
     if spec.baseline is None:
-        if level == "green":
+        if level not in levels:
             return Decision(
-                key, level, push=False, marker=_marker(level, False), reason="green_baseline"
+                key, level, push=False, marker=_marker(level, False), reason=f"{level}_baseline"
             )
         return Decision(key, level, push=True, marker=_marker(level, True), kind="warning")
 
     assert base is not None  # spec.baseline is set, so the hoisted resolution ran
-    if level == base:
+    # A level no push says (yellow under red-only) leaves what the traveller holds unchanged,
+    # whether a red stands or nothing does — the same "no_change" as a repeated level.
+    if level == base or (level != "green" and level not in levels):
         return Decision(
             key,
             level,
@@ -291,7 +305,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.togvarsel_rounds` (
   baseline_level STRING OPTIONS(description="For a follow-up, the level its baseline left in force (_effective_baseline); NULL for a baseline round."),
   sent BOOL OPTIONS(description="A push was ISSUED here. The policy decision, not delivery: a round can match zero devices."),
   kind STRING OPTIONS(description="warning | update | all_clear when sent; NULL when suppressed."),
-  reason STRING OPTIONS(description="untimely | no_change | green_baseline when suppressed; NULL when sent. yellow_baseline on rows from the red-only window (2026-09-02 evening to 2026-09-03, PR #130, reverted)."),
+  reason STRING OPTIONS(description="untimely | no_change | green_baseline when suppressed; NULL when sent. yellow_baseline under the red-only rule (TOGVARSEL_NOTIFY_RED_ONLY)."),
   decided_at TIMESTAMP OPTIONS(description="When the round was evaluated — the push time Varslingstid measures from."),
   matched_journeys INT64 OPTIONS(description="Registered journeys matched. Never served by /rushhistorikk-api."),
   matched_devices INT64 OPTIONS(description="Devices matched. Never served by /rushhistorikk-api."),

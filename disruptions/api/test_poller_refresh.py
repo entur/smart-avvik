@@ -420,9 +420,9 @@ def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
     way (test_meldinger.py:2029 documents the same trap). /config endpoints need neither BigQuery
     nor the lifespan, which is what makes 404-vs-200 a clean read on registration alone.
 
-    This suite imports main with SHOW_RUSHVARSEL unset, the posture every deployment is in today,
-    so what is asserted here is the shipped behaviour; the first line is what keeps that true if
-    an ambient value ever appears.
+    This suite imports main with SHOW_RUSHVARSEL unset, the base helm posture (tst's; dev and prd
+    turn it on since 2026-09-28), so what is asserted here is the shipped closed default; the first
+    line is what keeps that true if an ambient value ever appears.
     """
     import os
 
