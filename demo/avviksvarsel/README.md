@@ -61,7 +61,7 @@ A brand is four things, and leaving any one of them out still reads as Entur:
 
 | | Entur (default) | `?brand=none` |
 |---|---|---|
-| colour | Linje moved to the icon's lilac, `src/brands/entur.css` | petrol/slate, `src/brands/none.css` |
+| colour | Linje as shipped | petrol/slate, `src/brands/none.css` |
 | typeface | Entur Nationale | system sans |
 | masthead | `<Logo/>` + "Smarte reisevarsler" | "Smarte reisevarsler" |
 | tab title | Entur Smarte reisevarsler | Smarte reisevarsler |
@@ -202,10 +202,4 @@ for `?brand=none` — after changing the design (needs `npm ci` first, for the N
 
 ```sh
 uv run --with pillow --with fonttools --with svg.path python scripts/make_icons.py
-```
-
-and the default brand's colour sheet after upgrading Linje:
-
-```sh
-uv run python scripts/make_brand_css.py --brand entur
 ```
