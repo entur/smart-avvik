@@ -16,6 +16,7 @@ Linje upgrade that moves a colour cannot leave a stale sheet behind unnoticed.
     uv run python demo/avviksvarsel/scripts/make_brand_css.py --report      # survey the palette
     uv run python demo/avviksvarsel/scripts/make_brand_css.py               # write src/brands/
     uv run python demo/avviksvarsel/scripts/make_brand_css.py --check       # CI-style staleness check
+    uv run python demo/avviksvarsel/scripts/make_brand_css.py --brand entur # the default brand's lilac
 
 Requires demo/avviksvarsel/node_modules (npm install) -- it reads the published stylesheets.
 """
@@ -120,7 +121,17 @@ NONE = Brand(
     note="Brand-neutral: near-monochrome slate with one petrol accent, as /demo uses.",
 )
 
-BRANDS = {b.slug: b for b in (NONE,)}
+# `entur`: the default brand, recoloured to the app icon's lilac (#8e57e3, h~298) since the
+# 2026-09-28 «D + KI-lab» icon. Only Entur's own lavender/blue ramp moves, at a little more chroma
+# because lilac is more saturated than navy; status and transport colours keep their meaning.
+ENTUR = Brand(
+    slug="entur",
+    label="Entur KI-lab",
+    bands=(Band("ENTUR lavender/blue", 265.0, 292.0, 298.0, 1.3),),
+    note="Entur's navy/lavender moved to the app icon's lilac.",
+)
+
+BRANDS = {b.slug: b for b in (NONE, ENTUR)}
 
 
 def recolour(rgb: tuple[int, int, int], brand: Brand) -> tuple[int, int, int]:
