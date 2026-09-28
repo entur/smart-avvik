@@ -5,7 +5,7 @@ import { Heading1, Heading3, Paragraph } from '@entur/typography';
 import DayTable from './components/DayTable';
 import HitTable from './components/HitTable';
 import { fetchConfig, fetchDays } from './api';
-import type { DayRow, StatsRow, TrendPoint } from './api';
+import type { CalibrationRow, Coverage, DayRow, StatsRow } from './api';
 import { fmtDate } from './format';
 
 /** The page's only control (KD4). A rush forecast is one product-wide prognosis over a fixed
@@ -27,7 +27,8 @@ export default function App() {
 
   const [dayRows, setDayRows] = useState<DayRow[]>([]);
   const [stats, setStats] = useState<StatsRow[]>([]);
-  const [trend, setTrend] = useState<TrendPoint[]>([]);
+  const [calibration, setCalibration] = useState<CalibrationRow[]>([]);
+  const [coverage, setCoverage] = useState<Coverage | null>(null);
   const [recordingStarted, setRecordingStarted] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +67,8 @@ export default function App() {
         if (cancelled) return;
         setDayRows(res.days);
         setStats(res.stats);
-        setTrend(res.trend ?? []);
+        setCalibration(res.calibration ?? []);
+        setCoverage(res.coverage ?? null);
         setRecordingStarted(res.recording_started);
       } catch (e) {
         if (!cancelled) {
@@ -75,7 +77,8 @@ export default function App() {
           // window, and left standing under an error box they read as the current one.
           setDayRows([]);
           setStats([]);
-          setTrend([]);
+          setCalibration([]);
+          setCoverage(null);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -148,7 +151,9 @@ export default function App() {
         </SmallAlertBox>
       ) : null}
 
-      {stats.length > 0 && !error ? <HitTable stats={stats} trend={trend} /> : null}
+      {stats.length > 0 && !error ? (
+        <HitTable stats={stats} calibration={calibration} coverage={coverage} />
+      ) : null}
 
       {loading ? (
         <div className="rh-loading">
