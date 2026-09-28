@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 from contextlib import contextmanager
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -328,20 +328,28 @@ def test_a_rate_over_an_empty_denominator_is_null_never_zero():
     assert total["n_ikke_vurdert"] == 1 and total["varsler_sendt"] == 0
 
 
-def test_the_trend_is_the_total_row_per_iso_week():
-    """One point per Monday-started week, each the total row over that week's issues alone."""
-    prior = MONDAY - timedelta(days=7)
+def test_calibration_and_coverage_count_forecasts_and_rushes():
+    """Calibration bins every scored issue by its level; coverage counts RUSHES by their baseline,
+    and a warning first raised at the follow-up covers the rush late (or costs one when calm)."""
+    at = lambda h, m: datetime(2026, 8, 31, h, m, tzinfo=UTC)
     _reset([
-        _row(),
-        # The week before: a yellow push on a green morning, so not justified.
-        _row(d=prior, am_level="green", am_trouble10=0.03, amrest_level="green",
-             computed_at=datetime(2026, 8, 24, 4, 30, tzinfo=UTC),
-             decided_at=datetime(2026, 8, 24, 4, 31, tzinfo=UTC)),
+        _row(),  # 0630 yellow on a yellow morning: warned first
+        _row(issue="0700", p=0.25, sent=False, kind=None, reason="no_change",
+             baseline_level="yellow", computed_at=at(5, 0), decided_at=at(5, 1)),
+        _row(issue="1200", p=0.05, forecast_level="green", round_level="green", sent=False,
+             kind=None, reason="green_baseline", computed_at=at(10, 0), decided_at=at(10, 1)),
+        _row(issue="1400", p=0.20, baseline_level="green", kind="update",
+             computed_at=at(12, 0), decided_at=at(12, 1)),
     ])
-    trend = _days().json()["trend"]
-    assert [p["week_start"] for p in trend] == [prior.isoformat(), MONDAY.isoformat()]
-    assert [(p["presisjon_num"], p["presisjon_den"]) for p in trend] == [(0, 1), (1, 1)]
-    assert [p["presisjon"] for p in trend] == [0.0, 1.0]
+    body = _days().json()
+    cal = {r["level"]: r for r in body["calibration"]}
+    assert [r["level"] for r in body["calibration"]] == ["green", "yellow", "red"]
+    assert (cal["green"]["n"], cal["green"]["n_bad"], cal["green"]["mean_p"]) == (1, 0, 0.05)
+    assert (cal["yellow"]["n"], cal["yellow"]["n_bad"]) == (3, 2)
+    assert abs(cal["yellow"]["mean_p"] - (0.21 + 0.25 + 0.20) / 3) < 1e-9
+    assert (cal["red"]["n"], cal["red"]["mean_p"]) == (0, None)
+    assert body["coverage"] == {"rushes": 2, "days": 1, "bad": 1, "bad_first": 1, "bad_late": 0,
+                                "bad_missed": 0, "calm_warned": 1, "calm_quiet": 0}
 
 
 def test_the_matrix_and_the_verdict_agree_on_one_scored_day():
@@ -392,7 +400,8 @@ def test_the_response_carries_exactly_the_expected_keys():
     """The whole key set, pinned: a field added to the response fails HERE rather than shipping."""
     _reset()
     body = _days().json()
-    assert set(body) == {"days_window", "from_date", "days", "stats", "trend", "recording_started"}
+    assert set(body) == {"days_window", "from_date", "days", "stats", "calibration", "coverage",
+                         "recording_started"}
     assert set(body["days"][0]) == {
         "d", "issues", "am_level", "am_trouble10", "amrest_level", "pm_level", "pm_trouble10",
         "am_provisional_level", "pm_provisional_level", "eligible",

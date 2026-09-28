@@ -293,20 +293,37 @@ class StatsRow(BaseModel):
     )
 
 
-class TrendPoint(BaseModel):
-    """One ISO week of the total row, for the page's trend chart."""
+class CalibrationRow(BaseModel):
+    """One forecast level: how often a rush forecast at that level turned bad."""
 
     model_config = ConfigDict(extra="forbid")
 
-    week_start: date = Field(description="Monday of the week (Oslo). The window's first and last "
-                             "weeks can be partial.")
-    presisjon: float | None = Field(description="As the total row's, over this week's issues.")
-    presisjon_num: int = Field(description="Justified pushes.")
-    presisjon_den: int = Field(description="Pushes on scored issues.")
-    dekning: float | None = Field(description="As the total row's: per RUSH, over this week.")
-    dekning_num: int = Field(description="Rushes owing a push that got a justified one.")
-    dekning_den: int = Field(description="Rushes owing a push.")
-    n_venter: int = Field(description="Issues whose outcome is not settled yet.")
+    level: str = Field(description="The forecast level: green, yellow or red.")
+    n: int = Field(description="Scored issues forecast at this level, all four slots.")
+    n_bad: int = Field(description="Of those, the ones whose rush turned yellow or red — the "
+                       "models' label, whatever the realized level's shade.")
+    mean_p: float | None = Field(description="The mean probability those forecasts quoted. "
+                                 "Beside n_bad/n it says whether the level means what it promises.")
+
+
+class Coverage(BaseModel):
+    """The window from a commuter's side: per RUSH, was a bad one warned, and at what price.
+
+    A rush is a day's morning or afternoon whose BASELINE issue (06:30, 12:00) is scored, judged
+    on that issue's window. Warned means the model said yellow or red — at the baseline, or else at
+    the follow-up — which is the push policy's own trigger, so reconstructed and recorded rounds
+    read alike."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rushes: int
+    days: int = Field(description="Distinct days those rushes fall on, for a per-weekday price.")
+    bad: int = Field(description="Rushes that turned yellow or red.")
+    bad_first: int = Field(description="Bad rushes warned at the baseline.")
+    bad_late: int = Field(description="Bad rushes warned only at the follow-up.")
+    bad_missed: int = Field(description="Bad rushes neither issue warned about.")
+    calm_warned: int = Field(description="Green rushes that got a warning at either issue.")
+    calm_quiet: int = Field(description="Green rushes neither issue warned about.")
 
 
 class DaysResponse(BaseModel):
@@ -318,11 +335,10 @@ class DaysResponse(BaseModel):
     from_date: date = Field(description="First Oslo date included.")
     days: list[DayRow] = Field(description="Newest first.")
     stats: list[StatsRow] = Field(description="The total row first, then one per issue slot.")
-    trend: list[TrendPoint] = Field(
-        description="The total row's Presisjon and Dekning per ISO week, oldest first. Weekly "
-        "rather than daily because a day has at most four rounds, so a day's rate would be over "
-        "zero, one or two pushes."
+    calibration: list[CalibrationRow] = Field(
+        description="Green, yellow, red: how often each forecast level turned into a bad rush."
     )
+    coverage: Coverage
     recording_started: date | None = Field(
         description="The earliest day a notification round was ever recorded. A reconstructed "
         "round BEFORE this is the expected pre-launch backlog; one after it can only mean a lost "
@@ -576,28 +592,45 @@ def _stats_rows(stats: verdicts.Stats) -> list[StatsRow]:
     ]
 
 
-def _trend(issues: list[verdicts.Issue]) -> list[TrendPoint]:
-    """The total row per ISO week, from the same summarize() the table uses, so a week's figures
-    are the table's over that week and cannot be defined twice."""
-    weeks: dict[date, list[verdicts.Issue]] = {}
-    for issue in issues:
-        weeks.setdefault(issue.d - timedelta(days=issue.d.weekday()), []).append(issue)
-    points = []
-    for week_start in sorted(weeks):
-        total = verdicts.summarize(weeks[week_start]).total
-        points.append(
-            TrendPoint(
-                week_start=week_start,
-                presisjon=total.presisjon,
-                presisjon_num=total.presisjon_num,
-                presisjon_den=total.presisjon_den,
-                dekning=total.dekning,
-                dekning_num=total.dekning_num,
-                dekning_den=total.dekning_den,
-                n_venter=total.counts.n_venter,
-            )
-        )
-    return points
+def _bad(issue: verdicts.Issue) -> bool:
+    return issue.actual in ("yellow", "red")
+
+
+def _warns(issue: verdicts.Issue | None) -> bool:
+    return issue is not None and issue.level in ("yellow", "red")
+
+
+def _calibration(pairs: list[tuple[Any, verdicts.Issue]]) -> list[CalibrationRow]:
+    """Over the scored issues, the Presisjon/matrix population, so the three figures and the
+    table's cannot describe different forecasts."""
+    scored = [(row, i) for row, i in pairs if verdicts.population(i) == verdicts.BUCKET_SCORED]
+    out = []
+    for level in verdicts.LEVELS:
+        at = [(row, i) for row, i in scored if i.level == level]
+        ps = [row["p"] for row, _ in at if row["p"] is not None]
+        out.append(CalibrationRow(level=level, n=len(at), n_bad=sum(_bad(i) for _, i in at),
+                                  mean_p=sum(ps) / len(ps) if ps else None))
+    return out
+
+
+def _coverage(issues: list[verdicts.Issue]) -> Coverage:
+    by_key = {(i.d, i.issue): i for i in issues}
+    c = dict.fromkeys(("rushes", "bad", "bad_first", "bad_late", "bad_missed", "calm_warned",
+                      "calm_quiet"), 0)
+    days = set()
+    for (d, slot), base in by_key.items():
+        if slot not in ("0630", "1200") or verdicts.population(base) != verdicts.BUCKET_SCORED:
+            continue
+        first = _warns(base)
+        late = not first and _warns(by_key.get((d, "0700" if slot == "0630" else "1400")))
+        days.add(d)
+        c["rushes"] += 1
+        if _bad(base):
+            c["bad"] += 1
+            c["bad_first" if first else "bad_late" if late else "bad_missed"] += 1
+        else:
+            c["calm_warned" if first or late else "calm_quiet"] += 1
+    return Coverage(days=len(days), **c)
 
 
 router = APIRouter(prefix="/rushhistorikk-api", tags=["rushhistorikk"])
@@ -680,6 +713,7 @@ def days(
         from_date=from_date,
         days=day_rows,
         stats=_stats_rows(stats),
-        trend=_trend(issues),
+        calibration=_calibration(list(zip(rows, issues, strict=True))),
+        coverage=_coverage(issues),
         recording_started=rows[0]["first_recorded_day"] if rows else None,
     )
