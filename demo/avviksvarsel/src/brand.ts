@@ -48,7 +48,7 @@ const BRANDS: Record<BrandId, Brand> = {
     faviconPng32: `${B}favicon-32.png`,
     faviconPng16: `${B}favicon-16.png`,
     appleTouchIcon: `${B}icons/apple-touch-icon-180.png`,
-    themeColor: '#8e57e3', // the header band, the app icon's lilac (brands/entur.css)
+    themeColor: '#181c56', // --lavender-90, the Contrast band
   },
   none: {
     id: 'none',
