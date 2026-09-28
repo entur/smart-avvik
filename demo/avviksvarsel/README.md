@@ -61,13 +61,13 @@ A brand is four things, and leaving any one of them out still reads as Entur:
 
 | | Entur (default) | `?brand=none` |
 |---|---|---|
-| colour | Linje moved to the icon's lilac, `src/brands/entur.css` | petrol/slate, `src/brands/none.css` |
+| colour | Linje as shipped | petrol/slate, `src/brands/none.css` |
 | typeface | Entur Nationale | system sans |
 | masthead | `<Logo/>` + "Smarte reisevarsler" | "Smarte reisevarsler" |
 | tab title | Entur Smarte reisevarsler | Smarte reisevarsler |
-| favicon / home screen | «Smarte reisevarsler» + «Et ENTUR eksperiment» + KI-lab band on lilac | bell on petrol |
+| favicon / home screen | «Smarte reisevarsler» + «Et ENTUR eksperiment» + KI-lab band on Entur navy | bell on petrol |
 | manifest | `manifest.webmanifest` | `manifest-none.webmanifest`, `start_url=/varsel/?brand=none` |
-| push notification | the lilac app icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |
+| push notification | the KI-lab app icon, opens `/varsel/` | neutral icon, opens `/varsel/?brand=none` |
 | sender line | "Tjenesten leveres av Entur AS." | **the same line** — see below |
 
 The wording of a push is deliberately **identical** across brands: it is what `/historikk` records,
@@ -197,15 +197,9 @@ would otherwise discard feedback in silence (measured 2026-08-28 — see
 retention, deletion/subject-rights, staged rollout, reviewer usage, and rollback are documented in
 [`data/feedback/README.md`](../../data/feedback/README.md).
 
-Regenerate the PWA icons — the lilac KI-lab tile for the default brand, a white bell on petrol
+Regenerate the PWA icons — the navy KI-lab tile for the default brand, a white bell on petrol
 for `?brand=none` — after changing the design (needs `npm ci` first, for the Nationale fonts):
 
 ```sh
 uv run --with pillow --with fonttools --with svg.path python scripts/make_icons.py
-```
-
-and the default brand's colour sheet after upgrading Linje:
-
-```sh
-uv run python scripts/make_brand_css.py --brand entur
 ```

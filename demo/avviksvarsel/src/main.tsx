@@ -20,8 +20,8 @@ import '@entur/a11y/dist/styles.css';
 import '@entur/loader/dist/styles.css';
 
 // Brand overrides LAST — they win on specificity (`:root[data-brand=…]`), but only once the rules
-// they override have been defined. Entur's sheet recolours Linje to the app icon's lilac.
-import './brands/entur.css';
+// they override have been defined. Every brand but Entur has a sheet here; Entur is Linje as
+// shipped, so it has none, and a page with no `brand` parameter loads nothing extra.
 import './brands/none.css';
 
 import App from './App';
