@@ -2,7 +2,7 @@
  *
  * entur.generated.css moves Linje's own navy/lavender ramp to the icon's lilac hue at unchanged
  * perceptual lightness (scripts/make_brand_css.py --brand entur). This file adds what is not a
- * Linje colour: the header band in the icon's exact lilac, and the app's navy-tinted card shadow.
+ * Linje colour: the header band in the icon's Entur navy, and the app's card shadow.
  * Typeface and logo stay Entur's.
  */
 
@@ -12,9 +12,9 @@
   --av-card-shadow: 0 1px 3px rgb(48 5 92 / 0.08);
 }
 
-/* The icon's tile colour, so the page and the home-screen icon read as one thing. White text on it
-   is 4.5:1. Keep in step with brand.ts `themeColor` and the manifest's `theme_color`. */
+/* The icon's tile colour (Entur navy, as on the Entur logo), so the page and the home-screen icon
+   read as one thing. Keep in step with brand.ts `themeColor` and the manifest's `theme_color`. */
 :root[data-brand='entur'] .av-header,
 :root[data-brand='entur'] .pv-header {
-  background-color: #8e57e3;
+  background-color: #181c56;
 }
