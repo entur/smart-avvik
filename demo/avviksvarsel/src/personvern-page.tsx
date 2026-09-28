@@ -53,6 +53,7 @@ import '@entur/loader/dist/styles.css';
 // (`:root[data-brand=…]`) — or, for the `:where()`-scoped rules, on source order — but only over
 // rules that already exist. index.html has set data-brand from the same parameter before first
 // paint, so the palette is right from the first frame.
+import './brands/entur.css';
 import './brands/none.css';
 
 import { Contrast } from '@entur/layout';
