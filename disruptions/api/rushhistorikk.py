@@ -154,9 +154,8 @@ class IssueRow(BaseModel):
     )
     kind: str | None = Field(description="warning | update | all_clear when sent.")
     reason: str | None = Field(
-        description="untimely | no_change | green_baseline when the round decided not to push; "
-        "yellow_baseline on a row from the red-only window (2026-09-02 evening to 2026-09-03, "
-        "PR #130, reverted)."
+        description="untimely | no_change | green_baseline | yellow_baseline when the round "
+        "decided not to push; yellow_baseline under the red-only rule (TOGVARSEL_NOTIFY_RED_ONLY)."
     )
     baseline_level: str | None = Field(
         description="For a follow-up, the level its baseline left in force — the level a confirming "
@@ -310,9 +309,11 @@ class Coverage(BaseModel):
     """The window from a commuter's side: per RUSH, was a bad one warned, and at what price.
 
     A rush is a day's morning or afternoon whose BASELINE issue (06:30, 12:00) is scored, judged
-    on that issue's window. Warned means the model said yellow or red — at the baseline, or else at
-    the follow-up — which is the push policy's own trigger, so reconstructed and recorded rounds
-    read alike."""
+    on that issue's window. Warned means a warning push went out — at the baseline, or else at the
+    follow-up — as the round decided it: a recorded round under the rule live that day, a
+    reconstructed one under the rule live now (red-only or yellow-or-red, togvarsel_notify.
+    push_levels). Not the forecast level, which under red-only would count a yellow nobody was
+    sent, and which would regrade the yellow pushes recorded before the flag."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -597,7 +598,9 @@ def _bad(issue: verdicts.Issue) -> bool:
 
 
 def _warns(issue: verdicts.Issue | None) -> bool:
-    return issue is not None and issue.level in ("yellow", "red")
+    # Enough on its own: a baseline only pushes warnings, and a follow-up whose baseline pushed
+    # nothing cannot push a friskmelding.
+    return issue is not None and issue.sent
 
 
 def _calibration(pairs: list[tuple[Any, verdicts.Issue]]) -> list[CalibrationRow]:

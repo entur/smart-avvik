@@ -312,6 +312,20 @@ def test_config_reports_togvarsel_notify_only_where_wired_on():
         varsel._togvarsel_notify_provider = before
 
 
+def test_config_reports_the_red_only_rule_from_its_flag():
+    """The notice words the push rule («rød» or «gul eller rød») from this, so it must follow
+    TOGVARSEL_NOTIFY_RED_ONLY, unset reading as the launch rule."""
+    before = os.environ.pop("TOGVARSEL_NOTIFY_RED_ONLY", None)
+    try:
+        assert client.get("/varsel-api/config").json()["togvarsel_red_only"] is False
+        os.environ["TOGVARSEL_NOTIFY_RED_ONLY"] = "true"
+        assert client.get("/varsel-api/config").json()["togvarsel_red_only"] is True
+    finally:
+        os.environ.pop("TOGVARSEL_NOTIFY_RED_ONLY", None)
+        if before is not None:
+            os.environ["TOGVARSEL_NOTIFY_RED_ONLY"] = before
+
+
 @contextmanager
 def _deployed_as(project: str | None, override: str | None = None):
     """Run the body as if the app were deployed in `project` (ambient env, if any, restored after)."""

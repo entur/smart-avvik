@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 # such pin: `enabled` is an injected seam, and main.py is where the two flags are ANDed.
 os.environ["SHOW_RUSHVARSEL"] = "true"
 
+import deployment
 import togvarsel_notify
 import varsel
 from fastapi import FastAPI
@@ -102,6 +103,45 @@ def test_baseline_green_is_recorded_but_not_pushed():
     (d,) = togvarsel_notify.decide_rounds([_issue("0630", "green")], markers, now=_monday(6, 31))
     assert d.push is False and d.reason == "green_baseline"
     assert markers == {"0630": {"level": "green", "pushed": False}}
+
+
+# ---------------------------------------------------------------------------- red-only
+
+def _red_only(monkeypatch) -> None:
+    monkeypatch.setattr(deployment, "rushvarsel_red_only", lambda: True)
+
+
+def test_red_only_holds_back_a_yellow_baseline_and_pushes_a_red_one(monkeypatch):
+    _red_only(monkeypatch)
+    markers = {}
+    (d,) = togvarsel_notify.decide_rounds([_issue("0630", "yellow")], markers, now=_monday(6, 31))
+    assert d.push is False and d.reason == "yellow_baseline"
+    assert markers["0630"] == {"level": "yellow", "pushed": False}
+    (d,) = togvarsel_notify.decide_rounds([_issue("1200", "red")], markers, now=_monday(12, 1))
+    assert d.push is True and d.kind == "warning"
+
+
+def test_red_only_follow_ups_say_red_or_green_never_yellow(monkeypatch):
+    """The first row is 2026-09-28's morning: yellow at 06:30, red at 07:00 — a fresh warning, not
+    an update, since nothing was pushed. A yellow never pushes, after a red or after nothing."""
+    _red_only(monkeypatch)
+    held, red = {"level": "yellow", "pushed": False}, {"level": "red", "pushed": True}
+    cases = [
+        (held, "red", (True, "warning", None, "green")),
+        (red, "yellow", (False, None, "no_change", "red")),
+        (red, "green", (True, "all_clear", None, "red")),
+        (held, "yellow", (False, None, "no_change", "green")),
+        (held, "green", (False, None, "no_change", "green")),
+    ]
+    for base, level, want in cases:
+        (d,) = togvarsel_notify.decide_rounds(
+            [_issue("0700", level)], {"0630": dict(base)}, now=_monday(7, 1)
+        )
+        assert (d.push, d.kind, d.reason, d.baseline_level) == want, (base, level)
+
+
+def test_the_launch_rule_is_the_default():
+    assert togvarsel_notify.push_levels() == {"yellow", "red"}
 
 
 # ---------------------------------------------------------------------------- follow-up rounds
