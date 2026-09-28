@@ -2603,8 +2603,11 @@ class _VersionedStaticFiles(StaticFiles):
     the page keeps working, it is just the wrong version of it.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, swaps: dict[str, str] | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Request path -> file actually served, for per-environment variants of files whose URL is
+        # baked into the one image every environment shares (see _DEV_VARSEL_ASSETS).
+        self._swaps = swaps or {}
         # Resolved once, and it has to be resolved at all: StaticFiles hands file_response the
         # REALPATH of the file (it resolves symlinks before serving, so a client cannot escape the
         # mount) while `directory` stays exactly as it was passed in. Compare the two unresolved
@@ -2613,6 +2616,10 @@ class _VersionedStaticFiles(StaticFiles):
         # it failed when first written: caught by the tests on macOS, where a temp dir under
         # /var/... resolves to /private/var/..., and it would NOT have shown up in the container.
         self._root = Path(self.directory).resolve()
+
+    def get_path(self, scope):
+        path = super().get_path(scope)
+        return self._swaps.get(path, path)
 
     def file_response(self, full_path, stat_result, scope, status_code=200):
         # Set on the RESPONSE, deliberately, rather than before the super() call. The base method
@@ -2667,8 +2674,29 @@ else:
 # generated-directory pattern as /eval and /demo; the manifest, service worker and icons ship in
 # this directory and are served at /varsel/. Its data + push endpoints are /varsel-api (above).
 _VARSEL_STATIC_DIR = Path(__file__).parent / "varsel_static"
+# dev serves its own icon set («KI-lab dev» on a white band, make_icons.py) under the prd names, so
+# a dev install cannot be mistaken for prd on a home screen or in a notification. Swapped here
+# rather than by URL because the manifest, index.html and the push payload name these paths in the
+# one image every environment runs. Import-time, like the other environment gates in this file.
+_DEV_VARSEL_ASSETS = {
+    "icons/pwa-192.png": "icons/pwa-192-dev.png",
+    "icons/pwa-512.png": "icons/pwa-512-dev.png",
+    "icons/pwa-512-maskable.png": "icons/pwa-512-maskable-dev.png",
+    "icons/apple-touch-icon-180.png": "icons/apple-touch-icon-180-dev.png",
+    "favicon.svg": "favicon-dev.svg",
+    "favicon-32.png": "favicon-dev-32.png",
+    "favicon-16.png": "favicon-dev-16.png",
+}
 if _VARSEL_STATIC_DIR.is_dir():
-    app.mount("/varsel", _VersionedStaticFiles(directory=_VARSEL_STATIC_DIR, html=True), name="varsel")
+    app.mount(
+        "/varsel",
+        _VersionedStaticFiles(
+            directory=_VARSEL_STATIC_DIR,
+            html=True,
+            swaps=_DEV_VARSEL_ASSETS if deployment.environment_label() == "dev" else None,
+        ),
+        name="varsel",
+    )
     logger.info("Mounted avviksvarsel PWA at /varsel from %s", _VARSEL_STATIC_DIR)
 else:
     logger.info("No varsel_static/ directory; /varsel not mounted (run demo/avviksvarsel/build.sh)")

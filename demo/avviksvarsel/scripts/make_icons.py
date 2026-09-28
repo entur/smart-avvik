@@ -19,6 +19,8 @@ Outputs into demo/avviksvarsel/public/:
   icons/pwa-512-maskable                                    — the tile at 80 % inside the circular
       safe zone Android may crop a maskable icon to.
   favicon.svg (+ favicon-32, favicon-16)                    — name and bar only (vector + PNG).
+  the same seven with `-dev` before the extension           — «KI-lab dev» on a white band, served
+      in their place by the dev deployment (main.py, `_DEV_VARSEL_ASSETS`).
   icons/badge-72                                            — white bell glyph on transparent, the
       monochrome Android notification badge (a "notification" glyph, not the app icon — left alone).
   the same six, suffixed `-none`                            — the unbranded set.
@@ -107,12 +109,13 @@ class _Face:
         return out
 
 
-def entur_tile(*, sender: bool = True) -> list[Shape]:
+def entur_tile(*, sender: bool = True, band: str = "KI-lab", band_fill: str = CANARY) -> list[Shape]:
     """The «D + KI-lab» icon: the service name where Entur's logo has «EN», the coral bar, the
     sender line «Et [ENTUR] eksperiment» and a canary «KI-lab» band across the top-right corner.
 
     Laid out as the design sketch does it (x=14, a 72-wide block, pushed 5 down for the band);
-    `sender=False` is the favicon, where the sender line would be under a pixel tall.
+    `sender=False` is the favicon, where the sender line would be under a pixel tall. The dev
+    deployment's set says «KI-lab dev» on a white band, so a dev install is never mistaken for prd.
     """
     bold, medium = _Face("Demibold"), _Face("Medium")
     x, w, lh, lines = 14.0, 72.0, 14.0, ("Smarte", "reisevarsler")
@@ -136,10 +139,12 @@ def entur_tile(*, sender: bool = True) -> list[Shape]:
         mx, s2 = x + (lead + gap) * k, ws * k
         shapes += [(d, (s2, 0, 0, s2, mx, base - 13 * s2), fill) for d, fill in WORDMARK]
         shapes += medium.shapes("eksperiment", mx + (WORDMARK_W * ws + gap) * k, base, fs * k, "#fff")
-    band = (0.7071, 0.7071, -0.7071, 0.7071, 76, 24)  # translate(76 24) rotate(45)
-    shapes.append(("M-60 -8H60V8H-60Z", band, CANARY))
-    label = bold.width("KI-lab", 10, 0.6) - 0.6
-    shapes += bold.shapes("KI-lab", -label / 2, 3.8, 10, NAVY, band, 0.6)
+    m = (0.7071, 0.7071, -0.7071, 0.7071, 76, 24)  # translate(76 24) rotate(45)
+    shapes.append(("M-60 -8H60V8H-60Z", m, band_fill))
+    # The band's visible run across the corner is ~68 units; keep a longer label clear of its ends.
+    fs = min(10.0, 10 * 42 / (bold.width(band, 10, 0.6) - 0.6))
+    label = bold.width(band, fs, 0.6) - 0.6
+    shapes += bold.shapes(band, -label / 2, 0.38 * fs, fs, NAVY, m, 0.6)
     return shapes
 
 
@@ -274,6 +279,20 @@ def main() -> None:
     write_svg(OUT / "favicon.svg", favicon)
     write_png(OUT / "favicon-32.png", favicon, 32)
     write_png(OUT / "favicon-16.png", favicon, 16)
+
+    # The same set for the dev deployment, which main.py serves under the names above when
+    # environment_label() is "dev" -- the image is shared, so the URLs have to be too.
+    print("Entur, dev deployment:")
+    dev = {"band": "KI-lab dev", "band_fill": "#ffffff"}
+    tile = entur_tile(**dev)
+    write_png(ICONS / "pwa-192-dev.png", tile, 192)
+    write_png(ICONS / "pwa-512-dev.png", tile, 512)
+    write_png(ICONS / "apple-touch-icon-180-dev.png", tile, 180)
+    write_png(ICONS / "pwa-512-maskable-dev.png", scaled(tile, 0.8), 512)
+    favicon = entur_tile(sender=False, **dev)
+    write_svg(OUT / "favicon-dev.svg", favicon)
+    write_png(OUT / "favicon-dev-32.png", favicon, 32)
+    write_png(OUT / "favicon-dev-16.png", favicon, 16)
     # Notification badge: monochrome white bell on transparent (Android renders it as a mask).
     # Brand-independent -- Android draws it as a silhouette, so there is no colour to brand.
     make_bell(ICONS / "badge-72.png", 72, background=TRANSPARENT)

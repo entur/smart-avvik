@@ -177,6 +177,26 @@ def test_every_real_static_mount_uses_the_caching_subclass():
         )
 
 
+def test_a_swapped_path_serves_the_variant_under_the_original_name():
+    """dev's icon set: the URL the manifest and the push name, the bytes of the -dev file."""
+    root = Path(_tmp.name) / "swap"
+    (root / "icons").mkdir(parents=True)
+    (root / "icons" / "pwa-192.png").write_bytes(b"prd")
+    (root / "icons" / "pwa-192-dev.png").write_bytes(b"dev")
+    app = FastAPI()
+    swaps = {"icons/pwa-192.png": "icons/pwa-192-dev.png"}
+    app.mount("/s", main._VersionedStaticFiles(directory=root, swaps=swaps), name="s")
+    app.mount("/p", main._VersionedStaticFiles(directory=root), name="p")
+    c = TestClient(app)
+    assert c.get("/s/icons/pwa-192.png").content == b"dev"
+    assert c.get("/p/icons/pwa-192.png").content == b"prd"
+    # Every key names a file make_icons.py writes, or dev would 404 its own icons.
+    public = Path(__file__).resolve().parents[2] / "demo" / "avviksvarsel" / "public"
+    for original, variant in main._DEV_VARSEL_ASSETS.items():
+        assert (public / original).is_file(), original
+        assert (public / variant).is_file(), variant
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
