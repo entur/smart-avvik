@@ -1,35 +1,34 @@
 """Generate the Smarte reisevarsler PWA icons and favicons — one set per brand.
 
-DEFAULT BRAND (Entur). The home-screen / PWA / favicon artwork is the official Entur "EN" logo
-(white wordmark + coral underline, i.e. @entur/icons' LogoNegativeIcon) on the app's Lavender-90
-theme colour, so /varsel reads as Entur-branded. The Entur logo paths are pure straight-line
-geometry, so we render them faithfully with Pillow (no SVG toolchain needed).
+DEFAULT BRAND (Entur). The «D + KI-lab» tile from the 2026-09-28 icon proposal: the service name
+«Smarte reisevarsler» where Entur's logo has «EN», Entur's coral bar under it, the sender line
+«Et [ENTUR] eksperiment» with entur.no's wordmark, and a canary «KI-lab» band across the top-right
+corner, on Linje's data lilac so it is not mistaken for the Entur app. Text is Nationale, drawn from
+its glyph outlines (fontTools) so the vector favicon needs no font, and rasterised with Pillow.
 
 BRAND "none" (?brand=none). The unbranded variant needs its own set, or an install made from it
 would sit on the phone under the Entur mark and push a notification carrying it — the two places
 a page-level reskin does not reach. It reuses the bell glyph already drawn here for the Android
 badge, on the petrol accent /demo uses: a notification app, saying nothing about who runs it.
 
-Regenerate with:
-    uv run --with pillow python demo/avviksvarsel/scripts/make_icons.py
+Regenerate with (after `npm ci` in demo/avviksvarsel, which brings the Nationale font files):
+    uv run --with pillow --with fonttools --with svg.path python demo/avviksvarsel/scripts/make_icons.py
 
 Outputs into demo/avviksvarsel/public/:
-  icons/pwa-192, icons/pwa-512, icons/apple-touch-icon-180  — Entur logo, opaque, full-bleed so
-      the maskable/apple masks look right.
-  favicon.svg (+ favicon-32, favicon-16)                    — browser-tab favicon (vector + PNG).
+  icons/pwa-192, icons/pwa-512, icons/apple-touch-icon-180  — the tile, opaque and full-bleed.
+  icons/pwa-512-maskable                                    — the tile at 80 % inside the circular
+      safe zone Android may crop a maskable icon to.
+  favicon.svg (+ favicon-32, favicon-16)                    — name and bar only (vector + PNG).
   icons/badge-72                                            — white bell glyph on transparent, the
       monochrome Android notification badge (a "notification" glyph, not the app icon — left alone).
   the same six, suffixed `-none`                            — the unbranded set.
 """
 
-import re
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
-LAVENDER_90 = (24, 28, 86, 255)  # Entur --lavender-90 #181c56
 WHITE = (255, 255, 255, 255)
-CORAL = (255, 89, 89, 255)  # Entur logo underline #FF5959
 TRANSPARENT = (0, 0, 0, 0)
 # The unbranded icon tile. This is /demo's petrol accent rather than the #002c2d the brand sheet
 # recolours the header band to: that one is nearly black, which reads as a smudge at 48 px on a
@@ -39,69 +38,158 @@ SS = 4  # supersample factor for crisp anti-aliased edges
 
 OUT = Path(__file__).resolve().parent.parent / "public"
 ICONS = OUT / "icons"
+FONTS = OUT.parent / "node_modules" / "@entur" / "typography" / "fonts"
 
-# The Entur logo mark, straight from @entur/icons' LogoNegativeIcon (viewBox 0 0 16 16).
-# All commands are lines (M/L/H/V + relative variants), so each path is a simple filled polygon.
-LOGO_E = "M0 2h6.45v1.567H1.674v2.312h4.236v1.566H1.675v2.237H6.45v1.566H0z"
-LOGO_N = "M14.107 2h1.676v9.248h-.18L9.848 5.752v5.496H8.173V2h.179l5.755 5.597z"
-LOGO_BAR = "M0 14.799 15.783 14.799 15.783 13.377 0 13.377z"
-# Logo bounding box within the 16×16 viewBox (bar reaches y=14.799; letters start at y=2, x=0).
-LOGO_X0, LOGO_Y0, LOGO_W, LOGO_H = 0.0, 2.0, 15.783, 12.799
+# Linje colours for the Entur tile.
+LILAC = "#8e57e3"  # data-default-lilac: tells the icon apart from the Entur app's navy
+CORAL = "#ff5959"  # the Entur logo's underline
+CANARY = "#ffca28"  # the KI-lab corner band
+NAVY = "#181c56"  # Entur blue, the band's text
 
+# The ENTUR wordmark from entur.no's header (viewBox 0 0 62 19; EN's baseline is y=13).
+WORDMARK = [
+    ("M0 0v13.006h9.392v-2.203H2.439V7.658h6.169V5.455H2.439V2.203h6.953V0z", "#fff"),
+    ("M0 18h22.983v-2H0z", CORAL),
+    ("M20.543 0v7.871L12.163 0H11.9v13.006h2.44V5.277l8.38 7.73h.262V0zM35.467 7.657h-3.642V18.46h-2.439V7.657h-3.66V5.454h9.74z", "#fff"),
+    ("M42.872 18.691c-.825 0-1.574-.13-2.248-.39a4.929 4.929 0 0 1-1.725-1.102 4.877 4.877 0 0 1-1.106-1.724c-.261-.675-.392-1.427-.392-2.256V5.454h2.44v7.765c0 .651.104 1.19.313 1.617.209.426.467.764.775 1.012.308.25.64.421.994.516.354.095.67.142.95.142.278 0 .594-.047.949-.142.354-.095.685-.267.993-.516.308-.248.566-.586.775-1.012.21-.427.314-.966.314-1.617V5.454h2.44v7.765c0 .83-.128 1.581-.384 2.256a4.787 4.787 0 0 1-1.098 1.724 4.934 4.934 0 0 1-1.725 1.101c-.673.26-1.428.391-2.265.391M53.57 12.153h2.78c.509 0 .928-.065 1.258-.196.33-.13.59-.302.782-.515.191-.213.321-.453.39-.72.07-.266.105-.535.105-.808 0-.32-.05-.616-.148-.888a1.906 1.906 0 0 0-.451-.711 2.16 2.16 0 0 0-.782-.48c-.319-.118-.703-.178-1.155-.178H53.57v4.496zm0 2.167v4.14h-2.439V5.454h5.795c.652 0 1.248.11 1.789.329.541.22 1.004.527 1.387.924.384.397.684.87.9 1.421.214.551.322 1.152.322 1.804 0 .486-.064.956-.192 1.412a4.795 4.795 0 0 1-.532 1.235 3.718 3.718 0 0 1-.838.95 2.952 2.952 0 0 1-1.09.56l3.175 4.371h-2.91l-2.952-4.14H53.57z", "#fff"),
+]
+WORDMARK_W = 62.0
 
-def _parse_path(d: str) -> list[tuple[float, float]]:
-    """Parse a straight-line SVG path (M/L/H/V + relative) into absolute (x, y) vertices."""
-    tokens = re.findall(r"[MmLlHhVvZz]|-?\d*\.?\d+", d)
-    pts: list[tuple[float, float]] = []
-    x = y = 0.0
-    cmd = ""
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t.isalpha():
-            cmd = t
-            i += 1
-            continue
-        if cmd in ("M", "L"):
-            x, y = float(tokens[i]), float(tokens[i + 1])
-            i += 2
-            cmd = "L"  # implicit lineto for subsequent coordinate pairs
-        elif cmd in ("m", "l"):
-            x, y = x + float(tokens[i]), y + float(tokens[i + 1])
-            i += 2
-            cmd = "l"
-        elif cmd == "H":
-            x = float(tokens[i])
-            i += 1
-        elif cmd == "h":
-            x += float(tokens[i])
-            i += 1
-        elif cmd == "V":
-            y = float(tokens[i])
-            i += 1
-        elif cmd == "v":
-            y += float(tokens[i])
-            i += 1
-        else:  # a stray number under Z/z — shouldn't happen for these paths
-            i += 1
-            continue
-        pts.append((x, y))
-    return pts
+# A shape is (svg path d, affine matrix (a, b, c, d, e, f) as in SVG, fill). Every drawing below is
+# a list of shapes in a 100x100 box, so the same list is written as SVG and rasterised as PNG.
+Shape = tuple[str, tuple[float, ...], str]
 
 
-def _draw_logo(draw: ImageDraw.ImageDraw, s: int, width_frac: float) -> None:
-    """Draw the Entur logo mark centred, spanning `width_frac` of an s×s canvas."""
-    target_w = width_frac * s
-    sc = target_w / LOGO_W
-    ox = (s - target_w) / 2
-    oy = (s - LOGO_H * sc) / 2
+def _mul(m, n):
+    """m then n, i.e. the SVG matrix of `transform="n m"` applied to a point: n(m(p))."""
+    a, b, c, d, e, f = n
+    A, B, C, D, E, F = m
+    return (a * A + c * B, b * A + d * B, a * C + c * D, b * C + d * D, a * E + c * F + e, b * E + d * F + f)
 
-    def tf(pts):
-        return [(ox + (px - LOGO_X0) * sc, oy + (py - LOGO_Y0) * sc) for px, py in pts]
 
-    draw.polygon(tf(_parse_path(LOGO_E)), fill=WHITE)
-    draw.polygon(tf(_parse_path(LOGO_N)), fill=WHITE)
-    draw.polygon(tf(_parse_path(LOGO_BAR)), fill=CORAL)
+def _font(name: str):
+    from fontTools.ttLib import TTFont
+
+    path = FONTS / f"Entur-Nationale-{name}.woff"
+    if not path.exists():
+        raise SystemExit(f"{path} is missing: run `npm ci` in demo/avviksvarsel first")
+    return TTFont(path)
+
+
+class _Face:
+    """Nationale glyph outlines as SVG paths. No kerning: at icon sizes it is invisible."""
+
+    def __init__(self, name: str):
+        from fontTools.pens.svgPathPen import SVGPathPen
+
+        font = _font(name)
+        self.upm = font["head"].unitsPerEm
+        self.cmap = font.getBestCmap()
+        self.hmtx = font["hmtx"]
+        glyphs = font.getGlyphSet()
+        self.paths = {}
+        for g in set(self.cmap.values()):
+            pen = SVGPathPen(glyphs)
+            glyphs[g].draw(pen)
+            self.paths[g] = pen.getCommands()
+
+    def width(self, text: str, size: float, spacing: float = 0.0) -> float:
+        return sum(self.hmtx[self.cmap[ord(ch)]][0] * size / self.upm + spacing for ch in text)
+
+    def shapes(self, text: str, x: float, baseline: float, size: float, fill: str, m=None, spacing=0.0) -> list[Shape]:
+        out, k = [], size / self.upm
+        for ch in text:
+            g = self.cmap[ord(ch)]
+            if self.paths[g]:
+                glyph = (k, 0, 0, -k, x, baseline)  # font units are y-up
+                out.append((self.paths[g], _mul(glyph, m) if m else glyph, fill))
+            x += self.hmtx[g][0] * k + spacing
+        return out
+
+
+def entur_tile(*, sender: bool = True) -> list[Shape]:
+    """The «D + KI-lab» icon: the service name where Entur's logo has «EN», the coral bar, the
+    sender line «Et [ENTUR] eksperiment» and a canary «KI-lab» band across the top-right corner.
+
+    Laid out as the design sketch does it (x=14, a 72-wide block, pushed 5 down for the band);
+    `sender=False` is the favicon, where the sender line would be under a pixel tall.
+    """
+    bold, medium = _Face("Demibold"), _Face("Medium")
+    x, w, lh, lines = 14.0, 72.0, 14.0, ("Smarte", "reisevarsler")
+    block = len(lines) * lh + 4 + 3 + (12 if sender else 0)
+    y = (100 - block) / 2 + 5
+    shapes: list[Shape] = [("M0 0H100V100H0Z", (1, 0, 0, 1, 0, 0), LILAC)]
+    # One size for both name lines, shrunk until the longer one fits the bar.
+    size = lh * min(1.0, min(w / bold.width(t, lh) for t in lines))
+    for t in lines:
+        y += lh
+        shapes += bold.shapes(t, x, y - 2, size, "#fff")
+    y += 3
+    shapes.append((f"M{x} {y}h{w}v3h-{w}Z", (1, 0, 0, 1, 0, 0), CORAL))
+    y += 3
+    if sender:
+        # Words and wordmark are scaled together so the line is never wider than the bar.
+        base, fs, ws, gap = y + 10.5, 9.0, 11 / 19, 2.5
+        lead, trail = medium.width("Et", fs), medium.width("eksperiment", fs)
+        k = min(1.0, w / (lead + gap + WORDMARK_W * ws + gap + trail))
+        shapes += medium.shapes("Et", x, base, fs * k, "#fff")
+        mx, s2 = x + (lead + gap) * k, ws * k
+        shapes += [(d, (s2, 0, 0, s2, mx, base - 13 * s2), fill) for d, fill in WORDMARK]
+        shapes += medium.shapes("eksperiment", mx + (WORDMARK_W * ws + gap) * k, base, fs * k, "#fff")
+    band = (0.7071, 0.7071, -0.7071, 0.7071, 76, 24)  # translate(76 24) rotate(45)
+    shapes.append(("M-60 -8H60V8H-60Z", band, CANARY))
+    label = bold.width("KI-lab", 10, 0.6) - 0.6
+    shapes += bold.shapes("KI-lab", -label / 2, 3.8, 10, NAVY, band, 0.6)
+    return shapes
+
+
+def scaled(shapes: list[Shape], k: float) -> list[Shape]:
+    """Everything but the background scaled by k about the centre — the maskable safe zone."""
+    m = (k, 0, 0, k, 50 * (1 - k), 50 * (1 - k))
+    return shapes[:1] + [(d, _mul(t, m), fill) for d, t, fill in shapes[1:]]
+
+
+def write_svg(path: Path, shapes: list[Shape]) -> None:
+    body = "\n".join(
+        f'  <path fill="{fill}" transform="matrix({" ".join(f"{v:.4g}" for v in t)})" d="{d}"/>' for d, t, fill in shapes
+    )
+    path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">\n{body}\n</svg>\n')
+    print(f"  wrote {path.relative_to(OUT.parent)} (vector)")
+
+
+def _subpaths(d: str, steps: int = 12):
+    """Flatten a path into its subpaths' vertex lists (curves and arcs sampled)."""
+    from svg.path import Close, Line, Move, parse_path
+
+    polys: list[list[complex]] = []
+    for seg in parse_path(d):
+        if isinstance(seg, Move):
+            polys.append([seg.end])
+        elif isinstance(seg, (Line, Close)):
+            polys[-1].append(seg.end)
+        else:
+            polys[-1] += [seg.point(i / steps) for i in range(1, steps + 1)]
+    return polys
+
+
+def write_png(path: Path, shapes: list[Shape], size: int) -> None:
+    from PIL import ImageChops
+
+    px = size * SS
+    canvas = Image.new("RGBA", (px, px))
+    for d, (a, b, c, dd, e, f), fill in shapes:
+        # Even-odd fill: XOR each subpath in, which is what punches the counters out of «R», «e», «a».
+        mask = Image.new("1", (px, px))
+        for poly in _subpaths(d):
+            if len(poly) < 3:
+                continue
+            one = Image.new("1", (px, px))
+            pts = [((a * p.real + c * p.imag + e) * px / 100, (b * p.real + dd * p.imag + f) * px / 100) for p in poly]
+            ImageDraw.Draw(one).polygon(pts, fill=1)
+            mask = ImageChops.logical_xor(mask, one)
+        canvas.paste(ImageColor.getrgb(fill), mask=mask)
+    canvas.resize((size, size), Image.LANCZOS).save(path)
+    print(f"  wrote {path.relative_to(OUT.parent)} ({size}x{size})")
 
 
 def _draw_bell(draw: ImageDraw.ImageDraw, s: int, fill=WHITE) -> None:
@@ -139,13 +227,6 @@ def _draw_bell(draw: ImageDraw.ImageDraw, s: int, fill=WHITE) -> None:
     draw.ellipse([cx - c, 0.72 * s - c, cx + c, 0.72 * s + c], fill=fill)
 
 
-def make_logo(path: Path, size: int, *, width_frac: float, background=LAVENDER_90) -> None:
-    canvas = Image.new("RGBA", (size * SS, size * SS), background)
-    _draw_logo(ImageDraw.Draw(canvas), size * SS, width_frac)
-    canvas.resize((size, size), Image.LANCZOS).save(path)
-    print(f"  wrote {path.relative_to(OUT.parent)} ({size}x{size})")
-
-
 def make_bell(path: Path, size: int, *, background, glyph=WHITE) -> None:
     canvas = Image.new("RGBA", (size * SS, size * SS), background)
     _draw_bell(ImageDraw.Draw(canvas), size * SS, fill=glyph)
@@ -177,36 +258,22 @@ def make_bell_favicon_svg(path: Path, *, box: int = 32) -> None:
     print(f"  wrote {path.relative_to(OUT.parent)} (vector)")
 
 
-def make_favicon_svg(path: Path, *, box: int = 32, width_frac: float = 0.72) -> None:
-    """A crisp vector favicon: the Entur logo on a full-bleed Lavender tile."""
-    sc = width_frac * box / LOGO_W
-    tx = (box - width_frac * box) / 2
-    ty = (box - LOGO_H * sc) / 2 - LOGO_Y0 * sc
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {box} {box}">
-  <rect width="{box}" height="{box}" fill="#181c56"/>
-  <g transform="translate({tx:.3f} {ty:.3f}) scale({sc:.4f})">
-    <path fill="#FF5959" d="{LOGO_BAR}"/>
-    <path fill="#FFF" d="{LOGO_E}"/>
-    <path fill="#FFF" d="{LOGO_N}"/>
-  </g>
-</svg>
-"""
-    path.write_text(svg)
-    print(f"  wrote {path.relative_to(OUT.parent)} (vector)")
-
-
 def main() -> None:
     ICONS.mkdir(parents=True, exist_ok=True)
 
     print("Entur (default brand):")
-    # Home-screen / PWA icons (0.58 width keeps the mark inside the Android maskable safe zone).
-    make_logo(ICONS / "pwa-192.png", 192, width_frac=0.58)
-    make_logo(ICONS / "pwa-512.png", 512, width_frac=0.58)
-    make_logo(ICONS / "apple-touch-icon-180.png", 180, width_frac=0.58)
-    # Favicon: tighter (0.72) since the browser shows it tiny and un-masked.
-    make_favicon_svg(OUT / "favicon.svg")
-    make_logo(OUT / "favicon-32.png", 32, width_frac=0.72)
-    make_logo(OUT / "favicon-16.png", 16, width_frac=0.72)
+    tile = entur_tile()
+    # Home-screen / PWA icons: full-bleed, since iOS and Android draw their own rounded mask.
+    write_png(ICONS / "pwa-192.png", tile, 192)
+    write_png(ICONS / "pwa-512.png", tile, 512)
+    write_png(ICONS / "apple-touch-icon-180.png", tile, 180)
+    # Maskable: Android may crop to a circle of radius 40, which the full tile's text overruns.
+    write_png(ICONS / "pwa-512-maskable.png", scaled(tile, 0.8), 512)
+    # Favicon: name and bar only; the sender line is under a pixel at 32 px.
+    favicon = entur_tile(sender=False)
+    write_svg(OUT / "favicon.svg", favicon)
+    write_png(OUT / "favicon-32.png", favicon, 32)
+    write_png(OUT / "favicon-16.png", favicon, 16)
     # Notification badge: monochrome white bell on transparent (Android renders it as a mask).
     # Brand-independent -- Android draws it as a silhouette, so there is no colour to brand.
     make_bell(ICONS / "badge-72.png", 72, background=TRANSPARENT)
