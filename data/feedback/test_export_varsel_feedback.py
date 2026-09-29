@@ -126,7 +126,7 @@ def test_json_output_refuses_stdout_and_symlink(tmp_path):
 
 def test_hogql_is_bounded_to_event_environment_and_dates():
     query = export._hogql("prd", date(2026, 8, 1), date(2026, 8, 3))
-    assert "event = 'varsel_alert_feedback'" in query
+    assert "event IN ('varsel_alert_feedback', 'rush_alert_feedback')" in query
     assert "properties.environment = 'prd'" in query
     assert "timestamp >=" in query and "timestamp <" in query
     assert f"LIMIT {export.MAX_EVENTS + 1}" in query
