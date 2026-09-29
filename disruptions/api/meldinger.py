@@ -331,7 +331,7 @@ class Decision(BaseModel):
     description: str | None = Field(description="The operator's fuller explanation.")
     operator: str | None = Field(description="Ref codespace: VYG, GOA, RUT, ...")
     line: str | None = Field(description="Line ref of the matched train.")
-    mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    mode: str | None = Field(description="Vehicle noun: 'Tog', 'Buss', 'T-bane', 'Trikk' or 'Båt'.")
     from_name: str = Field(
         description="Registered journey origin, resolved to an NSR name when possible."
     )
@@ -499,7 +499,7 @@ class ReplayedMessage(BaseModel):
 
     situation_number: str | None = Field(description="SIRI-SX situationNumber, for alignment.")
     line: str | None = Field(description="Line ref of the matched train, for alignment.")
-    mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    mode: str | None = Field(description="Vehicle noun: 'Tog', 'Buss', 'T-bane', 'Trikk' or 'Båt'.")
     departure_time: datetime | None = Field(description="Aimed departure (UTC), for alignment.")
     would_send_at: datetime | None = Field(
         description="decided_at of the replayed cycle (UTC) — when this wording could have been "

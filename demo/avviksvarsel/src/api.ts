@@ -82,7 +82,7 @@ export interface Alert {
   summary: string | null;
   description?: string | null; // the operator's fuller explanation
   operator: string | null;
-  mode: string; // 'Tog' | 'Buss' — vehicle noun for the UI
+  mode: string; // 'Tog' | 'Buss' | 'T-bane' | 'Trikk' | 'Båt' — vehicle noun for the UI
   line: string | null;
   destination?: string | null; // where the train terminates: «Hamar»
   departure_time: string | null;
