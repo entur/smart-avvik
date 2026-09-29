@@ -4,9 +4,9 @@ import { fmtInterval, fmtPct, fmtTime, varselDriver } from './format';
 // One matching journey: departure (boarding stop) on the left, arrival on the right.
 
 const VERDICT = {
-  hit: { icon: '✓', label: 'Treff — varslet, og det ble trøbbel', cls: 'verdict-hit' },
+  hit: { icon: '✓', label: 'Treff — varslet, og det ble forstyrrelser', cls: 'verdict-hit' },
   correct_reject: { icon: '✓', label: 'Riktig ro — ikke varslet, gikk fint', cls: 'verdict-ok' },
-  miss: { icon: '✕', label: 'Bom — ikke varslet, men det ble trøbbel', cls: 'verdict-miss' },
+  miss: { icon: '✕', label: 'Bom — ikke varslet, men det ble forstyrrelser', cls: 'verdict-miss' },
   false_alarm: { icon: '!', label: 'Falsk alarm — varslet, men gikk fint', cls: 'verdict-false' },
 } as const;
 

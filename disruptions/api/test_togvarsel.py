@@ -162,7 +162,7 @@ def test_facts_the_model_does_not_credit_stay_out_of_the_reasons():
     reading either would argue for a level it did not raise. Both remain visible as FACTS — rows
     of the «kjente avvik» list — which is where 02-findings placed them."""
     row = _feature_row(sx_big_0630=1, sx_mt_0630=1, sx_big_1400=1)
-    assert togvarsel._am_reasons(row, "0630") == ["ingen tegn til trøbbel i morgentimene"]
+    assert togvarsel._am_reasons(row, "0630") == ["ingen tegn til forstyrrelser i morgentimene"]
     assert togvarsel._pm_reasons(row, "1400") == ["normal drift så langt i dag"]
     sx = [
         {"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
@@ -177,7 +177,7 @@ def test_facts_the_model_does_not_credit_stay_out_of_the_reasons():
 
 def test_quiet_morning_gets_the_fallback_reason():
     assert togvarsel._am_reasons(_feature_row(), "0630") == [
-        "ingen tegn til trøbbel i morgentimene"
+        "ingen tegn til forstyrrelser i morgentimene"
     ]
 
 
@@ -677,7 +677,7 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         assert snapshot["display_source"] == "togvarsel"
         assert snapshot["situation_number"] == f"KIX:Togvarsel:{first['date']}:0700"
         # the literal page rendering, JS-rounded (0.34 -> 34; >= RED_MIN 0.30 -> red)
-        assert snapshot["displayed_text"] == "stor fare for forstyrrelser (ca. 34 % sjanse for mye trøbbel)"
+        assert snapshot["displayed_text"] == "stor fare for forstyrrelser (ca. 34 % sjanse for mye forstyrrelser)"
         # the card's heading, rush + level (the issue time is a small line under it since 2026-09-02)
         assert snapshot["detail_text"] == "Morgenrushet 07:00–09:00 — rødt nivå"
         assert snapshot["operator"] == "VYG"
@@ -731,7 +731,7 @@ def test_feedback_snapshot_matches_the_context_table_columns():
     assert "display_source" in columns  # the parse found the column list, not noise
     issue = togvarsel.Issue(
         issue="0630", scope="morgenrushet 06:30–09:00", p=0.05, level="green",
-        reasons=["Ingen tegn til trøbbel."], computed_at=MONDAY_0710,
+        reasons=["Ingen tegn til forstyrrelser."], computed_at=MONDAY_0710,
     )
     snapshot = togvarsel._feedback_snapshot(issue, date(2026, 8, 31))
     assert set(snapshot) == columns - {"context_id", "context_date", "persisted_at"}
@@ -753,7 +753,7 @@ def test_feedback_snapshot_mirrors_the_page():
     assert page, f"no page sources found under {src}"
     for text in togvarsel._LEVEL_TEXT.values():
         assert text in page, f"page no longer renders the level text {text!r}"
-    assert " % sjanse for mye trøbbel)" in page
+    assert " % sjanse for mye forstyrrelser)" in page
     assert "/varsel-api/feedback" in page
     assert "feedback_context_id" in page and "feedback_enabled" in page
 

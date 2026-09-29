@@ -200,7 +200,7 @@ export default function HitSummary({ journeys }: { journeys: DemoJourney[] }) {
 
           {unflaggedTrouble > 0 && (
             <p className="hs-note">
-              {unflaggedTrouble} av avgangene uten prediksjon ble likevel trøbbel. Ingen
+              {unflaggedTrouble} av avgangene uten prediksjon ble likevel forstyrrelser. Ingen
               avviksmelding flagget påstigningsstoppet, så modellene scoret dem aldri — de teller
               verken som bom eller i dekningen over.
             </p>

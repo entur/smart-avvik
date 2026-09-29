@@ -135,7 +135,7 @@ function IssueCell({ issue }: { issue: IssueRow | undefined }) {
       </div>
       <div className="rh-issue-detail">
         <LevelChip level={issue.forecast_level} />
-        <span className="rh-num" title="Modellens sannsynlighet for mye trøbbel i dette rushet.">
+        <span className="rh-num" title="Modellens sannsynlighet for mye forstyrrelser i dette rushet.">
           {fmtPct(issue.p)}
         </span>
         {told ? <span title={toldTitle}>{told.text}</span> : null}
