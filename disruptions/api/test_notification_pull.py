@@ -127,7 +127,8 @@ def _join(**definition):
     """
     now = notification_pull._now()
     journey = notification_pull._definition(
-        NSR_A, NSR_B, definition.get("begin"), definition.get("end"), definition.get("days"), now
+        NSR_A, NSR_B, definition.get("begin"), definition.get("end"), definition.get("days"), now,
+        overnight=True,
     )
     key = notification_pull._inflight_key(varsel.journey_key(journey), now)
     with notification_pull._tasks_lock:
@@ -350,7 +351,6 @@ def test_every_malformed_input_is_a_422():
     cases = [
         ({"from_stop": "A"}, "a ref off the published shape"),
         ({"to_stop": "NSR:Quay:1"}, "a quay is not a stop place"),
-        ({"begin": "09:00", "end": "07:00"}, "begin must be before end"),
         ({"begin": "07:00", "end": "07:00"}, "an empty period"),
         ({"begin": "07:00"}, "begin without end"),
         ({"end": "09:00"}, "end without begin"),
@@ -377,9 +377,12 @@ def test_the_refusals_use_varsels_own_wording():
     """The window and weekday verdicts are `varsel._parse_webhook_recipient`'s, reused rather than
     restated -- the same messages `notification_api` pins against `JourneyIn`."""
     _reset()
-    assert _get(begin="09:00", end="07:00").json()["detail"] == (
+    # journey-alerts takes an overnight period (KIX-22); journey-status still refuses it, and in
+    # varsel's words, because it grades against today's plan alone.
+    assert _status(begin="09:00", end="07:00").json()["detail"] == (
         "begin must be before end (overnight windows are not supported)"
     )
+    assert _get(begin="07:00", end="07:00").json()["detail"] == "begin and end must differ"
     assert _get(days=[7]).json()["detail"] == "days must be a non-empty subset of 0..6 (0=Monday)"
     assert _get(begin="7:00", end="09:00").json()["detail"] == "begin/end must be HH:MM (24h)"
 
@@ -456,6 +459,34 @@ def test_a_late_evening_read_lists_tomorrows_train_and_says_so():
     assert entry["payload"]["call"]["departs_tomorrow"] is True
     assert " i morgen " in entry["payload"]["notification"]["title"], entry["payload"]["notification"]
 
+
+def test_an_overnight_period_is_one_read_and_one_summary_over_both_halves():
+    """KIX-22: `begin=22:00&end=01:00` was refused, so a client asked twice and each summary covered
+    one half. Now it is one window that ends the next day, and the summary counts tonight's train
+    and tomorrow's 00:30 together. Past midnight, yesterday's window is the one still open."""
+    now = datetime(2026, 9, 10, 21, 0, tzinfo=_OSLO)  # a Thursday
+    _reset(now=now)
+    _use_snapshot({
+        "S1": _train(now + timedelta(hours=2), p_cancel=0.9, p_impact_dep=0.95),  # 23:00
+        "S2": _train(now + timedelta(hours=3, minutes=30), jkey="t2", situation="S2", p_impact_dep=0.9),
+    })
+    body = _get(begin="22:00", end="01:00", wait=0).json()
+    assert body["journey"]["days"] == [2, 3, 4], "no days: yesterday's weekday too"
+    assert body["windows"][0] == {"start": "2026-09-10T20:00:00Z", "end": "2026-09-10T23:00:00Z"}
+    assert [a["train"]["journey_ref"] for a in body["alerts"]] == ["t1", "t2"]
+    assert [a["payload"]["call"]["departs_tomorrow"] for a in body["alerts"]] == [False, True]
+    assert body["summary"] == "Signalfeil: 1 tog kan bli innstilt i dag og 1 i morgen", body["summary"]
+
+    notification_pull._now = lambda: datetime(2026, 9, 11, 0, 10, tzinfo=_OSLO)  # Friday 00:10
+    body = _get(begin="22:00", end="01:00", wait=0).json()
+    assert body["journey"]["days"] == [3, 4, 5]
+    assert body["windows"][0] == {"start": "2026-09-10T20:00:00Z", "end": "2026-09-10T23:00:00Z"}
+    assert [a["train"]["journey_ref"] for a in body["alerts"]] == ["t2"], "Thursday's window, still open"
+    assert body["alerts"][0]["payload"]["call"]["departs_tomorrow"] is False
+
+    # Asked with Thursday alone, the period is Thursday night's, and a day period is unchanged.
+    assert _get(begin="22:00", end="01:00", days=[3], wait=0).json()["n_alerts"] == 1
+    assert _get(begin="00:00", end="01:00", days=[3], wait=0).json()["n_alerts"] == 0
 
 
 def test_the_summary_counts_every_alive_train_whatever_the_limit():
