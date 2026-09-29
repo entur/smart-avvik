@@ -1,0 +1,114 @@
+<!DOCTYPE html><html lang="no"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Varslingstid for forsinkelser</title><style>
+:root{--bg:#fbfaf8;--fg:#1d1b18;--mut:#6b675f;--line:#e2ded6;--card:#fff;--acc:#b03a2e;--ok:#2e7d52;--bar:#d9d4ca}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#171614;--fg:#eceae6;--mut:#9a958c;--line:#33312d;--card:#201f1c;--acc:#e8776a;--ok:#6cc79a;--bar:#3a3833}}
+:root[data-theme=dark]{--bg:#171614;--fg:#eceae6;--mut:#9a958c;--line:#33312d;--card:#201f1c;--acc:#e8776a;--ok:#6cc79a;--bar:#3a3833}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 16px 80px}
+h1{font-size:1.75rem;margin:0 0 4px;letter-spacing:-.02em}
+h2{font-size:1.1rem;margin:40px 0 10px;letter-spacing:-.01em}
+.sub{color:var(--mut);margin:0 0 28px;font-size:.92rem;max-width:80ch}
+.sub a,p.note a{color:inherit}
+.kpis{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:150px;flex:1 1 150px}
+.kpi b{display:block;font-size:1.5rem;line-height:1.2;font-variant-numeric:tabular-nums}
+.kpi span{color:var(--mut);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th{text-align:left;font-weight:600;color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.hl{color:var(--acc);font-weight:600}
+.share{display:flex;align-items:center;gap:8px;min-width:120px}
+.per{white-space:nowrap}
+.per small{display:block;color:var(--mut);font-size:.76rem}
+.share i{display:block;height:8px;border-radius:4px;background:var(--bar);flex:1;position:relative;overflow:hidden}
+.share i s{position:absolute;inset:0 auto 0 0;background:var(--ok);border-radius:4px}
+p.note{color:var(--mut);font-size:.85rem;max-width:72ch}
+ul.note{color:var(--mut);font-size:.85rem;max-width:72ch;padding-left:20px}
+ul.note li{margin:0 0 6px}
+details{margin-top:12px}
+summary{cursor:pointer;color:var(--mut);font-size:.85rem}
+pre{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;overflow-x:auto;font-size:.76rem;line-height:1.45}
+</style></head>
+<body><div class="wrap">
+<h1>Varslingstid for forsinkelser</h1>
+<p class="sub">Hvor lang forvarsel fikk de reisende når toget ble forsinket, ikke innstilt? Siste 7, 14 og 30 dager, prd. Samme telling som «Varslingstid» på <a href="https://kix-avvik.entur.io/historikk/">/historikk</a>, men bare for tog som faktisk gikk. Data hentet 29.09.2026; siste dag med fasit er 28.09.</p>
+
+<div class="kpis">
+<div class="kpi"><b>15 min</b><span>Median, 7 dager</span></div>
+<div class="kpi"><b>21 min</b><span>Median, 14 dager</span></div>
+<div class="kpi"><b>20 min</b><span>Median, 30 dager</span></div>
+<div class="kpi"><b>122 av 305</b><span>Varslet over 30 min før, 30 dager</span></div>
+</div>
+
+<h2>Forsinkelser: median varslingstid og varsler over 30 minutter før avgang</h2>
+<div class="scroll"><table>
+<thead><tr><th>Periode</th><th class="num">Forsinkede tog</th><th class="num">Median</th><th class="num">Over 30 min</th><th>Andel over 30 min</th><th class="num">≥ 30 min</th><th class="num">Sendt ut</th></tr></thead>
+<tbody>
+<tr><td class="per">7 dager<small>22.–28.09</small></td><td class="num">92</td><td class="num hl">15 min</td><td class="num hl">27</td><td><div class="share"><i><s style="width:29%"></s></i><span class="num">29 %</span></div></td><td class="num">28</td><td class="num">17</td></tr>
+<tr><td class="per">14 dager<small>15.–28.09</small></td><td class="num">166</td><td class="num hl">21 min</td><td class="num hl">70</td><td><div class="share"><i><s style="width:42%"></s></i><span class="num">42 %</span></div></td><td class="num">73</td><td class="num">39</td></tr>
+<tr><td class="per">30 dager<small>31.08–28.09</small></td><td class="num">305</td><td class="num hl">20 min</td><td class="num hl">122</td><td><div class="share"><i><s style="width:40%"></s></i><span class="num">40 %</span></div></td><td class="num">125</td><td class="num">78</td></tr>
+</tbody></table></div>
+<p class="note">«Forsinkede tog» er tog vi varslet om og som gikk forsinket. «Median» er median varslingstid. «Over 30 min» er varsler strengt mer enn 30 minutter før avgang. /historikk teller «30+ min» som 30 minutter eller mer, og det tallet står i kolonnen «≥ 30 min». «Sendt ut» er de av dem der et varsel faktisk gikk ut, som Web Push eller webhook.</p>
+
+<h2>Hvorfor det samlede tallet på /historikk er mye høyere</h2>
+<p class="note">Innstillinger dominerer. En innstilling står ofte i sanntidsdata (SIRI-ET) timer før avgang, og vi videreformidler den så snart toget kommer innenfor varslingsvinduet på 12 timer. En forsinkelse må vi forutsi, og den blir sjelden tydelig før kort tid før avgang. Det samlede tallet er derfor i praksis innstillingenes tall, og det flytter seg med blandingen av de to.</p>
+<div class="scroll"><table>
+<thead><tr><th>Periode</th><th class="num">Forsinkelser</th><th class="num">Median</th><th class="num">Innstillinger</th><th class="num">Median</th><th class="num">Alle tog vi traff</th><th class="num">Median (samlet)</th><th class="num">Forsinkelsenes andel</th></tr></thead>
+<tbody>
+<tr><td class="per">7 dager</td><td class="num">92</td><td class="num">15 min</td><td class="num">832</td><td class="num">487 min</td><td class="num">924</td><td class="num">426 min</td><td class="num">10 %</td></tr>
+<tr><td class="per">14 dager</td><td class="num">166</td><td class="num">21 min</td><td class="num">1 182</td><td class="num">353 min</td><td class="num">1 348</td><td class="num">262 min</td><td class="num">12 %</td></tr>
+<tr><td class="per">30 dager</td><td class="num">305</td><td class="num">20 min</td><td class="num">1 309</td><td class="num">305 min</td><td class="num">1 614</td><td class="num">167 min</td><td class="num">19 %</td></tr>
+</tbody></table></div>
+<p class="note">Antallet innstillinger er uvanlig høyt i september (se <a href="streik-2026/">streik-2026-rapportene</a>). Derfor er det samlede tallet høyest i det korteste vinduet.</p>
+
+<h2>Slik er tallene regnet</h2>
+<ul class="note">
+<li><b>Varslingstid</b> er minutter fra første gang et tog krysset varslingsterskelen til <b>planlagt</b> avgang. For et forsinket tog gikk toget senere enn planlagt, så den reelle forvarselen var lengre enn tallet her. Tallet undervurderer altså forsinkelsene, ikke innstillingene.</li>
+<li><b>Per tog, ikke per melding.</b> Operatørene sender ofte flere SX-meldinger om samme tog, men den reisende får ett varsel. Hvert tog telles én gang, med det tidligste varselet. Nøkkelen er den samme som i <code>historikk_summary.sql</code> (<code>hits_per_train</code>).</li>
+<li><b>Forsinkelse</b> betyr at vi varslet og at toget gikk minst 10 minutter forsinket uten å bli innstilt (<code>verdict = 'hit'</code> og <code>actual_cancelled</code> usann). Ingen tog i perioden manglet opplysningen om innstilling.</li>
+<li><b>Periode</b>: operasjonsdøgn fra i dag minus N dager til i dag, som standardvinduet i /historikk-api. Døgnet 29.09 har ennå ikke fått fasit, så siste dag er 28.09.</li>
+<li><b>Median</b> er BigQuerys <code>APPROX_QUANTILES</code>, som på siden. Ved så få rader er den i praksis eksakt.</li>
+<li><b>Varslet er ikke det samme som sendt.</b> Varslingstiden regnes fra da toget ble varslingsverdig, ikke fra da en push gikk ut. Mellom 53 og 62 % av de tidlige forsinkelsesvarslene ble faktisk sendt ut. Resten stoppet trolig på det daglige taket per registrering, eller gjaldt reiser uten push-abonnement.</li>
+<li>Tallene gjelder bare tog på reiser noen har registrert i /varsel eller via webhook-kanalen, ikke alle forsinkelser i nettet.</li>
+</ul>
+
+<details><summary>Spørringen (ent-kixavvik-prd, ca. 13 MB)</summary>
+<pre>DECLARE today DATE DEFAULT CURRENT_DATE('Europe/Oslo');
+WITH hits AS (
+  SELECT call_date, alert_lead_min, actual_cancelled, pushed_any,
+    CASE
+      WHEN jkey IS NOT NULL THEN FORMAT('call|%t|%t|%t|%t|%t', operator, jkey, call_date, stop_place, stop_order)
+      WHEN line IS NOT NULL AND departure_time IS NOT NULL
+        THEN FORMAT('line|%t|%t|%t', operator, line, departure_time)
+      ELSE FORMAT('sit|%t', situation_number)
+    END AS train
+  FROM `ent-kixavvik-prd.disruptions.varsel_decision_outcomes`
+  WHERE verdict = 'hit' AND call_date BETWEEN DATE_SUB(today, INTERVAL 30 DAY) AND today
+),
+trains AS (
+  SELECT train, MIN(call_date) AS call_date, MAX(alert_lead_min) AS lead,
+         LOGICAL_OR(actual_cancelled) AS cancelled, LOGICAL_OR(pushed_any) AS pushed
+  FROM hits GROUP BY train
+)
+SELECT n AS days,
+  COUNTIF(cancelled IS FALSE) AS delay_trains,
+  APPROX_QUANTILES(IF(cancelled IS FALSE, lead, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)] AS delay_median_min,
+  COUNTIF(cancelled IS FALSE AND lead &gt;= 30) AS delay_ge30,
+  COUNTIF(cancelled IS FALSE AND lead &gt; 30) AS delay_gt30,
+  COUNTIF(cancelled IS FALSE AND lead &gt;= 30 AND pushed) AS delay_ge30_pushed,
+  COUNTIF(cancelled IS TRUE) AS cancel_trains,
+  APPROX_QUANTILES(IF(cancelled IS TRUE, lead, NULL), 2 IGNORE NULLS)[SAFE_OFFSET(1)] AS cancel_median_min,
+  COUNTIF(cancelled IS NULL) AS kind_unknown,
+  COUNT(*) AS all_trains,
+  APPROX_QUANTILES(lead, 2 IGNORE NULLS)[SAFE_OFFSET(1)] AS all_median_min,
+  COUNTIF(lead &gt;= 30) AS all_ge30
+FROM trains CROSS JOIN UNNEST([7, 14, 30]) AS n
+WHERE call_date &gt;= DATE_SUB(today, INTERVAL n DAY)
+GROUP BY n ORDER BY n</pre>
+</details>
+</div></body></html>
