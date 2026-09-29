@@ -22,6 +22,9 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 logger = logging.getLogger(__name__)
 EVENT = "varsel_alert_feedback"
+# Rushvarsel's forecast cards (/togmelding) post here too, under their own event so PostHog can
+# tell the two pages apart; data/feedback's exporter reads both.
+RUSH_EVENT = "rush_alert_feedback"
 _MAX_BODY = 2_048
 _WINDOW_S = 60
 _GLOBAL_PER_MIN = 60
@@ -145,13 +148,17 @@ def _b64(data: bytes) -> str:
 
 
 def _receipt(
-    response_id: uuid.UUID, context_id: str, context_date: str, expires: datetime
+    response_id: uuid.UUID, context_id: str, context_date: str, expires: datetime, event: str
 ) -> str:
-    payload = f"{response_id}|{context_id}|{context_date}|{int(expires.timestamp())}".encode()
+    payload = f"{response_id}|{context_id}|{context_date}|{int(expires.timestamp())}|{event}".encode()
     return f"{_b64(payload)}.{_b64(hmac.new(_secret() or b'', payload, hashlib.sha256).digest())}"
 
 
-def _verify(receipt: str | None, response_id: uuid.UUID, context_id: str) -> str | None:
+def _verify(
+    receipt: str | None, response_id: uuid.UUID, context_id: str
+) -> tuple[str, str] | None:
+    """The receipt's (context_date, event), or None when it is not a valid receipt for this
+    response. A receipt minted before RUSH_EVENT existed names no event and is EVENT's."""
     if not receipt or "." not in receipt:
         return None
     try:
@@ -159,7 +166,7 @@ def _verify(receipt: str | None, response_id: uuid.UUID, context_id: str) -> str
         payload = base64.urlsafe_b64decode(left + "=" * (-len(left) % 4))
         expected = hmac.new(_secret() or b"", payload, hashlib.sha256).digest()
         actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
-        rid, cid, context_date, expiry = payload.decode().split("|")
+        rid, cid, context_date, expiry, *event = payload.decode().split("|")
         valid = (
             hmac.compare_digest(expected, actual)
             and rid == str(response_id)
@@ -167,7 +174,7 @@ def _verify(receipt: str | None, response_id: uuid.UUID, context_id: str) -> str
             and int(expiry) >= int(datetime.now(UTC).timestamp())
         )
         date.fromisoformat(context_date)
-        return context_date if valid else None
+        return (context_date, event[0] if event else EVENT) if valid else None
     except (ValueError, UnicodeError):
         return None
 
@@ -194,7 +201,16 @@ def _claim(context_id: str) -> bool:
         return True
 
 
-def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted_at: str) -> None:
+def _event(snapshot: dict) -> str:
+    """The event for the rated card, from the snapshot the server minted and never from the client:
+    Rushvarsel's issue cards are the only `display_source='togvarsel'` contexts
+    (togvarsel._feedback_snapshot)."""
+    return RUSH_EVENT if snapshot.get("display_source") == "togvarsel" else EVENT
+
+
+def _capture(
+    body: FeedbackIn, *, environment: str, context_date: str, submitted_at: str, event: str
+) -> None:
     # Scope PostHog's mandatory distinct_id to this exact response and display context. Even a
     # hostile client reusing its response UUID cannot create a cross-alert/cross-environment person.
     distinct_id = "fb_" + hashlib.sha256(
@@ -228,7 +244,7 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
         # deletion path.
         "$ip": "0.0.0.0",
     }
-    payload = json.dumps({"api_key": _token(), "event": EVENT, "properties": properties}).encode()
+    payload = json.dumps({"api_key": _token(), "event": event, "properties": properties}).encode()
     request = UrlRequest(
         # _host(), never a raw environ read: a newline here would build an unusable URL, and the
         # two must agree or enabled() and the POST could disagree about the destination.
@@ -245,15 +261,17 @@ def _capture(body: FeedbackIn, *, environment: str, context_date: str, submitted
 def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
     if not enabled():
         return {"status": "disabled"}
-    context_date = (
-        _verify(body.receipt, body.response_id, body.context_id)
-        if body.revision > 1
-        else None
-    )
-    if body.revision > 1 and context_date is None:
-        return {"status": "invalid_receipt"}
-    if body.revision == 1 and feedback_contexts.resolve(body.context_id) is None:
-        return {"status": "expired"}
+    if body.revision > 1:
+        # The receipt, not the context cache: a revision must survive the display lease.
+        verified = _verify(body.receipt, body.response_id, body.context_id)
+        if verified is None:
+            return {"status": "invalid_receipt"}
+        context_date, event = verified
+    else:
+        snapshot = feedback_contexts.resolve(body.context_id)
+        if snapshot is None:
+            return {"status": "expired"}
+        context_date, event = None, _event(snapshot)
     if not _claim(body.context_id):
         return {"status": "throttled"}
     if not _inflight.acquire(blocking=False):
@@ -273,6 +291,7 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
                 environment=environment,
                 context_date=context_date or submitted.date().isoformat(),
                 submitted_at=submitted.isoformat(),
+                event=event,
             )
         except Exception:
             logger.warning("Feedback capture failed", extra={"fields": {"event": "varsel_feedback", "result": "downstream"}}, exc_info=True)
@@ -286,5 +305,6 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
             body.context_id,
             context_date or submitted.date().isoformat(),
             submitted + timedelta(hours=24),
+            event,
         )
     return result
