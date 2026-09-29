@@ -127,8 +127,7 @@ def _join(**definition):
     """
     now = notification_pull._now()
     journey = notification_pull._definition(
-        NSR_A, NSR_B, definition.get("begin"), definition.get("end"), definition.get("days"), now,
-        overnight=True,
+        NSR_A, NSR_B, definition.get("begin"), definition.get("end"), definition.get("days"), now
     )
     key = notification_pull._inflight_key(varsel.journey_key(journey), now)
     with notification_pull._tasks_lock:
@@ -377,12 +376,9 @@ def test_the_refusals_use_varsels_own_wording():
     """The window and weekday verdicts are `varsel._parse_webhook_recipient`'s, reused rather than
     restated -- the same messages `notification_api` pins against `JourneyIn`."""
     _reset()
-    # journey-alerts takes an overnight period (KIX-22); journey-status still refuses it, and in
-    # varsel's words, because it grades against today's plan alone.
-    assert _status(begin="09:00", end="07:00").json()["detail"] == (
-        "begin must be before end (overnight windows are not supported)"
-    )
+    # Both reads take a period over midnight (KIX-22) and refuse an empty one, in varsel's words.
     assert _get(begin="07:00", end="07:00").json()["detail"] == "begin and end must differ"
+    assert _status(begin="07:00", end="07:00").json()["detail"] == "begin and end must differ"
     assert _get(days=[7]).json()["detail"] == "days must be a non-empty subset of 0..6 (0=Monday)"
     assert _get(begin="7:00", end="09:00").json()["detail"] == "begin/end must be HH:MM (24h)"
 
@@ -1959,6 +1955,35 @@ def test_journey_status_answers_every_train_in_the_window_from_memory():
     assert body["reason"] is None and body["window"] is not None
 
 
+def test_journey_status_answers_a_window_over_midnight_as_one_night_until_it_ends():
+    """KIX-22: 22:00-01:00 on a Tuesday is Tuesday night, the strip says so until 01:00 Wednesday
+    (`date` the day it began), and after that it is Wednesday's -- or no travel day at all."""
+    evening = datetime(2026, 9, 22, 23, 0, tzinfo=_OSLO)  # a Tuesday
+    rows = (
+        _status_train("eve", datetime(2026, 9, 22, 23, 30, tzinfo=_OSLO))
+        + _status_train("night", datetime(2026, 9, 23, 0, 30, tzinfo=_OSLO))
+        + _status_train("morning", datetime(2026, 9, 23, 7, 0, tzinfo=_OSLO))
+    )
+    _status_reset(rows, now=evening)
+    tuesday_night = {"start": "2026-09-22T20:00:00Z", "end": "2026-09-22T23:00:00Z"}
+    body = _status(begin="22:00", end="01:00", days=[1]).json()
+    assert [t["jkey"] for t in body["trains"]] == ["eve", "night"], body
+    assert (body["date"], body["window"]) == ("2026-09-22", tuesday_night)
+
+    notification_pull._now = lambda: datetime(2026, 9, 23, 0, 20, tzinfo=_OSLO)
+    body = _status(begin="22:00", end="01:00", days=[1]).json()
+    assert [t["jkey"] for t in body["trains"]] == ["eve", "night"], "still Tuesday night's"
+    assert (body["date"], body["window"]) == ("2026-09-22", tuesday_night)
+    assert _status(begin="22:00", end="01:00").json()["journey"]["days"] == [1, 2, 3], "no days: yesterday too"
+
+    notification_pull._now = lambda: datetime(2026, 9, 23, 1, 30, tzinfo=_OSLO)
+    body = _status(begin="22:00", end="01:00", days=[1]).json()
+    assert body["reason"] == "not_a_travel_day" and body["date"] == "2026-09-23"
+    body = _status(begin="22:00", end="01:00", days=[1, 2]).json()
+    assert body["window"] == {"start": "2026-09-23T20:00:00Z", "end": "2026-09-23T23:00:00Z"}
+    assert body["trains"] == [], "Wednesday night's trains are not in this plan"
+
+
 def test_journey_status_is_503_while_the_timetable_is_not_loaded():
     _status_reset()
     r = _status()
@@ -1999,7 +2024,7 @@ def test_journey_status_refuses_a_malformed_definition_with_the_pull_reads_422()
     _status_reset([])
     assert _status(from_stop="Oslo S").status_code == 422
     assert _status(begin="07:00").status_code == 422
-    assert _status(begin="09:00", end="07:00").status_code == 422
+    assert _status(begin="07:00", end="07:00").status_code == 422
 
 
 def test_journey_status_logs_one_record_with_nothing_identifying():

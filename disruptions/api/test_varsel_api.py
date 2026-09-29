@@ -838,9 +838,17 @@ def test_journey_crud_and_live_match():
     bad = client.post("/varsel-api/journeys", json={**payload, "to_stop": "A"})
     assert bad.status_code == 422
 
-    # Validation: begin >= end rejected.
-    bad2 = client.post("/varsel-api/journeys", json={**payload, "begin": "10:00", "end": "09:00"})
-    assert bad2.status_code == 422
+    # Validation: an empty window rejected (one over midnight is accepted: see the loader parity test).
+    bad2 = client.post("/varsel-api/journeys", json={**payload, "begin": "10:00", "end": "10:00"})
+    assert bad2.status_code == 422 and "begin and end must differ" in bad2.text
+
+    # A window over midnight is registered as one journey (KIX-22), then removed so the listing
+    # below is unchanged.
+    night = client.post("/varsel-api/journeys", json={**payload, "begin": "22:00", "end": "01:00"})
+    assert night.status_code == 200, night.text
+    assert (night.json()["begin"], night.json()["end"]) == ("22:00", "01:00")
+    night_id = night.json()["journey_id"]
+    assert client.delete(f"/varsel-api/journeys/{night_id}?device_id={DEVICE}").status_code == 200
 
     listing = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()
     assert [j["journey_id"] for j in listing["journeys"]] == [jid]
@@ -5901,7 +5909,7 @@ def test_the_webhook_loader_refuses_exactly_what_the_registration_api_refuses():
         ({}, True),                                   # the valid baseline
         ({"begin": "24:00"}, False),
         ({"end": "7:5"}, False),
-        ({"begin": "10:00", "end": "09:00"}, False),  # overnight windows are refused, not wrapped
+        ({"begin": "10:00", "end": "09:00"}, True),   # a window over midnight, accepted by both
         ({"begin": "10:00", "end": "10:00"}, False),
         ({"days": []}, False),
         ({"days": [7]}, False),

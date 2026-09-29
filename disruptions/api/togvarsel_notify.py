@@ -591,12 +591,19 @@ def _affects(
     [begin, end] window overlaps (compared half-open), both endpoints' alias-expanded ref sets
     intersect the station set. What differs is the window they pass: :func:`match_journeys` uses
     the part of the rush still ahead of evaluation time, :func:`affected_rushes` the whole rush.
+    A registration over midnight (`end < begin`) is two spans: its evening on the weekday it begins
+    on, its small hours on the next -- so a Monday 23:00-07:30 is Tuesday's morning rush.
     Raises on a malformed record; both callers turn that into "skip this journey and log it"."""
-    if weekday not in journey["days"]:
-        return False
+    days = journey["days"]
     begin_min = _parse_hhmm(journey["begin"])
     end_min = _parse_hhmm(journey["end"])
-    if not (window_start < window_end and begin_min < window_end and window_start < end_min):
+    if begin_min < end_min:
+        spans = [(begin_min, end_min)] if weekday in days else []
+    else:
+        spans = [(begin_min, 24 * 60)] if weekday in days else []
+        if (weekday - 1) % 7 in days:
+            spans.append((0, end_min))
+    if not (window_start < window_end and any(b < window_end and window_start < e for b, e in spans)):
         return False
     return _endpoint_listed(journey["from_stop"], stations, expand_refs) and _endpoint_listed(
         journey["to_stop"], stations, expand_refs
@@ -612,7 +619,8 @@ def match_journeys(
 ) -> tuple[list[str], set[str]]:
     """The registrations an issue affects and the device set to push to, deduped.
 
-    A journey is affected iff today's Oslo weekday is in its `days`, its stored-inclusive
+    A journey is affected iff today's Oslo weekday is in its `days` (yesterday's, for the small
+    hours of a window over midnight -- see :func:`_affects`), its stored-inclusive
     [begin, end] window overlaps — compared half-open — the live part of the issue's scope window
     [max(scope start, now), scope end), and both endpoints' alias-expanded ref sets intersect the
     station set. The evaluation-time bound means a journey whose window has fully passed at

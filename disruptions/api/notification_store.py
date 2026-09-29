@@ -1367,9 +1367,10 @@ class SubscriptionSpec:
         ``varsel.JourneyIn`` requires a ``device_id``, which a webhook subscription by definition
         does not have, and ``varsel._parse_webhook_recipient`` restates the same three rules on the
         read side for its own reason (it validates documents written by a possibly newer binary).
-        This is the third statement and the suite pins all three against each other: overnight
-        windows are refused here exactly as they are in /varsel, or a client could register a
-        window /varsel would not and R3's parity claim would be quietly false.
+        This is the third statement and the suite pins all three against each other: a window
+        over midnight (``end < begin``) is accepted and ``begin == end`` refused here exactly as in
+        /varsel, or a client could register a window /varsel would not (or the other way round) and
+        R3's parity claim would be quietly false.
         """
         if not self.subscription_id or not self.client_id:
             raise Conflict("subscription_id and client_id are required")
@@ -1398,8 +1399,8 @@ class SubscriptionSpec:
             raise Conflict("from_stop and to_stop must differ")
         if not _HHMM_RE.match(self.begin) or not _HHMM_RE.match(self.end):
             raise Conflict("begin/end must be HH:MM (24h)")
-        if self.begin >= self.end:
-            raise Conflict("begin must be before end (overnight windows are not supported)")
+        if self.begin == self.end:
+            raise Conflict("begin and end must differ")
         days = sorted(set(self.days))
         if not days or any(d < 0 or d > 6 for d in days):
             raise Conflict("days must be a non-empty subset of 0..6 (0=Monday)")

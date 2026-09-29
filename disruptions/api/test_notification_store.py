@@ -2911,7 +2911,7 @@ def test_the_recipient_document_carries_every_key_varsel_reads():
 
 def test_the_window_rules_are_varsels_own():
     for bad in (
-        {"begin": "08:00", "end": "06:00"},  # overnight: refused there, refused here
+        {"begin": "08:00", "end": "08:00"},  # empty: refused there, refused here
         {"begin": "8:00"},
         {"end": "24:00"},
         {"days": ()},
@@ -2925,9 +2925,11 @@ def test_the_window_rules_are_varsels_own():
         else:
             raise AssertionError(f"{bad} must be refused")
     _spec().validate()
-    # And the restatement must not be looser than /varsel's: both refuse an overnight window.
+    # A window over midnight is accepted here exactly as there (KIX-22), and the restatement must
+    # not be looser or stricter than /varsel's: both refuse only an empty window, in one sentence.
+    _spec(begin="22:00", end="06:00").validate()
     parser = VARSEL_SOURCE.split("def _parse_webhook_recipient", 1)[1].split("\ndef ", 1)[0]
-    assert "overnight windows are not supported" in parser
+    assert "begin and end must differ" in parser
 
 
 def test_the_load_provider_is_the_shape_varsel_declares():

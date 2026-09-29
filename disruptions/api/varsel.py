@@ -21,9 +21,9 @@ severity order behind both surfaces.
 Design notes
 ------------
 * **Weekdays** are ``0=Monday … 6=Sunday`` (Python ``date.weekday()``), consistent with the PWA.
-* **Windows** are inclusive ``[begin, end]`` in Europe/Oslo local time. Every registration path
-  validates ``begin < end``; only the public journey-alerts read passes an overnight window
-  (``begin > end``, KIX-22), which belongs to the day it begins and ends the next day.
+* **Windows** are inclusive ``[begin, end]`` in Europe/Oslo local time, and ``begin != end``. A
+  window with ``end < begin`` runs over midnight: it belongs to the weekday it begins on and ends
+  the next day (KIX-22, then every surface on 2026-09-29).
   :func:`journey_windows` offers today's and tomorrow's window, because the
   prediction cache carries near-future departures and late in the evening the next relevant window
   is tomorrow's.
@@ -876,15 +876,12 @@ class UnroutableChannel(ValueError):
     """
 
 
-def _parse_webhook_recipient(doc: Mapping[str, Any], *, overnight: bool = False) -> WebhookRecipient:
+def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
     """One raw client document → a :class:`WebhookRecipient`, raising on anything unreadable.
 
-    ``overnight=True`` is the public journey-alerts read's alone (KIX-22): it accepts
-    ``begin > end`` as a window that ends the next day, and still refuses ``begin == end``. Every
-    WRITE path keeps the default, so no registration or subscription ever holds such a window.
-
     Restates :class:`JourneyIn`'s three window rules (HH:MM, a non-empty subset of 0..6, and
-    ``begin < end`` so overnight windows are refused) rather than importing that model, for two
+    ``begin != end``, an ``end`` before ``begin`` being a window over midnight) rather than
+    importing that model, for two
     reasons that both matter. `JourneyIn` requires a ``device_id``, which a webhook subscription by
     definition does not have; and this runs on the ingestion thread against documents written by a
     possibly NEWER binary, so it must validate the fields the pass actually reads and be
@@ -924,10 +921,8 @@ def _parse_webhook_recipient(doc: Mapping[str, Any], *, overnight: bool = False)
     begin, end = str(doc["begin"]), str(doc["end"])
     if not _HHMM_RE.match(begin) or not _HHMM_RE.match(end):
         raise ValueError("begin/end must be HH:MM (24h)")
-    if overnight and begin == end:
+    if begin == end:
         raise ValueError("begin and end must differ")
-    if not overnight and _parse_hhmm(begin) >= _parse_hhmm(end):
-        raise ValueError("begin must be before end (overnight windows are not supported)")
     days = sorted({int(d) for d in doc["days"]})
     if not days or any(d < 0 or d > 6 for d in days):
         raise ValueError("days must be a non-empty subset of 0..6 (0=Monday)")
@@ -1814,10 +1809,10 @@ def journey_windows(journey: dict, now: datetime) -> list[tuple[datetime, dateti
     is tomorrow's. Windows whose end has already passed are dropped, and only the journey's own
     weekdays qualify (weekday of the *local* date, matching the PWA's 0=Monday).
 
-    An overnight window (``end < begin``, the public read's only) ends on the day after its
-    weekday, so yesterday's is offered too: at 00:30 Tuesday, Monday's 22:00-01:00 is still open.
-    Yesterday is offered for nothing else — with the catch-up grace it would re-offer every late
-    evening registration's window for the first 90 minutes after midnight.
+    An overnight window (``end < begin``) ends on the day after its weekday, so yesterday's is
+    offered too: at 00:30 Tuesday, Monday's 22:00-01:00 is still open. Yesterday is offered for
+    nothing else — with the catch-up grace it would re-offer every late evening window for the
+    first 90 minutes after midnight.
     """
     days = set(journey["days"])
     begin_min = _parse_hhmm(journey["begin"])
@@ -5656,7 +5651,10 @@ class JourneyIn(BaseModel):
     to_stop: str = Field(min_length=1, max_length=80)
     to_name: str | None = Field(default=None, max_length=120)
     begin: str = Field(description='Window start "HH:MM" (Europe/Oslo).')
-    end: str = Field(description='Window end "HH:MM" (Europe/Oslo); must be after begin.')
+    end: str = Field(
+        description='Window end "HH:MM" (Europe/Oslo), not equal to begin. Before begin is a window '
+        "over midnight, which belongs to the weekday it begins on."
+    )
     days: list[int] = Field(description="Weekdays to watch: 0=Monday … 6=Sunday.")
     consent_text_version: str | None = Field(
         default=None,
@@ -5690,8 +5688,8 @@ class JourneyIn(BaseModel):
     def _checks(self) -> "JourneyIn":
         if self.from_stop == self.to_stop:
             raise ValueError("from_stop and to_stop must differ")
-        if _parse_hhmm(self.begin) >= _parse_hhmm(self.end):
-            raise ValueError("begin must be before end (overnight windows are not supported)")
+        if self.begin == self.end:
+            raise ValueError("begin and end must differ")
         return self
 
 

@@ -222,7 +222,7 @@ address the other's record.
 | `from_stop` | string | yes | `^NSR:StopPlace:[0-9]+$`; a parent (multimodal) StopPlace means every stop under it |
 | `to_stop` | string | yes | `^NSR:StopPlace:[0-9]+$`, and different from `from_stop` **after canonicalisation** |
 | `begin` | string | yes | `HH:MM`, 24 h |
-| `end` | string | yes | `HH:MM`, strictly after `begin` — **overnight windows are refused**, as they are in `/varsel` |
+| `end` | string | yes | `HH:MM`, different from `begin`. Before `begin` is a window over midnight, which belongs to the weekday it **begins** on (see [A window over midnight](#a-window-over-midnight)) |
 | `days` | array of int | yes | non-empty subset of 0–6, 0 = Monday. Order and duplicates are normalised |
 | `external_ref` | string | no | ≤ 256 characters, opaque to us, echoed on every event |
 | `test` | boolean | no | default `false`. **Immutable after creation** |
@@ -353,14 +353,12 @@ Every error this module raises itself is `{"detail": "<short stable string>"}`:
 | 503 | `channel_not_configured`, `store_unavailable`, `signing_not_configured` — and, on the public reads only, `predictions_not_loaded`, `matcher_failed` (`journey-alerts`) and `plan_not_loaded`, `status_failed` (`journey-status`) |
 
 Validation refusals carry prose rather than a code, and it is the prose `/varsel`'s own rules produce:
-`"begin must be before end (overnight windows are not supported)"`,
+`"begin and end must differ"`,
 `"days must be a non-empty subset of 0..6 (0=Monday)"`, `"begin/end must be HH:MM (24h)"`,
 `"from_stop and to_stop must differ"`, `"the test marker is immutable; delete and re-create instead"`,
 `"subscription id already exists with a different definition"`, `f"version is {n}, not {m}"`.
-The public read adds three of its own, and none echoes your value:
-`"from_stop and to_stop must be NSR:StopPlace:<digits>"`, `"begin and end must be given together"`,
-and on `journey-alerts`, which takes a period over midnight, `"begin and end must differ"` in place
-of the overnight refusal.
+The public read adds two of its own, and neither echoes your value:
+`"from_stop and to_stop must be NSR:StopPlace:<digits>"`, `"begin and end must be given together"`.
 
 **One shape this page cannot flatten:** a schema-level 422 — an unknown body field under
 `extra="forbid"`, a `subscription_id` failing its pattern, `limit` out of range, a path segment over
@@ -490,13 +488,19 @@ assembly the webhook event goes through, so a receiver that renders an event ren
 tomorrow, which is every window the prediction cache can carry — a read at 22:00 with no period
 lists a 00:30 departure with `departs_tomorrow: true`.
 
-**A period over midnight is one read** (since 2026-09-29, KIX-22). `begin=22:00&end=01:00` is
-22:00 until 01:00 the next morning, and belongs to the weekday it **begins** on: `days=4` is Friday
-night into Saturday. With no `days` it also asks about yesterday's weekday, so at 00:30 the period
-that began at 22:00 is still in the answer. `summary` then covers both halves, counting
-tomorrow's trains apart («… i dag og 1 i morgen»). Trains after midnight are scored once the
-prediction cache carries them, as they were when the two halves were asked apart. Only this read
-takes such a period: `journey-status` and a subscription still refuse it.
+#### A window over midnight
+
+**A period over midnight is one read, one subscription and one `/varsel` journey** (since
+2026-09-29, KIX-22). `begin=22:00&end=01:00` is 22:00 until 01:00 the next morning, and belongs to
+the weekday it **begins** on: `days=4` is Friday night into Saturday. If you are merging two halves
+into one, keep the evening half's weekdays — the after-midnight half's are one day late, and would
+return the following night with no error. With no `days` a read also asks about yesterday's
+weekday, so at 00:30 the period that began at 22:00 is still in the answer. `summary` covers both
+halves, counting tomorrow's trains apart («… i dag og 1 i morgen»). Trains after midnight are
+scored once the prediction cache carries them, as they were when the two halves were asked apart.
+A subscription registered as two halves keeps working unchanged. One side effect for a
+subscription: the per-registration daily cap on alert pushes is per Oslo day, so it starts afresh
+at midnight inside the window.
 
 **Send the stop refs your traveller picked, parent or not** (since 2026-09-23). A parent
 (multimodal) StopPlace — what Entur's search returns for a station, `NSR:StopPlace:59872` for
@@ -735,6 +739,10 @@ destination, in departure order, the ones that already ran included. It is the b
 «I dag» strip on `/varsel`, and it takes the same five parameters as `journey-alerts` without `wait`
 and `limit`, and the same `ET-Client-Name` header. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
 Only today is answered: a today not in `days` is an empty `trains` with `reason: not_a_travel_day`.
+A window over midnight is answered as the night it is: from `begin` until `end` the next morning,
+and until that end it stays the answer — at 00:30 it is the window that began at 22:00, with `date`
+the day it began. Past midnight, once the plan is rebuilt, that night's trains that arrived before
+midnight drop out; the ones still running or to come stay.
 
 Each train carries a `state` and a `level`:
 

@@ -163,7 +163,7 @@ def test_a_definition_is_never_degenerate():
     plan = gen.draw_definitions(STOPS, count=500, pairs=60, seed=5)
     for definition in plan.definitions:
         assert definition.from_stop != definition.to_stop
-        assert definition.begin < definition.end, "overnight windows are refused by the spec"
+        assert definition.begin != definition.end, "an empty window is refused by the spec"
         assert definition.days and set(definition.days) <= set(range(7))
 
 
