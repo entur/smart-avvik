@@ -56,16 +56,24 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
 - **Each train carries its LINE's transport mode** (2026-09-29, KIX-23): `payload.mode` (so the event,
   the journey-alerts read and the test event), the read's `train.mode` and journey-status's
   `trains[].mode`, all from `line_modes.transport_mode` in JP's `TransportMode` vocabulary (`rail`,
-  `bus`, `metro`, `tram`, `water`, ...). NOT the codespace rule behind the push title's «Tog»/«Buss»
-  (`notification_wording.mode_label`): Ruter's T-bane 1-5 and trikk 12-19 are scored in the bus
-  family under `RUT`, and SIRI-ET's `vehicleModes` is empty for every RUT, SKY and TRO journey
-  (census 2026-09-29), so only JP can tell a metro from a bus. `main.refresh_line_modes` asks JP for
+  `bus`, `metro`, `tram`, `water`, ...). NOT the codespace rule the push title's «Tog»/«Buss» used
+  to come from: Ruter's T-bane 1-5 and trikk 12-19 are scored in the bus family under `RUT`, and
+  SIRI-ET's `vehicleModes` is empty for every RUT, SKY and TRO journey (census 2026-09-29), so only
+  JP can tell a metro from a bus. `main.refresh_line_modes` asks JP for
   every line (~4 700, ~240 KB) once per `line_modes.TTL` (24 h) in its own `line_modes` phase ABOVE
   `varsel_stops` (the orphan-window reason pinned in `test_poller_refresh`); a failed or empty answer
   keeps the previous map and retries next tick. A miss falls back to `rail` for a rail codespace and
   to null otherwise, never `bus` by elimination. `line_modes` is a stdlib leaf because
-  `journey_status`'s import set is pinned. It mints nothing when it changes. The push title's `Buss`
-  for a T-bane is the same codespace mistake and is NOT fixed here: the noun is in the wording key.
+  `journey_status`'s import set is pinned (and `notification_wording` imports it, so it holds
+  `RAIL_CODESPACES` itself). It mints nothing when it changes.
+  **The title's noun follows the same map since KIX-25** (2026-09-29): `mode_label(operator, line)`
+  capitalises `_LEG_MODE_NOUN` (the alternative's lower-case table), so «T-bane 5», «Trikk 12», «Båt»,
+  with the codespace rule («Tog»/«Buss») only where JP has not answered. It is `Alert.mode`, so it is
+  `transportmiddel` in the message input and therefore in the WORDING KEY: the deploy re-worded every
+  T-bane, trikk and boat alert once. The pass never words with the fallback, since the `line_modes`
+  phase runs before `varsel_notify`; only a journey-alerts read served off the warm caches in a
+  restart's first minute can say «Buss», and that entry is re-worded when the fetch lands. `varsel_decisions.mode` carries the new nouns
+  from that day; `/historikk` and `/meldinger` display it verbatim. `/demo` keeps the codespace rule.
 - The **webhook channel** (`/notification-api/v1`, `disruptions/api/notification_*.py` +
   `webhook_*.py` + `notification_wording.py`, 2026-09-08) sends an external client's BFF the alerts
   `/varsel` already sends its own browsers, as signed HTTPS webhooks. **Renamed on 2026-09-09 from the

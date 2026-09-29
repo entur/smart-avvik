@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- families: rail refs are date-scoped and unique alone, bus ServiceJourney jkeys repeat daily.
   operator              STRING    OPTIONS(description="Ref codespace: VYG, GOA, RUT, ..."),
   line                  STRING    OPTIONS(description="Line ref of the matched train."),
-  mode                  STRING    OPTIONS(description="Vehicle noun shown to the traveller: 'Tog' or 'Buss'."),
+  mode                  STRING    OPTIONS(description="Vehicle noun shown to the traveller: 'Tog', 'Buss', 'T-bane', 'Trikk' or 'Båt' (the last three since 2026-09-29)."),
   jkey                  STRING    OPTIONS(description="SIRI-ET datedVehicleJourneyRef minus its codespace prefix."),
   call_date             DATE      OPTIONS(description="Operating day of the boarding call (Europe/Oslo)."),
   stop_place            STRING    OPTIONS(description="StopPlace ref of the boarding call."),

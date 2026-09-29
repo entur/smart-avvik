@@ -196,9 +196,27 @@ def test_varsel_reads_this_module_rather_than_a_copy_of_it():
     assert varsel.mode_label is nw.mode_label
 
 
-def test_the_vehicle_noun_is_derived_from_the_codespace():
+def test_the_vehicle_noun_is_the_lines_mode_and_the_codespace_only_without_one():
+    """KIX-25: a Ruter T-bane said «Buss», because the codespace was all the noun knew and T-bane
+    and trikk ride under `RUT`. With the line's JP mode it is «T-bane»; without one (JP has not
+    answered, or a mode this codebase has no noun for) the codespace rule stands."""
+    import line_modes
+
+    line_modes.reset()
     assert [nw.mode_label(o) for o in ("VYG", "NSB", "GOA", "SJN", "FLT")] == ["Tog"] * 5
     assert [nw.mode_label(o) for o in ("RUT", "KOL", None, "")] == ["Buss"] * 4
+    modes = {"RUT:Line:5": "metro", "RUT:Line:12": "tram", "RUT:Line:31": "bus",
+             "SKY:Line:1047": "water", "SKY:Line:X": "air"}
+    line_modes.set_modes([{"id": k, "transportMode": v} for k, v in modes.items()], datetime.now(UTC))
+    try:
+        cases = {("RUT", "RUT:Line:5"): "T-bane", ("RUT", "RUT:Line:12"): "Trikk",
+                 ("RUT", "RUT:Line:31"): "Buss", ("SKY", "SKY:Line:1047"): "Båt",
+                 ("VYG", "VYG:Line:L1"): "Tog", ("SKY", "SKY:Line:X"): "Buss"}
+        assert {k: nw.mode_label(*k) for k in cases} == cases
+        # The other call site: the wording facts a pull entry is worded from pass the line too.
+        assert nw.DepartureWordingFacts(operator="RUT", line="RUT:Line:5").mode == "T-bane"
+    finally:
+        line_modes.reset()
 
 
 def test_the_leg_noun_is_lower_case_because_it_lands_mid_clause():
@@ -1074,6 +1092,8 @@ def test_tomorrows_trains_are_counted_apart_and_the_noun_follows_the_mode():
     assert nw.alerts_summary([trains[0], bus[1]]) == "Signalfeil ved Asker: 1 avgang er innstilt og 1 kan bli forsinket"
     one_bus = (_mi("07:18", mode="Buss", line="31", verb="cancelled"), [_sit("S1")])
     assert nw.alerts_summary([one_bus, bus[1]]) == "Signalfeil ved Asker: 1 buss er innstilt og 1 kan bli forsinket"
+    metro = [(_mi(hhmm, mode="T-bane", line="5"), [_sit("S1")]) for hhmm in ("07:18", "07:48")]
+    assert nw.alerts_summary(metro) == "Signalfeil ved Asker: 2 T-baner kan bli forsinket", "KIX-25"
 
 
 def test_one_train_is_its_own_title_and_no_train_is_nothing_to_say():

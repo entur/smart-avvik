@@ -184,7 +184,7 @@ class Decision(BaseModel):
     description: str | None = Field(description="The operator's fuller explanation.")
     operator: str | None = Field(description="Ref codespace: VYG, GOA, RUT, ...")
     line: str | None = Field(description="Line ref of the matched train.")
-    mode: str | None = Field(description="Vehicle noun: 'Tog' or 'Buss'.")
+    mode: str | None = Field(description="Vehicle noun: 'Tog', 'Buss', 'T-bane', 'Trikk' or 'Båt'.")
     from_name: str = Field(
         description="Registered journey origin, resolved to an NSR name when possible."
     )

@@ -51,17 +51,20 @@ from datetime import datetime
 from time import monotonic
 from typing import Any, NamedTuple
 
+from line_modes import transport_mode
+
 logger = logging.getLogger(__name__)
 
-# Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
-# vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
-# Moved here with `mode_label` so a wording never has to import `varsel` for a noun.
-RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
+def mode_label(operator: str | None, line: str | None = None) -> str:
+    """User-facing vehicle noun for a departure: its line's Journey Planner mode where known, so a
+    Ruter T-bane is «T-bane» and a Skyss boat «Båt» (KIX-25); else 'Tog' for a rail codespace and
+    'Buss' for the rest, which is all the codespace can say (T-bane and trikk ride under `RUT`).
 
-
-def mode_label(operator: str | None) -> str:
-    """User-facing vehicle noun for an operator: 'Tog' (rail) or 'Buss' (everything else)."""
-    return "Tog" if operator in RAIL_CODESPACES else "Buss"
+    Capitalised because it heads its line; `_LEG_MODE_NOUN` is the one table, lower-case for the
+    mid-clause alternative. The noun is in the wording key, so a line whose mode arrives after a
+    restart is worded once more."""
+    noun = _LEG_MODE_NOUN.get(transport_mode(operator, line) or "")
+    return noun.capitalize() if noun else "Buss"
 
 
 # ---- Trains taken out of the plan (plan 2026-09-23-001) --------------------------------------------
@@ -155,8 +158,9 @@ def train_label(
 
     `mode` is passed in RATHER THAN LOOKED UP, and its case comes with it: the first label heads its
     own line ("Tog R10 08:00: …") while the second sits mid-clause after "Alternativ", where bokmål
-    wants a lower-case common noun. This function cannot know which, so `_LEG_MODE_NOUN` — used only
-    for the second — carries the lower-case form and the alert's own `mode` stays as it is.
+    wants a lower-case common noun. This function cannot know which, so `_LEG_MODE_NOUN` is the one
+    noun table and each caller sets the case: lower for the alternative, capitalised by `mode_label`
+    for the alert's own `mode`.
 
     Every part is optional, and each missing one costs only itself: `linje` is absent when the ref
     was unknown, and a leg can carry a mode this codebase has no noun for. Inventing either would be
@@ -180,10 +184,11 @@ def train_label(
 # at all: "Alternativ R11 08:24" says less than it could, while a guessed noun would put the wrong
 # vehicle on a lock screen, and the line and time still identify the departure without one.
 #
-# LOWER CASE, unlike the `mode` on the alert (2026-08-20). These are ordinary bokmål nouns, and this
-# label is the only one that lands mid-clause -- always after "Alternativ", never at the start of a
-# line -- so "Alternativ tog R11 08:24" is what Norwegian orthography asks for and "Alternativ Tog
-# R11 08:24" reads as a proper noun. The alert's own label keeps its capital because it heads its
+# LOWER CASE (2026-08-20), unlike the `mode` on the alert, which `mode_label` capitalises from this
+# same table since KIX-25. These are ordinary bokmål nouns, and this label is the only one that
+# lands mid-clause -- always after "Alternativ", never at the start of a line -- so "Alternativ
+# tog R11 08:24" is what Norwegian orthography asks for and "Alternativ Tog R11 08:24" reads as a
+# proper noun. The alert's own label keeps its capital because it heads its
 # line. Case therefore belongs HERE, at the one call site whose position is fixed, and not in
 # `train_label`, which cannot know where its caller will put the result. "T-bane" keeps its capital
 # T in every position: it is an abbreviation, not a common noun.
@@ -429,7 +434,13 @@ CAUSE_STOP_PHRASES = frozenset({
 })
 _VERB_ORDER = ("er innstilt", "kan bli innstilt", "kan bli forsinket", "mulig avvik")
 #: (singular, plural) by the message input's `transportmiddel`; anything else counts «avganger».
-_NOUNS = {"tog": ("tog", "tog"), "buss": ("buss", "busser")}
+_NOUNS = {
+    "tog": ("tog", "tog"),
+    "buss": ("buss", "busser"),
+    "t-bane": ("T-bane", "T-baner"),
+    "trikk": ("trikk", "trikker"),
+    "båt": ("båt", "båter"),
+}
 _ANY_NOUN = ("avgang", "avganger")
 
 
@@ -722,7 +733,7 @@ class DepartureWordingFacts:
 
     @property
     def mode(self) -> str:
-        return mode_label(self.operator)
+        return mode_label(self.operator, self.line)
 
 
 @dataclass(frozen=True)
