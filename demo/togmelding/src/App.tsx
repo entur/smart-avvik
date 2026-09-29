@@ -219,7 +219,7 @@ export default function App() {
                         Prognosen kl. {issueTime(overdue[0])} er forsinket
                       </Heading3>
                       <Paragraph margin="none" className="tm-muted">
-                        Teknisk forstyrrelser — prognosen er ikke beregnet ennå. Neste forsøk kommer
+                        Teknisk trøbbel — prognosen er ikke beregnet ennå. Neste forsøk kommer
                         fortløpende.
                       </Paragraph>
                     </>
