@@ -428,7 +428,7 @@
             "name": "end",
             "in": "query",
             "required": false,
-            "description": "Period end, `HH:MM` in Europe/Oslo, strictly after `begin`. Overnight periods are refused, as they are in `/varsel`: ask as two.",
+            "description": "Period end, `HH:MM` in Europe/Oslo, different from `begin`. An `end` before `begin` is a period over midnight -- `22:00`-`01:00` is one read -- and belongs to the weekday it begins on; with no `days` it also asks about yesterday's, which is still open until `end`. Only this read takes one: `journey-status` and a subscription refuse it, as `/varsel` does.",
             "schema": {
               "$ref": "./subscription.schema.json#/properties/end"
             }
@@ -496,7 +496,7 @@
             }
           },
           "422": {
-            "description": "A malformed definition, period, weekday list, `wait` or `limit`. **Two shapes, and you must handle both.** A refusal this application made -- a ref that is not `NSR:StopPlace:<digits>`, `begin` without `end`, `end` not after `begin`, a weekday outside 0-6, two refs collapsing to one place -- is `Error`, with `detail` a string that never echoes your value. A refusal the framework made before the handler ran -- `wait` or `limit` out of range, a non-integer `days` element, a comma-separated `days` -- is `ValidationError`, with `detail` an array. `detail`'s type is what tells them apart. A 422 is logged nowhere.",
+            "description": "A malformed definition, period, weekday list, `wait` or `limit`. **Two shapes, and you must handle both.** A refusal this application made -- a ref that is not `NSR:StopPlace:<digits>`, `begin` without `end`, `end` equal to `begin`, a weekday outside 0-6, two refs collapsing to one place -- is `Error`, with `detail` a string that never echoes your value. A refusal the framework made before the handler ran -- `wait` or `limit` out of range, a non-integer `days` element, a comma-separated `days` -- is `ValidationError`, with `detail` an array. `detail`'s type is what tells them apart. A 422 is logged nowhere.",
             "content": {
               "application/json": {
                 "schema": {
