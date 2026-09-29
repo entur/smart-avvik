@@ -21,9 +21,10 @@ severity order behind both surfaces.
 Design notes
 ------------
 * **Weekdays** are ``0=Monday … 6=Sunday`` (Python ``date.weekday()``), consistent with the PWA.
-* **Windows** are non-wrapping inclusive ``[begin, end]`` in Europe/Oslo local time; the PWA
-  validates ``begin < end``, so overnight windows never reach the matcher (and are ignored if
-  they somehow do). :func:`journey_windows` offers today's and tomorrow's window, because the
+* **Windows** are inclusive ``[begin, end]`` in Europe/Oslo local time. Every registration path
+  validates ``begin < end``; only the public journey-alerts read passes an overnight window
+  (``begin > end``, KIX-22), which belongs to the day it begins and ends the next day.
+  :func:`journey_windows` offers today's and tomorrow's window, because the
   prediction cache carries near-future departures and late in the evening the next relevant window
   is tomorrow's.
 * **Work is shared per journey definition, delivery is not.** :func:`journey_key` collapses
@@ -875,8 +876,12 @@ class UnroutableChannel(ValueError):
     """
 
 
-def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
+def _parse_webhook_recipient(doc: Mapping[str, Any], *, overnight: bool = False) -> WebhookRecipient:
     """One raw client document → a :class:`WebhookRecipient`, raising on anything unreadable.
+
+    ``overnight=True`` is the public journey-alerts read's alone (KIX-22): it accepts
+    ``begin > end`` as a window that ends the next day, and still refuses ``begin == end``. Every
+    WRITE path keeps the default, so no registration or subscription ever holds such a window.
 
     Restates :class:`JourneyIn`'s three window rules (HH:MM, a non-empty subset of 0..6, and
     ``begin < end`` so overnight windows are refused) rather than importing that model, for two
@@ -919,7 +924,9 @@ def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
     begin, end = str(doc["begin"]), str(doc["end"])
     if not _HHMM_RE.match(begin) or not _HHMM_RE.match(end):
         raise ValueError("begin/end must be HH:MM (24h)")
-    if _parse_hhmm(begin) >= _parse_hhmm(end):
+    if overnight and begin == end:
+        raise ValueError("begin and end must differ")
+    if not overnight and _parse_hhmm(begin) >= _parse_hhmm(end):
         raise ValueError("begin must be before end (overnight windows are not supported)")
     days = sorted({int(d) for d in doc["days"]})
     if not days or any(d < 0 or d > 6 for d in days):
@@ -1806,19 +1813,25 @@ def journey_windows(journey: dict, now: datetime) -> list[tuple[datetime, dateti
     prediction cache carries near-future departures, so late in the evening the next relevant window
     is tomorrow's. Windows whose end has already passed are dropped, and only the journey's own
     weekdays qualify (weekday of the *local* date, matching the PWA's 0=Monday).
+
+    An overnight window (``end < begin``, the public read's only) ends on the day after its
+    weekday, so yesterday's is offered too: at 00:30 Tuesday, Monday's 22:00-01:00 is still open.
+    Yesterday is offered for nothing else — with the catch-up grace it would re-offer every late
+    evening registration's window for the first 90 minutes after midnight.
     """
     days = set(journey["days"])
     begin_min = _parse_hhmm(journey["begin"])
     end_min = _parse_hhmm(journey["end"])
+    overnight = end_min < begin_min
     local_now = now.astimezone(_OSLO)
     windows: list[tuple[datetime, datetime]] = []
-    for offset in (0, 1):
+    for offset in (-1, 0, 1) if overnight else (0, 1):
         local_date = (local_now + timedelta(days=offset)).date()
         if local_date.weekday() not in days:
             continue
         midnight = datetime.combine(local_date, time(0, 0), tzinfo=_OSLO)
         start = midnight + timedelta(minutes=begin_min)
-        end = midnight + timedelta(minutes=end_min)
+        end = midnight + timedelta(days=int(overnight), minutes=end_min)
         # Keep offering a window for a grace period after its end. Dropping it the moment `end`
         # passes discards exactly the case the alert exists for: a 07:52 train in an 07:00-08:00
         # window, predicted 45 min late, is still catchable at 08:02. `catchable_after` does the real

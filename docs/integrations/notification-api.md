@@ -357,8 +357,10 @@ Validation refusals carry prose rather than a code, and it is the prose `/varsel
 `"days must be a non-empty subset of 0..6 (0=Monday)"`, `"begin/end must be HH:MM (24h)"`,
 `"from_stop and to_stop must differ"`, `"the test marker is immutable; delete and re-create instead"`,
 `"subscription id already exists with a different definition"`, `f"version is {n}, not {m}"`.
-The public read adds two of its own, and neither echoes your value:
-`"from_stop and to_stop must be NSR:StopPlace:<digits>"`, `"begin and end must be given together"`.
+The public read adds three of its own, and none echoes your value:
+`"from_stop and to_stop must be NSR:StopPlace:<digits>"`, `"begin and end must be given together"`,
+and on `journey-alerts`, which takes a period over midnight, `"begin and end must differ"` in place
+of the overnight refusal.
 
 **One shape this page cannot flatten:** a schema-level 422 — an unknown body field under
 `extra="forbid"`, a `subscription_id` failing its pattern, `limit` out of range, a path segment over
@@ -478,7 +480,7 @@ assembly the webhook event goes through, so a receiver that renders an event ren
 | `from_stop` | yes | `^NSR:StopPlace:[0-9]+$`, canonicalised as `/varsel` canonicalises a submitted ref | — |
 | `to_stop` | yes | same, and a different physical place after canonicalisation | — |
 | `begin` | with `end` | `HH:MM`, Europe/Oslo | `00:00` |
-| `end` | with `begin` | `HH:MM`, strictly after `begin` — an overnight period is refused, ask as two | `23:59` |
+| `end` | with `begin` | `HH:MM`, different from `begin`. Before `begin` is a period over midnight (below) | `23:59` |
 | `days` | no | **repeated** parameter, `days=0&days=1`, integers 0–6, 0 = Monday. A comma-separated list is a 422 | today's and tomorrow's Oslo weekday |
 | `wait` | no | 0–20 seconds to wait for the wording and the alternative | 20 |
 | `limit` | no | 1–20 entries | 10 |
@@ -487,6 +489,14 @@ assembly the webhook event goes through, so a receiver that renders an event ren
 `begin`/`end` come together or not at all; no period is the whole day. No `days` is today and
 tomorrow, which is every window the prediction cache can carry — a read at 22:00 with no period
 lists a 00:30 departure with `departs_tomorrow: true`.
+
+**A period over midnight is one read** (since 2026-09-29, KIX-22). `begin=22:00&end=01:00` is
+22:00 until 01:00 the next morning, and belongs to the weekday it **begins** on: `days=4` is Friday
+night into Saturday. With no `days` it also asks about yesterday's weekday, so at 00:30 the period
+that began at 22:00 is still in the answer. `summary` then covers both halves, counting
+tomorrow's trains apart («… i dag og 1 i morgen»). Trains after midnight are scored once the
+prediction cache carries them, as they were when the two halves were asked apart. Only this read
+takes such a period: `journey-status` and a subscription still refuse it.
 
 **Send the stop refs your traveller picked, parent or not** (since 2026-09-23). A parent
 (multimodal) StopPlace — what Entur's search returns for a station, `NSR:StopPlace:59872` for

@@ -845,7 +845,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `disruptions/api/notification_pull.py`, plan 2026-09-10-001) is the same selection and the same
   payload assembly with **no registration and no credential**: the Entur app's favourites panel
   asks for a saved route — five fields, `from_stop`/`to_stop` canonicalized, optional Oslo
-  `begin`/`end`, optional repeated `days` — and gets one entry per alert-worthy train ahead,
+  `begin`/`end` (**`end` before `begin` is a period over midnight** since 2026-09-29, KIX-22 — this
+  read's alone, through `_parse_webhook_recipient(overnight=True)`; it belongs to the weekday it
+  begins on, `journey_windows` offers yesterday's too for it only, and every write path and
+  `journey-status` still refuse it, so no registration can hold one), optional repeated `days` —
+  and gets one entry per alert-worthy train ahead,
   soonest expected departure first with a worst-first `severity` rank, each carrying the webhook
   event's own `payload`. Its own `APIRouter` on the shared prefix with **no router-level
   dependency** (`notification_api.router` carries `_authenticated` and `_throttled` at router

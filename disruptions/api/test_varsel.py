@@ -562,6 +562,28 @@ def test_overnight_rejection():
     assert not match(_journey(), {"S1": _train(_oslo(2026, 7, 6, 23, 30))})
 
 
+def test_an_overnight_window_ends_the_next_day_and_is_still_open_after_midnight():
+    """KIX-22: `end < begin` (the public journey-alerts read's only; every registration path
+    refuses it) runs over midnight and belongs to the weekday it begins on. At 00:30 Tuesday,
+    Monday's 22:00-01:00 is still open. A day window is never offered from yesterday, even inside
+    the catch-up grace."""
+    tue_0030 = _oslo(2026, 7, 7, 0, 30)
+
+    def utc(*a):
+        return _oslo(*a).astimezone(UTC)
+
+    windows = varsel.journey_windows(_journey(begin="22:00", end="01:00", days=(0, 1)), tue_0030)
+    assert windows == [
+        (utc(2026, 7, 6, 22, 0), utc(2026, 7, 7, 1, 0)),
+        (utc(2026, 7, 7, 22, 0), utc(2026, 7, 8, 1, 0)),
+    ]
+    late = varsel.journey_windows(_journey(begin="22:00", end="23:59", days=(0, 1)), tue_0030)
+    assert late == [(utc(2026, 7, 7, 22, 0), utc(2026, 7, 7, 23, 59))]
+    assert match(
+        _journey(begin="22:00", end="01:00", days=(0,)), {"S1": _train(_oslo(2026, 7, 7, 0, 40))}, now=tue_0030
+    )
+
+
 def test_departed_train_no_match():
     # The situation stays open all day, but the 08:00 train (expected 08:03 with the 3 min
     # typical delay) left long ago — no alert lingering at noon.
