@@ -891,7 +891,8 @@ def test_deletion_is_ordered_idempotent_and_reports_its_cleanup():
 
 
 def test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word():
-    """Scenario 4. Overnight windows, a bad weekday and from == to, refused as /varsel refuses them.
+    """Scenario 4. An empty window, a bad weekday and from == to, refused as /varsel refuses them --
+    and a window over midnight accepted as /varsel accepts it (KIX-22).
 
     The point is not that a 422 comes back -- it is that the SAME sentence does. R2's shape lives in
     `notification_store.SubscriptionSpec.validate`, which restates /varsel's three rules and is pinned
@@ -903,10 +904,9 @@ def test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word():
     try:
         client = _client()
         cases = [
-            (_body(begin="22:00", end="06:00"), "overnight windows are not supported"),
             (_body(days=[0, 9]), "days must be a non-empty subset of 0..6"),
             (_body(days=[]), "days must be a non-empty subset of 0..6"),
-            (_body(begin="08:00", end="08:00"), "begin must be before end"),
+            (_body(begin="08:00", end="08:00"), "begin and end must differ"),
             (_body(to_stop=FROM), "from_stop and to_stop must differ"),
         ]
         for payload, fragment in cases:
@@ -915,8 +915,15 @@ def test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word():
             )
             assert response.status_code == 422, (payload, response.text)
             assert fragment in response.json()["detail"], (payload, response.text)
+        overnight = client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(begin="22:00", end="06:00"),
+            headers=_headers(bearer),
+        )
+        assert overnight.status_code in (200, 201), overnight.text
+        assert (overnight.json()["begin"], overnight.json()["end"]) == ("22:00", "06:00")
         # The verdicts are /varsel's, not this surface's invention.
-        assert "overnight windows are not supported" in VARSEL_SOURCE
+        assert "begin and end must differ" in VARSEL_SOURCE
         assert "days must be a non-empty subset of 0..6 (0=Monday)" in VARSEL_SOURCE
         assert "from_stop and to_stop must differ" in VARSEL_SOURCE
     finally:
@@ -930,7 +937,9 @@ def test_the_router_does_not_restate_the_window_rule():
     `varsel._parse_webhook_recipient` are one and two). A comparison of begin and end anywhere in
     this module would be a fourth, and the two surfaces would then drift silently.
     """
-    for forbidden in ("begin >= ", "begin >=", "_parse_hhmm", "_HHMM_RE", "range(0, 7)"):
+    # `spec.begin == sub.begin` is the idempotency comparison, not a window rule, so the equality
+    # shapes named here are the ones that compare a definition's begin with its OWN end.
+    for forbidden in ("begin >= ", "begin >=", "begin == end", ".begin == body.end", "_parse_hhmm", "_HHMM_RE", "range(0, 7)"):
         assert forbidden not in API_CODE, forbidden
     assert "spec.validate()" in API_CODE
 

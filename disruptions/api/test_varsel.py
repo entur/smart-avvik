@@ -5,7 +5,7 @@ No BigQuery, no network: the BigQuery client is stubbed before main is imported,
 provider is main's real one driven over an injected synthetic snapshot — so these exercise the
 actual /impact matcher plus varsel's policy on top of it, end to end.
 
-Covers direction, window edges, the weekday filter, overnight rejection, the departed-train filter
+Covers direction, window edges, the weekday filter, windows over midnight, the departed-train filter
 (no alert once the expected departure has passed), the alert-worthiness gate, the per-operator
 thresholds, and the notification wording.
 """
@@ -557,14 +557,13 @@ def test_only_today_and_tomorrow_are_considered():
     assert match(saturday_journey, {"S1": _train(SAT_0800)}, now=_oslo(2026, 7, 10, 22, 0))
 
 
-def test_overnight_rejection():
+def test_a_day_window_does_not_wrap_past_midnight():
     # A day-window [07:00, 09:00] must not catch a 23:30 departure (no wrap-around).
     assert not match(_journey(), {"S1": _train(_oslo(2026, 7, 6, 23, 30))})
 
 
 def test_an_overnight_window_ends_the_next_day_and_is_still_open_after_midnight():
-    """KIX-22: `end < begin` (the public journey-alerts read's only; every registration path
-    refuses it) runs over midnight and belongs to the weekday it begins on. At 00:30 Tuesday,
+    """KIX-22: `end < begin` runs over midnight and belongs to the weekday it begins on. At 00:30 Tuesday,
     Monday's 22:00-01:00 is still open. A day window is never offered from yesterday, even inside
     the catch-up grace."""
     tue_0030 = _oslo(2026, 7, 7, 0, 30)

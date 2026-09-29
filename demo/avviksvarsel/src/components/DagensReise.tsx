@@ -1,7 +1,7 @@
 import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import type { JourneyStatus } from '../api';
 import { fmtTime } from '../format';
-import { caption, circleClass, circleLabel, splitAtNow, updatedAt } from './dagensReiseModel';
+import { caption, circleClass, circleLabel, splitAtNow, stripTitle, updatedAt } from './dagensReiseModel';
 
 /** «I dag»: one circle per train in today's window, left to right, filled for a fact and a ring for
  *  a forecast (plan 2026-09-22-001). Renders nothing on a day the journey is not travelled. */
@@ -33,7 +33,7 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
   return (
     <section className="dr" aria-label="Dagens avganger">
       <div className="dr-head">
-        <span className="dr-title">I dag</span>
+        <span className="dr-title">{stripTitle(today)}</span>
         {updated && <span className="dr-updated">Oppdatert {fmtTime(updated)}</span>}
       </div>
       {today.trains.length > 0 && (

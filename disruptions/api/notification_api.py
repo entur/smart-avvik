@@ -36,7 +36,7 @@ Seven things here are decisions rather than mechanics.
    from :meth:`notification_store.SubscriptionSpec.validate`, which is /varsel's own three rules; the
    stop refs go through /varsel's ``canonical_stop``; the servability answer comes from /varsel's
    own connectivity seam. The Pydantic models below bound *sizes and charsets* and deliberately
-   state no semantics -- a fourth copy of "begin must be before end" is exactly how the two
+   state no semantics -- a fourth copy of the window rule is exactly how the two
    surfaces would drift apart, and ``test_notification_api`` greps this file to keep it that way.
 5. **The test-only marker is immutable and cannot be set after creation** (R15/AE18). The store
    refuses a replace that changes it; this module refuses a synthetic event for a subscription that
