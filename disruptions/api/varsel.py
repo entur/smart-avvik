@@ -105,6 +105,7 @@ import deployment
 import feedback
 import feedback_contexts
 import journey_status  # every train in a journey's window today, graded -- `Journey.today`
+import line_modes  # each line's Journey Planner transport mode, for `payload.mode` (KIX-23)
 import metrics  # sibling leaf module (no main import): the push-delivery counter (KTD11)
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
@@ -3912,6 +3913,9 @@ def _webhook_payload(
         # Where the train terminates, the value the title names it with («R14 Drammen 14:59»);
         # null while the journey-status spine is unloaded and for every train it does not hold.
         "destination": alert.destination,
+        # The line's Journey Planner mode (`rail`, `bus`, `metro`, ...), so a client can tell a
+        # train from a bus on the same stop pair (KIX-23); null when JP has not said.
+        "mode": line_modes.transport_mode(alert.operator, alert.line),
         "situations": _webhook_situations(contributing),
         "alternative_journey": dumped,
     }

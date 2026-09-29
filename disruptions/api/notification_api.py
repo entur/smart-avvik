@@ -1250,6 +1250,7 @@ def _synthetic_event(
             "effect": "cancelled",
             # The title's own, as on a real event.
             "destination": "Lillestrøm",
+            "mode": "rail",
             "situations": [
                 {
                     "situation_number": situation_number,

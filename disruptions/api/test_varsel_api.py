@@ -5493,6 +5493,7 @@ def test_the_event_payload_carries_the_destination_its_title_names(monkeypatch):
 
         [subject] = _subjects(varsel.check_and_notify(cancelled))
         assert subject.payload["destination"] == destination
+        assert subject.payload["mode"] == "rail", "KIX-23: a Vy train's line mode"
         assert (" Drammen " in subject.payload["notification"]["title"]) == (destination is not None)
     _use_snapshot(SNAPSHOT)
 

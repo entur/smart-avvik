@@ -532,7 +532,7 @@ and for a subscription's `from_stop`/`to_stop`.
       "phase": "confirmed",
       "train": {"operator": "VYG", "line": "VYG:Line:L1", "journey_ref": "VYG:ServiceJourney:L1-2143-20260910",
                 "call_date": "2026-09-10", "stop_place": "NSR:StopPlace:337", "stop_order": 4,
-                "destination": "Lillestrøm"},
+                "destination": "Lillestrøm", "mode": "rail"},
       "aimed_departure_time": "2026-09-10T05:45:00+00:00",
       "expected_departure_time": "2026-09-10T05:45:00+00:00",
       "situations": ["KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910"],
@@ -546,6 +546,7 @@ and for a subscription's `from_stop`/`to_stop`.
         "delay": null,
         "effect": "cancelled",
         "destination": "Lillestrøm",
+        "mode": "rail",
         "situations": [{"situation_number": "KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910",
                         "summary": "Innstilt", "description": null, "has_situation": false}],
         "alternative_journey": {"...": "the best remaining way there, see the event's payload"}
@@ -589,7 +590,9 @@ same object, so it is not restated here. What the envelope around it means:
 - **`train`** is the event's own six identity fields; an entry and an event about one train join on
   them without translation. Beside them, `destination` is where the train terminates, the same value
   `payload.notification.title` names it with («Tog R14 Drammen 14:59»), and `null` when we do not
-  know it — today every train but Vy's, and every bus. It is for display, not part of the identity.
+  know it — today every train but Vy's, and every bus. `mode` is the line's transport mode, the
+  same value as `payload.mode` (see [the event](#the-event)); filter on it to keep a bus favourite's
+  entries to buses. Neither is part of the identity.
   `expected_departure_time` is the aimed time plus the typical delay
   predicted for it — the figure that decides whether the train can still be caught, and the one the
   list is ordered on; equal to the aimed time for a declared cancellation.
@@ -766,7 +769,8 @@ instant: draw the «now» marker against it, not against the device clock.
 from today's timetable, with no cancellation published, carries `removed_from_plan: true` and is
 `cancelled` and `red` like any cancellation, ring before its time and filled after. Say «tatt ut av
 rutetabellen» for it rather than «innstilt»: the operator's own channels show no cancellation.
-`bus_for_train` is true when Vy has set up a replacement bus for it.
+`bus_for_train` is true when Vy has set up a replacement bus for it. Each train's `mode` is its
+line's transport mode, as on journey-alerts: `rail` for every train this read lists today.
 
 **Each train's `destination`** is where it terminates (`"Drammen"`), the same value a notification
 title and the journey-alerts read name the train with; name it `R14 Drammen 14:59`. It is `null`
@@ -797,7 +801,7 @@ bytes that were signed and sent, and a `POST /test-events` request captured verb
 with its three signing headers — both from dev on 2026-09-10. Both, and the journey-alerts samples
 under `samples/notification-pull/`, predate the situations' English (2026-09-24), so their
 `payload.situations` entries lack `summary_en`, `description_en` and `en_machine_translated`, and
-all of them predate `payload.destination` (2026-09-25); they are signed captures and are kept as
+all of them predate `payload.destination` (2026-09-25) and `payload.mode` (2026-09-29); they are signed captures and are kept as
 sent. `contracts/notifications/v1/test-event-sample.json` has
 the current shape.
 
@@ -871,7 +875,7 @@ named** is scored from real-time data alone and is cut at a higher bar than a pu
 last hour of observation and the probability decays with the ask horizon far faster. Read the value
 off the event; do not assume the published per-operator cut. A `situations` entry whose
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
-(`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `situations` (objects:
+(`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `mode`, `situations` (objects:
 `situation_number`, `summary`, `description`, `summary_en`, `description_en`,
 `en_machine_translated`, `has_situation`) and `alternative_journey` (`object|null`).
 
@@ -880,6 +884,16 @@ off the event; do not assume the published per-operator cut. A `situations` entr
 14:59»). It is `null` when we do not know it, which today is every train but Vy's and every bus, and
 absent from an event minted before the field existed. The journey-alerts read carries the same value twice
 in each entry, as `train.destination` and in its `payload`.
+
+**`mode`** (since 2026-09-29) is the transport mode of the train's LINE, in the Journey Planner's own
+`TransportMode` vocabulary: `rail`, `bus`, `metro`, `tram`, `water`, `coach`, and so on. It is how you
+keep a bus favourite's alerts to buses and a train favourite's to trains: the stop pair alone does
+not say, and the service scores Vy and Go-Ahead rail beside the bus, T-bane, tram and boat routes of
+other operators. We ask the Journey Planner for every line once a day, so a Ruter T-bane is
+`metro` and never `bus`. Because it is the line's mode, a replacement bus on a rail line is `rail`.
+It is `null` when the Journey Planner has not answered for the line, which for a non-rail line is
+the case for about a minute after we restart, and it is absent from an event minted before the field existed. The journey-alerts read carries the same value
+as `train.mode`, and `journey-status` as each train's `mode`.
 
 **Every situation carries its text in English as well as Norwegian** (since 2026-09-24).
 `summary` and `description` are the Norwegian, as before; `summary_en` and `description_en` are the
