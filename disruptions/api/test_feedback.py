@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import uuid
+from pathlib import Path
 
 import feedback
 
@@ -48,7 +51,10 @@ def test_capture_is_allowlisted_and_personless(monkeypatch):
     monkeypatch.setattr(feedback, "_token", lambda: "phc_test")
     monkeypatch.setattr(feedback, "urlopen", fake_open)
     body = _body()
-    feedback._capture(body, environment="dev", context_date="2026-08-26", submitted_at="now")
+    feedback._capture(
+        body, environment="dev", context_date="2026-08-26", submitted_at="now", event=feedback.EVENT
+    )
+    assert captured["event"] == "varsel_alert_feedback"
     assert captured["properties"]["distinct_id"].startswith("fb_")
     assert captured["properties"]["distinct_id"] != str(body.response_id)
     assert captured["properties"]["$process_person_profile"] is False
@@ -67,11 +73,22 @@ def test_receipt_binds_response_to_context(monkeypatch):
     monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
     from datetime import UTC, datetime, timedelta
     body = _body()
+    expires = datetime.now(UTC) + timedelta(hours=1)
     receipt = feedback._receipt(
-        body.response_id, body.context_id, "2026-08-26", datetime.now(UTC) + timedelta(hours=1)
+        body.response_id, body.context_id, "2026-08-26", expires, feedback.RUSH_EVENT
     )
-    assert feedback._verify(receipt, body.response_id, body.context_id) == "2026-08-26"
+    assert feedback._verify(receipt, body.response_id, body.context_id) == (
+        "2026-08-26",
+        "rush_alert_feedback",
+    )
     assert not feedback._verify(receipt, uuid.uuid4(), body.context_id)
+    # A receipt minted before RUSH_EVENT existed still updates its response, under EVENT.
+    legacy = f"{body.response_id}|{body.context_id}|2026-08-26|{int(expires.timestamp())}".encode()
+    old = f"{feedback._b64(legacy)}.{feedback._b64(hmac.new(b's' * 32, legacy, hashlib.sha256).digest())}"
+    assert feedback._verify(old, body.response_id, body.context_id) == (
+        "2026-08-26",
+        "varsel_alert_feedback",
+    )
 
 
 def test_revision_requires_a_well_formed_receipt(monkeypatch):
@@ -207,6 +224,7 @@ def test_signed_revision_survives_display_lease_and_reuses_context_date(monkeypa
         first.context_id,
         "2026-08-26",
         datetime.now(UTC) + timedelta(hours=1),
+        feedback.RUSH_EVENT,
     )
     captured = {}
     monkeypatch.setattr(feedback, "enabled", lambda: True)
@@ -222,6 +240,43 @@ def test_signed_revision_survives_display_lease_and_reuses_context_date(monkeypa
     )
     assert feedback.submit(revised, environment="dev")["status"] == "saved"
     assert captured["context_date"] == "2026-08-26"
+    assert captured["event"] == "rush_alert_feedback"
+
+
+def test_the_review_export_reads_both_events():
+    # A name the exporter does not query drops that page out of every review, silently.
+    exporter = Path(__file__).parents[2] / "data" / "feedback" / "export_varsel_feedback.py"
+    query = exporter.read_text()
+    assert f"'{feedback.EVENT}'" in query and f"'{feedback.RUSH_EVENT}'" in query
+
+
+def test_rushvarsel_feedback_is_its_own_event_and_rides_the_receipt_into_a_revision(monkeypatch):
+    # Server-derived from the minted snapshot, so a client cannot file /varsel feedback under
+    # Rushvarsel; and carried in the signed receipt, because a revision never re-reads the cache.
+    captured = []
+    monkeypatch.setattr(feedback, "enabled", lambda: True)
+    monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
+    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (True, None))
+    monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.append(kwargs["event"]))
+    monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
+    for source, event in (
+        ("togvarsel", "rush_alert_feedback"),
+        ("llm", "varsel_alert_feedback"),
+        ("summary", "varsel_alert_feedback"),
+    ):
+        monkeypatch.setattr(
+            feedback.feedback_contexts, "resolve", lambda context_id, s=source: {"display_source": s}
+        )
+        first = _body()
+        receipt = feedback.submit(first, environment="dev")["receipt"]
+        monkeypatch.setattr(
+            feedback.feedback_contexts,
+            "resolve",
+            lambda context_id: (_ for _ in ()).throw(AssertionError("resolved")),
+        )
+        revised = _body(response_id=str(first.response_id), revision=2, receipt=receipt)
+        assert feedback.submit(revised, environment="dev")["status"] == "saved"
+        assert captured[-2:] == [event, event], (source, captured)
 
 
 class _MonkeyPatch:

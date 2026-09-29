@@ -757,8 +757,8 @@ def _feedback_snapshot(issue: Issue, d: date) -> dict[str, Any]:
     Same key set as varsel's per-alert snapshot — these ARE varsel_feedback_contexts' columns, and
     persist() writes them positionlessly by name — with the forecast discriminated the documented
     way: display_source='togvarsel' and a KIX:Togvarsel:<date>:<issue> situation number, never a
-    new column or PostHog event (a new event name would drop these rows out of the existing
-    exporter/reviewer, exactly the meldinger-rename lesson). Every value is a pure function of the
+    new column. That display_source is also what files the response under its own PostHog event,
+    feedback.RUSH_EVENT. Every value is a pure function of the
     issued Issue, so the fingerprint is byte-stable across requests and the page's 5-minute
     polling refreshes one lease per issue instead of minting fresh contexts.
     """

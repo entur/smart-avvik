@@ -108,11 +108,14 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the gate (`feedback.enabled()` — dev since 2026-08-28 and prd since 2026-08-31, tst off; the
   approval behind it is per environment because the subjects are, and prd's also classified the
   origin/destination/departure-time trio as «Intern», which closed punkt 9b for the Gemini prompt
-  too), rate limits, receipts, PostHog event and the
-  data/feedback exporter/reviewer are all varsel's, unchanged. Rows are discriminated the
-  documented way — `display_source='togvarsel'`, `situation_number = KIX:Togvarsel:<date>:<issue>`
-  — never a new column or event name (a new event would drop them out of every existing export
-  query, the meldinger-rename lesson). The snapshot quotes the page's literal rendering
+  too), rate limits, receipts and the data/feedback exporter/reviewer are all varsel's. Context
+  rows are discriminated the documented way — `display_source='togvarsel'`,
+  `situation_number = KIX:Togvarsel:<date>:<issue>` — never a new column. **The PostHog event is
+  its own since 2026-09-29, `rush_alert_feedback`** (`feedback.RUSH_EVENT`), so PostHog's UI and
+  dashboards can tell the two pages apart; `feedback._event` picks it from that `display_source`
+  on the first submission and the signed receipt carries it into every edit. The exporter queries
+  both names, and `test_feedback.py` pins that — a name it did not query would drop one page's
+  feedback out of every review, the meldinger-rename lesson. The snapshot quotes the page's literal rendering
   (`togvarsel._LEVEL_TEXT` mirrors the page's `LEVEL_TEXT`, JS-round parity on the percentage) and
   its key set is pinned against the contexts DDL in `test_togvarsel.py` — a key the table lacks
   fails the streamed insert invisibly (the 2026-08-27 mode). Page-side, widget state lives outside
