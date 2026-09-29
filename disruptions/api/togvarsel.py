@@ -360,7 +360,7 @@ def _am_reasons(row: dict, suffix: str) -> list[str]:
         # them. Positive in every model (the rule of 2026-09-03); 20 calls is about two trains.
         out.append("færre rushtidsavganger enn vanlig i dagens ruteplan")
     if not out:
-        out.append("ingen tegn til trøbbel i morgentimene")
+        out.append("ingen tegn til forstyrrelser i morgentimene")
     return out[:4]
 
 
@@ -417,7 +417,7 @@ def skill_note_for(d: date) -> str:
     # that moves them.
     return (
         "Treffsikkerheten er omtrent som et par dagers værvarsel. Målt på tidligere morgener: etter "
-        "en grønn prognose fikk omtrent 6 av 100 likevel mye trøbbel, etter en gul omtrent 20 og "
+        "en grønn prognose fikk omtrent 6 av 100 likevel mye forstyrrelser, etter en gul omtrent 20 og "
         "etter en rød omtrent 55 – mot 20 av 100 morgener i snitt. Plutselige feil etter "
         "utsendelse fanges ikke."
     )
@@ -435,7 +435,7 @@ def pm_outlook_for(issues: dict[str, Issue]) -> str | None:
     if morning.level == "red":
         return (
             "noe forhøyet risiko i ettermiddag — etter en dårlig morgen har ettermiddagsrushet "
-            "historisk hatt ~32 % sjanse for trøbbel, mot ~11 % ellers; oppdatert prognose kl. 12 og 14"
+            "historisk hatt ~32 % sjanse for forstyrrelser, mot ~11 % ellers; oppdatert prognose kl. 12 og 14"
         )
     return "normale utsikter for ettermiddagsrushet; oppdatert prognose kl. 12 og 14"
 
@@ -767,7 +767,7 @@ def _feedback_snapshot(issue: Issue, d: date) -> dict[str, Any]:
         # JavaScript Math.round (used by the page) rounds non-negative .5 upward; Python's round
         # uses ties-to-even and would make the persisted "exact" text disagree at half percents.
         "displayed_text": f"{_LEVEL_TEXT.get(issue.level, issue.level)}"
-        f" (ca. {int(issue.p * 100 + 0.5)} % sjanse for mye trøbbel)",
+        f" (ca. {int(issue.p * 100 + 0.5)} % sjanse for mye forstyrrelser)",
         # The card's <h2> since 2026-09-02: the rush and its level, «Morgenrushet 07:00–09:00 —
         # gult nivå» (design review 2026-09-01, finding 25: the page's answer was in no heading).
         # Mirrors IssueCard.tsx's heading; the issue time moved to a small line under it.

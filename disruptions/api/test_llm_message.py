@@ -685,7 +685,7 @@ def test_an_invented_figure_is_rejected_rather_than_pushed():
     _reset(provider="claude")
     replies = iter([
         '{"melding": "Toget kl 09:47 er innstilt."}',   # 09:47 appears nowhere in the payload
-        '{"melding": "93 % sjanse for trøbbel kl 08:12."}',  # both figures are in the payload
+        '{"melding": "93 % sjanse for forstyrrelser kl 08:12."}',  # both figures are in the payload
     ])
     llm_message._BACKENDS["claude"] = lambda body: next(replies)
     try:

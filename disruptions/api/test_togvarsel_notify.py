@@ -700,13 +700,13 @@ def test_all_clear_payload_is_a_friskmelding_without_warning_language():
     warnings use. No reasons either: green's own reasons still talk about trouble signs."""
     markers = {"0630": {"level": "yellow", "pushed": True}}
     issue = _issued("0700", "green", scope="morgenrushet 07:00–09:00",
-                    reasons=("ingen tegn til trøbbel i morgentimene",))
+                    reasons=("ingen tegn til forstyrrelser i morgentimene",))
     decision = togvarsel_notify.decide_issue(issue, markers, now=_monday(7, 1))
     assert decision.kind == "all_clear"
     title, body = togvarsel_notify.compose_message(decision, issue)
     assert title == "Friskmelding: grønt nivå for morgenrushet"
     assert body == "Utsiktene for morgenrushet 07:00–09:00 er tilbake på grønt nivå."
-    for word in ("rushvarsel", "avvik", "forsinkel", "innstil", "trøbbel", "advarsel"):
+    for word in ("rushvarsel", "avvik", "forsinkel", "innstil", "forstyrrelser", "advarsel"):
         assert word not in title.lower() and word not in body.lower(), word
 
 

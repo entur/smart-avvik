@@ -40,7 +40,7 @@ export function issueTime(issue: string): string {
  * two texts have to be identical at half a percent.
  */
 export function levelSentence(level: string, p: number): string {
-  return `${LEVEL_TEXT[level] ?? level} (ca. ${Math.round(p * 100)} % sjanse for mye trøbbel)`;
+  return `${LEVEL_TEXT[level] ?? level} (ca. ${Math.round(p * 100)} % sjanse for mye forstyrrelser)`;
 }
 
 /** An ISO timestamp as an Oslo wall-clock time — the forecast's own timezone, not the reader's. */
