@@ -44,7 +44,7 @@ case but is the trap if the recipe is ever wrapped in a helper function.
 project holding the context table, so it always tracks `--environment`: `ent-kixavvik-{dev,tst,prd}`.
 
 The tool talks only to `https://eu.posthog.com/api/projects/{project_id}/query/`, queries the
-single `varsel_alert_feedback` event with server-built time/environment predicates, and refuses
+`varsel_alert_feedback` and `rush_alert_feedback` events with server-built time/environment predicates, and refuses
 more than 10,000 events. It then parameterizes the distinct context IDs and the same date bounds
 against `<project>.disruptions.varsel_feedback_contexts`. It selects the greatest complete
 `revision` per `(environment, context_id, response_id)`; `event_id` deterministically breaks an
@@ -118,6 +118,21 @@ happened to follow — nothing enforces it and no column records it — so a pat
 forgiving about spelling would silently discard real feedback, and a filter on free text can only be
 trusted if what it dropped stays as visible as what it kept. A response with no comment at all
 (`comment: null`, an ordinary thumbs-up) is never matched by it.
+
+## Tell /varsel and /togmelding apart in PostHog
+
+Both pages post to the same endpoint, and since 2026-09-29 each has its own event:
+**`varsel_alert_feedback`** for Smarte reisevarsler's alert cards and **`rush_alert_feedback`** for
+Rushvarsel's forecast cards. Build one dashboard per event. The export and the notebook read both,
+and the notebook's "shown" column says `togvarsel` for a Rushvarsel card.
+
+- The server picks the event from the snapshot it minted (`display_source='togvarsel'` is
+  Rushvarsel), never from the request. An edit (`revision` > 1) takes it from the signed receipt,
+  because an edit must not depend on the context cache.
+- Rushvarsel feedback captured before that date is under `varsel_alert_feedback`. None of it was
+  real, only synthetic test responses.
+- Count **`revision = 1`** events to count responses. Each edit of a comment is one more event.
+- Filter on `environment` as well: `Kix - dev` (259080) holds both dev and tst.
 
 ## Setup and release gate
 

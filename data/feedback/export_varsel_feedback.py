@@ -16,7 +16,6 @@ from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-EVENT = "varsel_alert_feedback"
 QUERY_HOST = "https://eu.posthog.com"
 TOKEN_ENV = "POSTHOG_PERSONAL_API_KEY"
 MAX_EVENTS = 10_000
@@ -53,6 +52,8 @@ def _hogql(environment: str, start: date, end: date) -> str:
     # zone is only a rendering, and leaving it project-relative makes an evidence document change
     # value when somebody edits a PostHog setting — which is why PostHog's own ingestion
     # `timestamp` is pinned to UTC here as well. HogQL exposes toInt, never ClickHouse's toInt64.
+    # The two events are /varsel's alert cards and Rushvarsel's forecast cards (feedback.EVENT and
+    # feedback.RUSH_EVENT); test_feedback pins that both names are here.
     return f"""SELECT
 toString(toTimeZone(timestamp, 'UTC')), properties.environment, properties.context_id,
 toString(toDate(properties.context_date)),
@@ -60,7 +61,7 @@ properties.response_id, toInt(properties.revision), properties.event_id,
 properties.rating, properties.comment,
 toString(toTimeZone(properties.submitted_at, 'UTC'))
 FROM events
-WHERE event = '{EVENT}'
+WHERE event IN ('varsel_alert_feedback', 'rush_alert_feedback')
   AND timestamp >= toDateTime('{start_ts}')
   AND timestamp < toDateTime('{end_ts}')
   AND properties.environment = '{environment}'
