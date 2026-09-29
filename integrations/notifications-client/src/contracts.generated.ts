@@ -295,9 +295,10 @@ export interface Subscription {
    */
   begin: string;
   /**
-   * End of the daily boarding window, HH:MM in Europe/Oslo. Must be strictly after begin:
-   * overnight windows are rejected here exactly as they are in /varsel, so a client cannot
-   * register a window /varsel would not.
+   * End of the daily boarding window, HH:MM in Europe/Oslo. Must differ from begin. An end before
+   * begin is a window over midnight, 22:00-01:00 say, which belongs to the weekday it begins on:
+   * days [4] is Friday night into Saturday. Validated exactly as /varsel validates it, so a client
+   * cannot register a window /varsel would not.
    */
   end: string;
   /**

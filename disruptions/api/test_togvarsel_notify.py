@@ -22,7 +22,7 @@ import logging
 import os
 from contextlib import contextmanager
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Rushvarsel's master gate, pinned ON before the module is imported: both routes here carry a
@@ -555,6 +555,20 @@ def test_the_live_window_is_bounded_by_evaluation_time():
         "0700", journeys, STATIONS, _ident, now=_monday(7, 50)
     )
     assert matched == ["still"]
+
+
+def test_a_window_over_midnight_is_the_next_weekdays_small_hours():
+    """KIX-22: a Monday 23:00-07:30 is Monday evening and TUESDAY morning, so it is Tuesday's
+    morning rush and not Monday's; a weekday 22:00-01:00 touches no rush at all."""
+    journeys = {
+        "night_shift": _j(begin="23:00", end="07:30", days=(0,)),
+        "late": _j(begin="22:00", end="01:00"),
+    }
+    tuesday = _monday(6, 31) + timedelta(days=1)
+    monday_matched, _devices = togvarsel_notify.match_journeys("0630", journeys, STATIONS, _ident, now=_monday(6, 31))
+    tuesday_matched, _devices = togvarsel_notify.match_journeys("0630", journeys, STATIONS, _ident, now=tuesday)
+    assert monday_matched == [] and tuesday_matched == ["night_shift"]
+    assert togvarsel_notify.affected_rushes("dev-1", journeys, STATIONS, _ident, tuesday) == {"am"}
 
 
 def test_pm_issues_notify_the_afternoon_windows_in_advance():
