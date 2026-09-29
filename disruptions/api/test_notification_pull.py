@@ -221,6 +221,9 @@ def test_each_train_carries_its_lines_journey_planner_mode():
         alerts = _get().json()["alerts"]
         assert [a["train"]["mode"] for a in alerts] == ["rail", "metro", None], alerts
         assert [a["payload"]["mode"] for a in alerts] == ["rail", "metro", None], "the event's field too"
+        # KIX-25: the title's noun follows the same map -- «T-bane 5», never «Buss 5».
+        titles = [a["payload"]["notification"]["title"] for a in alerts]
+        assert [t.split()[0] for t in titles] == ["Tog", "T-bane", "Buss"], titles
     finally:
         line_modes.reset()
 
