@@ -175,8 +175,15 @@ class JourneyStatus(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
     now: datetime = Field(description="The server's instant; the client draws «nå» against it.")
-    date: dt.date = Field(description="The Oslo date the window is on.")
-    window: WindowSpan | None = Field(description="Today's window; null on a day not in `days`.")
+    date: dt.date = Field(
+        description="The Oslo date the window begins on: yesterday's while a window over midnight "
+        "that began yesterday is still open."
+    )
+    window: WindowSpan | None = Field(
+        description="Today's window, or last night's until a window over midnight ends; null on a "
+        "day not in `days`. Past midnight, once the plan is rebuilt, last night's trains that "
+        "arrived before midnight drop out of it; the ones still running or to come stay."
+    )
     reason: Literal["not_a_travel_day"] | None = Field(description="`not_a_travel_day`, or null.")
     operators: list[str] = Field(description="Operators whose trains are listed (Vy only in v1).")
     as_of: AsOf
@@ -295,15 +302,24 @@ def window_today(definition: dict, now: datetime) -> tuple[datetime, datetime] |
 
     `varsel.journey_windows`' Oslo arithmetic, restated because this module may not import `varsel`
     — minus its "drop a window whose end has passed" branch: the past half of today IS the strip's
-    filled half.
+    filled half. A window over midnight (`end < begin`) ends the next day and stays the strip's
+    until then: at 00:30 Tuesday it is Monday's 22:00-01:00, from 01:00 Tuesday night's.
     """
-    local = now.astimezone(_OSLO).date()
-    if local.weekday() not in set(definition["days"]):
-        return None
-    midnight = datetime.combine(local, time(0, 0), tzinfo=_OSLO)
-    start = midnight + timedelta(minutes=_minutes(definition["begin"]))
-    end = midnight + timedelta(minutes=_minutes(definition["end"]))
-    return start.astimezone(UTC), end.astimezone(UTC)
+    local = now.astimezone(_OSLO)
+    days = set(definition["days"])
+    begin, end = _minutes(definition["begin"]), _minutes(definition["end"])
+    overnight = end < begin
+    today = local.date()
+    for date in (today - timedelta(days=1), today) if overnight else (today,):
+        if date.weekday() not in days:
+            continue
+        midnight = datetime.combine(date, time(0, 0), tzinfo=_OSLO)
+        start = midnight + timedelta(minutes=begin)
+        stop = midnight + timedelta(days=int(overnight), minutes=end)
+        if date < today and stop <= local:
+            continue  # last night's window is over
+        return start.astimezone(UTC), stop.astimezone(UTC)
+    return None
 
 
 def _trains(
@@ -564,6 +580,6 @@ def status_for(definition: dict, now: datetime) -> JourneyStatus | None:
         _status(b, a, spine, actuals, now) for b, a in _trains(spine, from_refs, to_refs, start, end)
     ]
     return JourneyStatus(
-        now=now, date=local_date, window=WindowSpan(start=start, end=end), reason=None,
+        now=now, date=start.astimezone(_OSLO).date(), window=WindowSpan(start=start, end=end), reason=None,
         operators=list(OPERATORS), as_of=as_of, trains=trains,
     )

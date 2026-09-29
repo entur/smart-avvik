@@ -845,10 +845,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `disruptions/api/notification_pull.py`, plan 2026-09-10-001) is the same selection and the same
   payload assembly with **no registration and no credential**: the Entur app's favourites panel
   asks for a saved route — five fields, `from_stop`/`to_stop` canonicalized, optional Oslo
-  `begin`/`end` (**`end` before `begin` is a period over midnight** since 2026-09-29, KIX-22 — this
-  read's alone, through `_parse_webhook_recipient(overnight=True)`; it belongs to the weekday it
-  begins on, `journey_windows` offers yesterday's too for it only, and every write path and
-  `journey-status` still refuse it, so no registration can hold one), optional repeated `days` —
+  `begin`/`end` (**`end` before `begin` is a window over midnight** everywhere since 2026-09-29,
+  KIX-22: the read first, then `/varsel` registration, subscriptions and `journey-status` the same
+  day; see the next paragraph), optional repeated `days` —
   and gets one entry per alert-worthy train ahead,
   soonest expected departure first with a worst-first `severity` rank, each carrying the webhook
   event's own `payload`. Its own `APIRouter` on the shared prefix with **no router-level
@@ -931,6 +930,21 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   read's completeness reveals that a matching registration exists, the ceiling and allowances are
   shared with every anonymous caller, and the definition rides in the query string outside the
   process's own redaction.
+  **A window over midnight (`end < begin`) belongs to the weekday it BEGINS on** (2026-09-29,
+  KIX-22). The one rule is `begin != end`, in all three restatements (`varsel.JourneyIn`,
+  `varsel._parse_webhook_recipient`, `notification_store.JourneySpec.validate`), still pinned
+  against each other word for word («begin and end must differ»). Four places do the day
+  arithmetic and each must keep the weekday-it-begins rule: `varsel.journey_windows` (offers
+  YESTERDAY's window too, for an overnight window only — offered for every window, the 90-minute
+  catch-up grace would re-offer each late-evening one after midnight), `journey_status.window_today`
+  (last night's window until it ends, `date` = the day it began), `togvarsel_notify._affects` (the
+  small hours are the NEXT weekday's rush: a Monday 23:00-07:30 is Tuesday's morning), and
+  `notification_pull._definition`'s default `days` (adds yesterday's). The strip after midnight is
+  honest but thinner: `rail_calls_planned_today` keeps journeys with a call aimed today-or-later
+  (Oslo), so once it is rebuilt past midnight, last night's trains that ARRIVED before midnight
+  drop out; `rail_calls_today`'s filter is the UTC date, so actuals survive until 02:00 Oslo. The
+  daily alert cap is per Oslo day, so it starts afresh at midnight inside such a window — accepted,
+  not fixed.
   **Infrastructure is this repo's own Terraform** (`terraform/firestore.tf`, the directory's first
   non-IAM resource): the API, one named Firestore database per environment in `europe-west1`
   (immutable), seven composite indexes materialised with `for_each` keyed on each index's **content**

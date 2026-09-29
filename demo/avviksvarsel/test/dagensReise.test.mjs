@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { caption, circleClass, circleLabel, splitAtNow, updatedAt } from '../src/components/dagensReiseModel.ts';
+import { caption, circleClass, circleLabel, splitAtNow, stripTitle, updatedAt } from '../src/components/dagensReiseModel.ts';
 
 // 2026-09-22 is CEST, so Oslo is UTC+2.
 function train(hhmm, overrides = {}) {
@@ -148,6 +148,14 @@ test('the caption counts trains, or says when the model starts saying anything',
   const grey = [train('14:03', { state: 'unknown', level: 'grey' }), train('14:18', { state: 'unknown', level: 'grey' })];
   assert.equal(caption(status(grey, oslo('07:42'))), 'Vurderes fra 12:03');
   assert.equal(caption(status(grey, oslo('14:30'))), '2 avganger', 'a window already under way is counted');
+});
+
+test('a window over midnight is «I natt», and its empty caption says so', () => {
+  assert.equal(stripTitle(status([], oslo('07:42'))), 'I dag');
+  // 22:00 until 01:00 on the 23rd, which is 23:00Z on the 22nd: the UTC dates agree, Oslo's do not.
+  const night = { ...status([], oslo('23:10')), window: { start: oslo('22:00'), end: '2026-09-22T23:00:00.000Z' } };
+  assert.equal(stripTitle(night), 'I natt');
+  assert.equal(caption(night), 'Ingen direkte Vy-tog i tidsrommet i natt');
 });
 
 test('a train is named by its line and destination, like the push', async () => {

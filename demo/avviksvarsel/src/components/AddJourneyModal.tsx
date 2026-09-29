@@ -50,7 +50,8 @@ function minutesBetween(begin: string, end: string): number | null {
   };
   const a = parse(begin);
   const b = parse(end);
-  return a === null || b === null ? null : b - a;
+  // An end before the start is a journey over midnight (KIX-22), so the span wraps.
+  return a === null || b === null ? null : (b - a + 24 * 60) % (24 * 60);
 }
 
 export default function AddJourneyModal({
@@ -143,7 +144,7 @@ export default function AddJourneyModal({
       return { field: 'to', message: 'Reisen må gå mellom to ulike stopp.' };
     }
     if (!begin || !end) return { field: 'time', message: 'Du må velge når reisen starter og slutter.' };
-    if (begin >= end) return { field: 'time', message: 'Tidsrommet må starte før det slutter.' };
+    if (begin === end) return { field: 'time', message: 'Tidsrommet må starte og slutte på ulike klokkeslett.' };
     if (days.length === 0) return { field: 'days', message: 'Du må velge minst én ukedag.' };
     return null;
   }
@@ -296,6 +297,12 @@ export default function AddJourneyModal({
             }}
           />
         </div>
+        {begin && end && end < begin && (
+          <SmallText as="p" className="av-form-hint">
+            Reisen går over midnatt. Velg ukedagen den starter, så gjelder tidsrommet til {end} dagen
+            etter.
+          </SmallText>
+        )}
         {longWindow && (
           <SmallText as="p" className="av-form-hint">
             Et langt tidsrom gir flere varsler. Reiser du til og fra jobb, gir to reiser med hvert
