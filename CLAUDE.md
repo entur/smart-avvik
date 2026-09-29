@@ -10,6 +10,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - Use uv for Python operations
 - Use bq for bigquery operations. For instance, use bq show --schema --format=prettyjson ent-anshar-prd:realtime.siri_realtime_et_production
+- Use acli for Jira operations. KIX-n, wehere n is an integer, refers to a Jira ticket, look it up with acli jira workitem view KIX-n
 
 ## Important BigQuery tables
 
