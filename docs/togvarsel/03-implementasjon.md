@@ -7,7 +7,7 @@
 Dette dokumentet beskriver produktimplementasjonen av anbefalingen i
 [02-findings-2026-08-27.md](02-findings-2026-08-27.md) §8, slik §14k reviderte den. Kort:
 fire prognoser på hverdager (06:30 og 07:00 for morgenrushet, 12:00 og 14:00 for
-ettermiddagsrushet), tunet logistisk regresjon på produktets trøbbelmål (innstilt ELLER ≥ 10 min
+ettermiddagsrushet), tunet logistisk regresjon på produktets mål på forstyrrelser (innstilt ELLER ≥ 10 min
 forsinket), grønn/gul/rød på studiens faste sannsynlighetskutt, regelbaserte begrunnelser fra de
 menneskelesbare featurene, og en deterministisk «kjente avvik»-liste.
 

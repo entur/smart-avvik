@@ -227,13 +227,13 @@ export default function App() {
           )}
           <footer className="legend">
             <span>
-              <span className="verdict verdict-hit">✓</span> treff (varslet, ble trøbbel)
+              <span className="verdict verdict-hit">✓</span> treff (varslet, ble forstyrrelser)
             </span>
             <span>
               <span className="verdict verdict-ok">✓</span> riktig ro (ikke varslet, gikk fint)
             </span>
             <span>
-              <span className="verdict verdict-miss">✕</span> bom (ikke varslet, ble trøbbel)
+              <span className="verdict verdict-miss">✕</span> bom (ikke varslet, ble forstyrrelser)
             </span>
             <span>
               <span className="verdict verdict-false">!</span> falsk alarm (varslet, gikk fint)
