@@ -422,14 +422,27 @@ class JourneyStatusResponse(journey_status.JourneyStatus):
 
 
 def _definition(
-    from_stop: str, to_stop: str, begin: str | None, end: str | None, days: list[int] | None, now: datetime
+    from_stop: str,
+    to_stop: str,
+    begin: str | None,
+    end: str | None,
+    days: list[int] | None,
+    now: datetime,
+    *,
+    overnight: bool = False,
 ) -> dict:
     """The five-key definition dict (KTD2), or a 422.
+
+    ``overnight`` lets ``begin > end`` through as a period over midnight (KIX-22); only
+    `journey_alerts` passes it. `journey_status` grades one plan day, and a period over midnight
+    spans two, so it keeps refusing. With no ``days``, an overnight period also
+    defaults to YESTERDAY's weekday, whose window is still open until ``end`` this morning.
 
     The rules are `/varsel`'s own, and they are REUSED rather than restated: after the shape test
     (this module's, and before canonicalization), the dict goes through
     `varsel._parse_webhook_recipient`, which canonicalizes both refs through `varsel.canonical_stop`,
-    refuses equal refs AFTER that, checks HH:MM and `begin < end`, and bounds `days` -- with the
+    refuses equal refs AFTER that, checks HH:MM and `begin < end` (`begin != end` when
+    ``overnight``), and bounds `days` -- with the
     messages `notification_api` already pins word for word against `JourneyIn`'s
     (`test_the_window_and_weekday_verdicts_are_varsels_own_word_for_word`). A second copy of four
     rules here is what would drift. The recipient id it needs is a fixed label; only `.journey` is
@@ -445,7 +458,10 @@ def _definition(
         raise HTTPException(status_code=422, detail="begin and end must be given together")
     local_now = now.astimezone(_OSLO)
     if days is None:
-        days = sorted({local_now.weekday(), (local_now.weekday() + 1) % 7})
+        # String order is time order for the HH:MM the parser below insists on; anything else is
+        # refused there before this guess matters.
+        offsets = (-1, 0, 1) if overnight and begin is not None and end is not None and end < begin else (0, 1)
+        days = sorted({(local_now.weekday() + offset) % 7 for offset in offsets})
     try:
         recipient = varsel._parse_webhook_recipient(
             {
@@ -455,7 +471,8 @@ def _definition(
                 "begin": begin if begin is not None else "00:00",
                 "end": end if end is not None else "23:59",
                 "days": days,
-            }
+            },
+            overnight=overnight,
         )
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -1643,7 +1660,11 @@ async def journey_alerts(
     from_stop: str = Query(description="Boarding stop, `NSR:StopPlace:<digits>`."),
     to_stop: str = Query(description="Alighting stop, `NSR:StopPlace:<digits>`."),
     begin: str | None = Query(default=None, description='Period start "HH:MM" (Europe/Oslo). Both or neither.'),
-    end: str | None = Query(default=None, description='Period end "HH:MM" (Europe/Oslo), after `begin`.'),
+    end: str | None = Query(
+        default=None,
+        description='Period end "HH:MM" (Europe/Oslo). Before `begin` means the next day: '
+        '"22:00"-"01:00" is one period, and belongs to the weekday it begins on.',
+    ),
     days: list[int] | None = Query(
         default=None,
         description="Weekdays to ask about, 0=Monday .. 6=Sunday, as a REPEATED parameter "
@@ -1674,7 +1695,9 @@ async def journey_alerts(
 
     `days` is a repeated query parameter only -- `days=0&days=1` -- and strictly integers 0..6: a
     comma-separated list is a 422, as is any other shape. No period means the whole day
-    (`00:00`-`23:59`); no days means today's and tomorrow's Oslo weekday.
+    (`00:00`-`23:59`); no days means today's and tomorrow's Oslo weekday. A period whose `end` is
+    before its `begin` runs over midnight and belongs to the weekday it begins on; with no days it
+    also asks about yesterday's, which is still open until `end`.
     """
     started = monotonic()
     # Time this read spends waiting is time the caller asked for, so the HTTP metrics middleware
@@ -1682,7 +1705,7 @@ async def journey_alerts(
     # defaults to MAX_WAIT_S -- a read without the parameter waits the longest.
     request.scope[metrics.LONG_POLL_SCOPE_KEY] = wait > 0
     now = _now()
-    definition = _definition(from_stop, to_stop, begin, end, days, now)
+    definition = _definition(from_stop, to_stop, begin, end, days, now, overnight=True)
     pair = (definition["from_stop"], definition["to_stop"])
     digest = alternatives.pair_digest(*pair)
     client = _client_label(et_client_name)
