@@ -83,6 +83,7 @@ import alternatives
 import decisions
 import impact as impact_engine
 import journey_status
+import line_modes
 import metrics
 import notification_api
 import notification_auth
@@ -323,7 +324,7 @@ class CoverageOut(BaseModel):
 
 class TrainOut(BaseModel):
     """The train's identity, in `notification_store.TrainRef`'s shape (the webhook's own), plus
-    where it terminates -- display only, never part of the identity."""
+    where it terminates and its line's mode -- never part of the identity."""
 
     model_config = ConfigDict(extra="forbid")
     operator: str
@@ -334,6 +335,8 @@ class TrainOut(BaseModel):
     stop_order: int
     # The same value `payload.notification.title` names the train with («R14 Drammen 14:59»).
     destination: str | None
+    # `payload.mode`'s value: the line's Journey Planner mode, `rail`, `bus`, `metro`, ... (KIX-23).
+    mode: str | None
 
 class WordingOut(BaseModel):
     """Where `payload.notification`'s text came from: `llm` or `deterministic`, and why."""
@@ -692,6 +695,7 @@ def _figures_from_alerts(
                     stop_place=ref.stop_place,
                     stop_order=ref.stop_order,
                     destination=winner.destination,
+                    mode=line_modes.transport_mode(winner.operator, winner.line),
                 ),
                 train_key=train_key,
                 expected_departure=expected,

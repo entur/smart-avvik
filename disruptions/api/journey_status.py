@@ -40,6 +40,7 @@ from zoneinfo import ZoneInfo
 
 import alert_policy
 import impact
+import line_modes
 from pydantic import BaseModel, ConfigDict, Field
 
 _OSLO = ZoneInfo("Europe/Oslo")
@@ -152,6 +153,10 @@ class TrainStatus(BaseModel):
     bus_for_train: bool = Field(description="A removed train Vy has set up a replacement bus for.")
     destination: str | None = Field(
         default=None, description="Where the train terminates, as a departure board names it: `Hamar`."
+    )
+    mode: str | None = Field(
+        default=None,
+        description="The line's Journey Planner transport mode: `rail` for every train listed today.",
     )
 
 
@@ -464,6 +469,7 @@ def _status(
         "line": b.line,
         "jkey": b.jkey,
         "destination": _destination(spine.by_key[key]),
+        "mode": line_modes.transport_mode(b.operator, b.line),
         "impact_probability": None,
         "alert_worthy": False,
         "expected_departure_time": None,

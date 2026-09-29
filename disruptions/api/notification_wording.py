@@ -56,12 +56,12 @@ logger = logging.getLogger(__name__)
 # Rail codespaces (operator == ref codespace). vehicleMode is NULL for most bus producers, so the
 # vehicle noun is derived from the codespace, not the feed; everything not rail is labelled "Buss".
 # Moved here with `mode_label` so a wording never has to import `varsel` for a noun.
-_RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
+RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
 
 
 def mode_label(operator: str | None) -> str:
     """User-facing vehicle noun for an operator: 'Tog' (rail) or 'Buss' (everything else)."""
-    return "Tog" if operator in _RAIL_CODESPACES else "Buss"
+    return "Tog" if operator in RAIL_CODESPACES else "Buss"
 
 
 # ---- Trains taken out of the plan (plan 2026-09-23-001) --------------------------------------------
