@@ -231,6 +231,14 @@ export interface NotificationEvent {
      */
     destination?: string | null;
     /**
+     * The line's transport mode in the Journey Planner's own `TransportMode` vocabulary: `rail`,
+     * `bus`, `metro`, `tram`, `water`, `coach`, ... It is the LINE's mode, so a replacement bus on
+     * a rail line is `rail`. Null when the Journey Planner has not answered for the line, which
+     * for a non-rail line is the case for about a minute after we restart. Absent from an event
+     * minted before the field existed.
+     */
+    mode?: string | null;
+    /**
      * The contributing situations, each with `situation_number`, the Norwegian `summary` and
      * `description`, their English `summary_en` and `description_en`, `en_machine_translated` and
      * `has_situation`. The English is the operator's own where they published one (Vy does on

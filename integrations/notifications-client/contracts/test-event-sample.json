@@ -79,6 +79,7 @@
       "delay": null,
       "effect": "cancelled",
       "destination": "Lillestrøm",
+      "mode": "rail",
       "situations": [
         {
           "situation_number": "KIX:TestEvent:0123456789ab",

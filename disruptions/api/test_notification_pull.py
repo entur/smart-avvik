@@ -195,6 +195,36 @@ def test_the_train_carries_the_destination_its_notification_title_names(monkeypa
     assert [a["payload"]["destination"] for a in body["alerts"]] == ["Drammen", None], "the event's field too"
 
 
+def test_each_train_carries_its_lines_journey_planner_mode():
+    """KIX-23. `train.mode` and `payload.mode` are one value: JP's mode for the line where the map
+    has it (a Ruter T-bane is `metro`, which the codespace would have called a bus), `rail` for a
+    rail codespace JP has not answered for, and null otherwise -- never `bus` by elimination."""
+    from dataclasses import replace
+
+    import line_modes
+
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+
+    def on(line, calls):
+        return [replace(c, operator=line.split(":")[0], line=line) for c in calls]
+
+    line_modes.set_modes([{"id": "RUT:Line:5", "transportMode": "metro"}], now)
+    try:
+        _use_snapshot({
+            "S1": _train(now + timedelta(hours=1), p_cancel=0.9, p_impact_dep=0.95),
+            "S2": on("RUT:Line:5", _train(now + timedelta(hours=2), jkey="t2", situation="S2",
+                                          p_cancel=0.9, p_impact_dep=0.95)),
+            "S3": on("RUT:Line:31", _train(now + timedelta(hours=3), jkey="t3", situation="S3",
+                                           p_cancel=0.9, p_impact_dep=0.95)),
+        })
+        alerts = _get().json()["alerts"]
+        assert [a["train"]["mode"] for a in alerts] == ["rail", "metro", None], alerts
+        assert [a["payload"]["mode"] for a in alerts] == ["rail", "metro", None], "the event's field too"
+    finally:
+        line_modes.reset()
+
+
 def test_the_selection_is_the_collapse_then_the_gate_and_nothing_the_card_adds():
     """R2/KTD7. Three things absent that other surfaces show: a published situation UNDER the gate
     (the card shows every published one through `has_situation`); the U2 collapse-then-gate case

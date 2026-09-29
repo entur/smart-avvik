@@ -80,6 +80,46 @@ def _run(refreshed_at, pinned):
 NOON = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
 
 
+def test_line_modes_load_once_a_day_and_a_failed_load_keeps_the_last_map():
+    """KIX-23. One Journey Planner query per `line_modes.TTL`; a failure, or an answer with no
+    lines, raises into the phase's own try and leaves yesterday's map -- a JP outage must not turn
+    every bus alert's `mode` null -- and the next tick asks again."""
+    import alternatives
+    import line_modes
+
+    replies = [{"data": {"lines": [{"id": "RUT:Line:5", "transportMode": "metro"}]}}]
+    asked = []
+
+    def post(url, payload, headers):
+        asked.append(payload["query"])
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    real = alternatives._post_json
+    alternatives._post_json = post
+    line_modes.reset()
+    try:
+        main.refresh_line_modes()
+        main.refresh_line_modes()  # inside the TTL: no second query
+        assert len(asked) == 1 and line_modes.transport_mode("RUT", "RUT:Line:5") == "metro"
+        line_modes._fetched_at -= line_modes.TTL
+        for failure in (RuntimeError("JP down"), {"data": {"lines": []}}):
+            replies.append(failure)
+            try:
+                main.refresh_line_modes()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("a failed load must raise into the phase's try")
+            assert line_modes.transport_mode("RUT", "RUT:Line:5") == "metro", "yesterday's map stays"
+        assert len(asked) == 3, "a failure leaves it due, so the next tick asks again"
+    finally:
+        alternatives._post_json = real
+        line_modes.reset()
+
+
 def test_first_call_always_rebuilds():
     """No stamp yet — the table may be missing or left over from yesterday, so never skip."""
     queries, stamp = _run(None, NOON)
@@ -574,6 +614,8 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "disruptions_cache",
         "impact_lookup",
         "svv_baselines",
+        # Each line's JP transport mode (KIX-23), above `varsel_stops` for the orphan window's reason.
+        "line_modes",
         "varsel_stops",
         "rail_planned_calls",
         # The trains Vy took out of today's plan (plan 2026-09-23-001): after the table it
