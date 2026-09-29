@@ -1232,7 +1232,7 @@
           },
           "train": {
             "title": "Train",
-            "description": "The train's identity, in the webhook event's own six fields (its `alert_id` is derived from exactly these), so an entry here and an event about the same train join without a translation -- plus `destination`, which is for display and not part of that identity.",
+            "description": "The train's identity, in the webhook event's own six fields (its `alert_id` is derived from exactly these), so an entry here and an event about the same train join without a translation -- plus `destination` and `mode`, which are not part of that identity.",
             "type": "object",
             "additionalProperties": false,
             "required": [
@@ -1242,7 +1242,8 @@
               "call_date",
               "stop_place",
               "stop_order",
-              "destination"
+              "destination",
+              "mode"
             ],
             "properties": {
               "operator": {
@@ -1269,6 +1270,13 @@
                   "null"
                 ],
                 "description": "Where the train terminates, as a departure board names it (`Drammen`), and the same value `payload.notification.title` names the train with: «Tog R14 Drammen 14:59». Null when we do not know it, which today is every train but Vy's and every bus."
+              },
+              "mode": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The line's transport mode in the Journey Planner's own `TransportMode` vocabulary (`rail`, `bus`, `metro`, `tram`, `water`, `coach`, ...), the same value as `payload.mode`. It is the LINE's mode, so a replacement bus on a rail line is `rail`. Filter on it to keep a bus favourite's entries to buses, or a train favourite's to trains. Null when the Journey Planner has not answered for the line, which for a non-rail line is the case for about a minute after we restart."
               }
             }
           },
@@ -1593,6 +1601,7 @@
           "line",
           "jkey",
           "destination",
+          "mode",
           "state",
           "level",
           "cancelled",
@@ -1636,6 +1645,13 @@
               "null"
             ],
             "description": "Where the train terminates, as a departure board names it (`Hamar`); name the train with it: `RE10 Hamar 08:00`. Null when the plan does not say."
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The line's transport mode in the Journey Planner's `TransportMode` vocabulary, as on journey-alerts: `rail` for every train listed today."
           },
           "jkey": {
             "type": "string",

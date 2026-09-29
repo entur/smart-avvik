@@ -22,6 +22,7 @@ import feedback_contexts  # exact display snapshots for isolated /varsel feedbac
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
 import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
 import journey_status  # sibling module: every train in a journey's window today, graded (the «I dag» strip)
+import line_modes  # sibling module: each line's Journey Planner transport mode (KIX-23)
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
 import logging_setup  # noqa: F401  (import side effect: golden-path JSON logging on stdout)
 import meldinger  # sibling module: past alert decisions replayed through today's prompt (/meldinger-api)
@@ -930,6 +931,23 @@ def _varsel_stop_places() -> dict[str, tuple[str, str | None, str | None]]:
     return places
 
 
+def refresh_line_modes() -> None:
+    """Every line's JP transport mode, once a day (`line_modes.TTL`). One query, ~240 KB. A failure
+    raises into the phase's own try and keeps yesterday's map; the next tick asks again."""
+    now = datetime.now(UTC)
+    if not line_modes.due(now):
+        return
+    data = alternatives._post_json(
+        alternatives._JP_URL,
+        {"query": "{ lines { id transportMode } }"},
+        headers={"ET-Client-Name": alternatives.ET_CLIENT_NAME},
+    )
+    lines = data["data"].get("lines") or []
+    if not lines:
+        raise RuntimeError("Journey Planner answered no lines")
+    logger.info("Line modes loaded: %d lines", line_modes.set_modes(lines, now))
+
+
 def refresh_varsel_stops() -> None:
     """Reload the stop picker list from the rail AND bus planned call sources (tiny scans).
 
@@ -1676,6 +1694,13 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             reisevalg.refresh_baselines()
     except Exception:
         logger.exception("SVV baselines refresh failed; reisevalg road side may be unavailable")
+    # Each line's transport mode for the `mode` field (KIX-23). Above `varsel_stops` for that step's
+    # reason below, and before `varsel_notify` so the pass words and mints with today's map.
+    try:
+        with _phase("line_modes", timings):
+            refresh_line_modes()
+    except Exception:
+        logger.exception("Line modes refresh failed; serving the previous map")
     # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
     #
     # ABOVE the per-call block, and that placement is load-bearing rather than tidy (2026-09-22).

@@ -199,6 +199,12 @@ def test_a_loaded_spine_with_no_predictions_is_every_future_train_unknown():
     assert status.as_of.actuals_refreshed_at is None
 
 
+def test_a_train_carries_its_lines_mode():
+    """KIX-23: `rail` for a Vy train, from `line_modes` -- the one rule journey-alerts uses too."""
+    _install(_train("a", _oslo(7, 48)))
+    assert [t.mode for t in js.status_for(DEFINITION, _oslo(7, 42)).trains] == ["rail"]
+
+
 # ---- Precedence and levels ---------------------------------------------------------------------
 
 
@@ -561,7 +567,7 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
 # ---- Module boundary ---------------------------------------------------------------------------
 
 
-def test_the_module_imports_only_impact_alert_policy_pydantic_and_the_stdlib():
+def test_the_module_imports_only_impact_alert_policy_line_modes_pydantic_and_the_stdlib():
     tree = ast.parse(Path(js.__file__).read_text())
     names = set()
     for node in ast.walk(tree):
@@ -570,7 +576,7 @@ def test_the_module_imports_only_impact_alert_policy_pydantic_and_the_stdlib():
         elif isinstance(node, ast.ImportFrom) and node.module:
             names.add(node.module.split(".")[0])
     local = names - set(sys.stdlib_module_names)
-    assert local == {"impact", "alert_policy", "pydantic"}, local
+    assert local == {"impact", "alert_policy", "line_modes", "pydantic"}, local
 
 
 def test_a_train_is_named_by_its_terminus_and_only_a_real_terminus():
