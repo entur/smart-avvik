@@ -8,14 +8,16 @@ and TRO journey (census of 2026-09-29). One JP query answers every line in the c
 ~240 KB, under half a second), which `main.refresh_line_modes` asks once a day.
 
 It is the LINE's mode: a replacement bus on a Vy rail line is `rail`, which is what a client
-filtering on its favourite route's mode wants. A stdlib leaf, so `journey_status` may import it.
+filtering on its favourite route's mode wants. A stdlib leaf, so `journey_status` and
+`notification_wording` (the push title's noun, KIX-25) may import it.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from notification_wording import RAIL_CODESPACES
+# Rail codespaces (operator == ref codespace): a line JP has not answered for is still `rail` here.
+RAIL_CODESPACES = frozenset({"VYG", "NSB", "GOA", "SJN", "FLT"})
 
 TTL = timedelta(hours=24)
 

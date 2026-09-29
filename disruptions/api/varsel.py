@@ -168,9 +168,11 @@ _OSLO = ZoneInfo("Europe/Oslo")
 # job is to produce a usable input when llm_message is the thing that failed.
 _CANCEL_LIKELY = 0.5
 
-# `mode_label` and its rail-codespace table moved to `notification_wording` with the wording that
-# reads them (2026-09-08): a notification event needs the vehicle noun and must not import this module
-# for it. Re-exported above, so `varsel.mode_label` -- which `main` calls twice -- still resolves.
+# `mode_label` moved to `notification_wording` with the wording that reads it (2026-09-08): a
+# notification event needs the vehicle noun and must not import this module for it. Re-exported
+# above, so `varsel.mode_label` -- which `main` calls twice -- still resolves. Since KIX-25 it takes
+# the line and reads `line_modes` (which holds the rail-codespace table), so pass `line` wherever
+# one is known, or a T-bane is «Buss».
 
 
 # FOLLOW-UP (needs its own eval before enabling): MOR/ATB/OST/GCO publish the SX *after* departure,
@@ -1851,7 +1853,11 @@ class Alert(BaseModel):
         default=None,
         description="Ref codespace of the worst affected journey (VYG, RUT, KOL, ...).",
     )
-    mode: str = Field(default="Tog", description="Vehicle noun for the UI: 'Tog' or 'Buss'.")
+    mode: str = Field(
+        default="Tog",
+        description="Vehicle noun for the UI, from the line's mode: 'Tog', 'Buss', 'T-bane', "
+        "'Trikk' or 'Båt'.",
+    )
     has_situation: bool = Field(
         default=True,
         description="False when no SX message named this train and the numbers are a prediction "
@@ -2094,7 +2100,7 @@ def _collect_alerts(
             description=sit.description,
             operator=sit.operator,
             has_situation=sit.has_situation,
-            mode=mode_label(sit.operator),
+            mode=mode_label(sit.operator, sit.line),
             line=sit.line,
             destination=journey_status.destination(sit.operator, sit.jkey),
             departure_time=dep.scheduled_time,
