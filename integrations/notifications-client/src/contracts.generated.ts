@@ -250,6 +250,23 @@ export interface NotificationEvent {
      */
     situations?: { [key: string]: unknown }[];
     /**
+     * The journey definition's one-sentence summary, in Norwegian: the same sentence
+     * journey-alerts serves as its top-level `summary`, over every alert-worthy train on the
+     * definition at mint and not only this one -- for a favourites row («Signalfeil ved Asker: 4
+     * tog er innstilt og 2 kan bli forsinket», «Tog L1 07:18 er innstilt, 2 til kan bli
+     * forsinket»). A snapshot at mint: a later change to the definition's trains mints nothing, so
+     * read journey-alerts for the current sentence. Null when there is nothing to say, which is
+     * never all-clear. Absent from an event minted before the field existed.
+     */
+    summary?: string | null;
+    /**
+     * `summary` in English, the same sentence in the same shape («Train L1 07:18 is cancelled, 2
+     * more may be delayed»). The cause leads only when the operator published it in English too;
+     * otherwise this line names the trains without it, so the two can differ there and only there.
+     * Null exactly when `summary` is. Absent from an event minted before the field existed.
+     */
+    summary_en?: string | null;
+    /**
      * The best remaining way there, which is not necessarily a faster one: for a cancelled train
      * it legitimately arrives later than the timetable promised, so read `arrives_before_original`
      * rather than assuming a saving.

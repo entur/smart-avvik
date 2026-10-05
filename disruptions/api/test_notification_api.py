@@ -2258,7 +2258,7 @@ def _real_payload() -> dict[str, Any]:
         cancelled=True,
     )
     return varsel._webhook_payload(
-        alert, [alert], message_input={"i_morgen": False}, title="t", body="b"
+        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=("s", "s_en")
     )
 
 
