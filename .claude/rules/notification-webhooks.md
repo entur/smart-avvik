@@ -40,6 +40,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the module's own pool and never waited for. It is looked up by situation number and never enters
   `message_input` (that is the wording key: English there would re-word every train). Gated on
   `VARSEL_LLM_PROVIDER` alone, not on the wording switches.
+- **Each `payload.situations[]` entry carries `report_type`** (2026-10-05, KIX-29): SIRI-SX
+  `reportType` (`INCIDENT`/`GENERAL`) off `disruptions_*initial_today` through `predict_calls*.sql`,
+  then `CallPred` → `TripCell` → `SituationImpact` → `Alert` like `has_situation`; null on a `KIX:`
+  row. journey-status has no situations and does not carry it. Not in `message_input`, so no re-word.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the previous pod
   built (`main.warm_caches_from_last_build`), so the public reads' 503s are left for a first deploy

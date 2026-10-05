@@ -73,6 +73,7 @@ class FakeCall:
     # Whether an SX message named this call. Defaults True, matching CallPred: every case written
     # before the no-SX population existed is about a train a situation pointed at.
     has_situation: bool = True
+    report_type: str | None = None
     # Whether a passenger may board / alight at this call. Default True, matching CallPred: every
     # case written before the F4 boarding-only bug is about a call anyone may use.
     boarding_allowed: bool = True

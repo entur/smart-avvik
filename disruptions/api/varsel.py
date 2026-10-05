@@ -1865,6 +1865,11 @@ class Alert(BaseModel):
         "alert was gated at, what the wording may claim (there is no operator text to quote), and "
         "which segment the decision lands in on /historikk.",
     )
+    report_type: str | None = Field(
+        default=None,
+        description="SIRI-SX `reportType` as published, `INCIDENT` or `GENERAL`; null on a "
+        "synthetic `KIX:` alert.",
+    )
     line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
     destination: str | None = Field(
         default=None,
@@ -2100,6 +2105,7 @@ def _collect_alerts(
             description=sit.description,
             operator=sit.operator,
             has_situation=sit.has_situation,
+            report_type=sit.report_type,
             mode=mode_label(sit.operator, sit.line),
             line=sit.line,
             destination=journey_status.destination(sit.operator, sit.jkey),
@@ -3848,6 +3854,8 @@ def _webhook_situations(alerts: list[Alert]) -> list[dict]:
                 # codebase wrote rather than an operator's. A receiver presenting it as an
                 # operator's statement would be making the 2026-08-20 mistake one layer out.
                 "has_situation": bool(alert.has_situation),
+                # SIRI-SX `reportType` as published (INCIDENT / GENERAL); null for a `KIX:` row (KIX-29).
+                "report_type": alert.report_type,
             }
         )
     return out

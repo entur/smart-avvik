@@ -1271,6 +1271,8 @@ def _synthetic_event(
                     # operator statement would be making the 2026-08-20 mistake one layer out --
                     # and a test event is exactly where that habit would be learned.
                     "has_situation": False,
+                    # No operator message, so no SIRI-SX reportType -- as on every `KIX:` row.
+                    "report_type": None,
                 }
             ],
             "alternative_journey": None,
