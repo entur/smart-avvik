@@ -66,6 +66,8 @@ sit AS (
     -- The operator's English, served only and joined back through `sd` like the description.
     d.summary_en,
     d.description_en,
+    -- SIRI-SX `reportType` as the operator published it (INCIDENT / GENERAL), served only.
+    d.reportType AS report_type,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -869,13 +871,16 @@ SELECT
   IF(s.has_situation, sd.summary_en, 'Possible disruption') AS summary_en,
   IF(s.has_situation, sd.description_en,
      'No situation message has been published for this departure. The assessment is based on '
-     || "real-time data: the train's own delay upstream and the state of the line.") AS description_en
+     || "real-time data: the train's own delay upstream and the state of the line.") AS description_en,
+  -- NULL on a no-SX row: no `sit` row carries its synthetic number, so `sd` is unmatched.
+  sd.report_type
 FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
   SELECT situationNumber, ANY_VALUE(description) AS description,
-         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en
+         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en,
+         ANY_VALUE(report_type) AS report_type
   FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
 JOIN wch  ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
@@ -974,5 +979,7 @@ SELECT
       "The train usually runs on this weekday, but is not in today's timetable."
       || IF(e.bus_for_train, ' Vy has set up rail replacement buses.', '')
     ELSE "The departure is marked as cancelled in the operator's real-time data."
-  END AS description_en
+  END AS description_en,
+  -- No operator message, so no report type.
+  CAST(NULL AS STRING)  AS report_type
 FROM et_only AS e;

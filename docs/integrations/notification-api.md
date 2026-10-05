@@ -893,8 +893,13 @@ off the event; do not assume the published per-operator cut. A `situations` entr
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
 (`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `mode`, `situations` (objects:
 `situation_number`, `summary`, `description`, `summary_en`, `description_en`,
-`en_machine_translated`, `has_situation`), `alternative_journey` (`object|null`), and `summary` and
+`en_machine_translated`, `has_situation`, `report_type`), `alternative_journey` (`object|null`), and `summary` and
 `summary_en`.
+
+**`situations[].report_type`** (since 2026-10-05) is SIRI-SX's `reportType` as the
+operator published it: `INCIDENT` for a disruption, `GENERAL` for general information such as
+planned work. It is `null` on a `KIX:` situation, which has no operator message behind it, and
+absent from an event minted before the field existed. A change to it mints nothing.
 
 **`destination`** (since 2026-09-25) is where the train terminates, as a departure board names it
 (`"Drammen"`), and the same value `notification.title` names the train with («Tog R14 Drammen

@@ -88,7 +88,8 @@
           "summary_en": "Test notification from Entur",
           "description_en": "Synthetic event sent from /notification-api/v1/test-events. No real departures are affected.",
           "en_machine_translated": false,
-          "has_situation": false
+          "has_situation": false,
+          "report_type": null
         }
       ],
       "alternative_journey": null,

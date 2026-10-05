@@ -117,7 +117,8 @@ def test_a_test_process_never_translates_even_with_a_project_and_a_provider():
 
 def test_the_payload_situations_carry_the_english_and_say_where_it_came_from():
     def alert(number, summary, description):
-        return SimpleNamespace(situation_number=number, summary=summary, description=description, has_situation=True)
+        return SimpleNamespace(situation_number=number, summary=summary, description=description, has_situation=True,
+                               report_type=None)
 
     with _wired():
         se.update({
