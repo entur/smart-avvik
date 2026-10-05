@@ -83,6 +83,7 @@
     "to_stop_in_timetable_today": true
   },
   "summary": "Tog F4 22:06 kan bli forsinket",
+  "summary_en": "Train F4 22:06 may be delayed",
   "journey": {
     "begin": "21:00",
     "days": [

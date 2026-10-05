@@ -433,18 +433,99 @@ CAUSE_STOP_PHRASES = frozenset({
     "toget kjører igjen",
 })
 _VERB_ORDER = ("er innstilt", "kan bli innstilt", "kan bli forsinket", "mulig avvik")
-#: (singular, plural) by the message input's `transportmiddel`; anything else counts «avganger».
-_NOUNS = {
-    "tog": ("tog", "tog"),
-    "buss": ("buss", "busser"),
-    "t-bane": ("T-bane", "T-baner"),
-    "trikk": ("trikk", "trikker"),
-    "båt": ("båt", "båter"),
-}
-_ANY_NOUN = ("avgang", "avganger")
 
 
-def _counted(inputs: list[dict], noun: tuple[str, str], *, beside_tomorrow: bool = False) -> str:
+@dataclass(frozen=True)
+class _Vocabulary:
+    """The words of one language's summary. The sentence's SHAPE is one function for both, so the
+    Norwegian and the English line cannot count, order or name differently (KIX-26)."""
+
+    #: per :func:`outcome_verb` key: (singular, plural)
+    verbs: dict[str, tuple[str, str]]
+    #: (singular, plural) by the message input's lower-cased `transportmiddel`
+    nouns: dict[str, tuple[str, str]]
+    any_noun: tuple[str, str]
+    #: a title's head noun by the same key; a mode outside it names the line and time alone
+    title_nouns: dict[str, str]
+    more: str  # «2 til kan bli forsinket»
+    with_word: str  # «3 tog med mulig avvik»
+    today: str
+    tomorrow: str
+    and_word: str
+    at: str  # the line-less label's «kl»
+
+
+_NB = _Vocabulary(
+    verbs={v: (v, v) for v in _VERB_ORDER},
+    nouns={
+        "tog": ("tog", "tog"),
+        "buss": ("buss", "busser"),
+        "t-bane": ("T-bane", "T-baner"),
+        "trikk": ("trikk", "trikker"),
+        "båt": ("båt", "båter"),
+    },
+    any_noun=("avgang", "avganger"),
+    title_nouns={},
+    more="til",
+    with_word="med",
+    today="i dag",
+    tomorrow="i morgen",
+    and_word="og",
+    at="kl",
+)
+_EN = _Vocabulary(
+    verbs={
+        "er innstilt": ("is cancelled", "are cancelled"),
+        "kan bli innstilt": ("may be cancelled", "may be cancelled"),
+        "kan bli forsinket": ("may be delayed", "may be delayed"),
+        "mulig avvik": ("possible disruption", "possible disruption"),
+    },
+    nouns={
+        "tog": ("train", "trains"),
+        "buss": ("bus", "buses"),
+        "t-bane": ("metro train", "metro trains"),
+        "trikk": ("tram", "trams"),
+        "båt": ("boat", "boats"),
+    },
+    any_noun=("departure", "departures"),
+    title_nouns={"tog": "Train", "buss": "Bus", "t-bane": "Metro", "trikk": "Tram", "båt": "Boat"},
+    more="more",
+    with_word="with",
+    today="today",
+    tomorrow="tomorrow",
+    and_word="and",
+    at="at",
+)
+
+
+def _joined(parts: list[str], and_word: str) -> str:
+    """«a, b og c» / "a, b and c". At most five parts reach it (four verbs and tomorrow)."""
+    return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} {and_word} {parts[-1]}"
+
+
+def _summary_title(message_input: dict, v: _Vocabulary) -> str | None:
+    """:func:`_train_title` in `v`'s words, from the same fields: the Norwegian one IS that title,
+    and the English one names the train the way it does, with the mode noun translated."""
+    if v is _NB:
+        return _train_title(message_input)
+    hhmm = message_input.get("avgang_kl")
+    if not hhmm:
+        return None
+    mode = (message_input.get("transportmiddel") or "").lower()
+    label = train_label(
+        v.title_nouns.get(mode), message_input.get("linje"), hhmm, message_input.get("destinasjon")
+    )
+    if not message_input.get("linje"):
+        label = label.replace(" kl ", f" {v.at} ").replace("kl ", f"{v.at} ", 1)
+    if message_input.get("i_morgen"):
+        label = f"{label} {v.tomorrow}"
+    verb = outcome_verb(message_input)
+    return f"{label}: {v.verbs[verb][0]}" if verb == "mulig avvik" else f"{label} {v.verbs[verb][0]}"
+
+
+def _counted(
+    inputs: list[dict], noun: tuple[str, str], v: _Vocabulary, *, beside_tomorrow: bool = False
+) -> str:
     """«4 tog er innstilt, 2 kan bli forsinket i dag og 1 i morgen»: one count per outcome, worst
     first, the noun on the first count only, in that count's number. Tomorrow's trains are one
     trailing count, so today's verbs count today's trains alone; all tomorrow, the counts carry
@@ -458,12 +539,13 @@ def _counted(inputs: list[dict], noun: tuple[str, str], *, beside_tomorrow: bool
         n = sum(1 for t in (today or tomorrow) if outcome_verb(t) == verb)
         if n:
             head = f"{n} {noun[0] if n == 1 else noun[1]}" if not parts else str(n)
-            parts.append(f"{head} med {verb}" if verb == "mulig avvik" else f"{head} {verb}")
+            phrase = v.verbs[verb][0 if n == 1 else 1]
+            parts.append(f"{head} {v.with_word} {phrase}" if verb == "mulig avvik" else f"{head} {phrase}")
     if today and (tomorrow or beside_tomorrow):
-        parts[-1] += " i dag"
+        parts[-1] += f" {v.today}"
     if today and tomorrow:
-        parts.append(f"{len(tomorrow)} i morgen")
-    return _listed(parts) if today else f"{_listed(parts)} i morgen"
+        parts.append(f"{len(tomorrow)} {v.tomorrow}")
+    return _joined(parts, v.and_word) if today else f"{_joined(parts, v.and_word)} {v.tomorrow}"
 
 
 def _operator_texts(situations: list[dict]) -> list[str]:
@@ -499,11 +581,48 @@ def _shared_cause(trains: list[tuple[dict, list[dict]]]) -> str | None:
     return None
 
 
-def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
+def _english_cause(cause: str, situations: list[dict]) -> str | None:
+    """The English of the Norwegian cause, off the worst train's situation that carries it
+    (`summary_en`, which `varsel._webhook_situations` attaches). The cause is CHOSEN on the
+    Norwegian text, because every rule that picks it is a rule about Norwegian; None when that
+    situation has no English or it runs past :data:`CAUSE_MAX_CHARS`, and the English line then
+    takes the no-cause branch rather than quote one language inside the other."""
+    for situation in situations:
+        if (situation.get("summary") or "").strip().rstrip(".") == cause:
+            english = (situation.get("summary_en") or "").strip().rstrip(".")
+            return english if english and len(english) <= CAUSE_MAX_CHARS else None
+    return None
+
+
+def _summary(trains: list[tuple[dict, list[dict]]], v: _Vocabulary) -> str | None:
+    inputs = [message_input for message_input, _ in trains]
+    lead = _summary_title(inputs[0], v)
+    if len(trains) == 1:
+        return lead
+    modes = {(t.get("transportmiddel") or "").lower() for t in inputs}
+    noun = v.nouns.get(modes.pop(), v.any_noun) if len(modes) == 1 else v.any_noun
+    cause = _shared_cause(trains)
+    if cause and v is not _NB:
+        cause = _english_cause(cause, trains[0][1])
+    if cause:
+        return f"{cause}: {_counted(inputs, noun, v)}"
+    worst = outcome_verb(inputs[0])
+    if lead is None or sum(1 for t in inputs if outcome_verb(t) == worst) > 1:
+        return _counted(inputs, noun, v)
+    # The named train and the counts are one sentence, so «i dag» follows the same rule across
+    # both: the lead says it when the rest mentions tomorrow, the rest says it when the lead does.
+    lead_tomorrow = bool(inputs[0].get("i_morgen"))
+    rest_tomorrow = any(t.get("i_morgen") for t in inputs[1:])
+    if rest_tomorrow and not lead_tomorrow:
+        lead = f"{lead} {v.today}"
+    return f"{lead}, {_counted(inputs[1:], (v.more, v.more), v, beside_tomorrow=lead_tomorrow)}"
+
+
+def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, str | None]:
     """One sentence over every alert-worthy train on a definition, for a favourites row that is
-    skimmed rather than read. `trains` is `(message_input, payload situations)` in WORST-FIRST
-    order over every alive train and not only the listed ones, so a truncated answer reads the
-    same as a full one.
+    skimmed rather than read, as `(Norwegian, English)` (KIX-26). `trains` is `(message_input,
+    payload situations)` in WORST-FIRST order over every alive train and not only the listed ones,
+    so a truncated answer reads the same as a full one.
 
     The operator's own cause leads when every train's situations carry the same operator text
     (:func:`_shared_cause`): «Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket».
@@ -516,30 +635,16 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> str | None:
     trains are counted apart -- «14 tog er innstilt i dag og 2 i morgen», with «i dag» said only
     when «i morgen» is.
 
-    `None` for no trains: "nothing to say", never all-clear -- an empty list means no alert-worthy
-    train among the trains the service scores.
+    The English line is the same sentence in :data:`_EN`'s words ("Train L1 07:18 is cancelled, 2
+    more may be delayed"). Its one divergence is the cause: the operator's English
+    (:func:`_english_cause`) or, when there is none, the no-cause branch.
+
+    `(None, None)` for no trains: "nothing to say", never all-clear -- an empty list means no
+    alert-worthy train among the trains the service scores.
     """
     if not trains:
-        return None
-    inputs = [message_input for message_input, _ in trains]
-    lead = _train_title(inputs[0])
-    if len(trains) == 1:
-        return lead
-    modes = {(t.get("transportmiddel") or "").lower() for t in inputs}
-    noun = _NOUNS.get(modes.pop(), _ANY_NOUN) if len(modes) == 1 else _ANY_NOUN
-    cause = _shared_cause(trains)
-    if cause:
-        return f"{cause}: {_counted(inputs, noun)}"
-    worst = outcome_verb(inputs[0])
-    if lead is None or sum(1 for t in inputs if outcome_verb(t) == worst) > 1:
-        return _counted(inputs, noun)
-    # The named train and the counts are one sentence, so «i dag» follows the same rule across
-    # both: the lead says it when the rest mentions tomorrow, the rest says it when the lead does.
-    lead_tomorrow = bool(inputs[0].get("i_morgen"))
-    rest_tomorrow = any(t.get("i_morgen") for t in inputs[1:])
-    if rest_tomorrow and not lead_tomorrow:
-        lead = f"{lead} i dag"
-    return f"{lead}, {_counted(inputs[1:], ('til', 'til'), beside_tomorrow=lead_tomorrow)}"
+        return None, None
+    return _summary(trains, _NB), _summary(trains, _EN)
 
 
 # ---- What a wording is keyed on (KTD9) ----------------------------------------------------------

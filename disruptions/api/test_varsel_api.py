@@ -5308,6 +5308,10 @@ def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(
     subject = _subjects(outcome)[0]
     assert set(subject.situations) == {"S1", "S2"}, subject.situations
     assert [s["situation_number"] for s in subject.payload["situations"]] == list(subject.situations)
+    # KIX-26: the definition's one-sentence summary, in both languages. One train here, so it is the
+    # train's own title (prd: no environment tag on either).
+    assert subject.payload["summary"] == subject.title, (subject.payload["summary"], subject.title)
+    assert subject.payload["summary_en"].startswith("Train "), subject.payload["summary_en"]
     # The subject carries the routing the emit step needs, from the LOAD snapshot's version.
     assert subject.subscription_id == "sub-0001" and subject.subscription_version == 1
     assert subject.alertworthy is True
