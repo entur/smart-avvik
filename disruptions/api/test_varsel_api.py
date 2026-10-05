@@ -1715,7 +1715,7 @@ SNAPSHOT_TWO_NOTICES = {
     "S1": SNAPSHOT["S1"],
     "S2": [
         FakeCall("t1", "A", 1, DEP, situation_number="S2", summary="Innstilt Drammen–Skøyen",
-                 p_cancel=0.78, p_impact_dep=0.87),
+                 p_cancel=0.78, p_impact_dep=0.87, report_type="INCIDENT"),
         FakeCall("t1", "B", 5, None, situation_number="S2", summary="Innstilt Drammen–Skøyen",
                  aimed_arr=DEP + timedelta(minutes=40)),
     ],
@@ -5308,6 +5308,9 @@ def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(
     subject = _subjects(outcome)[0]
     assert set(subject.situations) == {"S1", "S2"}, subject.situations
     assert [s["situation_number"] for s in subject.payload["situations"]] == list(subject.situations)
+    # KIX-29: SIRI-SX reportType rides through /impact onto each situation; S1's fixture has none.
+    assert {s["situation_number"]: s["report_type"] for s in subject.payload["situations"]} == {
+        "S1": None, "S2": "INCIDENT"}
     # KIX-26: the definition's one-sentence summary, in both languages. One train here, so it is the
     # train's own title (prd: no environment tag on either).
     assert subject.payload["summary"] == subject.title, (subject.payload["summary"], subject.title)

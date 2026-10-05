@@ -763,6 +763,8 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         # the poller by one cycle. Both cases mean "an SX message named this call", which is what
         # the default says.
         has_situation=getattr(r, "has_situation", True),
+        # Same getattr rule: a table built before 2026-10-05 has no report_type column.
+        report_type=getattr(r, "report_type", None),
         # Same getattr rule, same rollout window: a prediction table built before 2026-09-01 has
         # neither column, and "not stated" is permission. The matcher reads these to keep a
         # boarding-only long-distance call from being offered as somebody's trip.
