@@ -42,6 +42,8 @@ sit AS (
     -- The operator's English, served only -- see the same columns in predict_calls.sql.
     d.summary_en,
     d.description_en,
+    -- SIRI-SX `reportType` as the operator published it (INCIDENT / GENERAL), served only.
+    d.reportType AS report_type,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -420,13 +422,15 @@ SELECT
   IF(s.is_terminal, NULL, ROUND(s.cd10, 4)) AS p_dep_ge10_h,
   s.lead_bucket AS platt_lead_bucket,
   sd.summary_en,
-  sd.description_en
+  sd.description_en,
+  sd.report_type
 FROM curve AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
   SELECT situationNumber, ANY_VALUE(description) AS description,
-         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en
+         ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en,
+         ANY_VALUE(report_type) AS report_type
   FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
 -- dep p90: operator row (clamped to operator bounds), else global '*' row (clamped to '*' bounds)
@@ -507,5 +511,6 @@ SELECT
     WHEN e.seg_from = e.seg_to                  THEN CONCAT('Cancelled from ', e.seg_from)
     ELSE CONCAT('Cancelled ', e.seg_from, '–', e.seg_to)
   END AS summary_en,
-  "The departure is marked as cancelled in the operator's real-time data." AS description_en
+  "The departure is marked as cancelled in the operator's real-time data." AS description_en,
+  CAST(NULL AS STRING)  AS report_type
 FROM et_only AS e;

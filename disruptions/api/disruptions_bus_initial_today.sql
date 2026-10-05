@@ -18,7 +18,7 @@ WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,
     COALESCE(SAFE.TIMESTAMP(versionedAtTime), ingestionTime) AS event_ts,
-    severity, planned, summaries, descriptions, affects
+    severity, planned, reportType, summaries, descriptions, affects
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
   -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
   WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
@@ -39,6 +39,7 @@ SELECT
   fv.creationTime,
   fv.event_ts AS onset_ts,
   fv.planned,
+  fv.reportType,
   (SELECT x.value FROM UNNEST(fv.summaries) AS x
    WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
    LIMIT 1) AS summary,

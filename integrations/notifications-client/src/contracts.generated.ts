@@ -240,13 +240,15 @@ export interface NotificationEvent {
     mode?: string | null;
     /**
      * The contributing situations, each with `situation_number`, the Norwegian `summary` and
-     * `description`, their English `summary_en` and `description_en`, `en_machine_translated` and
-     * `has_situation`. The English is the operator's own where they published one (Vy does on
-     * every situation), the service's own for a `KIX:` situation (whose Norwegian it also wrote),
-     * and otherwise a machine translation of the Norwegian, with `en_machine_translated` true --
-     * present that as a translation, not as the operator's words. A translation can land a poller
-     * cycle after the situation first appears, and until one does all three English fields are
-     * null.
+     * `description`, their English `summary_en` and `description_en`, `en_machine_translated`,
+     * `has_situation` and `report_type`. `report_type` is SIRI-SX's `reportType` as the operator
+     * published it, `INCIDENT` or `GENERAL`, and null for a `KIX:` situation (no operator message)
+     * or one that carried none; absent from an event minted before the field existed. The English
+     * is the operator's own where they published one (Vy does on every situation), the service's
+     * own for a `KIX:` situation (whose Norwegian it also wrote), and otherwise a machine
+     * translation of the Norwegian, with `en_machine_translated` true -- present that as a
+     * translation, not as the operator's words. A translation can land a poller cycle after the
+     * situation first appears, and until one does all three English fields are null.
      */
     situations?: { [key: string]: unknown }[];
     /**

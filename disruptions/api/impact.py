@@ -148,6 +148,8 @@ class CallPred:
     # alert. `_trip_cells` is the only reader; see its eligibility block.
     boarding_allowed: bool = True
     alighting_allowed: bool = True
+    # SIRI-SX `reportType` (INCIDENT / GENERAL) as published; None on a synthetic `KIX:` row.
+    report_type: str | None = None
 
 
 class StopPrediction(BaseModel):
@@ -264,6 +266,11 @@ class SituationImpact(BaseModel):
         "`KIX:NoSituation:<jkey>`, and there is no operator text behind `summary`). Such rows are "
         "scored by the same models but calibrated against their own base rate, so they are cut at "
         "their own alerting threshold — see `alert_policy.threshold_for`.",
+    )
+    report_type: str | None = Field(
+        default=None,
+        description="SIRI-SX `reportType` as the operator published it, `INCIDENT` or `GENERAL`; "
+        "null when `has_situation` is false or the message carried none.",
     )
     alternative_journey: AlternativeJourney | None = Field(
         default=None,
@@ -423,6 +430,7 @@ class TripCell:
     # here as at the call level. A cell mixing populations cannot arise: a situation is either an
     # SX one or a synthetic per-journey `KIX:` one, never both.
     has_situation: bool = True
+    report_type: str | None = None
 
 
 def _certainly_cancelled(c: CallPred) -> bool:
@@ -702,6 +710,7 @@ def _trip_cells(
                     # situation, and a situation is either an operator's or a synthetic per-journey
                     # `KIX:` one.
                     has_situation=bcall.has_situation,
+                    report_type=bcall.report_type,
                 )
             )
     return cells
@@ -858,6 +867,7 @@ def _impact_response(
                 departure_prediction=_worst([c.departure for c in group]),
                 arrival_prediction=_worst([c.arrival for c in group]),
                 has_situation=group[0].has_situation,
+                report_type=group[0].report_type,
                 alternative_journey=outcome.journey,
                 original_is_best=outcome.original_is_best,
                 alternative_subject=outcome.subject,
