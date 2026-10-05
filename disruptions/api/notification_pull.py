@@ -405,7 +405,14 @@ class JourneyAlertsResponse(BaseModel):
         "outcome («Tog L1 07:18 er innstilt, 2 til kan bli forsinket»), or the counts alone when "
         "another train shares the worst outcome («4 tog er innstilt, 1 kan bli innstilt og 3 kan bli "
         "forsinket»). Built from the figures "
-        "alone, so it is complete at `wait=0`. `null` when there is nothing to say, never all-clear."
+        "alone, so it is complete at `wait=0`. `null` when there is nothing to say, never all-clear. "
+        "Every entry's `payload` carries the same sentence."
+    )
+    summary_en: str | None = Field(
+        description="`summary` in English, the same sentence in the same shape («Train L1 07:18 is "
+        "cancelled, 2 more may be delayed»). The cause leads only when the operator published it in "
+        "English too; otherwise this line takes the no-cause branch, so the two can differ there "
+        "and only there. `null` exactly when `summary` is."
     )
     alerts: list[JourneyAlertOut]
 
@@ -419,6 +426,14 @@ class JourneyStatusResponse(journey_status.JourneyStatus):
     model_config = ConfigDict(extra="forbid")
     journey: JourneyOut
     coverage: CoverageOut
+    summary: str | None = Field(
+        description="journey-alerts' `summary`: one sentence over the alert-worthy trains on this "
+        "definition right now, from the same figures (KIX-26). Not over `trains`: it can count "
+        "tomorrow's trains, which the strip does not list. `null` when there is nothing to say, and "
+        "also when the prediction cache is not loaded or the matcher failed -- the strip is served "
+        "regardless."
+    )
+    summary_en: str | None = Field(description="journey-alerts' `summary_en`: `summary` in English.")
 
 
 # ---- Validation --------------------------------------------------------------------------------
@@ -1483,7 +1498,9 @@ def _coverage(definition: dict) -> CoverageOut:
     )
 
 
-def _assembled_entry(definition: dict, entry: _Entry, state: _EntryState, rank: int) -> JourneyAlertOut:
+def _assembled_entry(
+    definition: dict, entry: _Entry, state: _EntryState, rank: int, summary: tuple[str | None, str | None]
+) -> JourneyAlertOut:
     """One answer entry from the figures plus what the caches hold: the message input built after
     the alternative, the wording through `varsel.notification_wording_for` (the route line around
     the text, the template when there is none), the payload through `varsel._webhook_payload` with
@@ -1494,7 +1511,12 @@ def _assembled_entry(definition: dict, entry: _Entry, state: _EntryState, rank: 
     to_name = resolved.get("til") or definition["to_stop"]
     title, body = varsel.notification_wording_for(state.message_input, from_name, to_name, state.text)
     payload = varsel._webhook_payload(
-        state.winner, list(entry.contributing), message_input=state.message_input, title=title, body=body
+        state.winner,
+        list(entry.contributing),
+        message_input=state.message_input,
+        title=title,
+        body=body,
+        summary=summary,
     )
     return JourneyAlertOut(
         severity=rank,
@@ -1522,39 +1544,48 @@ def _listed_states(
     ]
 
 
+def _summaries(
+    definition: dict, alive: list[_Entry], inputs: dict[int, dict], now: datetime
+) -> tuple[str | None, str | None]:
+    """The definition's sentence as `(Norwegian, English)` (KIX-26), over ALIVE in the worst-first
+    order, so `limit` cannot change what it counts -- `varsel.definition_summary`, the one the
+    webhook event carries. A listed entry lends its state's message input (`inputs`, by entry id);
+    any other gets its own build, off an `_enriched` winner with no alternative -- the label and the
+    verb read neither, and building it off the raw winner would let a warmed winner's alternative
+    into the input (see `_enriched`)."""
+    return varsel.definition_summary([
+        (
+            inputs[id(e)] if id(e) in inputs else _message_input(definition, _enriched(e.winner, None), now),
+            e.winner,
+            list(e.contributing),
+        )
+        for e in alive
+    ])
+
+
 def _assemble(
     definition: dict, alive: list[_Entry], states: list[_EntryState], limit: int, now: datetime
-) -> tuple[list[JourneyAlertOut], int, bool, str | None]:
+) -> tuple[list[JourneyAlertOut], int, bool, tuple[str | None, str | None]]:
     """The answer's list from the figures and their resolved states: the rank, the cut, `complete`,
-    and the one-sentence `summary`.
+    and the one-sentence `summary` as `(Norwegian, English)`.
 
     `alive` is the departure cut already applied against THIS request's clock (`_alive`), because
     `catchable_after` is match time and a cached figure can outlive a departure by a cycle.
     `severity` is the 1-based position in the worst-first order over every train that survived the
     cut, assigned before `limit` so a truncated answer's ranks still mean the same thing.
-    `complete` is over the LISTED entries: it describes the answer a cache would hold.
-
-    `summary` is over ALIVE, in the worst-first order, so `limit` cannot change what it counts. A
-    listed entry lends its state's message input; an unlisted one gets its own build, off an
-    `_enriched` winner with no alternative -- the label and the verb read neither, and building it
-    off the raw winner would let a warmed winner's alternative into the input (see `_enriched`).
+    `complete` is over the LISTED entries: it describes the answer a cache would hold. The summary
+    is :func:`_summaries`', and every entry's payload carries it as the webhook event does.
     """
     by_rank = sorted(alive, key=lambda e: varsel._alert_rank(e.winner), reverse=True)
     rank = {id(e): position for position, e in enumerate(by_rank, start=1)}
     inputs = {id(e): state.message_input for e, state in zip(alive[:limit], states, strict=True)}
-    out = [
-        _assembled_entry(definition, entry, state, rank[id(entry)])
-        for entry, state in zip(alive[:limit], states, strict=True)
-    ]
-    summary = notification_wording.alerts_summary([
-        (
-            inputs[id(e)] if id(e) in inputs else _message_input(definition, _enriched(e.winner, None), now),
-            varsel._webhook_situations(list(e.contributing)),
-        )
-        for e in by_rank
-    ])
     # Deliberately NOT tagged with the environment as the titles are (2026-09-25): the tag marks a
     # push in a tray that names no environment, and a favourites row is the client's own surface.
+    summary = _summaries(definition, alive, inputs, now)
+    out = [
+        _assembled_entry(definition, entry, state, rank[id(entry)], summary)
+        for entry, state in zip(alive[:limit], states, strict=True)
+    ]
     return out, len(alive), all(state.terminal for state in states), summary
 
 
@@ -1786,7 +1817,8 @@ async def journey_alerts(
         journey=JourneyOut(**definition),
         windows=[WindowOut(start=s, end=e) for s, e in windows],
         coverage=_coverage(definition),
-        summary=summary,
+        summary=summary[0],
+        summary_en=summary[1],
         alerts=alerts,
     )
 
@@ -1813,11 +1845,12 @@ def _log_status(
     )
 
 
-# `async def` like the alerts read, although nothing here waits: the answer is a walk over memory the
-# poller already holds (`journey_status`), so it neither needs the anyio pool nor blocks the loop for
-# longer than a dict lookup per train. It spends the SAME limiter buckets as `journey-alerts` -- a
-# client reading both for one favourite spends the per-pair thirty twice as fast, which the
-# operations document states.
+# `async def` like the alerts read. The strip is a walk over memory the poller already holds
+# (`journey_status`), a dict lookup per train. The `summary` beside it (KIX-26) is journey-alerts'
+# sentence off the SAME figures cache: a hit costs nothing, and a miss runs the matcher once on the
+# anyio pool (`_status_summary`), which a journey-alerts read for the definition then reuses. It
+# spends the SAME limiter buckets as `journey-alerts` -- a client reading both for one favourite
+# spends the per-pair thirty twice as fast, which the operations document states.
 @router.get(
     _STATUS_ROUTE,
     summary="Every train in a journey definition's window today, graded",
@@ -1886,9 +1919,41 @@ async def journey_status_read(
         _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise _retry_later("plan_not_loaded")
     coverage = _coverage(definition).model_copy(update={"operators": list(journey_status.OPERATORS)})
+    summary, summary_en = await _status_summary(definition, now)
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE
     _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest, client_name=client)
-    return JourneyStatusResponse(**dict(status), journey=JourneyOut(**definition), coverage=coverage)
+    return JourneyStatusResponse(
+        **dict(status),
+        journey=JourneyOut(**definition),
+        coverage=coverage,
+        summary=summary,
+        summary_en=summary_en,
+    )
+
+
+async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, str | None]:
+    """journey-alerts' sentence for the strip, off the SAME figures cache, so a client reading both
+    for one favourite pays one matcher run. `(None, None)` with a WARNING rather than a 503 when it
+    cannot be had: the strip's contract is the timetable, and a matcher failure must not take it
+    down. The exception's type only, as `journey_alerts` logs its matcher.
+
+    No `wait` is borrowed from journey-alerts: `_figures_for`'s single-flight parks a second caller
+    on the owner's MATCHER run only (the event is set when the figures are computed, never on
+    wording enrichment), so a status read inherits a matcher's duration at most, bounded by
+    :data:`MAX_WAIT_S`."""
+    refreshed_at = _refreshed_at_provider() if _refreshed_at_provider is not None else None
+    if refreshed_at is None:
+        return None, None
+    key = _cache_key(varsel.journey_key(definition), refreshed_at, now)
+    try:
+        figures = _cached_figures(key, refreshed_at)
+        if figures is None:
+            figures = await run_in_threadpool(_figures_for, definition, key, refreshed_at, now)
+        return _summaries(definition, _alive(figures.entries, now), {}, now)
+    except Exception as exc:
+        logger.debug("journey-status summary traceback for a public read", exc_info=True)
+        logger.warning("The journey-status summary failed on a public read: %s", type(exc).__name__)
+        return None, None
 
 
 def shutdown() -> None:

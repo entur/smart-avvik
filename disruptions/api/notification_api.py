@@ -1274,6 +1274,11 @@ def _synthetic_event(
                 }
             ],
             "alternative_journey": None,
+            # The definition's one-sentence summary (KIX-26): one train, so it is the title above,
+            # tagged as a test the same way, and its English twin. Hand-written like that title:
+            # move both if `notification_wording._train_title`'s shape ever moves.
+            "summary": "Testvarsel: Tog L1 Lillestrøm er innstilt",
+            "summary_en": "Test notification: Train L1 Lillestrøm is cancelled",
         },
     }
 

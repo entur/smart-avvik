@@ -935,7 +935,18 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the figures, so `wait=0` serves it final; an unlisted entry's message input is built off an
   `_enriched(winner, None)`, for the reason that helper's docstring gives; NOT tagged with the
   environment as titles are (the owner's call, 2026-09-25: the tag is for a tray, the row is the
-  client's). `null` for no trains, which is not all-clear. The
+  client's). `null` for no trains, which is not all-clear.
+  **`summary_en` beside it, and the pair on all three surfaces since 2026-10-05** (KIX-26): the
+  journey-alerts read, every entry's `payload`, every webhook event's `payload` and journey-status.
+  ONE builder, `alerts_summary` returning `(nb, en)` off a `_Vocabulary` per language, so the two
+  lines cannot count, order or name differently; the one place they may differ is the cause, which is
+  CHOSEN on the Norwegian (every rule that picks it is Norwegian) and quoted in English from that
+  situation's `summary_en` -- absent or over the cap, the English line takes the no-cause branch
+  rather than quote Norwegian inside English. English never enters `message_input` (the wording
+  key). `varsel.definition_summary` is the one ranking for the poller and the read; the event's pair
+  is a snapshot at mint (a changed sentence mints nothing, the phase rule). journey-status reads it
+  off the SAME figures cache as journey-alerts (`_status_summary`), and a cold cache or a matcher
+  failure is `null` plus a WARNING, never a 503: the strip's contract is the timetable. The
   captured samples under `docs/integrations/samples/notification-pull/` carry the value derived from
   their own entries (2026-09-25), not a re-capture. **Log redaction is R11**: `notification_pull` / `notification_pull_bounded` carry no
   ref, name, departure time or prose, only `pair_digest` and the caller's own `ET-Client-Name` as
