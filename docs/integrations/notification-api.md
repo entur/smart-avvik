@@ -526,6 +526,7 @@ and for a subscription's `from_stop`/`to_stop`.
   "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "TRO", "VYG"],
                "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true},
   "summary": "Tog L1 Lillestrøm 07:45 er innstilt",
+  "summary_en": "Train L1 Lillestrøm 07:45 is cancelled",
   "alerts": [
     {
       "severity": 1,
@@ -549,7 +550,9 @@ and for a subscription's `from_stop`/`to_stop`.
         "mode": "rail",
         "situations": [{"situation_number": "KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910",
                         "summary": "Innstilt", "description": null, "has_situation": false}],
-        "alternative_journey": {"...": "the best remaining way there, see the event's payload"}
+        "alternative_journey": {"...": "the best remaining way there, see the event's payload"},
+        "summary": "Tog L1 Lillestrøm 07:45 er innstilt",
+        "summary_en": "Train L1 Lillestrøm 07:45 is cancelled"
       },
       "wording": {"source": "llm", "status": "ok"},
       "alternative": {"status": "offered"}
@@ -581,7 +584,14 @@ same object, so it is not restated here. What the envelope around it means:
   and a forecast train never share a verb, and tomorrow's trains are counted apart, with «i dag» said exactly when
   «i morgen» is («14 tog er innstilt i dag og 2 i morgen»). It is built from the figures, so it is final at `wait=0` and never waits for wording.
   `null` when there is nothing to say — which is never all-clear, for the same reason `n_alerts` of
-  zero is not (see `coverage` below).
+  zero is not (see `coverage` below). Every entry's `payload` carries the same sentence, and so does
+  every webhook event and the journey-status read (since 2026-10-05, KIX-26).
+- **`summary_en` is `summary` in English** (since 2026-10-05, KIX-26): the same sentence in the
+  same shape, «Train L1 07:18 is cancelled, 2 more may be delayed», «4 trains are cancelled, 1 may be
+  cancelled and 3 may be delayed», «14 trains are cancelled today and 2 tomorrow». The cause leads
+  only when the operator published it in English too (its situation's `summary_en`); otherwise the
+  English line names the trains without it, so the two can differ there and only there. `null`
+  exactly when `summary` is.
 - **`phase` is `predicted` or `confirmed`** and there is no `withdrawn` entry: a train no longer over
   the gate, or whose expected departure has passed, is simply absent. `confirmed` also covers a Vy
   train missing from today's timetable altogether — it runs on this weekday, is not in today's plan,
@@ -776,6 +786,12 @@ line's transport mode, as on journey-alerts: `rail` for every train this read li
 title and the journey-alerts read name the train with; name it `R14 Drammen 14:59`. It is `null`
 when the day's timetable does not say.
 
+**`summary` and `summary_en`** (since 2026-10-05, KIX-26) are journey-alerts' sentence for the same
+definition, from the same figures, so a favourites row can be drawn from this read alone. They are
+over the alert-worthy trains and not over `trains`, so they can count tomorrow's trains, which this
+read does not list. Both are `null` when there is nothing to say, and also when the predictions are
+not loaded or the matcher failed: those cost the sentence, never the strip, which is still served.
+
 **How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
 cancellation) is rebuilt hourly. The recorded calls are rebuilt every fifteen minutes; until they
 are loaded, the timetable's own recorded calls stand in. The forecasts are rebuilt every prediction
@@ -801,8 +817,8 @@ bytes that were signed and sent, and a `POST /test-events` request captured verb
 with its three signing headers — both from dev on 2026-09-10. Both, and the journey-alerts samples
 under `samples/notification-pull/`, predate the situations' English (2026-09-24), so their
 `payload.situations` entries lack `summary_en`, `description_en` and `en_machine_translated`, and
-all of them predate `payload.destination` (2026-09-25) and `payload.mode` (2026-09-29); they are signed captures and are kept as
-sent. `contracts/notifications/v1/test-event-sample.json` has
+all of them predate `payload.destination` (2026-09-25), `payload.mode` (2026-09-29) and
+`payload.summary`/`summary_en` (2026-10-05); they are signed captures and are kept as sent. `contracts/notifications/v1/test-event-sample.json` has
 the current shape.
 
 `contracts/notifications/v1/event.schema.json` is the authority. `additionalProperties: false` **on
@@ -877,7 +893,8 @@ off the event; do not assume the published per-operator cut. A `situations` entr
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
 (`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `mode`, `situations` (objects:
 `situation_number`, `summary`, `description`, `summary_en`, `description_en`,
-`en_machine_translated`, `has_situation`) and `alternative_journey` (`object|null`).
+`en_machine_translated`, `has_situation`), `alternative_journey` (`object|null`), and `summary` and
+`summary_en`.
 
 **`destination`** (since 2026-09-25) is where the train terminates, as a departure board names it
 (`"Drammen"`), and the same value `notification.title` names the train with («Tog R14 Drammen
@@ -894,6 +911,14 @@ other operators. We ask the Journey Planner for every line once a day, so a Rute
 It is `null` when the Journey Planner has not answered for the line, which for a non-rail line is
 the case for about a minute after we restart, and it is absent from an event minted before the field existed. The journey-alerts read carries the same value
 as `train.mode`, and `journey-status` as each train's `mode`.
+
+**`summary` and `summary_en`** (since 2026-10-05, KIX-26) are the journey definition's one-sentence
+summary, in Norwegian and English: the same pair the journey-alerts read serves at its top level,
+over every alert-worthy train on the definition when the event was minted and not only this one, for
+a favourites row. Every event about the definition minted in one cycle carries the same pair. It is a
+snapshot: a later change to the definition's trains mints nothing, as a changed figure does not, so
+read journey-alerts for the current sentence. `null` when there is nothing to say, which is never
+all-clear, and absent from an event minted before the field existed.
 
 **Every situation carries its text in English as well as Norwegian** (since 2026-09-24).
 `summary` and `description` are the Norwegian, as before; `summary_en` and `description_en` are the

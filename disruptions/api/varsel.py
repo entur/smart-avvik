@@ -3860,8 +3860,13 @@ def _webhook_payload(
     message_input: dict,
     title: str,
     body: str,
+    summary: tuple[str | None, str | None],
 ) -> dict:
     """The event payload: the facts plus the Norwegian prose (R7).
+
+    `summary` is the definition's one-sentence summary as `(Norwegian, English)` -- over every
+    alert-worthy train on the definition, not this one (KIX-26) -- and the caller builds it once per
+    definition with :func:`definition_summary`, so every train's payload carries the same pair.
 
     "Normal receipt needs no second request to us" is a property of what this carries, which is why
     the figures ride along beside the wording rather than behind a lookup.
@@ -3924,7 +3929,23 @@ def _webhook_payload(
         "mode": line_modes.transport_mode(alert.operator, alert.line),
         "situations": _webhook_situations(contributing),
         "alternative_journey": dumped,
+        # The journey-alerts read's top-level sentence, so a client holding only events can render
+        # the favourites row too. A snapshot at mint: a changed sentence mints nothing, like every
+        # other figure here (notification_events' phase rule).
+        "summary": summary[0],
+        "summary_en": summary[1],
     }
+
+
+def definition_summary(trains: list[tuple[dict, Alert, list[Alert]]]) -> tuple[str | None, str | None]:
+    """`notification_wording.alerts_summary` over a definition's trains, given as `(message_input,
+    winner, contributing alerts)` per train in any order: sorted worst-first here by the winner's
+    `_alert_rank`, the order the journey-alerts read ranks its entries by, and with the situations
+    in the payload's own order, which is the order a cause is chosen in."""
+    ranked = sorted(trains, key=lambda t: _alert_rank(t[1]), reverse=True)
+    return notification_wording.alerts_summary(
+        [(message_input, _webhook_situations(contributing)) for message_input, _, contributing in ranked]
+    )
 
 
 def _webhook_observations(
@@ -4070,7 +4091,19 @@ def _observations_for_key(
         train = _train_key(alert)
         if train is not None:
             contributing.setdefault(train, []).append(alert)
-    for winner in one_alert_per_train(alerts):
+    winners = one_alert_per_train(alerts)
+    # The definition's sentence, once, over its alert-worthy trains -- removed-from-plan ones
+    # included, as the journey-alerts read counts them -- so every event carries the same pair.
+    summary = definition_summary([
+        (
+            message_inputs.get(_decision_key(key, w)) or _message_input_from_alert(w),
+            w,
+            contributing.get(_train_key(w), [w]),
+        )
+        for w in winners
+        if w.alertworthy
+    ])
+    for winner in winners:
         if notification_wording.is_plan_removed(winner.situation_number):
             # No event for a train Vy took out of the plan in v1 (plan 2026-09-23-001, R5): per-train
             # `confirmed` events would spend a subscription's daily cap at 03:00 exactly as the
@@ -4170,6 +4203,7 @@ def _observations_for_key(
             message_input=message_input,
             title=title,
             body=body,
+            summary=summary,
         )
         situations = tuple(s["situation_number"] for s in payload["situations"])
         routable: list[notification_events.Recipient] = []

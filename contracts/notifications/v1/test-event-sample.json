@@ -91,7 +91,9 @@
           "has_situation": false
         }
       ],
-      "alternative_journey": null
+      "alternative_journey": null,
+      "summary": "Testvarsel: Tog L1 Lillestrøm er innstilt",
+      "summary_en": "Test notification: Train L1 Lillestrøm is cancelled"
     }
   }
 }
