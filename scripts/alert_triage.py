@@ -37,9 +37,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-CHANNEL = ""  # #alerts-kix channel id: channel name -> About -> bottom of the panel
+CHANNEL = "C0C21FC78TS"  # #alerts-kix (private)
 # Grafana's bot. Left empty, every alert is skipped and the log names the bot that posted it.
-GRAFANA_BOT_ID = ""
+GRAFANA_BOT_ID = "B0C1VBMH19U"  # Grafana's shared Slack app
 TOKEN_SECRET = ["--secret=kixlog-slack-bot-token", "--project=ent-kixlog-prd"]
 LOOKBACK_S = 24 * 3600
 # A backlog after a night asleep drains over a few passes, not in one burst.
@@ -170,6 +170,17 @@ def pending(messages, handled):
         yield msg, text
 
 
+def headline_first(reply):
+    """Drop narration before the bold headline ("I checked the docs, now I write the reply").
+
+    The prompt asks for the headline first; this enforces it, because the model does not always comply."""
+    lines = reply.splitlines()
+    for i, line in enumerate(lines):
+        if line.startswith("*"):
+            return "\n".join(lines[i:]).strip()
+    return reply
+
+
 def analyse(alert):
     """Claude's reply for the thread, or None when the analysis itself failed.
 
@@ -208,7 +219,7 @@ def analyse(alert):
     ]  # fmt: skip
     print(f"cost ${out.get('total_cost_usd', 0):.2f}, {out.get('num_turns')} turns, "
           f"denied: {'; '.join(denied) or 'nothing'}", flush=True)  # fmt: skip
-    reply = (out.get("result") or "").strip()
+    reply = headline_first((out.get("result") or "").strip())
     if out.get("is_error") or not reply:
         notify(f"analysis failed ({out.get('subtype')}): {reply[-300:]}")
         return None
@@ -350,6 +361,9 @@ def check():
         "handled must be skipped"
     )
     assert "[prd] Poller stopped" in alert_text(firing)
+    narrated = "Jeg har sjekket docs. Nå skriver jeg svaret.\n\n*Overskrift*\n• punkt"
+    assert headline_first(narrated) == "*Overskrift*\n• punkt", headline_first(narrated)
+    assert headline_first("ingen overskrift") == "ingen overskrift"
     assert SECRET.search("token xoxb-123") and SECRET.search("ya29.abc")
     assert not SECRET.search("poller_cycle 52 s, varsel_notify 1.4 s")
     print("alert_triage checks passed")
