@@ -69,7 +69,7 @@ jobs:
     steps:
       # No setup action: ubuntu-24.04 ships helm, and the script fails loudly rather than skipping
       # if it ever stops doing so. One fewer third-party action in the path of the image build.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: bash helm/kix-avvik/test/worker_render.sh
 
   # --- Build and Test ---
@@ -82,7 +82,7 @@ jobs:
       contents: read
       checks: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version-file: '.python-version'
