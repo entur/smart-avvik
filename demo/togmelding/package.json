@@ -19,7 +19,7 @@
     "@entur/loader": "^0.7.4",
     "@entur/menu": "^6.3.1",
     "@entur/tokens": "^4.2.0",
-    "@entur/typography": "^2.1.12",
+    "@entur/typography": "^3.0.7",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
