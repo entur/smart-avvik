@@ -74,8 +74,9 @@ jobs:
 
   # --- Build and Test ---
 
+  # Runs on Dependabot PRs too: test, docker and docker-scan are required checks on main,
+  # and a skipped required check counts as passed.
   test:
-    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
