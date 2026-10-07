@@ -1203,6 +1203,41 @@ def test_a_cancelled_train_is_offered_a_replacement_that_arrives_late():
     )
 
 
+def test_a_running_train_scored_without_a_situation_is_still_a_candidate():
+    """A no-SX cell is a forecast, not a disruption, and must not delete its train from the pool.
+
+    Since nosx scoring every running train in the window has a `KIX:NoSituation:` cell. When those
+    cells were treated as "the disruption", every in-window rival was excluded and the
+    traveller was offered the first train BEFORE their window instead. Seen in prd on 2026-09-23:
+    R22 17:00 removed, 16:00 and 16:29 running, and the offer was the 13:00.
+    """
+    now = datetime.now(UTC)
+    calm = dict(has_situation=False, p_impact_dep=0.05, p_impact=0.05, p_cancel=0.01)
+    scope = _scope(
+        S1=_live_train(now, "gone", dep_min=120, arr_min=170, et_declared_cancelled=True),
+        **{
+            "KIX:NoSituation:r60": _live_train(
+                now, "r60", dep_min=60, arr_min=110,
+                situation_number="KIX:NoSituation:r60", **calm),
+            "KIX:NoSituation:r90": _live_train(
+                now, "r90", dep_min=90, arr_min=140,
+                situation_number="KIX:NoSituation:r90", **calm),
+        },
+    )
+    in_window = [
+        _live_candidate(now, dep_min=90, arr_min=140, refs=(("VYG", "r90"),), ordinal=0),
+        _live_candidate(now, dep_min=60, arr_min=110, refs=(("VYG", "r60"),), ordinal=1),
+    ]
+    before_window = [_live_candidate(now, dep_min=20, arr_min=70, refs=(("VYG", "r20"),))]
+    jp = _JourneyPlanner(in_window, before_window)
+    resp = _for_trip(scope, jp, now=now, min_impact=0.5, window_min=(30, 180))
+    alt = resp.alternative_journey
+    assert alt is not None
+    assert alt.departure_time == now + timedelta(minutes=90), (
+        "the latest running train that still arrives in time, not the one before the window"
+    )
+
+
 def test_a_two_minute_delay_leaves_the_traveller_on_their_own_train():
     """The materiality gate, end to end. Rail alerts are mostly delay-driven and the deadline is the
     AIMED arrival, so without it the systematic advice becomes "abandon your train" — for a delay
