@@ -2612,6 +2612,27 @@ def test_nearest_still_measures_from_at_through_the_pruned_scan():
     assert resp.situations[0].departure_prediction.scheduled_time == _at(8, 20)
 
 
+def test_served_situation_text_is_the_latest_version_and_all_clears_are_dropped():
+    # 2026-10-02: RE11 kept quoting v1 «Stengt: Tønsberg» after Vy's v2 «Åpnet» (GENERAL). No CI job
+    # runs SQL, so the text is the only place this can be held.
+    import re
+    from pathlib import Path
+
+    def code(name):
+        return re.sub(r"--.*$", "", (Path(__file__).parent / name).read_text(), flags=re.M)
+
+    for builder in ("disruptions_today.sql", "disruptions_bus_initial_today.sql"):
+        assert "ORDER BY event_ts DESC, version DESC" in code(builder), builder
+    rail, bus = code("predict_calls.sql"), code("predict_calls_bus.sql")
+    assert "AND NOT IFNULL(d.all_clear, FALSE)" in rail
+    assert "all_clear" not in bus  # bus publishers use GENERAL for live problems
+    for sql in (rail, bus):
+        assert "COALESCE(d.latest_summary, d.summary) AS served_summary" in sql
+        assert "COALESCE(d.latest_report_type, d.reportType) AS report_type" in sql
+    assert "IF(s.has_situation, sd.served_summary, s.summary) AS summary" in rail
+    assert "sd.served_summary AS summary" in bus
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)
