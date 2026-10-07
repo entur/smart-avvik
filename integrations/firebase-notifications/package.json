@@ -40,6 +40,9 @@
   "overrides": {
     "gaxios@6": {
       "uuid": "^11.1.1"
+    },
+    "@firebase/firestore": {
+      "@grpc/grpc-js": "^1.14.5"
     }
   }
 }
