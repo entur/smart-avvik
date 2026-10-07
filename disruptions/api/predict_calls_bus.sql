@@ -37,13 +37,15 @@ sit AS (
     d.situationNumber,
     SAFE.TIMESTAMP(d.creationTime) AS onset_ts,
     d.summary,
+    -- Served columns read the LATEST version, features the first -- see predict_calls.sql.
+    COALESCE(d.latest_summary, d.summary) AS served_summary,
     -- Carried for serving only (never a feature) -- see the same column in predict_calls.sql.
-    d.description,
+    COALESCE(d.latest_description, d.description) AS description,
     -- The operator's English, served only -- see the same columns in predict_calls.sql.
-    d.summary_en,
-    d.description_en,
-    -- SIRI-SX `reportType` as the operator published it (INCIDENT / GENERAL), served only.
-    d.reportType AS report_type,
+    COALESCE(d.latest_summary_en, d.summary_en) AS summary_en,
+    COALESCE(d.latest_description_en, d.description_en) AS description_en,
+    -- SIRI-SX `reportType` as the operator published it NOW (INCIDENT / GENERAL), served only.
+    COALESCE(d.latest_report_type, d.reportType) AS report_type,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -372,7 +374,7 @@ et_only AS (
 )
 SELECT
   s.operator,
-  s.situationNumber, s.summary, sd.description, s.onset_ts,
+  s.situationNumber, sd.served_summary AS summary, sd.description, s.onset_ts,
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
   s.et_declared_cancelled, s.et_dep_delay_min, s.call_source,
@@ -428,7 +430,8 @@ FROM curve AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
-  SELECT situationNumber, ANY_VALUE(description) AS description,
+  SELECT situationNumber, ANY_VALUE(served_summary) AS served_summary,
+         ANY_VALUE(description) AS description,
          ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en,
          ANY_VALUE(report_type) AS report_type
   FROM sit GROUP BY situationNumber

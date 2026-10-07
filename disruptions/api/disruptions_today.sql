@@ -44,6 +44,32 @@ first_version AS (
     ORDER BY event_ts ASC, version ASC, creationTime ASC
   ) = 1
 ),
+-- Latest version = what the operator says NOW. Served only, never a feature: the columns above
+-- stay first-version (training parity, and `categories` is keyed on that text). Without this the
+-- card kept quoting v1 after the operator had moved on -- 2026-10-02 22:11 UTC, RE11 still said
+-- «Stengt: Tønsberg» 47 min after Vy published v2 «Åpnet: Tønsberg» (GENERAL).
+latest_version AS (
+  SELECT
+    participantRef, situationNumber,
+    reportType AS latest_report_type,
+    (SELECT x.value FROM UNNEST(summaries) AS x
+     WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
+     LIMIT 1) AS latest_summary,
+    (SELECT x.value FROM UNNEST(descriptions) AS x
+     WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
+     LIMIT 1) AS latest_description,
+    (SELECT x.value FROM UNNEST(summaries) AS x
+     WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+     LIMIT 1) AS latest_summary_en,
+    (SELECT x.value FROM UNNEST(descriptions) AS x
+     WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+     LIMIT 1) AS latest_description_en
+  FROM all_versions
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY participantRef, situationNumber
+    ORDER BY event_ts DESC, version DESC, creationTime DESC
+  ) = 1
+),
 -- Observed reopening = earliest snapshot announcing the line is back.
 end_times AS (
   SELECT participantRef, situationNumber, MIN(event_ts) AS reopen_ts
@@ -87,6 +113,13 @@ base AS (
     (SELECT x.value FROM UNNEST(fv.descriptions) AS x
      WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
      LIMIT 1) AS description_en,
+    lv.latest_summary, lv.latest_description, lv.latest_summary_en, lv.latest_description_en,
+    lv.latest_report_type,
+    -- Vy's all-clear: an INCIDENT whose latest version is GENERAL («Åpnet», «Normal hastighet»,
+    -- «Toget kjører igjen»). Measured 2026-09-20..10-06: 377 of 383 such NSB situations say exactly
+    -- that, and the other 6 («Planlegger buss for tog» and the like) were CLOSED by Vy. Serving drops
+    -- these (predict_calls.sql); bus operators use GENERAL for live problems, so this is NSB-only.
+    (fv.reportType = 'INCIDENT' AND lv.latest_report_type = 'GENERAL') AS all_clear,
     (
       SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
       FROM (
@@ -142,6 +175,7 @@ base AS (
     EXTRACT(HOUR      FROM fv.event_ts AT TIME ZONE 'Europe/Oslo') AS hour
   FROM first_version AS fv
   LEFT JOIN end_times AS et USING (participantRef, situationNumber)
+  LEFT JOIN latest_version AS lv USING (participantRef, situationNumber)
   WHERE (fv.severity IS NULL OR fv.severity != 'NO_IMPACT')
 ),
 -- Impacted calls (cancel or big delay) at affected stops, within the look window.
