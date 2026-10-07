@@ -32,6 +32,30 @@ first_version AS (
     PARTITION BY participantRef, situationNumber
     ORDER BY event_ts ASC, version ASC, creationTime ASC
   ) = 1
+),
+-- Latest version = the text and reportType SERVED, never a feature (see disruptions_today.sql).
+-- No all-clear drop here: bus publishers use GENERAL for live problems («Holdeplassen er stengt»).
+latest_version AS (
+  SELECT
+    participantRef, situationNumber,
+    reportType AS latest_report_type,
+    (SELECT x.value FROM UNNEST(summaries) AS x
+     WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
+     LIMIT 1) AS latest_summary,
+    (SELECT x.value FROM UNNEST(descriptions) AS x
+     WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
+     LIMIT 1) AS latest_description,
+    (SELECT x.value FROM UNNEST(summaries) AS x
+     WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+     LIMIT 1) AS latest_summary_en,
+    (SELECT x.value FROM UNNEST(descriptions) AS x
+     WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
+     LIMIT 1) AS latest_description_en
+  FROM all_versions
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY participantRef, situationNumber
+    ORDER BY event_ts DESC, version DESC, creationTime DESC
+  ) = 1
 )
 SELECT
   fv.participantRef,
@@ -53,6 +77,8 @@ SELECT
   (SELECT x.value FROM UNNEST(fv.descriptions) AS x
    WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
    LIMIT 1) AS description_en,
+  lv.latest_summary, lv.latest_description, lv.latest_summary_en, lv.latest_description_en,
+  lv.latest_report_type,
   (
     SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
     FROM (
@@ -101,4 +127,5 @@ SELECT
     )
   ) AS affected_lines
 FROM first_version AS fv
+LEFT JOIN latest_version AS lv USING (participantRef, situationNumber)
 WHERE (fv.severity IS NULL OR fv.severity != 'NO_IMPACT');
