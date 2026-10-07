@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time as _time
+from collections import deque
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
@@ -1326,12 +1327,17 @@ def test_concurrent_cold_requests_share_one_generated_wording():
     assert results == [results[0], results[0]]
 
 
+# The budget checks own a ledger: a replay task an earlier test left running reserves on
+# _REPLAY_PATH with the real clock, and one such entry after _reset() tips a 4999-call day over.
+_BUDGET_PATH = "budget-check"
+
+
 def test_the_hourly_budget_allows_1000_calls_then_binds_across_requests():
     _reset()
     now = _time.monotonic()
-    assert meldinger._Budget().reserve(1000, now) is None
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1000, now) is None
     with _captured(logging.WARNING) as records:
-        assert meldinger._Budget().reserve(1, now) == "rate_limited"
+        assert meldinger._Budget(_BUDGET_PATH).reserve(1, now) == "rate_limited"
     assert meldinger._MAX_CALLS_PER_HOUR == 1000
     assert len(_reason(records, "rate_limited")) == 1
 
@@ -1339,22 +1345,22 @@ def test_the_hourly_budget_allows_1000_calls_then_binds_across_requests():
 def test_the_daily_budget_allows_5000_calls_then_binds_across_requests():
     _reset()
     now = _time.monotonic()
-    spent = meldinger._replay_calls[meldinger._REPLAY_PATH]
+    spent = meldinger._replay_calls.setdefault(_BUDGET_PATH, meldinger._CallLedger(deque(), deque()))
     spent.day.extend([now - 2 * 60 * 60] * 4999)
-    assert meldinger._Budget().reserve(1, now) is None
-    assert meldinger._Budget().reserve(1, now) == "rate_limited"
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1, now) is None
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1, now) == "rate_limited"
     assert meldinger._MAX_CALLS_PER_DAY == 5000
 
 
 def test_rolling_budgets_release_calls_at_each_window_boundary():
     _reset()
     now = _time.monotonic()
-    spent = meldinger._replay_calls[meldinger._REPLAY_PATH]
+    spent = meldinger._replay_calls.setdefault(_BUDGET_PATH, meldinger._CallLedger(deque(), deque()))
     spent.hour.extend([now] * 1000)
     spent.day.extend([now - 2 * 60 * 60] * 4999)
-    assert meldinger._Budget().reserve(1, now) == "rate_limited"
-    assert meldinger._Budget().reserve(1, now + meldinger._HOUR_WINDOW_S) is None
-    assert meldinger._Budget().reserve(1, now + meldinger._DAY_WINDOW_S) is None
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1, now) == "rate_limited"
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1, now + meldinger._HOUR_WINDOW_S) is None
+    assert meldinger._Budget(_BUDGET_PATH).reserve(1, now + meldinger._DAY_WINDOW_S) is None
 
 
 #: The API release's values files, and NOT the worker's (U11). `helm/kix-avvik/env/` holds two
