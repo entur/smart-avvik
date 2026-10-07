@@ -2619,7 +2619,7 @@ def test_served_situation_text_is_the_latest_version_and_all_clears_are_dropped(
     from pathlib import Path
 
     def code(name):
-        return re.sub(r"--.*$", "", (Path(__file__).parent / name).read_text(), flags=re.M)
+        return re.sub(r"--.*$", "", (Path(__file__).parent / name).read_text(), flags=re.MULTILINE)
 
     for builder in ("disruptions_today.sql", "disruptions_bus_initial_today.sql"):
         assert "ORDER BY event_ts DESC, version DESC" in code(builder), builder
