@@ -1212,7 +1212,7 @@ def test_a_running_train_scored_without_a_situation_is_still_a_candidate():
     R22 17:00 removed, 16:00 and 16:29 running, and the offer was the 13:00.
     """
     now = datetime.now(UTC)
-    calm = dict(has_situation=False, p_impact_dep=0.05, p_impact=0.05, p_cancel=0.01)
+    calm = {"has_situation": False, "p_impact_dep": 0.05, "p_impact": 0.05, "p_cancel": 0.01}
     scope = _scope(
         S1=_live_train(now, "gone", dep_min=120, arr_min=170, et_declared_cancelled=True),
         **{
