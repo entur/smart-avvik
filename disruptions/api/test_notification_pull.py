@@ -907,7 +907,9 @@ def test_the_access_log_redacts_this_paths_query_string_and_no_other():
         access.removeHandler(sink)
     assert len(lines) == 3
     messages = [json.loads(line)["message"] for line in lines]
-    assert NSR_A not in lines[0] and "07:00" not in lines[0], lines[0]
+    # The record's own timestamp is not the query's: at 07:00 UTC it contains "07:00" too.
+    leaked = json.dumps({k: v for k, v in json.loads(lines[0]).items() if k != "timestamp"})
+    assert NSR_A not in leaked and "07:00" not in leaked, lines[0]
     assert messages[0] == f'10.0.0.1:1234 - "GET {PATH}?<redacted> HTTP/1.1" 200', messages[0]
     assert f"/impact?from_stop={NSR_A}" in messages[1], "an unrelated path's query string is untouched"
     assert messages[2] == f'10.0.0.1:1234 - "GET {PATH} HTTP/1.1" 200'
