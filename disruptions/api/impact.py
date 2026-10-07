@@ -1251,6 +1251,13 @@ def score_candidates(
     return scored
 
 
+def _over_alert_gate(cell: TripCell) -> bool:
+    """The operator's own alert gate applied to the boarding call."""
+    return (cell.departure.impact_probability or 0.0) >= alert_policy.threshold_for(
+        cell.operator, has_situation=cell.has_situation
+    )
+
+
 def _original_candidate(
     cell: TripCell,
     *,
@@ -1283,8 +1290,7 @@ def _original_candidate(
         arrival_time=predicted_arrival,
         aimed_arrival_time=deadline,
         cancelled=cell.departure.cancelled,
-        risky=(cell.departure.impact_probability or 0.0)
-        >= alert_policy.threshold_for(cell.operator, has_situation=cell.has_situation),
+        risky=_over_alert_gate(cell),
         is_original=True,
         transit_refs=[(cell.operator, cell.jkey)] if cell.jkey else [],
         lines=[cell.line] if cell.line else [],
@@ -1381,8 +1387,16 @@ def _best_remaining_journey(
         return NO_ALTERNATIVE
 
     subject = (cell.operator, cell.jkey) if cell.jkey else None
-    affected_refs = {(c.operator, c.jkey) for c in affected if c.jkey}
-    affected_lines = {c.line for c in affected if c.line}
+    # Only DISRUPTED cells, plus the subject itself (whose JP copy must not win its own contest).
+    # Since nosx scoring every running train in the window has a cell, so "every cell" excluded
+    # every in-window rival and the offer fell back to a train before the window (prd 2026-09-23:
+    # R22 17:00 removed, 16:00 and 16:29 running, offered the 13:00). A rival under the gate is
+    # still judged on its own predictions by `score_candidates`.
+    disrupted = [c for c in affected if c.departure.cancelled or _over_alert_gate(c)]
+    affected_refs = {(c.operator, c.jkey) for c in disrupted if c.jkey}
+    if subject is not None:
+        affected_refs.add(subject)
+    affected_lines = {c.line for c in disrupted if c.line}
     original = _original_candidate(
         cell,
         from_stop=from_stop,

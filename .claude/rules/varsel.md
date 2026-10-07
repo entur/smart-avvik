@@ -728,7 +728,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     lands *later* than the timetable promised, so `minutes_saved` is signed and
     `arrives_before_original` is what says whether they still make it. A candidate already declared
     cancelled is never offered; one that would itself trip the alert gate is a soft preference
-    (`at_risk` says so out loud when it wins anyway). The traveller's **own train competes** under
+    (`at_risk` says so out loud when it wins anyway). The **hard** exclusion (`affected_refs`) is the
+    subject train plus cells that are cancelled or over the alert gate — never every cell on the
+    trip: since nosx scoring every running train has a cell, and until 2026-10-07 that excluded
+    every in-window rival, so the offer fell back to a train *before* the window (R22 17:00
+    removed, 16:00/16:29 running, offered the 13:00). The traveller's **own train competes** under
     the same rules: when it wins, `alternative_journey` is null and `original_is_best` is true —
     distinct from a null with `original_is_best` false, which means nothing could be established.
     Both the fallback query and the reconciliation of the original's arrival are decided on **what
