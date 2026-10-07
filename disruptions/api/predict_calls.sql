@@ -59,15 +59,19 @@ sit AS (
     d.situationNumber,
     SAFE.TIMESTAMP(d.creationTime) AS onset_ts,
     d.summary,
+    -- Served text is the situation's LATEST version (disruptions_today.sql), the first version
+    -- where the latest carries none. Features keep reading the first-version `d.summary` /
+    -- `d.description` below; only these served columns move.
+    COALESCE(d.latest_summary, d.summary) AS served_summary,
     -- Carried for serving only (never a feature): /impact returns the operator's own explanation
     -- alongside the summary. Joined back at the final SELECT rather than threaded through `base`,
     -- so this free text never widens the ML.PREDICT inputs.
-    d.description,
+    COALESCE(d.latest_description, d.description) AS description,
     -- The operator's English, served only and joined back through `sd` like the description.
-    d.summary_en,
-    d.description_en,
-    -- SIRI-SX `reportType` as the operator published it (INCIDENT / GENERAL), served only.
-    d.reportType AS report_type,
+    COALESCE(d.latest_summary_en, d.summary_en) AS summary_en,
+    COALESCE(d.latest_description_en, d.description_en) AS description_en,
+    -- SIRI-SX `reportType` as the operator published it NOW (INCIDENT / GENERAL), served only.
+    COALESCE(d.latest_report_type, d.reportType) AS report_type,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -91,6 +95,9 @@ sit AS (
     ON IFNULL(d.summary,'')     = IFNULL(c.summary,'')
    AND IFNULL(d.description,'') = IFNULL(c.description,'')
   WHERE SAFE.TIMESTAMP(d.creationTime) IS NOT NULL
+    -- Vy has declared it over (see `all_clear` in disruptions_today.sql), so it alerts nobody. Its
+    -- calls fall through to the no-SX and ET-relay branches like any call no situation names.
+    AND NOT IFNULL(d.all_clear, FALSE)
 ),
 aff AS (
   SELECT
@@ -780,7 +787,9 @@ et_only AS (
         BETWEEN -60 AND 720
 )
 SELECT
-  s.situationNumber, s.summary,
+  s.situationNumber,
+  -- `s.summary` is the first version (it rode through the feature CTEs); serve the latest.
+  IF(s.has_situation, sd.served_summary, s.summary) AS summary,
   -- A no-SX row has no operator text to serve, and NULL here would read downstream as "the
   -- operator published a message with no description". Say what the row actually is instead.
   IF(s.has_situation, sd.description,
@@ -878,7 +887,8 @@ FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
 LEFT JOIN (
-  SELECT situationNumber, ANY_VALUE(description) AS description,
+  SELECT situationNumber, ANY_VALUE(served_summary) AS served_summary,
+         ANY_VALUE(description) AS description,
          ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en,
          ANY_VALUE(report_type) AS report_type
   FROM sit GROUP BY situationNumber
