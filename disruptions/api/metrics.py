@@ -93,7 +93,8 @@ PUSH_TOTAL = Counter(
 LLM_MESSAGE_TOTAL = Counter(
     "kix_llm_message_total",
     "LLM wording attempts by backend (`provider`), outcome (`result` = the MessageResult status "
-    "vocabulary) and calling surface (`surface` = live/replay/...). Alert rules should select "
+    "vocabulary, plus `error_covered` for an error the caller covered with an earlier wording) "
+    "and calling surface (`surface` = live/replay/...). Alert rules should select "
     "surface=\"live\": replay bursts from /meldinger are expected during prompt work.",
     ["provider", "result", "surface"],
 )

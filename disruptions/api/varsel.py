@@ -278,6 +278,15 @@ _MAX_TRANSIENT_ATTEMPTS = 12
 # 693 `attempts_exhausted` across the same 11 subjects on 2026-08-07.
 _PAYLOAD_FAILURES = frozenset({"rejected", "ungrounded"})
 _TRANSIENT_FAILURES = frozenset({"error", "truncated"})
+# A transient failure that still left the traveller with model text -- see `_previous_wording`.
+# Charged like `error` (Vertex did fail, and `_MAX_TRANSIENT_ATTEMPTS` must still bound it), but
+# stored like a success.
+_KEPT_PREVIOUS = "kept_previous"
+# The largest gap between the snapshot a wording was written for and the one it stands in for. Two to
+# three rebuilds at the 120 s floor. It does NOT bound the text's total age: a borrowed wording is
+# stored under the new key, so the next failure borrows it again. That chain is bounded by
+# `_MAX_TRANSIENT_ATTEMPTS` (each borrow charges `_message_errors`), i.e. ~12 rebuilds, ~25-35 min.
+_KEEP_PREVIOUS_WORDING_FOR = timedelta(minutes=10)
 # Written messages per PLACE PAIR per cycle -- per JOURNEY DEFINITION until KTD9 (2026-09-12), and
 # the name is kept because it is referenced from .claude/rules/, the operations document and several
 # suites. The cycle cap above bounds the poller thread; this one stops a single corridor spending
@@ -2833,9 +2842,25 @@ def _write_message(
         if not llm_message.generation_enabled():
             note("disabled")
             return None
+        previous = _previous_wording(message_key) if message_key is not None else None
         result = llm_message.write_message_detailed(
-            message_input, journey_key=journey_key, situation_number=alert.situation_number
+            message_input,
+            journey_key=journey_key,
+            situation_number=alert.situation_number,
+            covered=previous is not None,
         )
+        if result.text is None and result.status == "error" and previous is not None:
+            previous_key, text = previous
+            note(_KEPT_PREVIOUS)
+            # The earlier entry's provenance, input included, so the decision row pairs the text
+            # with the input that produced it; `ok_cached` is what a reused wording already reads.
+            with _state_lock:
+                _message_meta[message_key] = {**_message_meta.get(previous_key, {}), "status": "ok_cached"}
+            logger.info(
+                "Wording failed transiently; keeping the previous snapshot's wording",
+                extra={"fields": {"event": "notification_wording", "result": _KEPT_PREVIOUS}},
+            )
+            return text
         note(result.status)
         if message_key is not None:
             _remember_message_meta(
@@ -2857,6 +2882,37 @@ def _write_message(
         # something escape — none of which is evidence that THIS input is unwritable, and all of
         # which a later cycle may find fixed.
         note("error")
+        return None
+
+
+def _previous_wording(message_key: tuple) -> tuple[tuple, str] | None:
+    """The newest wording of the SAME advice from an earlier snapshot, if one is recent enough.
+
+    `wording_key` ends with the impact snapshot's `refreshed_at`, so every rebuild (~2 min) re-words
+    every alerting train, and a rewrite that fails used to leave the card on the template although
+    near-identical text from the previous snapshot was still in `_messages` -- orphaned entries are
+    not swept until the situation ends (see `notification_wording.wording_key`). In prd that was
+    319 of 346 wording errors from 2026-10-08 to 2026-10-12. Every other element of the key must
+    match, so a changed alternative, cancellation, «i morgen» or prompt version is never covered.
+    """
+    # Swallowed to None: this runs before every wording call, inside `_write_message`'s try, so a
+    # raise here would skip the call AND charge an error -- every cycle, until the subject retired.
+    try:
+        *advice, snapshot = message_key
+        if not snapshot:
+            return None
+        now = datetime.fromisoformat(snapshot)
+        best: tuple[datetime, tuple, str] | None = None
+        with _state_lock:
+            for key, text in _messages.items():
+                if list(key[:-1]) != advice or not key[-1] or not text:
+                    continue
+                written = datetime.fromisoformat(key[-1])
+                if now - _KEEP_PREVIOUS_WORDING_FOR <= written < now and (best is None or written > best[0]):
+                    best = (written, key, text)
+        return best[1:] if best else None
+    except Exception:
+        logger.warning("Could not look up a previous wording", exc_info=True)
         return None
 
 
@@ -5250,6 +5306,10 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
         with _state_lock:
             if message:
                 _messages[entry.message_key] = message
+            if status == _KEPT_PREVIOUS:
+                # Vertex failed; the text is borrowed. Charged as the error it was.
+                _message_errors[entry.subject_key] = entry.errors + 1
+            elif message:
                 # Both budgets, because a success says the payload is writable AND the backend is
                 # reachable. Leaving the error count standing would let a subject that recovers
                 # still be retired by errors it has demonstrably outlived.
