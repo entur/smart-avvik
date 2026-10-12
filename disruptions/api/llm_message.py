@@ -1333,6 +1333,7 @@ def write_message_detailed(
     state: _LatchState | None = None,
     replay: bool = False,
     caller: str | None = None,
+    covered: bool = False,
 ) -> MessageResult:
     """:func:`_write_message_detailed_inner`'s full contract, counted — this wrapper adds nothing
     to the behaviour, and the docstring below it is the one that documents it.
@@ -1343,6 +1344,13 @@ def write_message_detailed(
     counting there would both undercount statuses and double-count attempts. One call, one
     increment, whatever the outcome — and `provider` falls back to the bounded "none" for the
     statuses that name no backend (`disabled`, `unavailable`).
+
+    `covered` says the caller holds an earlier wording of the same advice that it will serve if this
+    call fails (`varsel._previous_wording`). An `error` is then counted as `error_covered`: the
+    traveller lost nothing, and the "LLM wording failures" rule selects `error`, so a slow Vertex
+    morning re-wording trains that already have text no longer reads as travellers getting the
+    template. Measured 2026-10-12 in prd: 319 of the 346 errors since 2026-10-08 were such rewrites.
+    The returned status stays `error`, which is what the caller's retry budget is charged on.
     """
     result = _write_message_detailed_inner(
         message_input,
@@ -1354,7 +1362,7 @@ def write_message_detailed(
     )
     metrics.LLM_MESSAGE_TOTAL.labels(
         provider=result.provider or "none",
-        result=result.status,
+        result="error_covered" if covered and result.status == "error" else result.status,
         surface=_surface_label(replay, caller),
     ).inc()
     return result
