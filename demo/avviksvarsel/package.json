@@ -19,7 +19,7 @@
     "@entur/expand": "^3.7.12",
     "@entur/form": "^9.3.8",
     "@entur/icons": "^10.0.6",
-    "@entur/layout": "^3.7.5",
+    "@entur/layout": "^5.0.1",
     "@entur/loader": "^0.7.4",
     "@entur/menu": "^6.3.1",
     "@entur/modal": "^1.8.16",
