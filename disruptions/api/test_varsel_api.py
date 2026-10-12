@@ -1510,6 +1510,49 @@ def test_generation_being_off_does_not_spend_the_retry_budget(monkeypatch):
     assert written, "a recovered backend must still get to write this situation's wording"
 
 
+def test_a_failed_rewrite_keeps_the_previous_snapshots_wording(monkeypatch):
+    """Every rebuild re-words every alerting train (the snapshot is in the key), so a transient
+    Vertex failure used to drop a card back to the template although the previous snapshot's text
+    was still cached. It must now borrow that text -- only for the SAME advice, only within
+    `_KEEP_PREVIOUS_WORDING_FOR` -- count as `error_covered`, and still charge the error budget."""
+    import types
+
+    import llm_message
+
+    _reset_state()
+    calls = []
+    monkeypatch.setattr(llm_message, "generation_enabled", lambda: True)
+    monkeypatch.setattr(
+        llm_message,
+        "write_message_detailed",
+        lambda message_input, **kw: calls.append(kw)
+        or llm_message.MessageResult(None, provider="gemini", model="g", status="error"),
+    )
+    alert = types.SimpleNamespace(situation_number="S1")
+    advice = (("A", "B"), "S1", "2026-10-12T08:59:00+00:00", False, False, None, "v1")
+    old = advice + ("2026-10-12T08:50:00+00:00",)
+    now = advice + ("2026-10-12T08:52:00+00:00",)
+    varsel._messages[old] = "Tog R14 kan bli 30-54 min forsinket."
+    varsel._message_meta[old] = {"status": "ok", "provider": "gemini", "message_input": {"x": 1}}
+
+    outcome = {}
+    text = varsel._write_message(alert, journey_key="j", message_input={"x": 2}, message_key=now, outcome=outcome)
+    assert text == "Tog R14 kan bli 30-54 min forsinket."
+    assert outcome["status"] == varsel._KEPT_PREVIOUS
+    assert calls[-1]["covered"] is True
+    assert varsel._message_meta[now] == {"status": "ok_cached", "provider": "gemini", "message_input": {"x": 1}}
+
+    # Other advice (a different alternative) is never covered, and neither is a stale snapshot.
+    other = advice[:5] + (("alt",), "v1", "2026-10-12T08:52:00+00:00")
+    assert varsel._write_message(alert, journey_key="j", message_input={"x": 2}, message_key=other) is None
+    assert calls[-1]["covered"] is False
+    late = advice + ("2026-10-12T09:01:00+00:00",)
+    assert varsel._previous_wording(late) is None, "older than _KEEP_PREVIOUS_WORDING_FOR"
+    naive = advice + ("2026-10-12T08:52:00",)  # cannot be compared with an aware key: no raise
+    assert varsel._previous_wording(naive) is None
+    _reset_state()
+
+
 def test_a_cached_wording_is_recorded_beside_a_fresh_template(monkeypatch):
     """The `ok_cached` trap, pinned: the two wordings on that row describe different cycles.
 

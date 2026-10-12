@@ -459,6 +459,17 @@ def test_llm_counter_counts_one_representative_branch_per_class():
     assert _sample("kix_llm_message_total", labels) == before + 1
 
 
+def test_llm_counter_tells_a_covered_error_apart():
+    """An error the caller can cover with an earlier wording is `error_covered`, which the
+    "LLM wording failures" rule does not select; the returned status stays `error`."""
+    labels = {"provider": "claude", "result": "error_covered", "surface": "live"}
+    before = _sample("kix_llm_message_total", labels)
+    with _llm(backend=_raiser(RuntimeError("vertex 504"))):
+        result = llm_message.write_message_detailed({"a": 1}, covered=True)
+    assert result.status == "error"
+    assert _sample("kix_llm_message_total", labels) == before + 1
+
+
 def test_llm_counter_falls_back_to_a_bounded_provider_label():
     """`disabled` (and `unavailable`) carry no provider on the MessageResult; the label must be
     the bounded fallback "none", never an unlabelled series or a KeyError on the poller thread."""
