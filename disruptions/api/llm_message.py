@@ -130,7 +130,12 @@ _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
 # per MODEL, not per family: gemini-3.7-flash 404s at europe-west1 and europe-north1 exactly as
 # gemini-3.5-flash did, so the EU multi-region above remains the only endpoint that both serves it
 # and confines processing. Re-check that when moving this value, not only that the model answers.
-_GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.7-flash")
+#
+# gemini-3.8-flash since 2026-10-12, verified at eu in both projects that day. 3.7 had degraded to
+# 10-36 s for a one-word reply at eu (3.8: ~1 s), which put half of prd's wording calls past
+# `_TIMEOUT_S`. Replaying 100 recent prd inputs through 3.8 returned `ok` for all 100, p50 2.1-2.3 s,
+# max 8.1 s, with wordings equivalent to 3.7's; `thinking_level: "low"` is accepted.
+_GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.8-flash")
 
 # Web Push bodies are truncated by the platform and read on a lock screen. Anything longer than this
 # is a sign the model ignored the brief, so it is rejected rather than silently cut.
