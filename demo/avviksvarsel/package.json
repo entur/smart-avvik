@@ -22,7 +22,7 @@
     "@entur/layout": "^5.0.1",
     "@entur/loader": "^0.7.4",
     "@entur/menu": "^6.3.1",
-    "@entur/modal": "^1.8.16",
+    "@entur/modal": "^2.0.7",
     "@entur/tokens": "^4.2.0",
     "@entur/typography": "^2.1.12",
     "react": "^19.2.8",
