@@ -105,8 +105,8 @@
 
 -- SPLIT: temporal, keyed on onset date -> a whole situation (all its calls) lands on one side,
 -- so there is no within-situation grouping leak. Train = onset < 2026-04-01, eval = on/after.
--- Window is restricted to onset in [2024-06-01, 2026-06-19] so rail_calls fully covers the 12h
--- outcome window (table runs 2024-06-01 .. 2026-06-20); later onsets would be right-censored.
+-- Window is restricted to onset in [2024-06-01, 2026-10-11] so rail_calls fully covers the 12h
+-- outcome window (table runs 2024-06-01 .. 2026-10-13, extended 2026-10-13); later onsets would be right-censored.
 -- Unflagged rows have no onset, so their split (and their window) is keyed on call_date over the
 -- same range. A situation with onset just before the boundary keeps its calls in TRAIN while an
 -- unflagged call the same morning lands in EVAL; the fuzz is one 12 h window wide and does not
@@ -151,7 +151,7 @@ sit AS (
    AND IFNULL(d.onset_description,'') = IFNULL(c.description,'')
   WHERE d.participantRef = 'NSB'
     AND SAFE.TIMESTAMP(d.creationTime) IS NOT NULL
-    AND DATE(SAFE.TIMESTAMP(d.creationTime)) BETWEEN DATE '2024-06-01' AND DATE '2026-06-19'
+    AND DATE(SAFE.TIMESTAMP(d.creationTime)) BETWEEN DATE '2024-06-01' AND DATE '2026-10-11'
 ),
 aff AS (
   SELECT
@@ -240,7 +240,7 @@ nosx AS (
   LEFT JOIN covered AS c
     ON c.jkey = r.jkey AND c.stop_order = r.stop_order AND c.call_date = r.call_date
   WHERE c.jkey IS NULL
-    AND r.call_date BETWEEN DATE '2024-06-01' AND DATE '2026-06-19'
+    AND r.call_date BETWEEN DATE '2024-06-01' AND DATE '2026-10-11'
     AND (r.aimed_dep IS NOT NULL OR r.aimed_arr IS NOT NULL)
     AND (COALESCE(r.call_cancelled, FALSE) OR r.dep_delay_min IS NOT NULL OR r.arr_delay_min IS NOT NULL)
 ),

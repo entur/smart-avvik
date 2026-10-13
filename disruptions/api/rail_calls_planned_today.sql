@@ -133,7 +133,11 @@ SELECT
   COALESCE(n.stop_name, q.name) AS stop_name,
   d.stop_order, d.aimed_dep, d.aimed_arr, d.dep_delay_min,
   DATE(COALESCE(d.aimed_dep, d.aimed_arr), 'Europe/Oslo') AS call_date,
-  d.call_cancelled, d.call_source, d.boarding_allowed, d.alighting_allowed
+  d.call_cancelled, d.call_source, d.boarding_allowed, d.alighting_allowed,
+  -- When this state was read. The predict files measure "the last hour" and the ask horizon from
+  -- it rather than from CURRENT_TIMESTAMP(), because this table is rebuilt on a TTL and is up to
+  -- that old when they run (see `asof` in predict_calls.sql).
+  CURRENT_TIMESTAMP() AS built_at
 FROM dedup AS d
 LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
   ON d.quay = q.id
