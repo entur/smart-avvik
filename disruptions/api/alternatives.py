@@ -14,22 +14,20 @@ Design notes
   cannot contain a journey that leaves earlier and still gets there in time. Selection reads
   candidates; it never re-parses patterns.
 * **The bar is the traveller's appointment, not the fastest possible trip.** :func:`select_best`
-  keeps the **latest-departing** journey that still arrives before the disrupted train's *aimed*
-  arrival: somebody who will make their appointment either way would rather leave later than run for
-  an earlier train. Only when nothing arrives in time does it fall back to the earliest arrival —
-  which is the case where a replacement legitimately arrives *later* than the train it replaces, so
-  ``minutes_saved`` is signed and may be zero or negative. The rule this replaced (earliest arrival,
-  at least three minutes faster) was long described as firing "effectively never"; measured for the
-  first time on 2026-08-06 it fires on **26 %** of alerting subjects, and the earlier claim turns
-  out to rest on no measurement at all. The rate is not the argument for this rule either way — the
-  argument is the cancelled train, where "arrives earlier than a train that is not running" is
-  barely a question, and where the fallback tier is unreachable under the old rule by construction.
+  keeps the journey whose arrival is **closest to the disrupted train's *aimed* arrival**, with a
+  minute late weighted twice a minute early (2026-10-08). An in-time journey is not preferred at any
+  price: leaving two hours early is a worse answer than arriving half an hour late. A replacement
+  may therefore legitimately arrive *later* than the train it replaces, so ``minutes_saved`` is
+  signed and may be zero or negative. The rule before 2026-10-08 kept the latest-departing in-time
+  journey and fell back to the earliest arrival only when nothing arrived in time; the one before
+  that (earliest arrival, at least three minutes faster) fired on 26 % of alerting subjects when
+  measured on 2026-08-06.
   Re-derive with ``data/queries/alternative_offer_rate.sql``; see
   :func:`decisions._alternative_fields` for the reading and its caveats.
 * **The disrupted train competes under the same rules, and usually wins.** It is passed in as
   ``original`` and ranked alongside the candidates; when it wins, there is no alternative to offer.
   Because its arrival is aimed **plus** a non-negative predicted delay while the deadline is that
-  same aimed arrival, it can never sit in the in-time tier — which is why a *materiality* gate sits
+  same aimed arrival, any rival arriving nearer the deadline beats it — which is why a *materiality* gate sits
   on top (see ``_MIN_MATERIAL_MINUTES``), or a two-minute delay would produce "abandon your train".
 * **Candidates that ride the disruption are excluded, the original is not.** A candidate is dropped
   when any of its ``transit_refs`` is one of the affected ``(operator, jkey)`` pairs — JP's reply
@@ -165,13 +163,13 @@ _REFRESH_WAIT_MARGIN_S = 1.0
 # when the disrupted train is neither cancelled nor itself alert-worthy.
 #
 # Why the gate has to exist at all. The R3 deadline is the original's *aimed* arrival, while the
-# original's own arrival is that aimed time PLUS a non-negative predicted delay. So the original can
-# never sit in the in-time tier, and any earlier-arriving train beats it there — meaning "the
+# original's own arrival is that aimed time PLUS a non-negative predicted delay. So any rival arriving
+# nearer the deadline costs less and beats it — meaning "the
 # traveller should stay on the train they have" would be unreachable for every delay-driven alert.
 # Rail alerts are mostly delay-driven, so without this gate the systematic advice becomes "abandon
 # your train and run for an earlier one" — including when the delay is two minutes. Do not
-# "simplify" it away: it is not a duplicate of the tier logic, it is the reason the tier logic is
-# safe to state so simply.
+# "simplify" it away: it is not a duplicate of the ranking, it is the reason the ranking is safe to
+# state so simply.
 _MIN_MATERIAL_MINUTES = 3
 # Mirrors `varsel._WINDOW_CATCH_UP` (90 min): how long past a registered window's end a train from
 # that window can still be worth offering, sized above the p90 delays the exceedance stack produces.
@@ -179,6 +177,11 @@ _MIN_MATERIAL_MINUTES = 3
 # import AlternativeJourney`), so importing back is a cycle. `select_best` takes it as a parameter so
 # a caller that can see both may pass the real constant and keep the two from drifting.
 _CATCH_UP_GRACE = timedelta(minutes=90)
+# How much worse a minute LATE is than a minute EARLY when ranking alternatives. Early costs the
+# traveller waiting time; late can cost an appointment or a connection. Without the asymmetry an
+# hourly line ties exactly (one train 60 min early, the next 60 min late). A policy knob, not a
+# measured figure (2026-10-08).
+_LATE_WEIGHT = 2.0
 # How far ahead of `now` a requested travel time may sit before the lookup is skipped entirely.
 # Stated in hours rather than as a ratio of anything: a registration for tomorrow morning refreshes
 # on every poller cycle from the moment it is created, and the Journey Planner query it would issue
@@ -579,6 +582,16 @@ class AlternativeCandidate(BaseModel):
     risky: bool = Field(
         default=False,
         description="Caller-set: this candidate is itself predicted to be in trouble.",
+    )
+    likely_cancelled: bool = Field(
+        default=False,
+        description="Caller-set: our cancellation probability for a boarding or alighting call is "
+        "at or over the operator's alert gate. Dropped from the pool like a declared cancellation.",
+    )
+    predicted_arrival_time: datetime | None = Field(
+        default=None,
+        description="Caller-set: the arrival our models expect (aimed + p50 delay), when later than "
+        "`arrival_time`. What the ranking reads; `arrival_time` stays JP's, which is what is shown.",
     )
     departure_prediction: AlternativePrediction | None = Field(
         default=None,
@@ -1437,7 +1450,8 @@ def select_best(
 
     The rule, in order:
 
-    1. **Pool.** Drop anything cancelled and anything nothing can rank (no arrival time). Of the
+    1. **Pool.** Drop anything cancelled or `likely_cancelled` and anything nothing can rank (no
+       arrival time). Of the
        RIVALS additionally drop those whose departure has passed (`> now`, strictly, so a departure
        exactly at `now` is not offered), those beyond `window_end + catch_up_grace`, those with no
        readable departure at all, and any riding one of `affected_refs`. That last exclusion carries
@@ -1452,18 +1466,20 @@ def select_best(
        late and still perfectly catchable at 08:05 was being deleted from its own replacement
        contest. Dropping the baseline does not make "stay put" less likely; it makes it
        *unreachable*, and hands the answer to whatever the pool happens to contain.
-    2. **Tiers, arrival-feasibility outside risk-avoidance.** Within each tier the safe RIVALS are
-       consulted before the full pool. Nested the other way, a *safe* journey arriving two hours late
-       would beat a slightly risky one that still gets the traveller there on time.
+    2. **Closest arrival to the deadline, late weighted double** (2026-10-08). The cost of a
+       candidate is its minutes early plus :data:`_LATE_WEIGHT` x its minutes late, against
+       `original_arrival_time`. Until then an in-time candidate always won, however early: when
+       Vy removed the R14 12:04, 13:04 and 14:04, all three were offered the SJ 11:46, which for
+       the 14:04 meant leaving 2 h 18 min early rather than taking the 14:31 arriving 34 min late.
 
-       The original never belongs to the risk partition either, for a sharper reason: its `risky` is
-       set from `impact_probability >= threshold` — the very gate that made this trip alert-worthy —
-       so on every push path the baseline is risky by construction. Partitioning it out left the
-       fallback tier (which has no arrival constraint) handing the win to the earliest-arriving
-       *safe* candidate however much later it arrived; the materiality gate could not catch it
-       either, because `in_real_trouble` is released by that same flag. It instead joins whichever
-       group is being ranked, and creates none of its own: with no safe rival there is nothing to
-       prefer, so the whole pool is ranked at once and the original competes there.
+       Risk enters through our own predictions, not a separate penalty (2026-10-13). The cost
+       reads `predicted_arrival_time` (aimed + p50 delay, when later than JP's expectation) and
+       the original's own predicted arrival, so a train we expect to be late is ranked as late.
+       A train whose cancellation probability is at or over the operator's alert gate is dropped
+       in rule 1 (`likely_cancelled`), the original included: below the gate that probability is
+       overconfident (Vy, 1 Sep - 12 Oct 2026: predicted 0.30-0.65, cancelled 2 % without an SX
+       message and 9-14 % with one; at 0.65 and over, 30 % and 55 %). `risky` no longer ranks
+       anything; it is published as `at_risk` on the offer.
     3. **Ties** break on earlier arrival, then on `ordinal` (JP's own reply order), then in favour of
        the original. Not cosmetic: this runs again on every refresh, and an unstable winner would
        flip both the card's wording and which situation the written message is cached under.
@@ -1501,7 +1517,7 @@ def select_best(
     last_departure = window_end + catch_up_grace
     pool: list[AlternativeCandidate] = []
     for cand in pool_source:
-        if cand.cancelled:
+        if cand.cancelled or cand.likely_cancelled:
             continue
         if cand.arrival_time is None:
             continue  # nothing downstream can rank it, and every comparison below reads it
@@ -1523,27 +1539,18 @@ def select_best(
     originals = [cand for cand in pool if is_original(cand)]
     rivals = [cand for cand in pool if not is_original(cand)]
 
-    def in_time(group: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
-        return [cand for cand in group if cand.arrival_time < original_arrival_time]
+    def cost(cand: AlternativeCandidate) -> float:
+        """Minutes early plus LATE_WEIGHT x minutes late against the traveller's deadline, read off
+        the arrival our models predict (the original's `arrival_time` already is one)."""
+        arrival = cand.predicted_arrival_time or cand.arrival_time
+        diff = (arrival - original_arrival_time).total_seconds() / 60
+        return -diff if diff <= 0 else _LATE_WEIGHT * diff
 
-    def whenever(group: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
-        return group
-
-    def latest_departing(group: list[AlternativeCandidate]) -> AlternativeCandidate:
+    def closest(group: list[AlternativeCandidate]) -> AlternativeCandidate:
         return min(
             group,
             key=lambda cand: (
-                -cand.departure_time.timestamp() if cand.departure_time else float("inf"),
-                cand.arrival_time.timestamp(),
-                cand.ordinal,
-                0 if is_original(cand) else 1,
-            ),
-        )
-
-    def earliest_arriving(group: list[AlternativeCandidate]) -> AlternativeCandidate:
-        return min(
-            group,
-            key=lambda cand: (
+                cost(cand),
                 cand.arrival_time.timestamp(),
                 cand.ordinal,
                 0 if is_original(cand) else 1,
@@ -1561,21 +1568,7 @@ def select_best(
         if outcome is not None:
             outcome["original_is_best"] = bool(originals) and bool(rivals)
 
-    # R6 partitions the RIVALS by risk. The original is not a rival (its `risky` IS the alert gate,
-    # so it is set on every push) and joins whichever group is ranked; with no safe rival there is
-    # no preference to express, so the pool is ranked whole rather than "safe" meaning "the baseline
-    # alone" and winning the fallback tier outright.
-    safe_rivals = [cand for cand in rivals if not cand.risky]
-    groups = ([safe_rivals + originals] if safe_rivals else []) + [pool]
-    winner: AlternativeCandidate | None = None
-    for tier, pick in ((in_time, latest_departing), (whenever, earliest_arriving)):
-        for group in groups:
-            subset = tier(group)
-            if subset:
-                winner = pick(subset)
-                break
-        if winner is not None:
-            break
+    winner = closest(pool)
     if winner is None or is_original(winner):
         record_stay_put()
         return None

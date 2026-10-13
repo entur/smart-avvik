@@ -266,22 +266,64 @@ def test_a_candidate_departing_past_the_window_grace_is_excluded():
     assert got.departure_time == NOW + timedelta(minutes=60), "+140 is past +30 window +90 grace"
 
 
-def test_a_safe_journey_is_preferred_to_a_risky_one_in_the_same_tier():
-    """R6 as a preference: both arrive in time, so take the one not heading for trouble itself —
-    even though the risky one departs later and would win tier 1 on its own."""
+def test_a_slightly_late_train_beats_one_that_leaves_hours_early():
+    """The R14 Kongsvinger case (2026-10-07). The 14:04 was removed; the only train arriving in time
+    was the 11:46, 144 min early, while the 14:31 arrived 34 min late: 34 x 2 = 68 < 144."""
     got = _best(
-        [_cand(20, 55, risky=True, ordinal=0), _cand(10, 50, ordinal=1)],
-        _original(predicted_min=90),
+        [_cand(-138, -84, ordinal=0), _cand(27, 94, ordinal=1)],
+        _original(predicted_min=60, cancelled=True),
+        now=NOW - timedelta(minutes=180),
     )
+    assert got is not None
+    assert got.arrival_time == NOW + timedelta(minutes=94)
+    assert got.arrives_before_original is False and got.minutes_after_original == 34
+
+
+def test_a_late_minute_counts_double():
+    """The R22 Slitu shape on an hourly line: one train 50 min early, the next 40 min late. By plain
+    distance the late one is closer; a late minute counts double, so the early one wins."""
+    got = _best(
+        [_cand(90, 100, ordinal=0), _cand(0, 10, ordinal=1)],
+        _original(predicted_min=60, cancelled=True),
+        now=NOW - timedelta(minutes=180),
+    )
+    assert got is not None
+    assert got.arrival_time == NOW + timedelta(minutes=10), "50 early (50) beats 40 late (80)"
+
+
+def test_a_train_we_predict_late_is_ranked_on_its_predicted_arrival():
+    """Risk enters through our own p50, not a penalty: JP says the later train arrives 5 min early,
+    we predict it 10 min late (cost 20), so the one 10 min early (cost 10) wins."""
+    predicted_late = _cand(20, 55, risky=True, ordinal=0)
+    predicted_late.predicted_arrival_time = NOW + timedelta(minutes=70)
+    got = _best([predicted_late, _cand(10, 50, ordinal=1)], _original(predicted_min=90))
     assert got is not None
     assert got.departure_time == NOW + timedelta(minutes=10)
     assert got.at_risk is False
 
 
+def test_a_likely_cancelled_rival_is_never_offered():
+    """`likely_cancelled` (our p_cancel at the alert gate) drops a rival like a declared one."""
+    doomed = _cand(20, 55, ordinal=0)
+    doomed.likely_cancelled = True
+    got = _best([doomed, _cand(40, 150, ordinal=1)], _original(predicted_min=60, cancelled=True))
+    assert got is not None
+    assert got.arrival_time == NOW + timedelta(minutes=150)
+
+
+def test_a_likely_cancelled_original_cannot_win_stay_put():
+    """The same rule for the traveller's own train: predicted on time, but likely cancelled."""
+    original = _original(predicted_min=60, risky=True)
+    original.likely_cancelled = True
+    outcome = {}
+    got = _best([_cand(20, 55)], original, outcome=outcome)
+    assert got is not None and got.arrival_time == NOW + timedelta(minutes=55)
+    assert outcome["original_is_best"] is False
+
+
 def test_a_risky_journey_beats_a_safe_one_that_arrives_far_too_late():
-    """R6 is a preference, not a veto — and arrival-feasibility is the OUTER loop. Nested the other
-    way, a safe journey arriving an hour and a half late would beat a slightly risky one that still
-    gets the traveller there on time."""
+    """Being over the alert gate is not a veto: without a predicted delay or a likely cancellation
+    to rank it on, a risky journey that arrives in time beats a safe one 90 minutes late."""
     got = _best(
         [_cand(20, 55, risky=True, ordinal=0), _cand(40, 150, ordinal=1)],
         _original(predicted_min=90),

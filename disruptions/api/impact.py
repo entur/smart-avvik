@@ -799,9 +799,10 @@ class AlternativeOutcome(NamedTuple):
     ends up back-filled without the other two.
 
     `answered` (2026-09-10) is the fourth, and it is a different kind of claim from the other
-    three: not what the lookup concluded but whether the Journey Planner REPLIED. False means the
+    three: not what the lookup concluded but whether the Journey Planner REPLIED. False means a
     reply was never obtained — a throttled path, an outage, the post-failure cooldown, a raising
-    lookup — so the absence of an offer is transient and must not be cached as terminal; the
+    lookup — to either of the two queries (since 2026-10-08 a pool missing one side is a partial
+    comparison), so the absence of an offer is transient and must not be cached as terminal; the
     journey-alert pull read serves it as `unanswered` where an answered-but-empty lookup is
     `none_found`. Every terminal absence (no lookup issued, capped, beyond the horizon) stays True.
     It rides beside `subject` rather than replacing it, so `decisions._alternative_status`, which
@@ -1205,6 +1206,17 @@ def _score_candidate(
     # the very "take the next train" advice the operator is publishing.
     cand.cancelled = cand.cancelled or departure.cancelled or bool(arrival and arrival.cancelled)
     cand.risky = cand.risky or risky
+    # The same two ends, judged on our own cancellation probability at the operator's alert gate.
+    # Below the gate `p_cancel` is overconfident, so nothing lower is a reason to drop a train.
+    cand.likely_cancelled = any(
+        c is not None and _likely_cancelled(c.p_cancel, c) for c in (board, alight)
+    )
+    # Ranked on the arrival we predict, never earlier than JP's expectation: the same rule
+    # `_reconcile_original_arrival` applies to the disrupted train, so both sides are comparable.
+    p50 = alight.arr_delay_p50_stack_min if alight is not None else None
+    if p50 is not None and cand.aimed_arrival_time is not None and cand.arrival_time is not None:
+        predicted = cand.aimed_arrival_time + timedelta(minutes=max(p50, 0))
+        cand.predicted_arrival_time = max(predicted, cand.arrival_time)
     # Annotated in place as well as returned. `alternatives.select_best` answers with an
     # `AlternativeJourney`, not with the candidate that won, so nothing downstream can join the
     # winner back to its `CandidateScore` — identity is the only key and the journey does not carry
@@ -1251,6 +1263,15 @@ def score_candidates(
     return scored
 
 
+def _likely_cancelled(p_cancel: float | None, call: TripCell | CallPred) -> bool:
+    """Our cancellation probability at or over the operator's alert gate (2026-10-13). The gate is
+    the impact threshold reused; `p_cancel` is overconfident below it, so a lower bar would drop
+    trains that nearly always run."""
+    return (p_cancel or 0.0) >= alert_policy.threshold_for(
+        call.operator, has_situation=call.has_situation
+    )
+
+
 def _over_alert_gate(cell: TripCell) -> bool:
     """The operator's own alert gate applied to the boarding call."""
     return (cell.departure.impact_probability or 0.0) >= alert_policy.threshold_for(
@@ -1291,6 +1312,7 @@ def _original_candidate(
         aimed_arrival_time=deadline,
         cancelled=cell.departure.cancelled,
         risky=_over_alert_gate(cell),
+        likely_cancelled=_likely_cancelled(cell.departure.cancel_probability, cell),
         is_original=True,
         transit_refs=[(cell.operator, cell.jkey)] if cell.jkey else [],
         lines=[cell.line] if cell.line else [],
@@ -1364,12 +1386,11 @@ def _best_remaining_journey(
     when a real pool was compared against: a null journey with `original_is_best=False` means
     nothing could be established, and the two must not be worded alike downstream.
 
-    **Two queries, in this order, and the second one only when the first came back empty.**
-    Query 1 is anchored on the traveller's *deadline* (`arriveBy` the disrupted train's aimed
-    arrival), because a depart-after search cannot contain a journey that leaves earlier and still
-    gets there in time — and leaving earlier is what actually rescues somebody whose train is
-    cancelled. Query 2 anchors on `now` and is the fallback for the case where nothing arrives in
-    time at all, which is both the least pleasant answer and the one the traveller most needs.
+    **Two queries, both always.** Query 1 is anchored on the traveller's *deadline* (`arriveBy` the
+    disrupted train's aimed arrival), because a depart-after search cannot contain a journey that
+    leaves earlier and still gets there in time. Query 2 departs after the disrupted train's own
+    departure and holds the trains that arrive late. `select_best` ranks the union by how close each
+    arrival is to the deadline, so neither side can be skipped on what the other found.
     """
     cell = _worst_cell(cells)
     if cell is None or cell.arrival is None:
@@ -1434,54 +1455,45 @@ def _best_remaining_journey(
             outcome=outcome,
         )
 
-    # `answered` distinguishes "JP replied, and had nothing" from "no reply was obtained" — an
-    # outage, the post-failure cooldown, a spent fetch budget, or a served-stale value. Only the
-    # first is a reason to ask the second question: firing the fallback on a non-answer bought a
-    # SECOND blocking 3 s call on the ingestion thread, so a degraded Journey Planner cost twice
-    # what a healthy one does, exactly when it could least afford it. Defaults to True when the key
-    # is absent, which is what a stub that ignores the out-dict leaves behind.
-    first_query: dict[str, Any] = {}
+    # Both sides of the deadline (2026-10-08). The selection ranks by how close the arrival is to
+    # the deadline, so a late train can beat an early one and the late side must be in the pool
+    # whatever the early side found. The late query departs after the disrupted train's own
+    # departure, floored to the cache quantum: `fetch_candidates` keys a depart-after reply on that
+    # quantum, so an unfloored anchor would hand an earlier train in the same half hour a reply
+    # fetched for a later one, missing the trains between them. Anchored on `now` instead it would
+    # mostly return trains leaving before the disrupted one, which the arriveBy query covers.
+    # Skipped when the first query obtained no reply: the outcome is reported unanswered either
+    # way, and a Journey Planner outage would otherwise cost two timeouts per train.
+    by_deadline_query: dict[str, Any] = {}
     by_deadline = alternatives.fetch_candidates(
         from_stop, to_stop, arrive_by=True, date_time=deadline, now=now, path=path,
-        outcome=first_query,
+        outcome=by_deadline_query,
     )
-    _reconcile_original_arrival(original, by_deadline, subject=subject)
+    after: list[AlternativeCandidate] = []
+    after_query: dict[str, Any] = {"answered": False}
+    if by_deadline_query.get("answered", True):
+        departure = cell.departure.scheduled_time or now
+        quantum = alternatives._DATE_TIME_QUANTUM.total_seconds()
+        floored = datetime.fromtimestamp(departure.timestamp() // quantum * quantum, tz=UTC)
+        after_query = {}
+        after = alternatives.fetch_candidates(
+            from_stop, to_stop, arrive_by=False, date_time=max(now, floored), now=now,
+            path=path, outcome=after_query,
+        )
+    pool = by_deadline + after
+    # Reconciled against both replies: a reading in either is a reading of the same train.
+    _reconcile_original_arrival(original, pool, subject=subject)
 
     # The verdict comes back from the selection itself, never derived here from the pool: this
     # function's list never contains the original at all, so "the original won" could be published
     # for a comparison `select_best` never made.
     selection: dict[str, Any] = {}
-    best = select(scored_pool(by_deadline), selection)
+    best = select(scored_pool(pool), selection)
 
-    # **The fallback is decided on what selection could USE, not on what the query returned**
-    # (2026-08-06). Asking "did the reply contain anything" was the wrong question: a reply full of
-    # departures beyond the traveller's own window is a full answer to that question and an empty
-    # one to the real question, and the traveller — often somebody whose train is cancelled — was
-    # told there was no alternative while a catchable later journey existed. `original_is_best` is
-    # the one result that must NOT trigger it: a genuine stay-put verdict means something WAS in
-    # time (the original itself), so the fallback tier has nothing to add.
-    # Whichever query the selection actually used is the one whose reply status the outcome
-    # carries: the first when no fallback ran, the fallback's when it did. An unanswered fallback
-    # leaves the traveller with exactly the non-answer an unanswered first query would have.
-    used_query = first_query
-    if best is None and not selection.get("original_is_best") and first_query.get("answered", True):
-        fallback_query: dict[str, Any] = {}
-        fallback = alternatives.fetch_candidates(
-            from_stop, to_stop, arrive_by=False, date_time=now, now=now, path=path,
-            outcome=fallback_query,
-        )
-        used_query = fallback_query
-        # Reconciled against this reply too. The fallback runs precisely when nothing arrives in
-        # time, which is when the disrupted train is worst off — so leaving its arrival at our
-        # optimistic p50 here would rank it ahead of the rivals it is being compared against, in
-        # the one branch where being wrong strands somebody.
-        _reconcile_original_arrival(original, fallback, subject=subject)
-        selection = {}
-        best = select(scored_pool(fallback), selection)
-
-    return AlternativeOutcome(
-        best, bool(selection.get("original_is_best")), subject, used_query.get("answered", True)
-    )
+    # `answered` is "JP replied", not "JP had something". A pool with one side missing is a partial
+    # comparison, so it is reported as unanswered (transient, asked again) rather than settled.
+    answered = by_deadline_query.get("answered", True) and after_query.get("answered", True)
+    return AlternativeOutcome(best, bool(selection.get("original_is_best")), subject, answered)
 
 
 # How many Journey Planner lookups one /impact call may issue. The unit is a train, and the reason
@@ -1517,8 +1529,8 @@ def _alternatives_by_situation(
 ) -> dict[str, AlternativeOutcome]:
     """One lookup per disrupted TRAIN, keyed back to the situations that describe it.
 
-    The alternative is not a property of the trip. `select_best`'s in-time tier is "the latest
-    departure that still arrives before the disrupted train's *aimed* arrival", so the winner is
+    The alternative is not a property of the trip. `select_best` ranks by how close an arrival is to
+    the disrupted train's *aimed* arrival, so the winner is
     chosen against one train's deadline and is an answer about that train only. Shared across a
     window it is not merely imprecise, it is wrong in the direction that strands people: measured in
     prd on 2026-08-12, one registered journey's 00:31 cycle scored thirteen cancelled L1 departures

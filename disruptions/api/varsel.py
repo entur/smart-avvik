@@ -2051,8 +2051,8 @@ def match_journey(
 
     # **An alternative belongs to a train, and is back-filled onto alerts about THAT train only**
     # (2026-08-12). It used to be shared across the whole trip, on the reading that "a faster way
-    # from here to there" is a property of the pair — but `select_best`'s in-time tier picks the
-    # latest departure that still arrives before *the disrupted train's* aimed arrival, so the answer
+    # from here to there" is a property of the pair — but `select_best` ranks by how close an
+    # arrival is to *the disrupted train's* aimed arrival, so the answer
     # is chosen against one train's deadline and is a claim about that train. Shared across a window
     # it strands people: in prd on 2026-08-12 one journey's 00:31 cycle alerted on thirteen cancelled
     # L1 departures between 05:59 and 11:59 and offered every one of them the 05:45.
