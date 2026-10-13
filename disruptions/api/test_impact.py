@@ -731,6 +731,32 @@ def test_a_candidate_in_the_index_is_scored_from_the_cache():
     assert score.candidate.risky is False, "0.33 is under VYG's 0.65 gate"
 
 
+def test_a_candidate_is_ranked_on_our_p50_and_dropped_at_the_cancellation_gate():
+    """Two annotations the selection reads (2026-10-13): `predicted_arrival_time` is aimed + our p50
+    arrival delay when that is later than JP's time, and `likely_cancelled` is our p_cancel at or
+    over the operator's alert gate on either end the traveller uses."""
+
+    def index(p_cancel, p50):
+        return {
+            ALT_REF: [
+                _alt_call(stop_place=A, stop_order=1, aimed_dep=_at(9), p_cancel=p_cancel),
+                _alt_call(stop_place=B, stop_order=5, aimed_dep=None, aimed_arr=_at(9, 40),
+                          p_cancel=p_cancel, arr_delay_p50_stack_min=p50),
+            ]
+        }
+
+    gate = alert_policy.threshold_for("VYG", has_situation=True)
+    [late] = _scored([_candidate()], index=index(0.05, 12))
+    assert late.candidate.predicted_arrival_time == _at(9, 52)
+    assert late.candidate.likely_cancelled is False
+    [doomed] = _scored([_candidate()], index=index(gate, 0))
+    assert doomed.candidate.likely_cancelled is True
+    assert doomed.candidate.predicted_arrival_time == _at(9, 40), "never earlier than JP's time"
+    [under] = _scored([_candidate()], index=index(gate - 0.01, None))
+    assert under.candidate.likely_cancelled is False
+    assert under.candidate.predicted_arrival_time is None, "no p50, nothing to rank on but JP's"
+
+
 def test_a_candidate_absent_from_the_index_is_unscored_with_null_probabilities():
     """The COMMON case, and not a failure: the cache only holds journeys a live situation touches.
 
@@ -1154,7 +1180,7 @@ def test_the_public_endpoint_cannot_spend_the_pollers_fetch_budget():
 
     jp = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)])
     _for_trip(scope, jp, now=now)
-    assert [c["path"] for c in jp.calls] == ["request"], "an unwired caller is charged publicly"
+    assert {c["path"] for c in jp.calls} == {"request"}, "an unwired caller is charged publicly"
 
     poller = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)])
     _install_snapshot(scope)
@@ -1172,7 +1198,7 @@ def test_the_public_endpoint_cannot_spend_the_pollers_fetch_budget():
         )
     finally:
         alternatives.fetch_candidates = original
-    assert [c["path"] for c in poller.calls] == ["poller"], (
+    assert {c["path"] for c in poller.calls} == {"poller"}, (
         "main._varsel_impact passes this; without it the poller competes with the public endpoint"
     )
 
@@ -1280,7 +1306,9 @@ def test_forty_minutes_late_with_an_earlier_arrival_available_is_offered():
     assert alt is not None
     assert alt.minutes_saved == 45 and alt.arrives_before_original is True
     assert resp.original_is_best is False
-    assert len(jp.calls) == 1, "a usable first reply must not cost a second query"
+    assert [c["arrive_by"] for c in jp.calls] == [True, False], (
+        "both sides of the deadline are always asked: a later train may arrive closer to it"
+    )
 
 
 def test_the_original_is_read_off_one_cell_not_assembled_from_several():
@@ -1370,34 +1398,38 @@ def test_the_journey_planners_gloomier_view_of_the_disrupted_train_wins():
     assert alt.arrival_time == now + timedelta(minutes=45)
 
 
-def test_an_empty_first_query_falls_back_to_a_depart_after_search():
-    """Two queries, and only when the first came back with nothing the traveller could take.
+def _floored(t):
+    quantum = alternatives._DATE_TIME_QUANTUM.total_seconds()
+    return datetime.fromtimestamp(t.timestamp() // quantum * quantum, tz=UTC)
 
-    A reply consisting solely of the disrupted train's own pattern is an empty answer wearing a full
-    one — JP does not know we are alerting on it — so it counts as empty here.
+
+def test_both_queries_run_and_the_second_departs_after_the_disrupted_train():
+    """Two queries, always: arriveBy the deadline for the early side, depart-after the disrupted
+    train's own departure for the late side. The second is anchored on that departure floored to
+    the cache quantum (never later than `now` would allow), so a cached reply is a superset for
+    every train departing in the same half hour.
+
+    A reply consisting solely of the disrupted train's own pattern, or of departed trains, leaves
+    the second query's reply to supply the answer.
     """
     now = datetime.now(UTC)
-    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93))
+    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20))
     usable = _live_candidate(now, dep_min=15, arr_min=45)
     own_pattern = _live_candidate(now, dep_min=10, arr_min=50, refs=(("VYG", "j1"),),
                                   lines=("VYG:Line:R10",))
     departed = _live_candidate(now, dep_min=-10, arr_min=40)
 
-    one = _JourneyPlanner([usable])
-    _for_trip(scope, one, now=now)
-    assert len(one.calls) == 1
-
     for label, first in (("only its own pattern", own_pattern), ("only departed trains", departed)):
         jp = _JourneyPlanner([first], [usable])
         resp = _for_trip(scope, jp, now=now)
-        assert len(jp.calls) == 2, f"{label} must trigger the depart-after fallback"
-        assert jp.calls[1]["arrive_by"] is False
-        assert jp.calls[1]["date_time"] == jp.calls[1]["now"], "the fallback anchors on now"
-        assert resp.alternative_journey is not None, f"{label}: the fallback must be used"
+        assert [c["arrive_by"] for c in jp.calls] == [True, False], label
+        sent = jp.calls[1]
+        assert sent["date_time"] == max(sent["now"], _floored(now + timedelta(minutes=10)))
+        assert resp.alternative_journey is not None, f"{label}: the second reply must be used"
 
 
 def test_a_first_query_that_obtained_no_reply_does_not_buy_a_second_one():
-    """The fallback exists for "JP answered, and had nothing", not for "JP did not answer".
+    """The second query exists for "JP answered", not for "JP did not answer".
 
     Every non-answer — timeout, GraphQL `errors`, the post-failure cooldown, single-flight, a spent
     fetch budget, a refused ref — fails open to the same `[]` an answered-but-empty search returns.
@@ -1405,7 +1437,7 @@ def test_a_first_query_that_obtained_no_reply_does_not_buy_a_second_one():
     so a degraded Journey Planner cost twice what a healthy one does.
     """
     now = datetime.now(UTC)
-    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93))
+    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20))
 
     silent = _JourneyPlanner([], answered=False)
     resp = _for_trip(scope, silent, now=now)
@@ -1413,10 +1445,23 @@ def test_a_first_query_that_obtained_no_reply_does_not_buy_a_second_one():
     assert resp.alternative_journey is None
     assert resp.original_is_best is False, "and silence is still not a stay-put verdict"
 
-    # The contrast, on the same scope: an answered-but-empty first query DOES earn the fallback.
+    # The contrast, on the same scope: an answered-but-empty first query DOES earn the second.
     answered = _JourneyPlanner([], [_live_candidate(now, dep_min=15, arr_min=45)])
     resp = _for_trip(scope, answered, now=now)
     assert [c["arrive_by"] for c in answered.calls] == [True, False]
+    assert resp.alternative_journey is not None
+
+
+def test_a_pool_missing_one_side_is_reported_unanswered():
+    """The deadline query replied, the depart-after one did not: the comparison is partial, so the
+    outcome is transient (asked again) rather than settled. The journey found is still carried."""
+    now = datetime.now(UTC)
+    scope = _scope(S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20))
+    jp = _JourneyPlanner([_live_candidate(now, dep_min=15, arr_min=45)], [],
+                         answered=[True, False])
+    resp = _for_trip(scope, jp, now=now)
+    assert len(jp.calls) == 2
+    assert resp.answered is False
     assert resp.alternative_journey is not None
 
 
@@ -1592,9 +1637,9 @@ def test_each_disrupted_train_is_answered_against_its_own_deadline():
     )
     resp = _for_trip(
         _scope(
-            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93,
+            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20,
                              situation_number="SOON"),
-            LATER=_live_train(now, "later", dep_min=190, arr_min=230, p_impact_dep=0.91,
+            LATER=_live_train(now, "later", dep_min=190, arr_min=230, p_impact_dep=0.91, arr_delay_p50_stack_min=20,
                               line="VYG:Line:R12", situation_number="LATER"),
         ),
         jp, now=now, window_min=(-5, 300),
@@ -1624,9 +1669,9 @@ def test_a_train_past_the_horizon_gets_nothing_rather_than_a_nearer_trains_answe
     jp = _PerDeadlinePlanner({50: [_live_candidate(now, dep_min=5, arr_min=45)]}, now)
     resp = _for_trip(
         _scope(
-            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93,
+            SOON=_live_train(now, "soon", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20,
                              situation_number="SOON"),
-            FAR=_live_train(now, "far", dep_min=420, arr_min=460, p_impact_dep=0.99,
+            FAR=_live_train(now, "far", dep_min=420, arr_min=460, p_impact_dep=0.99, arr_delay_p50_stack_min=20,
                             line="VYG:Line:R12", situation_number="FAR"),
         ),
         jp, now=now, window_min=(-5, 500),
@@ -1650,9 +1695,9 @@ def test_several_situations_about_one_train_share_a_single_lookup():
     jp = _PerDeadlinePlanner({50: [_live_candidate(now, dep_min=5, arr_min=45)]}, now)
     resp = _for_trip(
         _scope(
-            S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93,
+            S1=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20,
                            situation_number="S1"),
-            S2=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93,
+            S2=_live_train(now, "j1", dep_min=10, arr_min=50, p_impact_dep=0.93, arr_delay_p50_stack_min=20,
                            situation_number="S2", summary="Ta neste tog"),
         ),
         jp, now=now,

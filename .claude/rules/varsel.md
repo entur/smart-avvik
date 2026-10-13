@@ -721,24 +721,30 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     deliberately never latched, so it would fail every call on every cycle rather than once.
   - `/impact` also returns `alternative_journey` when `to_stop` is given — the **best remaining way
     there**, not a faster one (`disruptions/api/alternatives.py`, TTL-cached, fail-open, no
-    credentials). Two tiers, and the second is why "faster" is the wrong word: prefer the **latest**
-    departure that still arrives before the disrupted train's *aimed* arrival (the traveller's own
-    deadline) among trains not yet departed; when nothing gets there in time, fall back to the
-    **earliest arrival** among those still catchable — which for a cancelled train legitimately
-    lands *later* than the timetable promised, so `minutes_saved` is signed and
-    `arrives_before_original` is what says whether they still make it. A candidate already declared
-    cancelled is never offered; one that would itself trip the alert gate is a soft preference
-    (`at_risk` says so out loud when it wins anyway). The **hard** exclusion (`affected_refs`) is the
-    subject train plus cells that are cancelled or over the alert gate — never every cell on the
-    trip: since nosx scoring every running train has a cell, and until 2026-10-07 that excluded
-    every in-window rival, so the offer fell back to a train *before* the window (R22 17:00
-    removed, 16:00/16:29 running, offered the 13:00). The traveller's **own train competes** under
-    the same rules: when it wins, `alternative_journey` is null and `original_is_best` is true —
-    distinct from a null with `original_is_best` false, which means nothing could be established.
-    Both the fallback query and the reconciliation of the original's arrival are decided on **what
-    the selection could use**, never on what the query returned (2026-08-06: a reply full of
-    departures past the traveller's window answered "yes, something came back" and suppressed the
-    only tier that could still help somebody whose train was cancelled).
+    credentials). **The winner is the arrival closest to the disrupted train's *aimed* arrival, a
+    late minute counting double** (`_LATE_WEIGHT`, 2026-10-08): cost = minutes early + 2 × minutes
+    late, among trains not yet departed. Until then any in-time train won however early, and the
+    R14 14:04 was offered the SJ 11:46 (144 min early) over the 14:31 (34 min late). **Both Journey
+    Planner queries run on every lookup** — `arriveBy` the deadline, and depart-after the train's
+    own departure floored to the 30-min cache quantum — so a later train is always in the pool; the
+    second is skipped only when the first got no reply, and a pool missing either side reports
+    `answered = false`. A late winner is normal, so `minutes_saved` is signed and
+    `arrives_before_original` says whether they still make it. A candidate already declared
+    cancelled is never offered, and neither is one whose `p_cancel` is at or over the operator's
+    alert gate (`likely_cancelled`, 2026-10-13) — **the original included**, so "stay put" is never
+    the verdict on a train we expect to be cancelled. Below the gate `p_cancel` is overconfident
+    (Vy, 1 Sep-12 Oct 2026: predicted 0.30-0.65, cancelled 2 % without an SX message, 9-14 % with
+    one), so no lower bar. Every scored train is ranked on `predicted_arrival_time` (aimed + our
+    p50, never earlier than JP's) like the original already was; `risky` only publishes `at_risk`.
+    Every alerted Vy train in that period had either `p_cancel` over the gate or a p50 of ≥ 3 min,
+    so an alerted original never ranks as on time.
+    The **hard** exclusion (`affected_refs`) is the subject train
+    plus cells that are cancelled or over the alert gate — never every cell on the trip: since nosx
+    scoring every running train has a cell, and until 2026-10-07 that excluded every in-window
+    rival, so the offer fell back to a train *before* the window (R22 17:00 removed, 16:00/16:29
+    running, offered the 13:00). The traveller's **own train competes** under the same rules: when
+    it wins, `alternative_journey` is null and `original_is_best` is true — distinct from a null
+    with `original_is_best` false, which means nothing could be established.
     **The lookup runs once per disrupted TRAIN** (`impact._alternatives_by_situation`, 2026-08-12).
     The deadline that decides the winner is that train's own aimed arrival, so the answer is a claim
     about one train and about nothing else — it was one lookup per journey *window* until then, and
