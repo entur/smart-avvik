@@ -105,18 +105,18 @@ DECISION_WRITE_TOTAL = Counter(
     "failures need a counter: the decision log going quiet is otherwise invisible.",
     ["result"],
 )
-MIRROR_AGE = Gauge(
-    "kix_mirror_age_seconds",
-    "How far behind the subscription mirror's watermark is, in seconds — the age of the newest "
-    "change it has applied (U6, KTD5). This is the series that says whether the poller is matching "
-    "the CURRENT population: the pass reads the mirror rather than the collection, so a mirror that "
-    "stops syncing keeps alerting a revoked recipient and keeps missing a new one, with every cycle "
-    "otherwise looking healthy. Two thresholds worth knowing apart. Warn above roughly three median "
-    "cycle periods (~15 min), which is a sync that has failed a few times. The value that matters "
-    "for CORRECTNESS is notification_store.MIRROR_MAX_AGE_S (6 h), past which the store re-seeds "
-    "itself — because a revocation arrives as a tombstone whose own TTL deletes it after about a "
-    "day, so a sync broken for longer than that loses the removal for good. Absent until the first "
-    "sync completes, which is the restart window and not a fault.",
+MIRROR_LAST_SYNC = Gauge(
+    "kix_mirror_last_sync_timestamp_seconds",
+    "Epoch seconds when the subscription mirror last completed a seed or a sync that drained the "
+    "collection (U6, KTD5). The pass reads the mirror rather than the collection, so a mirror that "
+    "stops syncing keeps alerting a revoked recipient and misses a new one while every cycle looks "
+    "healthy. The sync runs inside the rebuild, so on a quiet night it pauses with the cycle: alert "
+    "on `kix_poller_last_cycle_timestamp_seconds - value`, which grows only while cycles finish and "
+    "the mirror does not (runbook rule 2a). Replaces kix_mirror_age_seconds, which measured the "
+    "watermark — the newest document's stamp — and so grew without bound on a quiet, healthy "
+    "collection (dev, 2026-09-15). The CORRECTNESS bound is notification_store.MIRROR_MAX_AGE_S "
+    "(6 h), past which the store re-seeds: a revocation arrives as a tombstone whose own TTL "
+    "deletes it after about a day. Absent until the first sync completes.",
 )
 WORKER_LAST_TICK = Gauge(
     "kix_worker_last_tick_timestamp_seconds",

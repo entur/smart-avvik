@@ -42,7 +42,7 @@ def rules(text):
         body = text[head.end(): nxt.start() if nxt else len(text)]
         query, cond, desc = PROMQL.search(body), CONDITION.search(body), DESCRIPTION.search(body)
         if not (query and cond):
-            continue  # a section with no creatable rule, e.g. 2a
+            continue  # a section with no creatable rule
         yield (
             head.group(1),
             head.group(2),
@@ -157,7 +157,7 @@ def check(dash):
         assert steps[1]["value"] is not None, f"{p['title']}: no threshold"
     titles = [p["title"] for p in dash["panels"]]
     assert any("Labelling stale" in t for t in titles), "rule 9 missing"
-    assert not any(t.startswith("2a") for t in titles), "2a is not creatable and must be skipped"
+    assert any("mirror stale" in t for t in titles), "rule 2a missing"
 
 
 if __name__ == "__main__":

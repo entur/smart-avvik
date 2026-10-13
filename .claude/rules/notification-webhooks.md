@@ -192,7 +192,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   no-op. **`MIRROR_MAX_AGE_S` (6 h) is a CORRECTNESS bound, not a freshness one**: a revocation arrives
   as a tombstone whose own TTL deletes it after roughly a day, so a sync broken for longer loses the
   removal for good and the poller keeps alerting a revoked recipient — past the bound the mirror
-  re-seeds instead of syncing. `kix_mirror_age_seconds` is the series an alert selects on (rule 2a).
+  re-seeds instead of syncing. The bound is measured from the last seed or COMPLETE sync, never from
+  the watermark: the watermark is the newest document's stamp, so on a quiet collection it aged past
+  6 h while every sync succeeded and the mirror re-seeded every cycle (dev, 2026-09-15; fixed
+  2026-10-13). `kix_mirror_last_sync_timestamp_seconds` is the series rule 2a selects on.
   Two Firestore traps recorded here because both are silent: an `order_by` **excludes documents that
   lack the field** exactly as an equality does, so the seed orders by `created_at` and never by the
   watermark — ordering by it would skip every document written before it existed, which on the deploy
