@@ -5829,7 +5829,7 @@ def test_a_sync_that_raises_keeps_the_previous_mirror():
     assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s1"]
 
 
-def test_a_watermark_older_than_the_bound_forces_a_re_seed():
+def test_a_sync_older_than_the_bound_forces_a_re_seed():
     """The carried review's P1, and it is a CORRECTNESS bound rather than a freshness one.
 
     A revocation reaches the mirror as a tombstone, and that tombstone has a TTL of its own. If
@@ -5852,14 +5852,58 @@ def test_a_watermark_older_than_the_bound_forces_a_re_seed():
     fresh = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S - 60))
     assert fresh.reseeded is False, fresh
 
-    # Past it: the whole collection is read again, and the mirror follows the SEED's page.
+    # Past it, measured from that last COMPLETE sync (as though every sync since had failed): the
+    # whole collection is read again, and the mirror follows the SEED's page.
     _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s2")])
-    stale = mirror.sync(now=NOW + timedelta(seconds=notification_store.MIRROR_MAX_AGE_S + 60))
+    stale = mirror.sync(now=NOW + timedelta(seconds=2 * notification_store.MIRROR_MAX_AGE_S))
     assert stale.reseeded is True, stale
     assert [e.subscription_id for e in mirror.recipients(NOW)] == ["s2"], (
         "a re-seed replaces the mirror rather than merging into it -- which is the point: the "
         "entries it can no longer account for are exactly the ones a lost tombstone would leave"
     )
+
+
+def test_a_quiet_collection_never_re_seeds_while_syncs_succeed():
+    """The dev defect of 2026-09-15: the bound measured the WATERMARK, the newest document's stamp.
+
+    Nobody writing a subscription for six hours made a healthy mirror read as stale, and since the
+    seed re-derives the same old stamp, every cycle after that re-seeded -- a full read per cycle.
+    """
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [_mirrored(subscription_id="s1")])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    _mirror_page(client, "mirror_sync", [])
+    for minutes in range(5, 13 * 60, 5):
+        result = mirror.sync(now=NOW + timedelta(minutes=minutes))
+        assert result.reseeded is False, f"re-seeded at +{minutes} min on a healthy mirror"
+        assert result.sync_age_s == 0.0, result
+
+
+def test_a_truncated_sync_does_not_count_as_synced():
+    """A sync that stops at its page budget has not read what lies past its cursor -- possibly the
+    tombstones the age bound exists for -- so it must not reset the clock."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [])
+    mirror = notification_store.SubscriptionMirror()
+    mirror.seed(now=NOW)
+
+    _mirror_page(
+        client,
+        "mirror_sync",
+        [_mirrored(subscription_id=f"s{i}", mirror_at=NOW + timedelta(minutes=9)) for i in range(3)],
+    )
+    page_size, max_pages = notification_store.MIRROR_PAGE_SIZE, notification_store.MIRROR_MAX_PAGES_PER_SYNC
+    notification_store.MIRROR_PAGE_SIZE, notification_store.MIRROR_MAX_PAGES_PER_SYNC = 1, 1
+    try:
+        result = mirror.sync(now=NOW + timedelta(minutes=10))
+    finally:
+        notification_store.MIRROR_PAGE_SIZE, notification_store.MIRROR_MAX_PAGES_PER_SYNC = page_size, max_pages
+    assert result.truncated is True, "the page budget never bound; this test proved nothing"
+    assert result.sync_age_s == 600.0, result
 
 
 def test_an_unseeded_mirror_answers_for_nobody_and_seeds_on_first_sync():
@@ -6162,7 +6206,7 @@ def test_a_sync_does_not_overwrite_a_commit_this_process_made_while_it_was_readi
     assert interleaved == ["sub-1"], "the competing delete never ran; this test proved nothing"
     assert mirror.size() == 0, "a stale read resurrected a subscription this process had deleted"
     assert report.overtaken == 1, "the skip is not reported, so an operator cannot see it happen"
-    assert report.watermark_age_s is not None, "the watermark still advanced past the document"
+    assert report.sync_age_s == 0.0, "a drained sync must stamp the mirror as just synced"
 
 
 def test_an_erasure_drops_its_journeys_from_the_mirror_at_once():

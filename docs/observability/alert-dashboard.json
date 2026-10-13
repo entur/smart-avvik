@@ -140,6 +140,51 @@
     },
     {
       "type": "timeseries",
+      "title": "2a — Subscription mirror stale",
+      "description": "warning · fires above 900 for 15m\n\nThe webhook pass is matching an old subscription population: a revoked recipient keeps getting alerts and a new one gets none. Look at poller_phase records with phase=notification_mirror and result=error. A sync that keeps truncating at its page budget also grows this: check truncated on the mirror_sync records before treating it as a failure. Past 6 h the store re-seeds itself; past ~24 h revocations are lost for good.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "(max(kix_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) - max(kix_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})) and on() (max(kix_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) > 0)",
+          "legendFormat": "alert expression",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 900.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "2b — Worker stopped",
       "description": "critical · fires above 900 for 5m\n\nNo delivery round for 15 minutes; the tick moves on every round, including the ones that find nothing. Check the kix-avvik-worker Deployment — scaled to zero, rolled back, or crash-looping. Pending webhook events expire after an hour.",
       "datasource": {
@@ -149,7 +194,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 8
       },
       "targets": [
@@ -194,8 +239,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 8
+        "x": 0,
+        "y": 16
       },
       "targets": [
         {
@@ -239,7 +284,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 16
       },
       "targets": [
@@ -289,8 +334,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 16
+        "x": 0,
+        "y": 24
       },
       "targets": [
         {
@@ -334,7 +379,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 24
       },
       "targets": [
@@ -379,8 +424,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 24
+        "x": 0,
+        "y": 32
       },
       "targets": [
         {
@@ -429,7 +474,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 32
       },
       "targets": [
@@ -479,8 +524,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 32
+        "x": 0,
+        "y": 40
       },
       "targets": [
         {
@@ -529,7 +574,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 40
       },
       "targets": [
@@ -579,8 +624,8 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 40
+        "x": 0,
+        "y": 48
       },
       "targets": [
         {
@@ -629,7 +674,7 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 0,
+        "x": 12,
         "y": 48
       },
       "targets": [
@@ -679,17 +724,17 @@
       "gridPos": {
         "h": 8,
         "w": 12,
-        "x": 12,
-        "y": 48
+        "x": 0,
+        "y": 56
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }

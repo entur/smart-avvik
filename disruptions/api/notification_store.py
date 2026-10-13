@@ -2391,7 +2391,7 @@ MIRROR_PAGE_SIZE = 1000
 #: whole read; bounded, it catches up over several cycles and the mirror is merely behind, which is
 #: the state `mirror_age` publishes.
 MIRROR_MAX_PAGES_PER_SYNC = 20
-#: When the watermark gets this old, the mirror stops trusting incremental sync and re-seeds.
+#: When the last complete sync is this old, the mirror stops trusting incremental sync and re-seeds.
 #:
 #: **This is a correctness bound, not a freshness one, and it is why the number is what it is.** A
 #: revocation reaches the mirror as a tombstone (`_delete_body`), and that tombstone is itself a
@@ -2540,7 +2540,7 @@ class MirrorSync:
     size: int = 0
     reseeded: bool = False
     truncated: bool = False
-    watermark_age_s: float | None = None
+    sync_age_s: float | None = None
     error: str | None = None
     #: Documents the read returned that this process had already superseded with its own commit.
     #: Its own number rather than folded into `synced`, because the two are different operator
@@ -2571,7 +2571,12 @@ class SubscriptionMirror:
         self._entries: dict[str, MirrorEntry] = {}
         self._watermark: datetime | None = None
         self._seeded = False
-        self._seeded_at: datetime | None = None
+        #: When the last seed or the last COMPLETE sync finished -- what the age bound is measured
+        #: from. Never the watermark: that is the newest document's stamp, a property of how recently
+        #: anyone wrote a subscription, so on a quiet collection it ages while every sync succeeds.
+        #: Measured from it, the bound fired on a healthy mirror and -- since a seed re-derives the
+        #: same old stamp -- re-seeded every cycle forever (dev, 2026-09-15).
+        self._synced_at: datetime | None = None
         self._cursor: Any = None
         #: subscription_id -> the `monotonic()` at which THIS process last applied its own commit
         #: for it. Read by :meth:`_overtaken` and by nothing else. Bounded by a prune at the end of
@@ -2595,9 +2600,10 @@ class SubscriptionMirror:
         with self._lock:
             return len(self._entries)
 
-    def watermark_age_s(self, now: datetime) -> float | None:
+    def sync_age_s(self, now: datetime) -> float | None:
+        """Seconds since the last seed or complete sync; None before the first one."""
         with self._lock:
-            mark = self._watermark or self._seeded_at
+            mark = self._synced_at
         if mark is None:
             return None
         return max(0.0, (now - mark).total_seconds())
@@ -2608,7 +2614,7 @@ class SubscriptionMirror:
             self._entries = {}
             self._watermark = None
             self._seeded = False
-            self._seeded_at = None
+            self._synced_at = None
             self._cursor = None
             self._local_applied = {}
 
@@ -2791,10 +2797,12 @@ class SubscriptionMirror:
             self._entries = entries
             self._watermark = watermark
             self._seeded = True
-            self._seeded_at = now
+            self._synced_at = now
             self._cursor = None
             self._prune_local_applied(started)
-        return MirrorSync(synced=len(entries), pages=pages, size=len(entries), reseeded=True)
+        return MirrorSync(
+            synced=len(entries), pages=pages, size=len(entries), reseeded=True, sync_age_s=0.0
+        )
 
     def sync(self, *, now: datetime, beat: Callable[[], None] | None = None) -> MirrorSync:
         """Apply everything written since the watermark. One bounded read per cycle.
@@ -2804,16 +2812,16 @@ class SubscriptionMirror:
         """
         if not self.ready:
             return self.seed(now=now, beat=beat)
-        age = self.watermark_age_s(now)
+        age = self.sync_age_s(now)
         if age is not None and age > MIRROR_MAX_AGE_S:
             logger.warning(
-                "Subscription mirror watermark is %.0f s old; re-seeding rather than syncing",
+                "Subscription mirror last synced %.0f s ago; re-seeding rather than syncing",
                 age,
                 extra={
                     "fields": {
                         "event": "notification_store_load",
                         "result": "mirror_reseed",
-                        "watermark_age_s": int(age),
+                        "sync_age_s": int(age),
                     }
                 },
             )
@@ -2891,6 +2899,10 @@ class SubscriptionMirror:
         with self._lock:
             self._watermark = newest
             self._cursor = cursor
+            if not truncated:
+                # Only a sync that drained the collection counts: one that keeps truncating has
+                # not read the tombstones past its cursor, and the bound is about exactly those.
+                self._synced_at = now
             self._prune_local_applied(started)
             size = len(self._entries)
         return MirrorSync(
@@ -2899,7 +2911,7 @@ class SubscriptionMirror:
             pages=pages,
             size=size,
             truncated=truncated,
-            watermark_age_s=self.watermark_age_s(now),
+            sync_age_s=self.sync_age_s(now),
             overtaken=overtaken,
         )
 
