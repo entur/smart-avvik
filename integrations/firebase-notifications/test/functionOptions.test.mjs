@@ -35,7 +35,7 @@ test("the installed firebase-functions is the version this was verified against"
   );
   assert.equal(
     manifest.version,
-    "7.3.2",
+    "7.4.0",
     "the retry option's shape has moved across majors -- re-verify it before widening this",
   );
 });

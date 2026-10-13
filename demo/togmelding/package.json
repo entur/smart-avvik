@@ -9,25 +9,25 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@entur/a11y": "^0.2.113",
-    "@entur/alert": "^0.19.4",
+    "@entur/a11y": "^0.3.5",
+    "@entur/alert": "^0.21.3",
     "@entur/button": "^5.1.1",
     "@entur/expand": "^3.7.12",
     "@entur/form": "^9.3.8",
     "@entur/icons": "^10.0.6",
     "@entur/layout": "^5.0.1",
-    "@entur/loader": "^0.7.4",
+    "@entur/loader": "^0.8.7",
     "@entur/menu": "^7.3.1",
     "@entur/tokens": "^4.2.0",
     "@entur/typography": "^3.0.7",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
   },
   "devDependencies": {
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^6.0.4",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
     "typescript": "^7.0.2",
-    "vite": "^8.1.5"
+    "vite": "^8.3.2"
   }
 }

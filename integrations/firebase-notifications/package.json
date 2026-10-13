@@ -27,22 +27,24 @@
   },
   "dependencies": {
     "@entur/kix-notifications-client": "file:../notifications-client",
-    "firebase-admin": "14.4.0",
-    "firebase-functions": "7.3.2"
+    "firebase-admin": "14.5.0",
+    "firebase-functions": "7.4.0"
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^5.0.2",
     "@types/express": "^5.0.6",
     "@types/node": "^24.10.1",
-    "firebase": "^12.18.0",
+    "firebase": "^12.19.0",
     "typescript": "^7.0.2"
   },
+  "//": "overrides.@firebase/app: firebase 12.19.0 pins @firebase/app 0.16.2 while the other @firebase packages (0.x peer) stayed on a hoisted 0.16.1, so the client SDK got two app registries and the emulator suite failed with 'Service firestore is not available'. Remove the override once `npm ls @firebase/app` shows a single version without it.",
   "overrides": {
     "gaxios@6": {
       "uuid": "^11.1.1"
     },
     "@firebase/firestore": {
       "@grpc/grpc-js": "^1.14.5"
-    }
+    },
+    "@firebase/app": "0.16.2"
   }
 }
