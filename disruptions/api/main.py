@@ -1820,7 +1820,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                             "removed": report.removed,
                             "pages": report.pages,
                             "truncated": report.truncated,
-                            "watermark_age_s": report.watermark_age_s,
+                            "sync_age_s": report.sync_age_s,
                             # Documents the read returned that this process had already superseded
                             # with its own commit (U13). Expect zeros on a webhook-only deployment
                             # and small numbers once `/varsel` registrations are in the store.
@@ -1830,8 +1830,10 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                 )
                 # The series an alert rule selects on. Set from the report rather than re-derived,
                 # so the gauge and the log record cannot disagree about the same cycle.
-                if report.watermark_age_s is not None:
-                    metrics.MIRROR_AGE.set(report.watermark_age_s)
+                # A timestamp rather than the age, so the series keeps aging while syncs fail; an
+                # age set here would freeze at its last healthy value on exactly those cycles.
+                if report.sync_age_s is not None:
+                    metrics.MIRROR_LAST_SYNC.set(time.time() - report.sync_age_s)
         except Exception:
             logger.exception(
                 "The notification store's mirrors could not be synced; this cycle matches the "
