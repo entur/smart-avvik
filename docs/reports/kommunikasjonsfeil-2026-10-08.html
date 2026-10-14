@@ -1,0 +1,155 @@
+<!DOCTYPE html><html lang="no"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Togstansen 2026-10-08</title><style>
+:root{--bg:#fbfaf8;--fg:#1d1b18;--mut:#6b675f;--line:#e2ded6;--card:#fff;--acc:#b03a2e;--ok:#2e7d52;--s1:#2a78d6;--s2:#e8590c}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#171614;--fg:#eceae6;--mut:#9a958c;--line:#33312d;--card:#201f1c;--acc:#e8776a;--ok:#6cc79a;--s1:#3987e5;--s2:#e8690c}}
+:root[data-theme=dark]{--bg:#171614;--fg:#eceae6;--mut:#9a958c;--line:#33312d;--card:#201f1c;--acc:#e8776a;--ok:#6cc79a;--s1:#3987e5;--s2:#e8690c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 16px 80px}
+h1{font-size:1.75rem;margin:0 0 4px;letter-spacing:-.02em}
+h2{font-size:1.15rem;margin:44px 0 10px;letter-spacing:-.01em}
+p{max-width:76ch}
+.sub{color:var(--mut);margin:0 0 28px;font-size:.92rem;max-width:80ch}
+.kpis{display:flex;flex-wrap:wrap;gap:10px;margin:0 0 8px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 16px;min-width:150px;flex:1 1 150px}
+.kpi b{display:block;font-size:1.5rem;line-height:1.2;font-variant-numeric:tabular-nums}
+.kpi span{color:var(--mut);font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+.scroll{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th{text-align:left;font-weight:600;color:var(--mut);font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;padding:10px 12px;border-bottom:1px solid var(--line)}
+td{padding:9px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.hl{color:var(--acc);font-weight:600}
+p.note,ul.note{color:var(--mut);font-size:.85rem;max-width:76ch}
+ul.note{padding-left:20px} ul.note li{margin:0 0 6px}
+details{margin-top:12px} summary{cursor:pointer;color:var(--mut);font-size:.85rem}
+figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 8px 6px;position:relative}
+figcaption{font-size:.9rem;font-weight:600;padding:0 8px 6px}
+.legend{display:flex;gap:16px;font-size:.8rem;color:var(--mut);padding:0 8px 4px}
+.legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:6px}
+svg{width:100%;height:auto;display:block}
+.grid{stroke:var(--line);stroke-width:1} .ax{fill:var(--mut);font-size:11px} .lab{fill:var(--fg);font-size:12px}
+.mark{stroke:var(--mut);stroke-width:1;stroke-dasharray:3 3} .cross{stroke:var(--mut);stroke-width:1}
+.s1,.s2{fill:none;stroke-width:2;stroke-linejoin:round} .s1{stroke:var(--s1)} .s2{stroke:var(--s2)}
+#tip{position:absolute;pointer-events:none;background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:.8rem;display:none;white-space:nowrap}
+code{font-size:.85em}
+</style></head>
+<body><div class="wrap">
+<h1>Togstansen 2026-10-08: hva dataene viste og hva vi varslet</h1>
+<p class="sub">Vy meldte «feil i kommunikasjonssystemet» fra kl. 16:03 og stengte hele landet for togtrafikk kl. 16:49. Trafikken åpnet igjen kl. 19:33. Rapporten viser hvordan stansen så ut i SIRI-SX (operatørenes avviksmeldinger) og SIRI-ET (sanntidsdata per tog), og hva vi sendte i /varsel og /notification-api. Tallene gjelder prd (produksjonsmiljøet) der ikke annet står; dev er utviklingsmiljøet. Alle klokkeslett er norsk tid. Tallene er lest ut mellom kl. 20:00 og 20:45 samme kveld.</p>
+
+<div class="kpis">
+<div class="kpi"><b>2 t 44 min</b><span>Fra «Stengt» til «Åpnet»</span></div>
+<div class="kpi"><b>88 mot 1964</b><span>Avganger 17:00–19:30, mot dagen før</span></div>
+<div class="kpi"><b>5 av 60</b><span>Rammede registreringer som fikk varsel</span></div>
+<div class="kpi"><b>18:52</b><span>Første varsel etter «Stengt» kl. 16:49</span></div>
+</div>
+
+<h2>Kort fortalt</h2>
+<p>Stansen var godt synlig i dataene, men vi varslet nesten ingen. 60 registrerte reiser i prd hadde minst ett tog som ble innstilt, sto fast eller gikk over en time for sent mellom kl. 16:00 og 20:00. Fem av dem fikk et varsel. 17 av de 60 har ikke fått noe varsel på 14 dager og kan trolig ikke motta varsler, så vi kunne i beste fall nådd rundt 43. I tillegg fikk fem andre registreringer varsel kl. 16:28 om R22 til Mysen, som gikk i rute fra Oslo S og ble innstilt fra Kråkstad. De teller som «i rute» i tabellen lenger ned. Etter at Vy skrev «Hele landet er stengt for togtrafikk» kl. 16:49, gikk det to timer før neste varsel, kl. 18:52.</p>
+<p>Fire ting forklarer det. Modellen ga den landsdekkende meldingen lav sannsynlighet. Meldingen navnga bare 123–164 enkelttog, så de fleste registrerte tog ble vurdert uten melding. Sanntidsdataene viste nesten rutetid for tog som sto stille. Og da togene til slutt ble varselverdige, hadde flere registreringer brukt opp dagens fire varsler.</p>
+
+<h2>Slik så stansen ut i SIRI-SX</h2>
+<div class="scroll"><table>
+<thead><tr><th>Kl.</th><th>Melding fra Vy</th><th class="num">Tog navngitt</th></tr></thead><tbody>
+<tr><td>16:03</td><td>«Redusert hastighet: Myrdal–Hønefoss … Dette skyldes en feil i kommunikasjonssystemet.»</td><td class="num">4</td></tr>
+<tr><td>16:09</td><td>«Redusert hastighet: Drammen–Skien», samme årsak</td><td class="num">7</td></tr>
+<tr><td>16:10</td><td>De to første enkelttogene innstilt med samme årsak (Oslo S–Skien)</td><td class="num">2</td></tr>
+<tr><td>16:22</td><td>«Innstilt Ski–Mysen», samme årsak. Kl. 16:26: «Ta neste tog mellom Ski og Mysen.» Dette er toget vi varslet om kl. 16:28.</td><td class="num">1</td></tr>
+<tr><td>16:16</td><td>De to strekningsmeldingene lukkes</td><td class="num"></td></tr>
+<tr><td>16:18</td><td>«Redusert hastighet: Hele landet. Togene kjører saktere.»</td><td class="num">164</td></tr>
+<tr><td class="hl">16:49</td><td>«Stengt: Hele landet. Hele landet er stengt for togtrafikk.»</td><td class="num">143</td></tr>
+<tr><td>17:09–17:59</td><td>14 enkelttog innstilt Bergen–Arna og Bergen–Voss</td><td class="num">14</td></tr>
+<tr><td class="hl">19:33</td><td>«Åpnet: Hele landet. Togene kjører, men det kan ta litt tid før de er i rute.»</td><td class="num">123</td></tr>
+</tbody></table></div>
+<p class="note">Vy sendte i alt 18 enkelttog-meldinger, to strekningsmeldinger og én landsdekkende melding med denne årsaken. Den landsdekkende kom i 37 utgaver. Flytoget sendte 46 meldinger fra kl. 16:51 med teksten «Se Flytoget app eller Flytoget.no for detaljert reiseforslag», uten årsak. Go-Ahead og SJ Nord sendte ingen nye meldinger i perioden. Ingen melding nevner mobilnett. Operatørens ord er «kommunikasjonssystemet».</p>
+<p>Den landsdekkende meldingen var ikke landsdekkende i dataene. SIRI-SX-meldingen pekte på en liste av enkelttog, og lista krympet fra 164 tog til 123. Et tog som ikke sto på lista, hadde for oss ingen melding.</p>
+
+<h2>Slik så stansen ut i SIRI-ET</h2>
+<figure>
+<figcaption>Registrerte togavganger per ti minutter, alle togoperatører</figcaption>
+<div class="legend"><span><i style="background:var(--s1)"></i>Onsdag 2026-10-07</span><span><i style="background:var(--s2)"></i>Torsdag 2026-10-08</span></div>
+<svg viewBox="0 0 960 320" role="img" aria-label="Registrerte togavganger per ti minutter, 7. og 8. oktober 2026" id="chart">
+<line x1="44" x2="864" y1="286.0" y2="286.0" class="grid"/><text x="36" y="290.0" class="ax" text-anchor="end">0</text><line x1="44" x2="864" y1="218.5" y2="218.5" class="grid"/><text x="36" y="222.5" class="ax" text-anchor="end">50</text><line x1="44" x2="864" y1="151.0" y2="151.0" class="grid"/><text x="36" y="155.0" class="ax" text-anchor="end">100</text><line x1="44" x2="864" y1="83.5" y2="83.5" class="grid"/><text x="36" y="87.5" class="ax" text-anchor="end">150</text><line x1="44" x2="864" y1="16.0" y2="16.0" class="grid"/><text x="36" y="20.0" class="ax" text-anchor="end">200</text><text x="44.0" y="310" class="ax" text-anchor="middle">14:00</text><text x="188.7" y="310" class="ax" text-anchor="middle">15:00</text><text x="333.4" y="310" class="ax" text-anchor="middle">16:00</text><text x="478.1" y="310" class="ax" text-anchor="middle">17:00</text><text x="622.8" y="310" class="ax" text-anchor="middle">18:00</text><text x="767.5" y="310" class="ax" text-anchor="middle">19:00</text><text x="839.9" y="310" class="ax" text-anchor="middle">19:30</text><line x1="340.6" x2="340.6" y1="16" y2="286" class="mark"/><text x="345.6" y="28" class="ax">16:03 første melding</text><line x1="451.6" x2="451.6" y1="16" y2="286" class="mark"/><text x="456.6" y="44" class="ax">16:49 «Stengt»</text><line x1="847.1" x2="847.1" y1="16" y2="286" class="mark"/><text x="852.1" y="28" class="ax">19:33 «Åpnet»</text>
+<path d="M44.0,120.0 L68.1,111.8 L92.2,90.2 L116.4,101.0 L140.5,106.4 L164.6,121.3 L188.7,101.0 L212.8,99.7 L236.9,105.1 L261.1,94.3 L285.2,91.6 L309.3,88.9 L333.4,94.3 L357.5,93.0 L381.6,95.7 L405.8,84.8 L429.9,106.4 L454.0,79.4 L478.1,97.0 L502.2,103.7 L526.4,102.4 L550.5,99.7 L574.6,95.7 L598.7,110.5 L622.8,88.9 L646.9,109.1 L671.1,95.7 L695.2,98.4 L719.3,111.8 L743.4,120.0 L767.5,141.6 L791.6,132.1 L815.8,132.1 L839.9,125.4 L864.0,121.3" class="s1"/><path d="M44.0,117.2 L68.1,106.4 L92.2,94.3 L116.4,122.7 L140.5,98.4 L164.6,111.8 L188.7,91.6 L212.8,76.8 L236.9,99.7 L261.1,91.6 L285.2,109.1 L309.3,93.0 L333.4,93.0 L357.5,84.8 L381.6,90.2 L405.8,99.7 L429.9,125.4 L454.0,249.6 L478.1,272.5 L502.2,273.8 L526.4,280.6 L550.5,283.3 L574.6,284.6 L598.7,281.9 L622.8,281.9 L646.9,273.8 L671.1,276.6 L695.2,277.9 L719.3,281.9 L743.4,275.2 L767.5,281.9 L791.6,276.6 L815.8,268.5 L839.9,107.8 L864.0,105.1" class="s2"/>
+<text x="622.8" y="76.9" class="lab" text-anchor="middle">7. oktober</text>
+<text x="622.8" y="269.9" class="lab" text-anchor="middle">8. oktober</text>
+<line id="cross" y1="16" y2="286" class="cross" visibility="hidden"/>
+<rect x="44" y="16" width="820" height="270" fill="transparent" id="hit"/>
+</svg><div id="tip"></div>
+</figure>
+<p>Avgangene falt fra rundt 140 per ti minutter til 27 kl. 16:50 og lå på 1–13 fram til 19:20. Mellom kl. 17:00 og 19:30 registrerte ET 88 avganger. Dagen før var tallet 1964. Kl. 19:30 var trafikken tilbake på vanlig volum, og Vy-togene som da gikk, var i median 165 minutter forsinket.</p>
+<p>Meldingsstrømmen i ET falt samtidig, fra om lag 1000 meldinger per ti minutter til 100–190. ET alene kan ikke skille «togene står» fra «rapporteringen har stoppet». SX-teksten og forsinkelsen på 165 minutter da togene gikk igjen, viser at togene sto.</p>
+<p>Innstillingene kom sent og dekket bare en del. 146 tog fikk sitt første innstillingsflagg i ET mellom kl. 16:00 og 20:00 (Vy 89, Flytoget 46, SJ Nord 8, Go-Ahead 3), mot 14 dagen før. Resten sto i ET som planlagt. ET bar forventede tider for dem, men tidene ble ikke oppdatert: kl. 19:25 hadde 110 av 127 Vy-tog med planlagt avgang mellom kl. 17 og 19 fortsatt under ti minutters forventet forsinkelse, og bare 4 hadde over en time. Da hadde togene stått i opptil to og en halv time. Begge dagene gikk med streikeredusert ruteplan, så onsdagen er sammenlignbar, men ikke en normaldag.</p>
+<details><summary>Tabell: avganger og ET-meldinger per ti minutter fra kl. 16:00</summary>
+<div class="scroll"><table><thead><tr><th>Kl.</th><th class="num">Avganger 10-07</th><th class="num">Avganger 10-08</th><th class="num">ET-meldinger 10-07</th><th class="num">ET-meldinger 10-08</th></tr></thead><tbody><tr><td>16:00</td><td class="num">142</td><td class="num">143</td><td class="num">800</td><td class="num">869</td></tr><tr><td>16:10</td><td class="num">143</td><td class="num">149</td><td class="num">850</td><td class="num">940</td></tr><tr><td>16:20</td><td class="num">141</td><td class="num">145</td><td class="num">946</td><td class="num">985</td></tr><tr><td>16:30</td><td class="num">149</td><td class="num">138</td><td class="num">908</td><td class="num">1043</td></tr><tr><td>16:40</td><td class="num">133</td><td class="num">119</td><td class="num">911</td><td class="num">1054</td></tr><tr><td>16:50</td><td class="num">153</td><td class="num hl">27</td><td class="num">928</td><td class="num">851</td></tr><tr><td>17:00</td><td class="num">140</td><td class="num hl">10</td><td class="num">965</td><td class="num hl">299</td></tr><tr><td>17:10</td><td class="num">135</td><td class="num hl">9</td><td class="num">871</td><td class="num hl">138</td></tr><tr><td>17:20</td><td class="num">136</td><td class="num hl">4</td><td class="num">810</td><td class="num hl">98</td></tr><tr><td>17:30</td><td class="num">138</td><td class="num hl">2</td><td class="num">898</td><td class="num hl">153</td></tr><tr><td>17:40</td><td class="num">141</td><td class="num hl">1</td><td class="num">874</td><td class="num hl">130</td></tr><tr><td>17:50</td><td class="num">130</td><td class="num hl">3</td><td class="num">785</td><td class="num hl">148</td></tr><tr><td>18:00</td><td class="num">146</td><td class="num hl">3</td><td class="num">838</td><td class="num hl">136</td></tr><tr><td>18:10</td><td class="num">131</td><td class="num hl">9</td><td class="num">727</td><td class="num hl">130</td></tr><tr><td>18:20</td><td class="num">141</td><td class="num hl">7</td><td class="num">751</td><td class="num hl">138</td></tr><tr><td>18:30</td><td class="num">139</td><td class="num hl">6</td><td class="num">788</td><td class="num hl">127</td></tr><tr><td>18:40</td><td class="num">129</td><td class="num hl">3</td><td class="num">785</td><td class="num hl">119</td></tr><tr><td>18:50</td><td class="num">123</td><td class="num hl">8</td><td class="num">733</td><td class="num hl">175</td></tr><tr><td>19:00</td><td class="num">107</td><td class="num hl">3</td><td class="num">655</td><td class="num hl">189</td></tr><tr><td>19:10</td><td class="num">114</td><td class="num hl">7</td><td class="num">674</td><td class="num hl">134</td></tr><tr><td>19:20</td><td class="num">114</td><td class="num hl">13</td><td class="num">703</td><td class="num hl">130</td></tr><tr><td>19:30</td><td class="num">119</td><td class="num">132</td><td class="num">767</td><td class="num">935</td></tr><tr><td>19:40</td><td class="num">122</td><td class="num">134</td><td class="num">722</td><td class="num">1120</td></tr></tbody></table></div></details>
+
+<h2>Hva /varsel sendte</h2>
+<p>Tabellen teller par av registrert reise og tog i prd, med planlagt avgang fra den reisendes stoppested mellom kl. 16:00 og 20:00. Tog som Vy hadde tatt ut av ruteplanen på forhånd, er holdt utenfor. De ble varslet i morgensammendraget.</p>
+<div class="scroll"><table>
+<thead><tr><th>Utfall for toget</th><th class="num">Par (reise × tog)</th><th class="num">Varslet</th></tr></thead><tbody>
+<tr><td>Innstilt i ET</td><td class="num">130</td><td class="num">3</td></tr>
+<tr><td>Over 60 minutter forsinket</td><td class="num">83</td><td class="num">0</td></tr>
+<tr><td>10–59 minutter forsinket</td><td class="num">2</td><td class="num">0</td></tr>
+<tr><td>Verken gått eller innstilt da tallene ble lest</td><td class="num">140</td><td class="num">3</td></tr>
+<tr><td><b>Rammet i alt</b> (60 registreringer, 94 tog)</td><td class="num"><b>355</b></td><td class="num hl"><b>6</b></td></tr>
+<tr><td>Gikk i rute fra påstigningsstoppet (nesten alle før kl. 16:50)</td><td class="num">243</td><td class="num">5</td></tr>
+</tbody></table></div>
+
+<p><b>Modellen trodde ikke på meldingen.</b> Beslutningsloggen har 882 vurderinger av den landsdekkende meldingen mot registrerte tog. Under «Redusert hastighet: Hele landet» var median sannsynlighet for avvik 0,35, og 2 av 418 vurderinger kom over terskelen på 0,65. Under «Stengt: Hele landet» falt medianen til 0,21, og typisk forventet forsinkelse falt fra 42 til 3 minutter. Den strengeste meldingen Vy kan sende, ga altså lavere tall enn den mildere. Hvorfor har vi ikke undersøkt. En hypotese er at «Stengt» sammen med «Hele landet» knapt finnes i treningsdataene.</p>
+<p><b>De fleste tog hadde ingen melding.</b> Bare 128 av de 355 rammede parene var koblet til den landsdekkende meldingen. Resten ble vurdert uten SX-melding, der terskelen er 0,85 og det eneste signalet er siste observerte forsinkelse. Et tog som står stille, rapporterer ingen ny avgang, og ETs forventede tider flyttet seg heller ikke. Siste observasjon for RE10 kl. 16:34 var fortsatt «3 minutter forsinket ved Oslo S» 49 minutter senere. De 74 parene som endte over en time forsinket i halvtimen fra 16:30, hadde median høyeste sannsynlighet på 0,09. Stillhet i ET leses som punktlighet. Vi bruker ikke ETs forventede tider i dag, men denne dagen hadde de ikke hjulpet.</p>
+<p><b>Dagstaket stoppet varsler mot slutten.</b> Fra kl. 18:50 ble flere tog varselverdige, fordi ET meldte innstillinger og modellen uten SX slo ut på L1 og L2. Da hadde flere registreringer brukt dagens fire varsler på morgensammendraget om tog tatt ut av ruteplanen og på avvik tidligere på dagen. Loggen viser at taket holdt tilbake opptil 11 varsler per runde for opptil 5 registreringer mellom kl. 18 og 20. Taket forklarer ikke alt: 11 registreringer hadde varselverdige tog som ikke ble sendt, og 4 av dem har ikke fått noe varsel på 14 dager. De er trolig enheter uten varsler slått på. Ett eksempel på taket: et R22-tog mot Oslo S med avgang kl. 17:47 lå på 0,94 fra kl. 17:30 uten at varselet ble sendt.</p>
+
+<h2>Varslene som gikk ut</h2>
+<div class="scroll"><table>
+<thead><tr><th>Kl.</th><th class="num">Antall</th><th>Kilde</th><th>Tekst (eksempel)</th><th>Kommentar</th></tr></thead><tbody>
+<tr><td>16:28</td><td class="num">5</td><td>SX, enkelttog</td><td>«Det er 73 % sjanse for at tog R22 Mysen 16:29 blir innstilt.»</td><td>Sendt ett minutt før avgang. Toget gikk i rute fra Oslo S og ble innstilt fra Kråkstad til Mysen, som varslet. Årsaken var kommunikasjonsfeilen.</td></tr>
+<tr><td>16:34–16:43</td><td class="num">3</td><td>SX, Ruter buss 23</td><td>«Buss 23 16:57 kan bli typisk 21–37 min forsinket.»</td><td>Kø i veitrafikken, ikke togstansen.</td></tr>
+<tr><td>18:52</td><td class="num">2</td><td>ET-innstilling + «Stengt: Hele landet»</td><td>«Tog L1 Asker 18:57 er innstilt. Ta tog R13 Drammen 19:19 i stedet.»</td><td>Første varsel etter stengingen. R13 19:19 hadde ikke gått fra Oslo S kl. 19:54.</td></tr>
+<tr><td>18:52</td><td class="num">3</td><td>Uten SX</td><td>«Det er 88 % sjanse for at tog L1 Lillestrøm 19:20 blir innstilt.»</td><td>Ingen årsak i teksten, etter reglene for varsler uten melding.</td></tr>
+<tr><td>19:24, 19:52</td><td class="num">2</td><td>Uten SX</td><td>«Tog RE20 Oslo S 19:14 kan bli typisk 56–90 min forsinket.»</td><td>Det siste gikk 39 minutter etter planlagt avgang.</td></tr>
+</tbody></table></div>
+<p class="note">15 varsler i prd mellom kl. 16:00 og 20:00, 12 av dem om tog. Dev sendte to varsler uten SX kl. 18:46. Alternativene kl. 18:52 pekte på tog som selv sto i stansen. Alternativsøket vet ikke at hele nettet er stengt.</p>
+<p>Rushvarsel (/togmelding) sendte rødt nivå for ettermiddagsrushet kl. 12:00 til 22 mottakere, begrunnet med innstillinger og kuttet ruteplan tidligere på dagen. Runden kl. 14:00 ga ingen endring. Rushvarsel har ingen runde etter kl. 14:00, så det sa ingenting om stansen.</p>
+
+<h2>Hva /notification-api sendte</h2>
+<p>Ingenting i prd, og det kunne ikke blitt noe. Prd har ingen webhook-abonnement: beslutningsloggen har null webhook-rader de siste 14 dagene, og leveringsarbeideren fant null hendelser i hver runde. Det åpne oppslaget <code>journey-alerts</code> ble lest seks ganger rundt kl. 15:49 og ikke én gang under stansen.</p>
+<p>Dev har testabonnement. Der ble to hendelser laget kl. 19:48, begge for F4 til Bergen («kan bli typisk 56–90 min forsinket. Kl. 17:00 var toget 164 min forsinket ved Drammen stasjon»). Ingen ble levert. Testklientens adresse er en midlertidig tunnel som ikke lenger finnes i DNS, og senderen avviste den. Meldingen «Hele landet» traff testabonnementene uten å komme over terskelen, som i /varsel.</p>
+
+<h2>Systemet selv</h2>
+<p>Polleren, bakgrunnsjobben som henter data og lager prediksjoner om lag hvert annet minutt, gikk uten opphold: 104 runder i prd mellom kl. 15:30 og 20:00, hver på 49–90 sekunder.</p>
+
+<h2>Hva vi bør se på</h2>
+<ul>
+<li><b>Stengt strekning som faktum.</b> En SX-melding som sier «stengt», bør gi sikkert avvik uten modell, slik en erklært innstilling i ET gjør. Sikkert avvik, ikke sikker innstilling: 83 av parene endte over en time forsinket, ikke innstilt. I dag vinner modellens tall.</li>
+<li><b>Meldinger som gjelder hele nettet.</b> Når en melding navngir over hundre tog og teksten sier «Hele landet», bør den gjelde alle tog, ikke bare dem på lista.</li>
+<li><b>Stillhet i ET.</b> Et tog som skulle ha passert et stopp og ikke er observert, er et signal. I dag teller det som siste kjente forsinkelse. ETs forventede tider kan ikke erstatte dette, for de sto også stille.</li>
+<li><b>Dagstaket.</b> Morgensammendraget om tog tatt ut av ruteplanen bruker én av fire plasser. Registreringer med avvik om morgenen hadde ingen plasser igjen da stansen kom.</li>
+<li><b>Alternativer under full stans.</b> Vi foreslo tog som ikke gikk.</li>
+</ul>
+
+<h2>Forbehold og kilder</h2>
+<ul class="note">
+<li>Utfall per tog er lest fra <code>rail_calls_planned_today</code> i prd, sist bygd kl. 19:54. «Verken gått eller innstilt» betyr at ET da verken hadde registrert avgang eller innstilling. Nattens merkejobb gir fasit, og tallene kan flytte seg litt.</li>
+<li>Utfallet gjelder avgangen fra den reisendes påstigningsstopp. Et tog som gikk i rute derfra og ble innstilt senere på strekningen, teller som «i rute». Det gjelder de fem varslene kl. 16:28, som var riktige for reisende forbi Ski.</li>
+<li>SX: <code>ent-anshar-prd.realtime.siri_realtime_sx_production</code>, dagens partisjon og strømmebufferen. ET: <code>siri_realtime_et_production</code> for 2026-10-07 og 2026-10-08, tog (<code>vehicleModes = RAIL</code>). Avganger er unike registrerte avgangstider per tog og stopp.</li>
+<li>Varsler: <code>disruptions.varsel_decisions</code> i prd og dev, kanal <code>browser</code> og <code>webhook</code>. Dagstak, webhook-levering og pollerrunder er lest fra applikasjonsloggen (<code>push_capped</code>, <code>webhook_delivery_round</code>, <code>notification_emit</code>, <code>poller_cycle</code>).</li>
+<li>«Kan trolig ikke motta varsler» er en tilnærming: registreringen har ingen sendte varsler i beslutningsloggen siste 14 dager. Vi har ikke lest abonnementene.</li>
+<li>Spørringene ligger ikke i repoet. Denne lista er den eneste beskrivelsen av hvordan tallene er laget.</li>
+<li>Forklaringen på de lave sannsynlighetene er delvis målt (siste observasjon, andelen tog uten melding) og delvis hypotese (hvorfor «Stengt» ga lavere tall enn «Redusert hastighet»).</li>
+</ul>
+</div>
+<script>
+(()=>{const bins=["14:00", "14:10", "14:20", "14:30", "14:40", "14:50", "15:00", "15:10", "15:20", "15:30", "15:40", "15:50", "16:00", "16:10", "16:20", "16:30", "16:40", "16:50", "17:00", "17:10", "17:20", "17:30", "17:40", "17:50", "18:00", "18:10", "18:20", "18:30", "18:40", "18:50", "19:00", "19:10", "19:20", "19:30", "19:40"],a=[123, 129, 145, 137, 133, 122, 137, 138, 134, 142, 144, 146, 142, 143, 141, 149, 133, 153, 140, 135, 136, 138, 141, 130, 146, 131, 141, 139, 129, 123, 107, 114, 114, 119, 122],b=[125, 133, 142, 121, 139, 129, 144, 155, 138, 144, 131, 143, 143, 149, 145, 138, 119, 27, 10, 9, 4, 2, 1, 3, 3, 9, 7, 6, 3, 8, 3, 7, 13, 132, 134];
+const svg=document.getElementById('chart'),hit=document.getElementById('hit'),cross=document.getElementById('cross'),tip=document.getElementById('tip');
+const L=44,R=96,W=960;
+hit.addEventListener('pointermove',e=>{const r=svg.getBoundingClientRect(),x=(e.clientX-r.left)/r.width*W;
+let i=Math.round((x-L)/(W-L-R)*(bins.length-1));i=Math.max(0,Math.min(bins.length-1,i));
+const cx=L+i*(W-L-R)/(bins.length-1);cross.setAttribute('x1',cx);cross.setAttribute('x2',cx);cross.setAttribute('visibility','visible');
+tip.textContent='';const t=document.createElement('b');t.textContent='Kl. '+bins[i];tip.append(t,document.createElement('br'),'7. oktober: '+a[i],document.createElement('br'),'8. oktober: '+b[i]);
+tip.style.display='block';const fx=cx/W*r.width;tip.style.left=Math.min(fx+12,r.width-150)+'px';tip.style.top=(svg.offsetTop+8)+'px';});
+hit.addEventListener('pointerleave',()=>{cross.setAttribute('visibility','hidden');tip.style.display='none';});})();
+</script>
+</body></html>
