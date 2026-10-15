@@ -7,7 +7,10 @@ publishing SX on SJ's behalf.
 
 **Decision: serve SJN through the existing rail family, zero-shot.** No new model and no retrain.
 SJN trains enter the planned rail table, and three paths serve them unchanged: the no-SX path
-(`has_situation = FALSE`, the 0.85 gate), the ET-cancellation relay and the «I dag» strip. Every
+(`has_situation = FALSE`, the 0.85 gate), the ET-cancellation relay and the «I dag» strip. On the
+test snapshot (2026-10-15, 71 SJN trains scored) the no-SX path produced rows and nothing cleared
+the gate. No SJN call was cancelled that day, so the relay has no SJN-specific predicate but was not
+exercised. Every
 number below was measured this session; the session billed about $1.30 of BigQuery.
 
 ## TL;DR
@@ -132,6 +135,22 @@ belongs in a follow-up ticket.
 Checked and left alone: `rail_calls_removed_today.sql` (GTFS filtered to VYG, and SJN jkeys never
 match its regexes); `varsel_connectivity.sql` (SJN-only stop pairs correctly become servable);
 `line_modes.py` (already maps SJN to «Tog»).
+
+## Not covered by the measurement
+
+- **Live feature skew.** The numbers above come from the training pipeline. Live serving on `main`
+  still measures `own_prev_delay` and `line_now_*` from `CURRENT_TIMESTAMP()`, which the unmerged fix
+  `79a88cb` (branch `feat/p-cancel-recalibration`) corrects. SJN's stops are far apart (Oslo S →
+  Lillestrøm → Gardermoen → Hamar), so "no observed stop ≥ 30 min back" is more common per call than
+  on L1. Expect live SJN `p_cancel` to run high until that fix lands. Land it before taking SJN to
+  prd.
+- **Scoring cost.** The planned build reads the same ET bytes, but `predict_calls.sql`'s input
+  grows: SJN was 2 781 of 17 979 planned rows (15 %) on the test snapshot. Read `poller_phase` for
+  `predict_calls_*` after the dev deploy to see what that does to the ~0.9 GB of `ML.PREDICT` per
+  rebuild.
+- **Conflict surface.** This branch and `feat/p-cancel-recalibration` both touch
+  `predict_calls.sql` and `rail_calls_planned_today.sql`, in different hunks, so whichever lands
+  second rebases cleanly.
 
 ## Follow-ups
 
