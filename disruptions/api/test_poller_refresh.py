@@ -1521,6 +1521,35 @@ def test_the_warm_load_runs_before_the_poller_starts():
     assert source.index("warm_caches_from_last_build()") < source.index("thread.start()")
 
 
+
+# ---- Live features read the planned table's clock, not the wall clock ----------------------------
+
+
+def _cte(sql: str, name: str) -> str:
+    start = sql.index(f"\n{name} AS (")
+    return sql[start : sql.index("\n),", start)]
+
+
+def test_live_features_are_measured_from_when_the_planned_table_was_built():
+    """The planned tables are rebuilt on a TTL (an hour for rail), so "the last hour" and the ask
+    horizon measured from CURRENT_TIMESTAMP() read every stop passed since the build as unobserved.
+    The model learned an unobserved earlier stop as "its earlier calls were cancelled", and live
+    p_cancel ran far above what happened (2026-10-13). Both live files must anchor on `built_at`."""
+    from pathlib import Path
+
+    here = Path(main.__file__).parent
+    for predict, planned in (
+        ("predict_calls.sql", "rail_calls_planned_today"),
+        ("predict_calls_bus.sql", "bus_calls_planned_today"),
+    ):
+        sql = (here / predict).read_text()
+        assert "MAX(built_at)" in _cte(sql, "asof") and planned in _cte(sql, "asof"), predict
+        assert "CURRENT_TIMESTAMP()" not in _cte(sql, "linenow"), predict
+        assert "(SELECT t FROM asof)" in _cte(sql, "linenow"), predict
+        bucket = sql[sql.index("CASE", sql.index("\ncalls AS (")) : sql.index("AS lead_bucket")]
+        assert "CURRENT_TIMESTAMP()" not in bucket and bucket.count("(SELECT t FROM asof)") == 4, predict
+        assert "CURRENT_TIMESTAMP() AS built_at" in (here / f"{planned}.sql").read_text(), planned
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
