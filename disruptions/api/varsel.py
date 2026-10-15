@@ -2561,6 +2561,29 @@ def _digest_payload(digest: _Digest, *, now: datetime) -> dict:
     }
 
 
+#: The push services browsers actually issue subscriptions on. The endpoint is client-supplied and
+#: the server POSTs to it, so anything else is an SSRF lever into the cluster (internal hosts,
+#: loopback, a redirect to either). A host allow-list rather than an address check: resolving and
+#: then letting requests resolve again is the rebinding race `webhook_sender` documents, and nobody
+#: but Google/Mozilla/Microsoft/Apple controls these names. Chrome-family -> FCM, Firefox -> autopush,
+#: Edge on Windows -> WNS, Safari -> `*.push.apple.com` (Apple's documented allow-list entry).
+_PUSH_HOSTS = frozenset({"fcm.googleapis.com"})
+_PUSH_HOST_SUFFIXES = (".push.services.mozilla.com", ".notify.windows.com", ".push.apple.com")
+# A strict shape instead of urlsplit: the authority must be bare letters/digits/dots/hyphens ending
+# at "/" or the end, so no userinfo, port, backslash or whitespace can make urllib3 (which sends)
+# and urllib.parse (which pywebpush reads the VAPID audience with) see two different hosts.
+_PUSH_ENDPOINT = re.compile(r"https://([A-Za-z0-9.-]+)(/[!-~]*)?")
+
+
+def push_endpoint_allowed(endpoint: object) -> bool:
+    """Whether a subscription endpoint is an https URL on a known Web Push service."""
+    match = _PUSH_ENDPOINT.fullmatch(endpoint) if isinstance(endpoint, str) else None
+    if match is None:
+        return False
+    host = match.group(1).lower()
+    return host in _PUSH_HOSTS or host.endswith(_PUSH_HOST_SUFFIXES)
+
+
 def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     """Send one Web Push. Returns ``(result, error_detail)``: result is 'sent', 'gone' (404/410 —
     drop the device) or 'error' (retry); error_detail is None on success, else the failure's
@@ -2576,6 +2599,11 @@ def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     host = endpoint.split("/", 3)[2] if "://" in endpoint else endpoint[:40]
     error_detail: dict | None = None
     try:
+        # Checked again at send time, not only at registration: a stored record predates the
+        # registration check or came in by import. Raised as WebPushException so it is one counted,
+        # WARNING-level "error" with no socket opened -- never a probe that reaches the network.
+        if not push_endpoint_allowed(endpoint):
+            raise WebPushException(f"refused endpoint: not a known Web Push service ({host})")
         webpush(
             subscription_info=subscription,
             data=json.dumps(payload),
@@ -5751,6 +5779,8 @@ class DeviceIn(BaseModel):
     def _has_endpoint(cls, v: dict) -> dict:
         if not isinstance(v, dict) or not v.get("endpoint"):
             raise ValueError("subscription must include an endpoint")
+        if not push_endpoint_allowed(v["endpoint"]):
+            raise ValueError("subscription endpoint must be an https URL on a known push service")
         return v
 
 
