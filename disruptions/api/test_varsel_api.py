@@ -68,7 +68,7 @@ from test_varsel import (  # reuse the synthetic call shape + the stubbed main
 )
 
 DEVICE = "dev-abc12345"
-SUBSCRIPTION = {"endpoint": "https://push.example.com/x", "keys": {"p256dh": "k", "auth": "a"}}
+SUBSCRIPTION = {"endpoint": "https://fcm.googleapis.com/x", "keys": {"p256dh": "k", "auth": "a"}}
 
 # Oslo stops A (order 1) -> B (order 5) on a train flagged by situation S1. The endpoints match
 # against the real clock (departed trains are filtered out), so the departure must lie in the
@@ -1132,6 +1132,50 @@ def test_the_brand_survives_a_state_reload():
         varsel._devices.clear()
     varsel._apply_state(blob)
     assert varsel._devices[DEVICE]["brand"] == "none"
+
+
+def test_a_push_endpoint_off_the_known_push_services_is_refused_and_never_dialled():
+    """SSRF: the server POSTs to the client-supplied endpoint, so only https URLs on the browser
+    push services are accepted -- at registration (422) and again at send (no socket opened)."""
+    import pywebpush
+
+    _reset_state()
+    keys = {"p256dh": "k", "auth": "a"}
+    for endpoint in (
+        "http://fcm.googleapis.com/x",  # not https
+        "https://10.0.0.1:8080/x",  # internal address
+        "https://localhost/x",
+        "https://evil.example/x",  # arbitrary host
+        "https://fcm.googleapis.com@evil.example/x",  # userinfo
+        "https://evil.example\\@fcm.googleapis.com/x",  # backslash parser differential
+        "https://fcm.googleapis.com:8080/x",  # port
+        "https://fcm.googleapis.com.evil.example/x",  # suffix trick
+        "https://fcm.googleapis.com/x\nHost: evil",  # whitespace
+    ):
+        r = client.post(
+            "/varsel-api/devices",
+            json={"device_id": DEVICE, "subscription": {"endpoint": endpoint, "keys": keys}},
+        )
+        assert r.status_code == 422, (endpoint, r.status_code)
+    assert DEVICE not in varsel._devices
+    for endpoint in (
+        "https://fcm.googleapis.com/fcm/send/abc:APA91b-_x",
+        "https://updates.push.services.mozilla.com/wpush/v2/gAAAAA",
+        "https://wns2-db5p.notify.windows.com/w/?token=BQYAAAB%2b%2f",
+        "https://web.push.apple.com/QGx_y-z",
+    ):
+        assert varsel.push_endpoint_allowed(endpoint), endpoint
+
+    # A record that predates the check (or came in by import) is refused at send, never dialled.
+    dialled = []
+    before = pywebpush.webpush
+    pywebpush.webpush = lambda **kwargs: dialled.append(kwargs)
+    try:
+        result, detail = varsel._send_push({"endpoint": "http://10.0.0.1/x"}, {"title": "t"})
+    finally:
+        pywebpush.webpush = before
+    assert result == "error" and dialled == []
+    assert detail["status"] is None and "refused endpoint" in detail["body"]
 
 
 def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
@@ -3879,6 +3923,31 @@ def test_delete_all_rejects_out_of_bounds_device_ids():
     assert client.delete("/varsel-api/devices/short/data").status_code == 422
 
 
+def test_a_device_id_carrying_a_slash_is_refused_and_nothing_else_is():
+    """A device_id becomes a Firestore document id, and the client splits a document path on "/",
+    so "aaaaaaaa/x/bbbbbbbb" would write the nested document devices/aaaaaaaa/x/bbbbbbbb -- outside
+    the device ceiling, the TTL policy and the export. Every route that takes the id from a body or
+    the query string refuses a "/", and refuses nothing else: the ids the PWA mints, an id with a
+    character outside any charset, and the empty query value all answer as they did before."""
+    _reset_state()
+    slashed = "aaaaaaaa/x/bbbbbbbb"
+
+    def refused(r):
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"][0]["loc"][-1] == "device_id", r.text
+
+    refused(client.post("/varsel-api/devices", json={"device_id": slashed, "subscription": SUBSCRIPTION}))
+    refused(client.post("/varsel-api/journeys", json={"device_id": slashed, **JOURNEY_BODY}))
+    refused(client.post("/varsel-api/test", json={"device_id": slashed}))
+    refused(client.get("/varsel-api/journeys", params={"device_id": slashed}))
+    refused(client.delete("/varsel-api/journeys/j-unknown", params={"device_id": slashed}))
+
+    for kept in ("0b6f2c1e-3d4a-4f5b-8c9d-0e1f2a3b4c5d", "dev-1760000000000-k3j4h5g6f7", "dev.12345678"):
+        r = client.post("/varsel-api/devices", json={"device_id": kept, "subscription": SUBSCRIPTION})
+        assert r.status_code == 200, (kept, r.text)
+    assert client.get("/varsel-api/journeys", params={"device_id": ""}).status_code == 200
+
+
 def test_delete_all_without_a_device_record_still_deletes_journeys():
     """Push never enabled → no device record, but the journeys are still the user's data."""
     _reset_state()
@@ -6112,7 +6181,7 @@ def test_a_failed_push_keeps_its_severity_and_an_unexpected_raise_keeps_its_trac
         try:
             with _capture_varsel_logs() as records:
                 result, detail = varsel._send_push(
-                    {"endpoint": "https://push.example.com/sub/1"}, {"title": "t", "body": "b"}
+                    {"endpoint": "https://fcm.googleapis.com/sub/1"}, {"title": "t", "body": "b"}
                 )
                 pushes = [r for r in records if getattr(r, "fields", {}).get("event") == "push"]
                 varsel._log_push("alert", result, "dev-1", {"title": "t"}, error_detail=detail)

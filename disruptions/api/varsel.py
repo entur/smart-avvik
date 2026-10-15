@@ -2561,6 +2561,29 @@ def _digest_payload(digest: _Digest, *, now: datetime) -> dict:
     }
 
 
+#: The push services browsers actually issue subscriptions on. The endpoint is client-supplied and
+#: the server POSTs to it, so anything else is an SSRF lever into the cluster (internal hosts,
+#: loopback, a redirect to either). A host allow-list rather than an address check: resolving and
+#: then letting requests resolve again is the rebinding race `webhook_sender` documents, and nobody
+#: but Google/Mozilla/Microsoft/Apple controls these names. Chrome-family -> FCM, Firefox -> autopush,
+#: Edge on Windows -> WNS, Safari -> `*.push.apple.com` (Apple's documented allow-list entry).
+_PUSH_HOSTS = frozenset({"fcm.googleapis.com"})
+_PUSH_HOST_SUFFIXES = (".push.services.mozilla.com", ".notify.windows.com", ".push.apple.com")
+# A strict shape instead of urlsplit: the authority must be bare letters/digits/dots/hyphens ending
+# at "/" or the end, so no userinfo, port, backslash or whitespace can make urllib3 (which sends)
+# and urllib.parse (which pywebpush reads the VAPID audience with) see two different hosts.
+_PUSH_ENDPOINT = re.compile(r"https://([A-Za-z0-9.-]+)(/[!-~]*)?")
+
+
+def push_endpoint_allowed(endpoint: object) -> bool:
+    """Whether a subscription endpoint is an https URL on a known Web Push service."""
+    match = _PUSH_ENDPOINT.fullmatch(endpoint) if isinstance(endpoint, str) else None
+    if match is None:
+        return False
+    host = match.group(1).lower()
+    return host in _PUSH_HOSTS or host.endswith(_PUSH_HOST_SUFFIXES)
+
+
 def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     """Send one Web Push. Returns ``(result, error_detail)``: result is 'sent', 'gone' (404/410 —
     drop the device) or 'error' (retry); error_detail is None on success, else the failure's
@@ -2576,6 +2599,11 @@ def _send_push(subscription: dict, payload: dict) -> tuple[str, dict | None]:
     host = endpoint.split("/", 3)[2] if "://" in endpoint else endpoint[:40]
     error_detail: dict | None = None
     try:
+        # Checked again at send time, not only at registration: a stored record predates the
+        # registration check or came in by import. Raised as WebPushException so it is one counted,
+        # WARNING-level "error" with no socket opened -- never a probe that reaches the network.
+        if not push_endpoint_allowed(endpoint):
+            raise WebPushException(f"refused endpoint: not a known Web Push service ({host})")
         webpush(
             subscription_info=subscription,
             data=json.dumps(payload),
@@ -5731,10 +5759,22 @@ class StopItem(BaseModel):
     )
 
 
+# A device_id becomes a Firestore document id (`notification_store._Refs.device`), and the client
+# splits a document path on "/": "a/x/b" would write the nested document devices/a/x/b, which the
+# device ceiling, the TTL policy and the export never see. So "/" is refused and nothing else is --
+# no charset, so a UUID, the legacy `dev-<ts>-<rand>` and any other id without "/" stay legal. The
+# body models need at least one character (min_length=8 also keeps out Firestore's "." and ".."); the
+# two query parameters keep accepting the empty string they accepted before.
+_DEVICE_ID_PATTERN = r"^[^/]+$"
+_DEVICE_ID_QUERY_PATTERN = r"^[^/]*$"
+
+
 class DeviceIn(BaseModel):
     """A device registering (or refreshing) its Web Push subscription."""
 
-    device_id: str = Field(min_length=8, max_length=100, description="Client-generated UUID.")
+    device_id: str = Field(
+        min_length=8, max_length=100, pattern=_DEVICE_ID_PATTERN, description="Client-generated UUID."
+    )
     subscription: dict = Field(description="The PushSubscription JSON (endpoint + keys).")
     brand: str | None = Field(
         default=None,
@@ -5751,13 +5791,15 @@ class DeviceIn(BaseModel):
     def _has_endpoint(cls, v: dict) -> dict:
         if not isinstance(v, dict) or not v.get("endpoint"):
             raise ValueError("subscription must include an endpoint")
+        if not push_endpoint_allowed(v["endpoint"]):
+            raise ValueError("subscription endpoint must be an https URL on a known push service")
         return v
 
 
 class JourneyIn(BaseModel):
     """A journey to register for alerts."""
 
-    device_id: str = Field(min_length=8, max_length=100)
+    device_id: str = Field(min_length=8, max_length=100, pattern=_DEVICE_ID_PATTERN)
     from_stop: str = Field(min_length=1, max_length=80)
     from_name: str | None = Field(default=None, max_length=120)
     to_stop: str = Field(min_length=1, max_length=80)
@@ -5853,7 +5895,7 @@ class JourneysResponse(BaseModel):
 class TestIn(BaseModel):
     """Request a test push to verify the pipe end to end."""
 
-    device_id: str = Field(min_length=8, max_length=100)
+    device_id: str = Field(min_length=8, max_length=100, pattern=_DEVICE_ID_PATTERN)
 
 
 class ClientLogIn(BaseModel):
@@ -6007,8 +6049,9 @@ def delete_device_data(
     is authoritative and a lost write costs one restart's worth of freshness, whereas here it
     costs the erasure itself.
 
-    The path param carries the same bounds every body model puts on `device_id` (FastAPI validates
-    a path param only where constraints are declared). No charset pattern: the legacy fallback id
+    The path param carries the same length bounds every body model puts on `device_id` (FastAPI
+    validates a path param only where constraints are declared). It does not repeat their "no '/'"
+    pattern, because a path segment cannot carry a "/". No charset pattern: the legacy fallback id
     shape `dev-<ts>-<rand>` must stay legal.
 
     Plain `def`, not `async def`: `_save_state` blocks on GCS. See `upsert_device`.
@@ -6214,7 +6257,7 @@ def _feedback_observation(obs: LatestObservation | None) -> str | None:
 
 @router.get("/journeys", summary="A device's journeys with the disruptions currently hitting them")
 def list_journeys(
-    device_id: str = Query(description="Client-generated device UUID."),
+    device_id: str = Query(pattern=_DEVICE_ID_QUERY_PATTERN, description="Client-generated device UUID."),
 ) -> JourneysResponse:
     """Every journey registered by this device, each annotated with the situations currently
     affecting it (the same matcher used for push, but with no dedup — this is the live picture).
@@ -6387,7 +6430,10 @@ def create_journey(body: JourneyIn) -> Journey:
 @router.delete("/journeys/{journey_id}", summary="Delete a registered journey")
 def delete_journey(
     journey_id: str,
-    device_id: str = Query(description="The owning device; a journey is only deleted by its owner."),
+    device_id: str = Query(
+        pattern=_DEVICE_ID_QUERY_PATTERN,
+        description="The owning device; a journey is only deleted by its owner.",
+    ),
 ) -> dict:
     """Delete a journey. 404 if it doesn't exist or isn't owned by this device.
 

@@ -79,7 +79,7 @@ def _push(webpush_stub) -> str:
         with _quiet(varsel):
             # U5 made the return (result, error_detail); only the result matters to the counter.
             result, _error_detail = varsel._send_push(
-                {"endpoint": "https://push.example.com/sub/1"}, {"title": "t"}
+                {"endpoint": "https://fcm.googleapis.com/sub/1"}, {"title": "t"}
             )
             return result
     finally:
