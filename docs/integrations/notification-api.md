@@ -842,7 +842,7 @@ the envelope**; the nested objects under `payload` are deliberately open.
 | `test` | boolean | yes | inside the signed body, not a header |
 | `operator` | string | yes | codespace, e.g. `VYG` |
 | `line` | string | yes | |
-| `journey_ref` | string | yes | the dated service journey reference |
+| `journey_ref` | string | yes | the dated service journey reference as real-time data carries it. For SJ Norge (`operator` `SJN`) that is Bane NOR's `<train number>:<date>`, e.g. `49:2026-10-15`, not a NeTEx id |
 | `call_date` | date | yes | |
 | `stop_place` | string | yes | the **boarding** stop place |
 | `stop_order` | int ≥ 0 | yes | |

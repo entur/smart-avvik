@@ -2713,6 +2713,21 @@ def test_served_situation_text_is_the_latest_version_and_all_clears_are_dropped(
     assert "sd.served_summary AS summary" in bus
 
 
+def test_sjn_trains_are_served_without_moving_vy_network_state():
+    # KIX-39: SJ Norge rides in the planned rail table, but net_pre_* was fit on Vy's network only.
+    # Measured 2026-10-15 on one live snapshot: without the filter 1 110 of 8 694 Vy prediction rows
+    # changed when SJN joined the table; with it, none did.
+    import re
+    from pathlib import Path
+
+    def code(name):
+        return re.sub(r"--.*$", "", (Path(__file__).parent / name).read_text(), flags=re.MULTILINE)
+
+    assert "lineRef LIKE 'SJN:%'" in code("rail_calls_planned_today.sql")
+    netpre = code("predict_calls.sql").split("netpre AS (", 1)[1].split("GROUP BY", 1)[0]
+    assert "WHERE r.lineRef LIKE 'VYG:%'" in netpre
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

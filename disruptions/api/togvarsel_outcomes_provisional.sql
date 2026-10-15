@@ -44,7 +44,9 @@
 -- numerator and the denominator both, and ten duplicates among a hundred resolved calls moves
 -- 0.10 to roughly 0.18 -- a different published level.
 --
--- Both sources filter `lineRef LIKE 'VYG:%'`, which is the label's `dataSource = 'VYG'`.
+-- Both sources are Vy only, which is the label's `dataSource = 'VYG'`. `rail_calls_today` is that by
+-- construction; `rail_calls_planned_today` also carries SJ Norge since KIX-39 (F6 calls at Oslo S and
+-- Lillestrøm), so both reads of it below filter on the lineRef themselves.
 WITH
 scopes AS (
   SELECT * FROM UNNEST([
@@ -81,6 +83,7 @@ w AS (
     JOIN `disruptions.togvarsel_oslo_stations` AS s
       ON p.stop_place = s.stop_place
     WHERE COALESCE(p.aimed_dep, p.aimed_arr) IS NOT NULL
+      AND p.lineRef LIKE 'VYG:%'
   )
   WHERE DATE(aimed_local) = @day
 ),
@@ -156,7 +159,7 @@ et_trips AS (
     REGEXP_REPLACE(lineRef, r'^VYG:Line:', '') AS line,
     REGEXP_EXTRACT(jkey, r'DatedServiceJourney:(\d+)[-_]') AS trainno
   FROM `disruptions.rail_calls_planned_today`
-  WHERE call_date = @day
+  WHERE call_date = @day AND lineRef LIKE 'VYG:%'
 ),
 miss_calls AS (
   SELECT g.h

@@ -1989,7 +1989,7 @@ def test_journey_status_answers_every_train_in_the_window_from_memory():
     body = r.json()
     assert [t["jkey"] for t in body["trains"]] == ["a"], "the 10:48 is outside 07:00-09:00"
     assert body["trains"][0]["state"] == "unknown", "no prediction for it: grey, never green"
-    assert body["coverage"]["operators"] == ["VYG"]
+    assert body["coverage"]["operators"] == ["VYG", "SJN"]
     assert body["journey"] == {"from_stop": NSR_A, "to_stop": NSR_B, "begin": "07:00", "end": "09:00", "days": [1]}
     assert body["as_of"]["predictions_refreshed_at"] is not None
     assert body["reason"] is None and body["window"] is not None

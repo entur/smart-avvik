@@ -25,6 +25,7 @@ from alternatives import (
     AlternativeCandidate,
     AlternativeLeg,
     _KeyedTTLCache,
+    cache_key,
     fetch_candidates,
     parse_candidates,
     select_best,
@@ -717,6 +718,23 @@ def test_split_codespace_returns_both_halves():
     assert split_codespace("ServiceJourney:sj-1") == (None, "ServiceJourney:sj-1")
     assert split_codespace(None) is None
     assert split_codespace("") is None
+
+
+def test_an_sjn_leg_resolves_to_the_et_key_the_cache_holds():
+    """KIX-39: JP's SJN dated ref and ET's ('49:2026-10-15', via Bane NOR) name the same train. Read
+    with the plain split, the leg never resolved and the train could be offered as its own rival."""
+    assert cache_key("SJN:DatedServiceJourney:49_OSL-TND_26-10-15") == ("SJN", "49:2026-10-15")
+    assert cache_key("SJN:DatedServiceJourney:426_STK-LMO_M_26-10-13") == ("SJN", "426:2026-10-13")
+    # The plain ServiceJourney form and every other operator are the split, unchanged.
+    assert cache_key("SJN:ServiceJourney:49-LOD_43056-R") == ("SJN", "ServiceJourney:49-LOD_43056-R")
+    assert cache_key("VYG:DatedServiceJourney:65_OSL-BRG_26-08-06") == split_codespace(
+        "VYG:DatedServiceJourney:65_OSL-BRG_26-08-06"
+    )
+    assert cache_key(None) is None
+
+    patterns = _recorded_patterns()
+    patterns[0]["legs"][0]["datedServiceJourney"]["id"] = "SJN:DatedServiceJourney:49_OSL-TND_26-10-15"
+    assert ("SJN", "49:2026-10-15") in parse_candidates(patterns)[0].transit_refs
 
 
 def _with_cancellation(which, value=True):

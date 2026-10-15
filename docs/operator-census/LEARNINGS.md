@@ -27,7 +27,8 @@ first; total census cost well under $1, no anshar full scans).
   historical build nearly free** (722 GB total, clustered by `dataSource`, one row per call,
   cancellation flags at 94% parity with `rail_calls`) — vs the ~10 TiB / $63 anshar scans.
   Training source only; live serving keeps the anshar TTL scan.
-- **SJN is blocked** (2026-07-05 re-check: its trains publish ET via dataSource **BNR**
+- **SJN is blocked** (SUPERSEDED 2026-10-15: SJN's rail history is in `last_recorded` under
+  `dataSource = 'BNR'`, and SJN is now served; see `docs/sjn/LEARNINGS.md`. 2026-07-05 re-check: its trains publish ET via dataSource **BNR**
   with `<trainnr>:<date>` refs; an exact train-number+date join recovers **72%** over 12
   months — the missing 28% are trains with NO ET record on the disruption date, i.e. the
   planned-cancelled/bus-replaced departures the SX itself announces, so no join key —
