@@ -24,7 +24,7 @@
 --     SAME semantic as training ("no upstream observation").
 --   * line_now_* -- training anchors this on the hour bucket ~30-90 min before EACH call, which
 --     is only observable for calls <= ~1h ahead. Live we NOW-CAST it: one aggregate per line over
---     the last 60 min before CURRENT_TIMESTAMP(). For imminent calls this matches (slightly
+--     the last 60 min before the planned table was built (`asof`). For imminent calls this matches (slightly
 --     fresher than) training; for far-future calls it is the best current estimate of that
 --     feature, converging to training semantics as the 10-min refresh cycle approaches the call.
 --
@@ -134,14 +134,25 @@ netpre AS (
   GROUP BY 1
 ),
 -- now-cast line state: last 60 observed minutes per line (see header)
+-- The moment `observed` was read: when rail_calls_planned_today was built, not now. That table is rebuilt on a
+-- TTL (main._PLANNED_TTL, 60 min), so measuring the last hour and the ask horizon from CURRENT_TIMESTAMP() read every
+-- stop passed since the build as unobserved. own_prev_delay = -1 at a mid-route stop is what a
+-- train whose earlier calls were cancelled looks like in training, so the model scored running
+-- trains as likely cancellations (2026-10-13: live p_cancel 0.75 where the same calls scored 0.48
+-- through the training pipeline and 40 % were cancelled). Anchored here, line_now_* and
+-- lead_bucket describe what was known at the build, which is what leadtime_eval.sql fit the
+-- per-horizon Platt layers on. COALESCE covers an empty table.
+asof AS (
+  SELECT COALESCE(MAX(built_at), CURRENT_TIMESTAMP()) AS t FROM `disruptions.rail_calls_planned_today`
+),
 linenow AS (
   SELECT lineRef,
          COUNT(*) AS line_now_n,
          ROUND(AVG(GREATEST(dep_delay_min, 0)), 2) AS line_now_delay,
          ROUND(AVG(CAST(call_cancelled AS INT64)), 3) AS line_now_cancel
   FROM observed
-  WHERE aimed_dep >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 60 MINUTE)
-    AND aimed_dep <  CURRENT_TIMESTAMP()
+  WHERE aimed_dep >= TIMESTAMP_SUB((SELECT t FROM asof), INTERVAL 60 MINUTE)
+    AND aimed_dep <  (SELECT t FROM asof)
   GROUP BY 1
 ),
 own AS (
@@ -182,10 +193,10 @@ calls AS (
     TRUE                            AS has_situation,
     -- ask-horizon bucket: which platt layer calibrates this call's scores (see header)
     CASE
-      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 45  THEN '30'
-      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 90  THEN '60'
-      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 180 THEN '120'
-      WHEN TIMESTAMP_DIFF(b.call_ts, CURRENT_TIMESTAMP(), MINUTE) < 360 THEN '240'
+      WHEN TIMESTAMP_DIFF(b.call_ts, (SELECT t FROM asof), MINUTE) < 45  THEN '30'
+      WHEN TIMESTAMP_DIFF(b.call_ts, (SELECT t FROM asof), MINUTE) < 90  THEN '60'
+      WHEN TIMESTAMP_DIFF(b.call_ts, (SELECT t FROM asof), MINUTE) < 180 THEN '120'
+      WHEN TIMESTAMP_DIFF(b.call_ts, (SELECT t FROM asof), MINUTE) < 360 THEN '240'
       ELSE 'plan'
     END AS lead_bucket
   FROM base AS b
