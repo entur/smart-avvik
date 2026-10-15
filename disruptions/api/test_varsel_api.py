@@ -3923,6 +3923,31 @@ def test_delete_all_rejects_out_of_bounds_device_ids():
     assert client.delete("/varsel-api/devices/short/data").status_code == 422
 
 
+def test_a_device_id_carrying_a_slash_is_refused_and_nothing_else_is():
+    """A device_id becomes a Firestore document id, and the client splits a document path on "/",
+    so "aaaaaaaa/x/bbbbbbbb" would write the nested document devices/aaaaaaaa/x/bbbbbbbb -- outside
+    the device ceiling, the TTL policy and the export. Every route that takes the id from a body or
+    the query string refuses a "/", and refuses nothing else: the ids the PWA mints, an id with a
+    character outside any charset, and the empty query value all answer as they did before."""
+    _reset_state()
+    slashed = "aaaaaaaa/x/bbbbbbbb"
+
+    def refused(r):
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"][0]["loc"][-1] == "device_id", r.text
+
+    refused(client.post("/varsel-api/devices", json={"device_id": slashed, "subscription": SUBSCRIPTION}))
+    refused(client.post("/varsel-api/journeys", json={"device_id": slashed, **JOURNEY_BODY}))
+    refused(client.post("/varsel-api/test", json={"device_id": slashed}))
+    refused(client.get("/varsel-api/journeys", params={"device_id": slashed}))
+    refused(client.delete("/varsel-api/journeys/j-unknown", params={"device_id": slashed}))
+
+    for kept in ("0b6f2c1e-3d4a-4f5b-8c9d-0e1f2a3b4c5d", "dev-1760000000000-k3j4h5g6f7", "dev.12345678"):
+        r = client.post("/varsel-api/devices", json={"device_id": kept, "subscription": SUBSCRIPTION})
+        assert r.status_code == 200, (kept, r.text)
+    assert client.get("/varsel-api/journeys", params={"device_id": ""}).status_code == 200
+
+
 def test_delete_all_without_a_device_record_still_deletes_journeys():
     """Push never enabled → no device record, but the journeys are still the user's data."""
     _reset_state()
