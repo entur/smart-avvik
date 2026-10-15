@@ -45,8 +45,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
-#: Both call tables are `lineRef LIKE 'VYG:%'` (R8). A client says «kun Vy-tog» off this.
-OPERATORS: tuple[str, ...] = ("VYG",)
+#: The operators the spine carries: Vy and, since KIX-39, SJ Norge. A client says which trains it
+#: covers off this. SJN's actuals come from the spine's recorded calls only (`rail_calls_today` stays
+#: Vy), so its facts can be up to the planned TTL old.
+OPERATORS: tuple[str, ...] = ("VYG", "SJN")
 #: A no-SX figure further out than this is served `unknown`, not green (KTD7): without an operator
 #: message the only signal is the last hour of observation, and beyond ~2 h the no-SX layer collapses
 #: to the base rate — a green there would be the manufactured all-clear this codebase refuses.
@@ -190,7 +192,7 @@ class JourneyStatus(BaseModel):
         "arrived before midnight drop out of it; the ones still running or to come stay."
     )
     reason: Literal["not_a_travel_day"] | None = Field(description="`not_a_travel_day`, or null.")
-    operators: list[str] = Field(description="Operators whose trains are listed (Vy only in v1).")
+    operators: list[str] = Field(description="Operators whose trains are listed (Vy and SJ Norge).")
     as_of: AsOf
     trains: list[TrainStatus]
 
@@ -258,7 +260,7 @@ def _destination(calls: tuple[PlannedCall, ...]) -> str | None:
 
 def destination(operator: str | None, jkey: str | None) -> str | None:
     """Where one train terminates, from the spine; None while unloaded or for an unknown train
-    (every bus: the spine is Vy only)."""
+    (every bus: the spine is Vy and SJ Norge only)."""
     with _lock:
         spine = _spine
     if spine is None or operator is None or jkey is None:

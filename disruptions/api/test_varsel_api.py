@@ -6969,7 +6969,7 @@ def test_the_journey_list_carries_today_when_the_timetable_is_loaded():
         journey_status.reset_state()
     today = journey["today"]
     assert [t["jkey"] for t in today["trains"]] == ["strip1"]
-    assert today["operators"] == ["VYG"] and today["now"]
+    assert today["operators"] == ["VYG", "SJN"] and today["now"]
 
 
 def test_without_a_timetable_today_is_null_and_the_card_is_otherwise_unchanged():

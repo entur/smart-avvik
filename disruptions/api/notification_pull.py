@@ -205,10 +205,12 @@ WORDING_TTL_S = 43_200
 FAILURE_TTL_S = 60
 
 #: The operator codes the read can say anything about: the bus operators with a tuned threshold in
-#: `alert_policy._OPERATOR_ALERT_THRESHOLD`, plus `VYG` -- the rail family, which runs on the
-#: DEFAULT threshold and is therefore deliberately absent from that table. Served in `coverage` so a
-#: client can tell "no alert" from "not an operator we score".
-SERVED_OPERATORS: tuple[str, ...] = tuple(sorted({*alert_policy._OPERATOR_ALERT_THRESHOLD, "VYG"}))
+#: `alert_policy._OPERATOR_ALERT_THRESHOLD`, plus the rail family -- `VYG` and, since KIX-39, `SJN` --
+#: which runs on the DEFAULT threshold and is therefore deliberately absent from that table. Served in
+#: `coverage` so a client can tell "no alert" from "not an operator we score".
+SERVED_OPERATORS: tuple[str, ...] = tuple(
+    sorted({*alert_policy._OPERATOR_ALERT_THRESHOLD, "VYG", "SJN"})
+)
 
 #: `NSR:StopPlace:<digits>` -- the shape `notification_api.SubscriptionIn` publishes for a stop ref,
 #: tested BEFORE canonicalization (KTD2): a collapsed ref is still an NSR ref, and an alias map

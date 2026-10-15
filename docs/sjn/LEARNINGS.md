@@ -117,3 +117,31 @@ That is a 2.4× lift, and the model misses ~10 points of it. But 25 % is nowhere
 and only ~3.5 calls a day are flagged. The lift is worth having as a feature: a stop-keyed situation
 branch with its own training population. As an alert trigger on its own it is not. Either way it
 belongs in a follow-up ticket.
+
+## What changed in serving
+
+| File | Change | Why |
+|---|---|---|
+| `rail_calls_planned_today.sql` | `lineRef LIKE 'SJN:%'` beside `VYG:%`; GTFS names from `SJN:Authority:SJN` too | SJN trains enter `/impact`, `/varsel`, the ET relay and the «I dag» strip. The ET scan reads the same bytes; GTFS adds 0.3 GB to 31.8 GB. |
+| `predict_calls.sql` | `netpre` filtered to `VYG:%` | On one live snapshot, 1 110 of 8 694 Vy prediction rows changed when SJN joined the network average. With the filter, none did. |
+| `togvarsel_outcomes_provisional.sql` | both planned reads filtered to `VYG:%` | F6 calls at Oslo S and Lillestrøm would otherwise count in Rushvarsel's provisional labels, while the settled label is Vy-only. |
+| `alternatives.py` | `cache_key` rewrites JP's SJN dated ref to the ET key | JP says `SJN:DatedServiceJourney:49_OSL-TND_26-10-15`, ET says `49:2026-10-15`. Without the rewrite, a late SJ train can be offered as its own alternative. |
+| `data/queries/label_varsel_decisions.sql` | reads SJN from `dataSource = 'BNR'` | Otherwise SJN decisions stay «ukjent» in `/historikk` forever. **The scheduled query must be re-registered** in dev and prd. |
+| `historikk.py`, `notification_pull.py`, `journey_status.py`, «I dag» caption | SJN added to the operator lists; «Ingen direkte tog» | `/historikk`'s operator filter returned 400 for SJN, and the coverage lists said Vy only. |
+
+Checked and left alone: `rail_calls_removed_today.sql` (GTFS filtered to VYG, and SJN jkeys never
+match its regexes); `varsel_connectivity.sql` (SJN-only stop pairs correctly become servable);
+`line_modes.py` (already maps SJN to «Tog»).
+
+## Follow-ups
+
+1. **R60's false «innstilt»**: pool SJN into `training_calls` once the `p_cancel` serving fix has
+   landed and been measured. `create_training_calls_sjn.sql` is already the pool's shape.
+2. **SJN's own SX as explanation text.** Ingest `participantRef = 'SJN'` and bridge
+   `SJN:DatedServiceJourney:<nr>_…_<yy-mm-dd>` → `<nr>:<yyyy-mm-dd>`, the same rewrite as
+   `alternatives.cache_key`.
+3. **Vy infrastructure messages as a stop-keyed feature for SJN** (the 2.4× lift above).
+4. **Fresh actuals for SJN**: `rail_calls_today` is still Vy-only, so the «I dag» strip reads SJN's
+   recorded calls from the planned table, up to 60 min old. Widening it touches Rushvarsel and the
+   labeller, so it is a change of its own.
+5. **SJV and TM** (also under `BNR`) would take the same path if wanted.

@@ -80,7 +80,7 @@ export function stripTitle(status: JourneyStatus): string {
 /** The legend's trailing text: the count, or when the model will start saying anything. */
 export function caption(status: JourneyStatus): string {
   const trains = status.trains;
-  if (trains.length === 0) return `Ingen direkte Vy-tog i tidsrommet ${stripTitle(status).toLowerCase()}`;
+  if (trains.length === 0) return `Ingen direkte tog i tidsrommet ${stripTitle(status).toLowerCase()}`;
   const first = Date.parse(trains[0].departure_time);
   const now = Date.parse(status.now);
   if (trains.every((t) => t.state === 'unknown') && first > now) {
