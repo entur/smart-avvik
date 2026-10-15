@@ -353,7 +353,7 @@ def _push(webpush_stub):
     before = pywebpush.webpush
     pywebpush.webpush = webpush_stub
     try:
-        return varsel._send_push({"endpoint": "https://push.example.com/sub/1"}, {"title": "t"})
+        return varsel._send_push({"endpoint": "https://fcm.googleapis.com/sub/1"}, {"title": "t"})
     finally:
         pywebpush.webpush = before
 
@@ -368,7 +368,7 @@ def test_a_failed_send_logs_nothing_itself_and_returns_the_capped_detail():
         result, detail = _push(_raiser(exc))
     assert records == [], "the prose failure lines are gone — the audit record is the only trace"
     assert result == "error"
-    assert detail == {"status": 500, "host": "push.example.com", "body": "x" * 400}
+    assert detail == {"status": 500, "host": "fcm.googleapis.com", "body": "x" * 400}
     # Grep-style pin: _send_push makes no log calls at all any more.
     assert "logger." not in inspect.getsource(varsel._send_push)
 
@@ -379,7 +379,7 @@ def test_an_unexpected_exception_still_yields_a_detail_and_no_log_line():
     assert records == []
     assert result == "error"
     assert detail["status"] is None
-    assert detail["host"] == "push.example.com"
+    assert detail["host"] == "fcm.googleapis.com"
     assert detail["body"] == "RuntimeError: socket melted"
     # The TRACEBACK rides the detail too. `type: str` alone left the raising frame unrecoverable,
     # and an unexpected raise here is by definition a defect whose location is the whole question
@@ -401,7 +401,7 @@ def test_a_failed_push_yields_exactly_one_push_record_carrying_the_error_fields(
     assert fields["event"] == "push"
     assert fields["result"] == "gone"
     assert fields["push_error_status"] == 410
-    assert fields["push_error_host"] == "push.example.com"
+    assert fields["push_error_host"] == "fcm.googleapis.com"
     assert fields["push_error_body"] == "Gone"
 
 
@@ -425,7 +425,7 @@ def test_deliver_to_devices_yields_the_detail_and_tolerates_bare_string_stubs():
     import pywebpush
 
     def prepare(item):
-        return ({"endpoint": "https://push.example.com/s/1"}, {"title": "t"})
+        return ({"endpoint": "https://fcm.googleapis.com/s/1"}, {"title": "t"})
 
     exc = pywebpush.WebPushException(
         "boom", response=SimpleNamespace(status_code=500, text="b")
@@ -443,7 +443,7 @@ def test_deliver_to_devices_yields_the_detail_and_tolerates_bare_string_stubs():
             "item-1",
             "error",
             {"title": "t"},
-            {"status": 500, "host": "push.example.com", "body": "b"},
+            {"status": 500, "host": "fcm.googleapis.com", "body": "b"},
         )
     ]
     before_send = varsel._send_push
