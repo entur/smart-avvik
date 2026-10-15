@@ -116,7 +116,9 @@ grouped AS (
 -- the operating day and the Oslo calendar date of the aimed departure diverge around midnight.
 et AS (
   SELECT
-    REGEXP_EXTRACT(serviceJourneyId, r'^([A-Za-z]+):')   AS operator,
+    -- SJ Norge (KIX-39) reaches last_recorded through Bane NOR as '<train number>:<date>', a ref with
+    -- no codespace; the WHERE below admits only its rows from dataSource BNR, so BNR means SJN.
+    IF(dataSource = 'BNR', 'SJN', REGEXP_EXTRACT(serviceJourneyId, r'^([A-Za-z]+):')) AS operator,
     REGEXP_REPLACE(serviceJourneyId, r'^[A-Za-z]+:', '') AS jkey,
     sequenceNr                                           AS stop_order,
     DATE(COALESCE(aimedDepartureTime, aimedArrivalTime), 'Europe/Oslo') AS call_date,
@@ -130,7 +132,8 @@ et AS (
     operatingDate, lineRef, stopPointRef, vehicleMode
   FROM `ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded`
   WHERE operatingDate BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 11 DAY) AND CURRENT_DATE()
-    AND dataSource IN ('VYG','GOA','KOL','SOF','NOR','SKY','ATB','OST','FIN','MOR','RUT','TRO','GCO')
+    AND (dataSource IN ('VYG','GOA','KOL','SOF','NOR','SKY','ATB','OST','FIN','MOR','RUT','TRO','GCO')
+         OR (dataSource = 'BNR' AND lineRef LIKE 'SJN:%'))
     AND stopPointRef IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY serviceJourneyId, operatingDate, sequenceNr
@@ -170,6 +173,8 @@ labelled AS (
     -- date is redundant. Bus ServiceJourney jkeys repeat every operating day, so there the date is
     -- load-bearing (demo_journeys.sql:11-15). Allowing rail to match without it means a boundary
     -- disagreement about which Oslo date a near-midnight departure belongs to costs nothing.
+    -- SJN's '<train number>:<date>' is date-scoped too, but matching it on the date as well costs
+    -- nothing: both sides take call_date from the same aimed time.
     AND (r.call_date = g.call_date OR STARTS_WITH(g.jkey, 'DatedServiceJourney:'))
   -- Removed-train subjects are labelled by their own branch below. The COALESCE keeps a row with no
   -- situation number here, so the two branches partition `grouped` exactly.

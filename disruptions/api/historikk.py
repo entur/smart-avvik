@@ -145,7 +145,7 @@ _VERDICTS = ("hit", "false_alarm", "miss", "correct_reject")
 # rail family's own tagging). Validated rather than passed straight through, so an arbitrary
 # caller-supplied string cannot mint a cache entry and a BigQuery query per distinct value.
 _OPERATORS = frozenset(
-    {"VYG", "NSB", "GOA", "KOL", "SOF", "NOR", "SKY", "ATB", "OST", "FIN", "MOR", "RUT", "GCO"}
+    {"VYG", "NSB", "SJN", "GOA", "KOL", "SOF", "NOR", "SKY", "ATB", "OST", "FIN", "MOR", "RUT", "GCO"}
 )
 
 _bq_client: Any | None = None

@@ -230,6 +230,10 @@ netpre AS (
   JOIN observed AS r
     ON r.aimed_dep >= TIMESTAMP_SUB(p.onset_ts, INTERVAL 60 MINUTE)
    AND r.aimed_dep <  p.onset_ts
+  -- Vy only: training's network is rail_calls, which is Vy. The planned table also carries SJ
+  -- Norge since KIX-39, and letting its trains into this average would move every NSB
+  -- situation's net_pre_* away from what the heads were fit on.
+  WHERE r.lineRef LIKE 'VYG:%'
   GROUP BY 1
 ),
 linenow AS (

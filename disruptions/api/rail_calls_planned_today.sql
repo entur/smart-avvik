@@ -1,5 +1,12 @@
 -- PLANNED-timetable call source for live per-call serving: every UPCOMING call of every Vy/NSB
--- journey currently in the ET feed, with its scheduled (aimed) departure/arrival, stop and order.
+-- and SJ Norge journey currently in the ET feed, with its scheduled (aimed) departure/arrival, stop
+-- and order.
+--
+-- SJ NORGE (KIX-39, 2026-10-15): SJN's trains reach ET through Bane NOR (dataSource 'BNR') with
+-- lineRef 'SJN:Line:*' and the legacy ref '<train number>:<date>' in datedVehicleJourneyRef, so
+-- their jkey is e.g. '47:2026-10-14' (no codespace to strip) and their operator, read from the
+-- lineRef downstream, is 'SJN'. They are served zero-shot by the rail heads as no-SX calls plus the
+-- ET relay -- measured in docs/sjn/LEARNINGS.md, where the same heads rank SJN better than Vy.
 --
 -- This is the forward-looking sibling of rail_calls_today.sql (disruptions/api/). That table is
 -- for realized actuals (recordedCalls only, departure-only) so it cannot answer "will this train
@@ -67,7 +74,7 @@ WITH last_snap AS (
   -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
   WHERE (DATE(_PARTITIONTIME) BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) AND CURRENT_DATE()
          OR _PARTITIONTIME IS NULL)
-    AND lineRef LIKE 'VYG:%'
+    AND (lineRef LIKE 'VYG:%' OR lineRef LIKE 'SJN:%')
     AND datedVehicleJourneyRef IS NOT NULL
   QUALIFY ROW_NUMBER() OVER (
     PARTITION BY datedVehicleJourneyRef ORDER BY SAFE.TIMESTAMP(recordedAtTime) DESC) = 1
@@ -121,7 +128,7 @@ dedup AS (
 gtfs_names AS (
   SELECT parent_station AS stop_place, ANY_VALUE(stop_name) AS stop_name
   FROM `ent-data-sharing-ext-prd.timetable_gtfs.gtfs_last_recorded_ent_v1`
-  WHERE agency_id LIKE 'VYG:%'
+  WHERE (agency_id LIKE 'VYG:%' OR agency_id LIKE 'SJN:%')
     AND operating_date BETWEEN DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
                            AND DATE_ADD(CURRENT_DATE(), INTERVAL 2 DAY)
     AND parent_station IS NOT NULL

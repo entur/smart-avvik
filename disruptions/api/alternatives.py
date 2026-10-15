@@ -1065,6 +1065,25 @@ def split_codespace(ref: str | None) -> tuple[str | None, str] | None:
     return (None, ref)
 
 
+# JP names an SJ Norge train 'SJN:DatedServiceJourney:49_OSL-TND_26-10-15', but its ET arrives through
+# Bane NOR as '49:2026-10-15', and that is the jkey the prediction cache holds (KIX-39).
+_SJN_DATED = re.compile(r"DatedServiceJourney:(\d+)_.*_(\d{2})-(\d{2})-(\d{2})")
+
+
+def cache_key(ref: str | None) -> tuple[str | None, str] | None:
+    """:func:`split_codespace`, with an SJN dated ref rewritten to the ET key the cache holds.
+
+    Without it an SJN leg never resolves: its own train is not excluded from the rival pool, so a
+    late SJ train could be offered as the alternative to itself, and no SJN rival is ever scored.
+    """
+    split = split_codespace(ref)
+    if split is not None and split[0] == "SJN":
+        m = _SJN_DATED.fullmatch(split[1])
+        if m:
+            return ("SJN", f"{m[1]}:20{m[2]}-{m[3]}-{m[4]}")
+    return split
+
+
 # ---- Candidates ------------------------------------------------------------------------------
 def _as_dict(value: Any) -> dict:
     """`value` if it is a dict, else an empty one.
@@ -1139,7 +1158,7 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
         if not refs:
             continue
         for ref in refs:
-            split = split_codespace(ref)
+            split = cache_key(ref)
             if split is not None and split not in seen_refs:
                 seen_refs.add(split)
                 transit_refs.append(split)

@@ -910,3 +910,16 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   definition. Making it per (pair, train) per cycle needs a cycle-stable instant in `impact`, which
   does not exist — `for_trip` samples its own `now` per call — so the seam is `main._rebuild_all`
   calling something like `impact.begin_lookup_cycle()`, and `main.py` was outside this unit.
+- **SJ Norge trains are served zero-shot by the rail family** (KIX-39, 2026-10-15; measurements in
+  `docs/sjn/LEARNINGS.md`). SJN's ET arrives through Bane NOR (`dataSource = 'BNR'`) with lineRef
+  `SJN:Line:*` and the legacy ref `<train number>:<date>`, so an SJN jkey is `49:2026-10-15` and its
+  operator, read from the lineRef, is `SJN`. `rail_calls_planned_today.sql` takes those lineRefs, and
+  the no-SX path, the ET relay and the «I dag» strip serve them unchanged; no SJN SX is ingested.
+  Four places keep it from leaking or missing, each easy to undo by accident:
+  `predict_calls.sql`'s `netpre` stays Vy-only (training's network is Vy; without the filter 1 110
+  of 8 694 Vy rows moved on one snapshot, pinned in `test_impact.py`); Rushvarsel's provisional
+  outcomes filter `VYG:%` on both planned-table reads; `alternatives.cache_key` rewrites JP's
+  `SJN:DatedServiceJourney:49_OSL-TND_26-10-15` to the ET key, without which a late SJ train is
+  offered as its own alternative; and `label_varsel_decisions.sql` reads SJN from `BNR`
+  (re-register the scheduled query after changing it). `rail_calls_today` stays Vy-only, so SJN's
+  «I dag» facts come from the planned table's recorded calls, up to the planned TTL old.
