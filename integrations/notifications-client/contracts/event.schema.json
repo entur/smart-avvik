@@ -141,6 +141,14 @@
           "items": { "type": "object" },
           "description": "The contributing situations, each with `situation_number`, the Norwegian `summary` and `description`, their English `summary_en` and `description_en`, `en_machine_translated`, `has_situation` and `report_type`. `report_type` is SIRI-SX's `reportType` as the operator published it, `INCIDENT` or `GENERAL`, and null for a `KIX:` situation (no operator message) or one that carried none; absent from an event minted before the field existed. The English is the operator's own where they published one (Vy does on every situation), the service's own for a `KIX:` situation (whose Norwegian it also wrote), and otherwise a machine translation of the Norwegian, with `en_machine_translated` true -- present that as a translation, not as the operator's words. A translation can land a poller cycle after the situation first appears, and until one does all three English fields are null."
         },
+        "situations_text": {
+          "type": ["string", "null"],
+          "description": "The `situations` as ONE Norwegian text, for showing in place of every `description` stacked: the operator's own sentences, never rewritten, only left out or reordered. A forecast Vy has superseded is left out («Forsinkelse forventes» once «Forsinket» is published), as is a sentence an earlier message already said (the shared cause), and advice («Ta neste tog ...») comes after the facts. Exact repeats only: two messages that differ in a place name are both kept. Built from the `has_situation` situations only, so null when there is none (a `KIX:` situation alone); absent from an event minted before the field existed."
+        },
+        "situations_text_en": {
+          "type": ["string", "null"],
+          "description": "`situations_text` in English, from the same messages: null until every one of them has its English, rather than mix languages. It is a translation when any of those situations has `en_machine_translated` true -- present it as one."
+        },
         "summary": {
           "type": ["string", "null"],
           "description": "The journey definition's one-sentence summary, in Norwegian: the same sentence journey-alerts serves as its top-level `summary`, over every alert-worthy train on the definition at mint and not only this one -- for a favourites row («Signalfeil ved Asker: 4 tog er innstilt og 2 kan bli forsinket», «Tog L1 07:18 er innstilt, 2 til kan bli forsinket»). A snapshot at mint: a later change to the definition's trains mints nothing, so read journey-alerts for the current sentence. Null when there is nothing to say, which is never all-clear. Absent from an event minted before the field existed."

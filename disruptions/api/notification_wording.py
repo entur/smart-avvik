@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import threading
 from collections import deque
 from collections.abc import Callable
@@ -645,6 +646,67 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, s
     if not trains:
         return None, None
     return _summary(trains, _NB), _summary(trains, _EN)
+
+
+# ---- One text over a train's operator messages (2026-10-18) -------------------------------------
+#: Vy publishes a forecast («Forsinkelse forventes»: «Vi forventer at toget blir forsinket fra
+#: Skien») and, once the train has left, the fact («Forsinket»: «Toget kjørte 40 minutter forsinket
+#: fra Skien»), and leaves the forecast open beside it. The fact supersedes it: all 15 such pairs in
+#: prd over the 14 days to 2026-10-18 named the same origin. Keyed on the summary pair Vy uses, so a
+#: forecast under any other wording is never dropped.
+_SUPERSEDED_BY = {"forsinkelse forventes": "forsinket"}
+#: A sentence ends at terminal punctuation followed by a capital, so «11. oktober» and «kl. 14:00»
+#: stay whole. A missed boundary only costs a deduplication; a false one could drop half a sentence.
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-ZÆØÅ])")
+
+
+def _summary_key(text: str | None) -> str:
+    return (text or "").strip().rstrip(".").lower()
+
+
+def _deduped(texts: list[str]) -> str | None:
+    seen: set[str] = set()
+    out: list[str] = []
+    for text in texts:
+        text = " ".join(text.split())
+        if not text:
+            continue
+        if text[-1] not in ".!?":
+            text += "."
+        for sentence in _SENTENCE_BREAK.split(text):
+            if sentence not in seen:
+                seen.add(sentence)
+                out.append(sentence)
+    return " ".join(out) or None
+
+
+def situations_text(situations: list[dict]) -> tuple[str | None, str | None]:
+    """The operator's messages about one train as ONE text, `(Norwegian, English)`, for a client
+    that would otherwise stack every `description` -- 52 % of alert-worthy trains on prd's
+    registered journeys carried two or more over the 14 days to 2026-10-18.
+
+    Every word is the operator's: messages are only left out or reordered, never rewritten. A
+    superseded forecast goes (:data:`_SUPERSEDED_BY`), a sentence an earlier message already said
+    goes (the shared cause, «Dette skyldes …»), and advice («Ta neste tog …») comes after the facts
+    -- otherwise the payload's order, which is severity. Exact sentences only: two messages that
+    differ only in a place name («Ta neste tog mellom Høn og Sandvika» / «… Blommenholm og
+    Lysaker») differ in exactly what matters.
+
+    Only `has_situation` messages contribute, since anything else is text this codebase wrote. The
+    situations to keep are chosen once, on the Norwegian, and each language is deduplicated on its
+    own, so the two cannot disagree about which message survived. English is None unless every
+    kept message has its English counterpart, rather than quote Norwegian inside English.
+    """
+    kept = [s for s in situations if s.get("has_situation") and (s.get("description") or s.get("summary"))]
+    summaries = {_summary_key(s.get("summary")) for s in kept}
+    kept = [s for s in kept if _SUPERSEDED_BY.get(_summary_key(s.get("summary"))) not in summaries]
+    kept.sort(key=lambda s: _summary_key(s.get("summary")).startswith("ta "))
+    fields = [("description", "description_en") if s.get("description") else ("summary", "summary_en") for s in kept]
+    english = [s.get(en) for s, (_, en) in zip(kept, fields, strict=True)]
+    return (
+        _deduped([s[nb] for s, (nb, _) in zip(kept, fields, strict=True)]),
+        _deduped(english) if all(english) else None,
+    )
 
 
 # ---- What a wording is keyed on (KTD9) ----------------------------------------------------------

@@ -550,6 +550,8 @@ and for a subscription's `from_stop`/`to_stop`.
         "mode": "rail",
         "situations": [{"situation_number": "KIX:ETCancellation:VYG:ServiceJourney:L1-2143-20260910",
                         "summary": "Innstilt", "description": null, "has_situation": false}],
+        "situations_text": null,
+        "situations_text_en": null,
         "alternative_journey": {"...": "the best remaining way there, see the event's payload"},
         "summary": "Tog L1 Lillestrøm 07:45 er innstilt",
         "summary_en": "Train L1 Lillestrøm 07:45 is cancelled"
@@ -893,8 +895,26 @@ off the event; do not assume the published per-operator cut. A `situations` entr
 `has_situation` is `false` is how you can tell which population an alert came from. Then `delay`
 (`{typical_min, worst_case_min}` or `null`), `effect`, `destination`, `mode`, `situations` (objects:
 `situation_number`, `summary`, `description`, `summary_en`, `description_en`,
-`en_machine_translated`, `has_situation`, `report_type`), `alternative_journey` (`object|null`), and `summary` and
-`summary_en`.
+`en_machine_translated`, `has_situation`, `report_type`), `situations_text` and `situations_text_en`
+(`string|null`), `alternative_journey` (`object|null`), and `summary` and `summary_en`.
+
+**`situations_text`** (since 2026-10-18) is the `situations` as one Norwegian text, for showing
+in place of every `description` stacked. Half of all alerted Vy trains carry two or more operator
+messages, and they repeat each other. The text is the operator's own sentences, never rewritten,
+only left out or reordered:
+
+- a forecast Vy has superseded is left out: «Forsinkelse forventes» once «Forsinket» is published
+  for the same train;
+- a sentence an earlier message already said is left out, which is usually the cause («Dette
+  skyldes …»);
+- advice («Ta neste tog …») comes after the facts.
+
+Only exact repeats go: «Ta neste tog mellom Høn og Sandvika» and «Ta neste tog mellom Blommenholm
+og Lysaker» are both kept. It is built from the situations whose `has_situation` is true, so it is
+`null` when there are none, as on the test event. **`situations_text_en`** is the same text in
+English, from the same messages. It is `null` until every one of them has its English, so the
+line never mixes languages. Present it as a translation when any of those situations has
+`en_machine_translated` true. Both are absent from an event minted before the fields existed.
 
 **`situations[].report_type`** (since 2026-10-05) is SIRI-SX's `reportType` as the
 operator published it: `INCIDENT` for a disruption, `GENERAL` for general information such as
