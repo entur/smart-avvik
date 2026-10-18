@@ -259,6 +259,14 @@ class SituationImpact(BaseModel):
     arrival_prediction: StopPrediction | None = Field(
         description="Worst-case alighting prediction; null when `to_stop` is omitted.",
     )
+    paired_arrival_prediction: StopPrediction | None = Field(
+        default=None,
+        description="Alighting prediction PAIRED with `departure_prediction`: the same vehicle "
+        "journey (`jkey`), unlike `arrival_prediction`, which is the worst arrival across lines "
+        "and may be another one. It answers \"will the departure I board get me to `to_stop`?\": "
+        "a vehicle can leave the boarding stop as planned and still have its later calls "
+        "cancelled. Null when `to_stop` is omitted.",
+    )
     has_situation: bool = Field(
         default=True,
         description="False when no SX message named this train at all and the numbers above are a "
@@ -867,6 +875,7 @@ def _impact_response(
                 jkey=worst_cell.jkey,
                 departure_prediction=_worst([c.departure for c in group]),
                 arrival_prediction=_worst([c.arrival for c in group]),
+                paired_arrival_prediction=worst_cell.arrival,
                 has_situation=group[0].has_situation,
                 report_type=group[0].report_type,
                 alternative_journey=outcome.journey,

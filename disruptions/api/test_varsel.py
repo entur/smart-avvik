@@ -1956,6 +1956,55 @@ def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timesta
             main._call_pred_refreshed_at = previous
 
 
+def _payload(alert):
+    return varsel._webhook_payload(
+        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=(None, None)
+    )
+
+
+def test_a_train_that_leaves_but_never_reaches_the_destination_says_so_in_arrival():
+    """R14 on 2026-10-12: it left Oslo S 36 min late and every call past Skøyen, Asker included, was
+    cancelled. The payload's figures are the BOARDING call's, so a client showed «Sannsynlighet for
+    innstilling: 10 %» to a traveller who could not get to Asker on that train. `arrival` carries
+    the destination side, and adds it without moving anything that was already there."""
+    board, alight = _train(MON_0800, p_cancel=0.10, p_impact_dep=0.97, p_dep_ge10=0.96)
+    alight.et_declared_cancelled = True
+    [alert] = match(_journey(), {"S1": [board, alight]})
+
+    payload = _payload(alert)
+    assert payload["arrival"] == {
+        "stop_place": "B",
+        "stop_order": 5,
+        "aimed_arrival_time": (MON_0800 + timedelta(minutes=40)).isoformat(),
+        "cancelled": True,
+        "cancellation": 1.0,
+        "delay_ge10": None,
+        "delay": None,
+    }
+    # Unchanged: the boarding figures, the effect and the gate all still read the boarding call.
+    assert payload["probabilities"]["cancellation"] == 0.10
+    assert payload["probabilities"]["delay_ge10"] == 0.96
+    assert payload["effect"] == "delayed"
+    assert alert.cancelled is False and alert.impact_probability == 0.97
+
+
+def test_arrival_is_the_boarded_journeys_own_never_another_lines():
+    """`SituationImpact.arrival_prediction` is the worst arrival across the situation's lines and
+    may belong to a different train. Reading it would put another line's cancelled destination on
+    this train's alert, so `arrival` must come from the train the boarding figures describe."""
+    mine = _train(MON_0800, jkey="mine", p_impact_dep=0.95, line="VYG:Line:R14")
+    mine[1].p_cancel = 0.05
+    theirs = _train(MON_0800 + timedelta(minutes=10), jkey="theirs", p_impact_dep=0.40,
+                    line="VYG:Line:R13")
+    theirs[1].et_declared_cancelled = True
+    [alert] = match(_journey(), {"S1": mine + theirs})
+
+    assert alert.jkey == "mine"
+    assert alert.impact.situations[0].arrival_prediction.cancelled is True  # the other train's
+    arrival = _payload(alert)["arrival"]
+    assert arrival["cancelled"] is False and arrival["cancellation"] == 0.05
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for t in tests:
