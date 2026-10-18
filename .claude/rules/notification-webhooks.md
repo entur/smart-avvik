@@ -44,6 +44,19 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `reportType` (`INCIDENT`/`GENERAL`) off `disruptions_*initial_today` through `predict_calls*.sql`,
   then `CallPred` → `TripCell` → `SituationImpact` → `Alert` like `has_situation`; null on a `KIX:`
   row. journey-status has no situations and does not carry it. Not in `message_input`, so no re-word.
+- **`payload.situations_text` / `situations_text_en` are the situations as ONE text** (2026-10-18,
+  asked for by an integrator whose card stacked Vy's «Forsinkelse forventes» and «Forsinket»
+  descriptions, same cause sentence twice). `notification_wording.situations_text`, called once in
+  `varsel._webhook_payload`, so the event, the journey-alerts read and (as null) the test event
+  carry it. Deterministic and operator words only: it drops a Vy forecast once «Forsinket» is out
+  (`_SUPERSEDED_BY`, 15 of 15 prd pairs named the same origin), drops exact repeated sentences and
+  puts «Ta …» advice last. Measured on prd's 14 days to 2026-10-18: 112 of 216 alert-worthy trains
+  carried 2+ situations, none with identical descriptions, and this shortens the text by only ~11 %.
+  The rest of the overlap is in meaning (bus ordered both directions, 3-5 message incidents), and an
+  LLM summary is the next step only if an integrator asks for it. Never fuzzy matching: messages
+  that differ in one place name differ in what matters. The sentence split needs a capital after the
+  stop, or «11. oktober kl. 14:00» would split and a different date could lose its tail. Not in
+  `message_input`.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the previous pod
   built (`main.warm_caches_from_last_build`), so the public reads' 503s are left for a first deploy

@@ -1166,6 +1166,63 @@ def test_one_train_is_its_own_title_and_no_train_is_nothing_to_say():
     assert _en([(_mi("07:18", line=None, mode="Ferje"), [_sit("S1")])]) == "at 07:18 may be delayed"
 
 
+def _msg(number, summary, description, summary_en=None, description_en=None, has_situation=True):
+    """One of the payload's `situations`, operator text in both languages."""
+    return {"situation_number": number, "summary": summary, "description": description,
+            "summary_en": summary_en, "description_en": description_en, "has_situation": has_situation}
+
+
+def test_situations_text_drops_vys_superseded_forecast_and_says_the_cause_once():
+    # The partner's screenshot (2026-10-18): the forecast left open beside the fact.
+    forecast = _msg("S1", "Forsinkelse forventes",
+                    "Vi forventer at toget blir forsinket fra Skien. Dette skyldes at togsettet vi trenger er forsinket.",
+                    "Delay expected",
+                    "We expect the train to be delayed from Skien. This is due to the train set we need being delayed.")
+    fact = _msg("S2", "Forsinket",
+                "Toget kjørte 40 minutter forsinket fra Skien. Dette skyldes at togsettet vi trenger er forsinket.",
+                "Delayed",
+                "The train departed 40 minutes late from Skien. This is due to the train set we need being delayed.")
+    assert nw.situations_text([forecast, fact]) == (
+        "Toget kjørte 40 minutter forsinket fra Skien. Dette skyldes at togsettet vi trenger er forsinket.",
+        "The train departed 40 minutes late from Skien. This is due to the train set we need being delayed.",
+    )
+    # Alone, the forecast is the news and stays.
+    assert nw.situations_text([forecast])[0].startswith("Vi forventer")
+
+
+def test_situations_text_puts_advice_last_and_keeps_messages_that_differ_in_a_place():
+    advice = _msg("S1", "Ta neste tog", "Ta neste tog mellom Høn og Sandvika.")
+    other = _msg("S2", "Ta neste tog", "Ta neste tog mellom Blommenholm og Lysaker.")
+    fact = _msg("S3", "Ny kjørerute mellom Asker og Lysaker",
+                "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket.")
+    ours = _msg("KIX:NoSituation:t1", "Mulig avvik", "Skrevet av oss.", has_situation=False)
+    assert nw.situations_text([advice, ours, other, fact])[0] == (
+        "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket. "
+        "Ta neste tog mellom Høn og Sandvika. Ta neste tog mellom Blommenholm og Lysaker."
+    )
+    # «11. oktober» and «kl. 14:00» are not sentence breaks, so a different date is not cut down to
+    # «Ny oppdatering kommer 12.» by the shared «oktober kl. 14:00.».
+    a = _msg("S1", "Stengt: Lysaker–Stabekk", "Lysaker–Stabekk er stengt. Ny oppdatering kommer 11. oktober kl. 14:00.")
+    b = _msg("S2", "Stengt: Lysaker–Oslo S", "Lysaker–Oslo S er stengt. Ny oppdatering kommer 12. oktober kl. 14:00.")
+    assert nw.situations_text([a, b])[0] == (
+        "Lysaker–Stabekk er stengt. Ny oppdatering kommer 11. oktober kl. 14:00. "
+        "Lysaker–Oslo S er stengt. Ny oppdatering kommer 12. oktober kl. 14:00."
+    )
+
+
+def test_situations_text_never_mixes_languages_and_is_none_without_an_operator_message():
+    with_en = _msg("S1", "Signalfeil", "Signalfeil ved Asker.", "Signal failure", "Signal failure at Asker.")
+    no_description = _msg("S2", "Innstilt Asker–Skøyen", None, "Cancelled Asker–Skøyen")
+    untranslated = _msg("S3", "Buss for tog", "Vi har bestilt buss.")
+    # A message with no description contributes its summary, as a sentence.
+    assert nw.situations_text([with_en, no_description]) == (
+        "Signalfeil ved Asker. Innstilt Asker–Skøyen.", "Signal failure at Asker. Cancelled Asker–Skøyen.")
+    # One kept message without English: no English line rather than Norwegian inside it.
+    assert nw.situations_text([with_en, untranslated]) == ("Signalfeil ved Asker. Vi har bestilt buss.", None)
+    assert nw.situations_text([_msg("KIX:ETCancellation:t1", "Innstilt", "Innstilt.", has_situation=False)]) == (None, None)
+    assert nw.situations_text([]) == (None, None)
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(
