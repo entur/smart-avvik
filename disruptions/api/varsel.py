@@ -136,7 +136,13 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi import (
     Path as PathParam,  # aliased: `Path` here is pathlib's (see _STATE_PATH)
 )
-from impact import AlternativeOutcome, ImpactResponse, LatestObservation, StopPrediction, severity_key
+from impact import (
+    AlternativeOutcome,
+    ImpactResponse,
+    LatestObservation,
+    StopPrediction,
+    severity_key,
+)
 
 # The WORDING moved out on 2026-09-08 (U1) so a second notification surface can produce the same
 # Norwegian text without importing this module -- 147 KB of poller state, the device registry, the
