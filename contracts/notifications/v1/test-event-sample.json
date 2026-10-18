@@ -77,6 +77,15 @@
         "alert_threshold": 0.85
       },
       "delay": null,
+      "arrival": {
+        "stop_place": "NSR:StopPlace:59872",
+        "stop_order": 5,
+        "aimed_arrival_time": "2026-09-09T06:05:00+00:00",
+        "cancelled": true,
+        "cancellation": 1.0,
+        "delay_ge10": null,
+        "delay": null
+      },
       "effect": "cancelled",
       "destination": "Lillestrøm",
       "mode": "rail",

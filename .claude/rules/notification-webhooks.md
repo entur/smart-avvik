@@ -57,6 +57,14 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   that differ in one place name differ in what matters. The sentence split needs a capital after the
   stop, or «11. oktober kl. 14:00» would split and a different date could lose its tail. Not in
   `message_input`.
+- **`payload.arrival` is the same vehicle journey at the destination stop** (2026-10-18, every mode): built in
+  `varsel._webhook_payload` from `Alert.arrival_prediction`, which is
+  `SituationImpact.paired_arrival_prediction` (the worst cell's OWN alighting call) and never
+  `arrival_prediction` (the worst arrival across lines, possibly another vehicle journey). The event, the
+  journey-alerts read and the test event carry it. `probabilities` and `delay` stay the boarding
+  call's: on 2026-10-12 an R14 ran from Oslo S but was cancelled Lysaker-Asker, and an app showed
+  10 % «innstilling». It mints nothing, moves neither the gate nor `effect`/`phase`, and is not in
+  `message_input` (`llm_message` builds situations from summary and description only).
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the previous pod
   built (`main.warm_caches_from_last_build`), so the public reads' 503s are left for a first deploy

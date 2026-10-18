@@ -545,6 +545,8 @@ and for a subscription's `from_stop`/`to_stop`.
                  "aimed_departure_time": "2026-09-10T05:45:00+00:00", "departs_tomorrow": false},
         "probabilities": {"impact": 1.0, "cancellation": 1.0, "delay_ge10": null, "alert_threshold": 0.85},
         "delay": null,
+        "arrival": {"stop_place": "NSR:StopPlace:59872", "stop_order": 9, "aimed_arrival_time": "2026-09-10T06:06:00+00:00",
+                    "cancelled": true, "cancellation": 1.0, "delay_ge10": null, "delay": null},
         "effect": "cancelled",
         "destination": "Lillestrøm",
         "mode": "rail",
@@ -916,6 +918,17 @@ English, from the same messages. It is `null` until every one of them has its En
 line never mixes languages. Present it as a translation when any of those situations has
 `en_machine_translated` true. Both are absent from an event minted before the fields existed.
 
+**`arrival`** (since 2026-10-18) is the same vehicle journey at your subscription's destination stop:
+`stop_place`, `stop_order`, `aimed_arrival_time`, `cancelled`, `cancellation`, `delay_ge10` and
+`delay` (`{typical_min, worst_case_min}` or `null`). **Everything in `probabilities` and `delay` is
+the BOARDING call's**, and a vehicle can leave on time and still never reach your destination. On
+2026-10-12 an R14 left Oslo S 36 minutes late with every call from Lysaker to Asker cancelled; a
+client rendering `probabilities.cancellation` showed «Sannsynlighet for innstilling: 10 %» to a
+traveller going to Asker. `arrival.cancelled: true` beside a low `probabilities.cancellation` means
+the traveller cannot complete the journey on this departure, and that is what to show. It applies to every mode (bus, tram, ferry), not only rail. It is
+informational: it does not change `phase`, `effect` or whether an event is sent. `null` when the
+destination call could not be resolved, and absent from an event minted before the field existed.
+
 **`situations[].report_type`** (since 2026-10-05) is SIRI-SX's `reportType` as the
 operator published it: `INCIDENT` for a disruption, `GENERAL` for general information such as
 planned work. It is `null` on a `KIX:` situation, which has no operator message behind it, and
@@ -983,7 +996,10 @@ neither was.
 `arrives_before_original` rather than assuming a saving; `minutes_saved` is signed.
 
 A `confirmed` event carries probabilities of 1.0 and **null delay figures** — every delay figure meant
-"if it runs".
+"if it runs". The same rule holds inside `arrival`: when `arrival.cancelled` is true, its
+`delay_ge10` and `delay` are null. **`delay_ge10` is conditional on the vehicle running** on both
+sides, so it is not the overall chance of being 10 minutes late: with `cancellation` 0.10 and
+`delay_ge10` 0.96, about 86 % of such departures run 10+ minutes late and 10 % do not run at all.
 
 ---
 
