@@ -12,7 +12,7 @@
     "@entur/alert": "^0.21.3",
     "@entur/loader": "^0.8.7",
     "@entur/tokens": "^4.2.0",
-    "@entur/typography": "^2.1.12",
+    "@entur/typography": "^3.0.7",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },
