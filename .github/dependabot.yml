@@ -32,6 +32,12 @@ updates:
       minor-and-patch:
         applies-to: version-updates
         update-types: [minor, patch]
+      # The @entur packages depend on each other's tokens. A major taken one package
+      # at a time leaves two generations in the lockfile, so they come in one PR.
+      entur:
+        applies-to: version-updates
+        patterns: ["@entur/*"]
+        update-types: [major]
     cooldown:
       default-days: 7
     commit-message:
