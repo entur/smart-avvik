@@ -121,11 +121,15 @@
         },
         "probabilities": {
           "type": "object",
-          "description": "Impact and cancellation probabilities. Both are 1.0 and the delay figures are null when `phase` is `confirmed`."
+          "description": "Impact and cancellation probabilities at the BOARDING call; `arrival` carries the destination call's. Both are 1.0 and the delay figures are null when `phase` is `confirmed`."
         },
         "delay": {
           "type": ["object", "null"],
           "description": "Delay figures, or null for a confirmed cancellation."
+        },
+        "arrival": {
+          "type": ["object", "null"],
+          "description": "The same vehicle journey at the subscription's destination stop: `stop_place`, `stop_order`, `aimed_arrival_time`, `cancelled` (the real-time feed has declared that call cancelled), `cancellation` (P(cancelled) there, 0-1), `delay_ge10` (P(arrival >= 10 min late | it runs)) and `delay` (`{typical_min, worst_case_min}` arrival delay, or null). `probabilities` and `delay` beside it describe the BOARDING call, and a vehicle can leave on time and still never reach the destination, so `arrival.cancelled` true beside a low `probabilities.cancellation` means the traveller cannot complete the journey on this departure. Like `delay_ge10` and `delay`, every figure that means 'if it runs' is null when `cancelled` is true. Informational only: it does not move `phase`, `effect` or whether an event is sent. Null when we could not resolve the destination call, and absent from an event minted before the field existed."
         },
         "effect": { "type": ["string", "null"] },
         "destination": {
