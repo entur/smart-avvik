@@ -3984,6 +3984,8 @@ def _webhook_payload(
             dumped = alternative.model_dump(mode="json")
         except Exception:
             logger.debug("Could not serialize an alternative journey for a notification event", exc_info=True)
+    situations = _webhook_situations(contributing)
+    situations_text = notification_wording.situations_text(situations)
     return {
         "notification": {"title": title, "body": body, "action": None},
         "call": {
@@ -4019,7 +4021,11 @@ def _webhook_payload(
         # The line's Journey Planner mode (`rail`, `bus`, `metro`, ...), so a client can tell a
         # train from a bus on the same stop pair (KIX-23); null when JP has not said.
         "mode": line_modes.transport_mode(alert.operator, alert.line),
-        "situations": _webhook_situations(contributing),
+        "situations": situations,
+        # The same messages as one text, for a client that would otherwise stack every description
+        # (2026-10-18): operator words only, a superseded forecast and repeated sentences left out.
+        "situations_text": situations_text[0],
+        "situations_text_en": situations_text[1],
         "alternative_journey": dumped,
         # The journey-alerts read's top-level sentence, so a client holding only events can render
         # the favourites row too. A snapshot at mint: a changed sentence mints nothing, like every

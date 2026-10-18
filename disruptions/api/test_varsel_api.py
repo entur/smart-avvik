@@ -5423,6 +5423,10 @@ def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(
     # KIX-29: SIRI-SX reportType rides through /impact onto each situation; S1's fixture has none.
     assert {s["situation_number"]: s["report_type"] for s in subject.payload["situations"]} == {
         "S1": None, "S2": "INCIDENT"}
+    # Both messages as one text, in the payload's order; neither fixture has a description, so each
+    # contributes its summary, and neither has English.
+    assert subject.payload["situations_text"] == "Signalfeil. Innstilt Drammen–Skøyen.", subject.payload
+    assert subject.payload["situations_text_en"] is None
     # KIX-26: the definition's one-sentence summary, in both languages. One train here, so it is the
     # train's own title (prd: no environment tag on either).
     assert subject.payload["summary"] == subject.title, (subject.payload["summary"], subject.title)

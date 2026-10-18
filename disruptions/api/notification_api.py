@@ -1275,6 +1275,10 @@ def _synthetic_event(
                     "report_type": None,
                 }
             ],
+            # Null, as on a real event whose only situation has `has_situation: false`: there is no
+            # operator text to combine.
+            "situations_text": None,
+            "situations_text_en": None,
             "alternative_journey": None,
             # The definition's one-sentence summary (KIX-26): one train, so it is the title above,
             # tagged as a test the same way, and its English twin. Hand-written like that title:

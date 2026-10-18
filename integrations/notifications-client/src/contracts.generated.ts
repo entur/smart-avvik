@@ -252,6 +252,22 @@ export interface NotificationEvent {
      */
     situations?: { [key: string]: unknown }[];
     /**
+     * The `situations` as ONE Norwegian text, for showing in place of every `description` stacked:
+     * the operator's own sentences, never rewritten, only left out or reordered. A forecast Vy has
+     * superseded is left out («Forsinkelse forventes» once «Forsinket» is published), as is a
+     * sentence an earlier message already said (the shared cause), and advice («Ta neste tog ...»)
+     * comes after the facts. Exact repeats only: two messages that differ in a place name are both
+     * kept. Built from the `has_situation` situations only, so null when there is none (a `KIX:`
+     * situation alone); absent from an event minted before the field existed.
+     */
+    situations_text?: string | null;
+    /**
+     * `situations_text` in English, from the same messages: null until every one of them has its
+     * English, rather than mix languages. It is a translation when any of those situations has
+     * `en_machine_translated` true -- present it as one.
+     */
+    situations_text_en?: string | null;
+    /**
      * The journey definition's one-sentence summary, in Norwegian: the same sentence
      * journey-alerts serves as its top-level `summary`, over every alert-worthy train on the
      * definition at mint and not only this one -- for a favourites row («Signalfeil ved Asker: 4
