@@ -2239,6 +2239,7 @@ def _real_payload() -> dict[str, Any]:
     import), and this suite runs in its own process like every other.
     """
     import varsel
+    from impact import StopPrediction
 
     alert = varsel.Alert(
         situation_number="ENT:SituationNumber:1",
@@ -2256,6 +2257,17 @@ def _real_payload() -> dict[str, Any]:
         alert_threshold=0.65,
         alertworthy=True,
         cancelled=True,
+        arrival_prediction=StopPrediction(
+            stop_place=TO,
+            stop_order=5,
+            stop_name=None,
+            scheduled_time=NOW,
+            cancelled=True,
+            cancel_probability=1.0,
+            delay_typ_min=None,
+            delay_p90_min=None,
+            impact_probability=1.0,
+        ),
     )
     return varsel._webhook_payload(
         alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=("s", "s_en")
@@ -2309,7 +2321,7 @@ def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
         synthetic = json.loads(_deliveries[0]["body"])["payload"]
         real = _real_payload()
         assert set(synthetic) == set(real), (set(synthetic) ^ set(real))
-        for key in ("notification", "call", "probabilities"):
+        for key in ("notification", "call", "probabilities", "arrival"):
             assert set(synthetic[key]) == set(real[key]), (key, set(synthetic[key]) ^ set(real[key]))
         assert set(synthetic["situations"][0]) == set(real["situations"][0])
         # And the whole nested structure, which is what actually catches a renamed key three levels
@@ -2330,6 +2342,13 @@ def test_the_synthetic_payload_has_the_same_shape_as_a_real_one():
             real["probabilities"],
         )
         assert nullability["delay_ge10"] is True, "a confirmed cancellation states no delay figure"
+        # The same rule one stop along: a whole-train cancellation is cancelled at the destination
+        # too, and every figure there that meant "if it runs" is null on both producers.
+        arrival_nulls = {k: v is None for k, v in synthetic["arrival"].items()}
+        assert arrival_nulls == {k: v is None for k, v in real["arrival"].items()}, (
+            arrival_nulls,
+            real["arrival"],
+        )
     finally:
         _uninstall()
 

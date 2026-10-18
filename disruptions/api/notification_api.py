@@ -1247,6 +1247,17 @@ def _synthetic_event(
             },
             # Null, because every delay figure meant "if it runs".
             "delay": None,
+            # The same vehicle journey at the subscription's destination. A whole-journey cancellation is
+            # cancelled there too, so it reads (cancelled, 1.0, NULL, NULL) like the boarding call.
+            "arrival": {
+                "stop_place": sub.to_stop,
+                "stop_order": 5,
+                "aimed_arrival_time": (aimed + timedelta(minutes=20)).isoformat(),
+                "cancelled": True,
+                "cancellation": 1.0,
+                "delay_ge10": None,
+                "delay": None,
+            },
             "effect": "cancelled",
             # The title's own, as on a real event.
             "destination": "Lillestrøm",

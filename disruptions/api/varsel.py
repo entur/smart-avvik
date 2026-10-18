@@ -136,7 +136,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi import (
     Path as PathParam,  # aliased: `Path` here is pathlib's (see _STATE_PATH)
 )
-from impact import AlternativeOutcome, ImpactResponse, LatestObservation, severity_key
+from impact import AlternativeOutcome, ImpactResponse, LatestObservation, StopPrediction, severity_key
 
 # The WORDING moved out on 2026-09-08 (U1) so a second notification surface can produce the same
 # Norwegian text without importing this module -- 147 KB of poller state, the device registry, the
@@ -1931,6 +1931,15 @@ class Alert(BaseModel):
         default=None,
         description="Calibrated P(cancelled OR >= 10 min late) at boarding — the alerting score.",
     )
+    arrival_prediction: StopPrediction | None = Field(
+        default=None,
+        description="The same vehicle journey's call at the journey's `to_stop`: whether ET has "
+        "declared it "
+        "cancelled, P(cancelled) there and the arrival delay if it runs. Every figure above is the "
+        "BOARDING call's, and a vehicle can leave on time and still never reach the destination "
+        "(R14 on 2026-10-12: Oslo S ran, Lysaker-Asker was cancelled). Informational only: the "
+        "gate reads `impact_probability` and nothing here. Null when no alighting call resolved.",
+    )
     alert_threshold: float = Field(
         description="The operator's alerting threshold applied to impact_probability here (as "
         "shown per card on /demo).",
@@ -2129,6 +2138,9 @@ def _collect_alerts(
             delay_p90_min=dep.delay_p90_min,
             ge10_probability=dep.ge10_probability,
             impact_probability=impact_p,
+            # The boarded vehicle journey's own alighting call, never `sit.arrival_prediction`:
+            # that one is the worst arrival across the situation's lines and may be another one.
+            arrival_prediction=getattr(sit, "paired_arrival_prediction", None),
             alert_threshold=threshold,
             alertworthy=alertworthy,
             latest_observation=observation_by_line.get(sit.line),
@@ -3976,6 +3988,7 @@ def _webhook_payload(
     )
     alternative = getattr(alert, "alternative_journey", None)
     dumped: Any = None
+    arr = alert.arrival_prediction
     if alternative is not None:
         try:
             # `mode="json"` so the stored document holds JSON primitives: the event is serialized to
@@ -4005,6 +4018,29 @@ def _webhook_payload(
             "alert_threshold": alert.alert_threshold,
         },
         "delay": delay,
+        # The same vehicle journey at the traveller's destination, beside `call` rather than inside
+        # `probabilities` and `delay`, which stay the boarding call's: a client that renders
+        # «Sannsynlighet for innstilling» off `probabilities.cancellation` showed 10 % for a train
+        # whose every call past Skøyen was cancelled. Informational only -- it moves neither the
+        # gate, nor `effect`, nor the phase, and it is not in the message input (the wording key).
+        # Aimed, never expected, for `call`'s reason.
+        "arrival": (
+            None
+            if arr is None
+            else {
+                "stop_place": arr.stop_place,
+                "stop_order": arr.stop_order,
+                "aimed_arrival_time": arr.scheduled_time.isoformat() if arr.scheduled_time else None,
+                "cancelled": arr.cancelled,
+                "cancellation": arr.cancel_probability,
+                "delay_ge10": arr.ge10_probability,
+                "delay": (
+                    None
+                    if arr.cancelled
+                    else {"typical_min": _typ_delay(arr), "worst_case_min": arr.delay_p90_min}
+                ),
+            }
+        ),
         # A two-value vocabulary derived from what we actually know, `null` when neither is
         # established. New wire vocabulary, so U7's typed client and U8's published contract have to
         # match these two literals rather than invent their own.
