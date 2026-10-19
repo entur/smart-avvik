@@ -95,7 +95,10 @@ INSERT INTO `disruptions.varsel_decision_outcomes` (
   -- first so the columns exist, then `bq update --transfer_config` in dev and prd. The old stored
   -- text keeps working until then -- it simply inserts two columns short, leaving them NULL -- and
   -- the job fails outright the moment the new text runs against a table without the columns.
-  channel, n_subscriptions
+  channel, n_subscriptions,
+  -- 2026-10-19, the same operator step again: deploy (the startup ALTER adds both), then
+  -- `bq update --transfer_config` in dev and prd in the same sitting.
+  destination_cancelled, actual_destination_cancelled
 )
 WITH
 -- The decision subjects to label. The grouping itself lives in the
@@ -149,12 +152,28 @@ realized AS (
   -- far as this table is concerned, and must stay unknown rather than become "fine".
   WHERE call_cancelled OR actual_dep IS NOT NULL
 ),
+-- The journey's destination calls that ET cancelled (2026-10-19). ET's stopPointRef is a QUAY and
+-- the subject names the stop place, resolved the way removed_et does and the way the matcher's own
+-- rail_calls tables are built, so `to_stop` compares like for like. One row per (journey, stop place,
+-- position): the join below asks only whether one exists after the boarding call.
+destination_cancelled_et AS (
+  SELECT DISTINCT e.operator, e.jkey, e.call_date, e.stop_order, q.stopPlaceRef AS stop_place
+  FROM et AS e
+  JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
+    ON q.id = e.stopPointRef
+  WHERE e.call_cancelled
+),
 labelled AS (
   SELECT
     g.*,
     r.call_cancelled AS actual_cancelled,
     IF(r.call_cancelled, NULL, r.dep_delay_min) AS actual_dep_delay_min,
     CASE
+      -- The train never reached the traveller's destination: trouble whatever the boarding call
+      -- did, and even when the boarding call is not in ET at all -- an unknown departure cannot
+      -- rescue a trip whose end was cancelled. Before 2026-10-19 such a train labelled on the
+      -- boarding call alone, so a warning about it read as a false alarm when it left on time.
+      WHEN dc.is_cancelled THEN TRUE
       WHEN r.operator IS NULL THEN NULL          -- no realized call found: unknown, not "no trouble"
       WHEN r.call_cancelled THEN TRUE
       -- No COALESCE to 0 here, deliberately. A matched call whose departure delay is still NULL
@@ -163,8 +182,29 @@ labelled AS (
       -- unmatched branch above. Defaulting it to 0 would have made it read as "no trouble" and
       -- manufactured a correct_reject out of missing data -- the one thing this table must never do.
       ELSE r.dep_delay_min >= 10                 -- same bar as varsel.TROUBLE_DELAY_MIN
-    END AS actual_trouble
+    END AS actual_trouble,
+    COALESCE(dc.is_cancelled, FALSE) AS actual_destination_cancelled
   FROM grouped AS g
+  -- At most one row per subject (a LOGICAL_OR), so this LEFT JOIN cannot duplicate one; the date
+  -- rule is the realized join's below.
+  LEFT JOIN (
+    SELECT g2.journey_digest, g2.operator, g2.jkey, g2.call_date, g2.stop_order, g2.situation_number,
+           TRUE AS is_cancelled
+    FROM grouped AS g2
+    JOIN destination_cancelled_et AS d
+      ON  d.operator   = g2.operator
+      AND d.jkey       = g2.jkey
+      AND d.stop_place = g2.to_stop
+      AND d.stop_order > g2.stop_order
+      AND (d.call_date = g2.call_date OR STARTS_WITH(g2.jkey, 'DatedServiceJourney:'))
+    GROUP BY 1, 2, 3, 4, 5, 6
+  ) AS dc
+    ON  dc.journey_digest   = g.journey_digest
+    AND dc.operator         = g.operator
+    AND dc.jkey             = g.jkey
+    AND dc.call_date        = g.call_date
+    AND dc.stop_order       = g.stop_order
+    AND dc.situation_number = g.situation_number
   LEFT JOIN realized AS r
     ON  r.operator   = g.operator
     AND r.jkey       = g.jkey
@@ -279,7 +319,9 @@ labelled_removed AS (
        AND g.r_od <= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY) THEN TRUE
       -- The line absent from ET, or the train present with no realized call at the boarding stop
       -- (on another line, a boarding call only estimated, or not recorded at all): unknown.
-    END AS actual_trouble
+    END AS actual_trouble,
+    -- Not judged here: a removed train is absent from ET, so it has no destination call either.
+    CAST(NULL AS BOOL) AS actual_destination_cancelled
   FROM removed_subjects AS g
   LEFT JOIN removed_boarding AS b
     ON  b.od = g.r_od AND b.trainno = g.r_trainno AND b.line = g.r_line
@@ -333,7 +375,8 @@ SELECT
   -- a row said so or browser rows and webhook rows both occur) and takes the highest
   -- n_subscriptions, exactly as it takes the highest n_devices. Restating either here would be a
   -- second definition of which channel a shared definition belongs to.
-  channel, n_subscriptions
+  channel, n_subscriptions,
+  destination_cancelled, actual_destination_cancelled
 FROM labelled_all AS l
 -- Idempotent, but only for subjects that actually RESOLVED. A subject labelled while ET had not yet
 -- caught up carries actual_trouble = NULL; skipping it here too would freeze that "unknown" forever,

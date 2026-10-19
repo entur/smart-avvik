@@ -280,6 +280,18 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
       has wrong column count; Has 35, expected 36". The INSERT now names its columns, and new
       columns still go **last** in the CREATE so a fresh environment and an ALTERed one agree on
       order. Applying the DDL and updating the config are one operation, not two.
+  - **A cancelled DESTINATION call is relayed, and trouble** (2026-10-19). `destination_cancelled`
+    on `varsel_decisions`, the groups function (resolved at the cycle the verdict judges, exactly
+    like `et_cancelled`, and appended LAST so the registered labelling copy's `SELECT *` keeps
+    lining its two UNION ALL branches up) and `varsel_decision_outcomes`, which also gains
+    `actual_destination_cancelled`. The six provenance CASEs read `et_cancelled IS TRUE OR
+    destination_cancelled IS TRUE` as `relayed`, still after the removed prefix and the NULL arm.
+    The labeller resolves the journey's call at `to_stop` after the boarding call (quay to stop place
+    through `quays_last_version`) and makes `actual_trouble` TRUE when ET cancelled it, ahead of the
+    boarding arms, so it changes labels for every NEW subject, flagged or not: replayed over prd's
+    10-day window on 2026-10-19 it turned 4 false alarms and 9 unknowns into hits and 26 correct
+    rejects and 15 unknowns into misses. Frozen rows are untouched. Operator step as for every
+    outcomes column: deploy, then `bq update --transfer_config` in dev and prd in the same sitting.
   - **Four segments since 2026-09-23: `predicted`, `relayed`, `no_sx` and `removed`** (plan
     2026-09-23-001, KTD10). `removed` is a train Vy took out of the day's timetable without
     publishing a cancellation (`KIX:PlanRemoved:<jkey>`, relayed by `predict_calls.sql`'s `et_only`

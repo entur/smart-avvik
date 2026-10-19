@@ -1962,14 +1962,18 @@ def _payload(alert):
     )
 
 
-def test_a_train_that_leaves_but_never_reaches_the_destination_says_so_in_arrival():
+def test_a_train_that_leaves_but_never_reaches_the_destination_is_a_confirmed_cancellation():
     """R14 on 2026-10-12: it left Oslo S 36 min late and every call past Skøyen, Asker included, was
-    cancelled. The payload's figures are the BOARDING call's, so a client showed «Sannsynlighet for
-    innstilling: 10 %» to a traveller who could not get to Asker on that train. `arrival` carries
-    the destination side, and adds it without moving anything that was already there."""
+    cancelled. For a traveller to Asker that is a cancelled TRIP, and since 2026-10-19 the alert
+    says so the way a boarding cancellation does: the certainty in the figures, `effect`
+    "cancelled", phase `confirmed` -- while `cancelled` stays the boarding call's own (False)."""
     board, alight = _train(MON_0800, p_cancel=0.10, p_impact_dep=0.97, p_dep_ge10=0.96)
     alight.et_declared_cancelled = True
     [alert] = match(_journey(), {"S1": [board, alight]})
+
+    assert alert.cancelled is False and alert.destination_cancelled is True
+    assert alert.trip_cancelled is True
+    assert alert.alertworthy and alert.impact_probability == 1.0
 
     payload = _payload(alert)
     assert payload["arrival"] == {
@@ -1981,11 +1985,65 @@ def test_a_train_that_leaves_but_never_reaches_the_destination_says_so_in_arriva
         "delay_ge10": None,
         "delay": None,
     }
-    # Unchanged: the boarding figures, the effect and the gate all still read the boarding call.
-    assert payload["probabilities"]["cancellation"] == 0.10
-    assert payload["probabilities"]["delay_ge10"] == 0.96
-    assert payload["effect"] == "delayed"
-    assert alert.cancelled is False and alert.impact_probability == 0.97
+    # The schema's rule for a confirmed event: 1.0 and no delay figure, which all meant "if it runs".
+    assert payload["probabilities"]["impact"] == 1.0
+    assert payload["probabilities"]["cancellation"] == 1.0
+    assert payload["probabilities"]["delay_ge10"] is None
+    assert payload["delay"] is None
+    assert payload["effect"] == "cancelled"
+
+
+def test_a_cancelled_destination_alerts_a_train_whose_departure_looked_fine():
+    """The widening, proved to fire for its own reason: 0.30 at boarding is far under the bar, and
+    the alert comes from ET's declared cancellation of the destination call and nothing else."""
+    board, alight = _train(MON_0800, p_cancel=0.02, p_impact_dep=0.30)
+    [quiet] = match(_journey(), {"S1": [board, alight]})
+    assert not quiet.alertworthy and not quiet.trip_cancelled
+
+    alight.et_declared_cancelled = True
+    [alert] = match(_journey(), {"S1": [board, alight]})
+    assert alert.alertworthy and alert.destination_cancelled
+
+
+def test_a_cancelled_intermediate_stop_does_not_cancel_the_trip():
+    """Endpoints only: a stop the train skips between the traveller's two stops strands nobody."""
+    board, alight = _train(MON_0800, p_cancel=0.02, p_impact_dep=0.30)
+    skipped = FakeCall(jkey="t1", stop_place="M", stop_order=3, aimed_dep=MON_0800 + timedelta(minutes=20),
+                       aimed_arr=MON_0800 + timedelta(minutes=19), et_declared_cancelled=True)
+    [alert] = match(_journey(), {"S1": [board, skipped, alight]})
+    assert not alert.destination_cancelled and not alert.alertworthy
+
+
+def test_a_train_cut_short_outranks_a_delayed_sibling_on_the_same_line():
+    """`worst` keeps one train per line, and it ranks the TRIP: a train that will not reach the
+    destination must win over a merely delayed one, or it is dropped before any gate sees it."""
+    delayed = _train(MON_0800, jkey="delayed", p_impact_dep=0.90)
+    cut = _train(MON_0800 + timedelta(minutes=30), jkey="cut", p_impact_dep=0.20)
+    cut[1].et_declared_cancelled = True
+    [alert] = match(_journey(), {"S1": delayed + cut})
+    assert alert.jkey == "cut" and alert.destination_cancelled
+
+
+def test_a_train_cut_short_is_a_confirmed_webhook_observation():
+    """The phase follows the TRIP: the pass's own loop hands the emit step `cancelled=True` for a
+    train whose destination call ET cancelled, which `requested_phase` turns into `confirmed`."""
+    import notification_events
+    import notification_store
+
+    board, alight = _train(MON_0800)
+    alight.et_declared_cancelled = True
+    alerts = match(_journey(), {"S1": [board, alight]})
+    key = "A|B|07:00|09:00|0,1,2,3,4"
+    out: list = []
+    recipient = varsel.WebhookRecipient("sub_1", _journey(), client_id="c1", destination_id="d1")
+    varsel._observations_for_key(
+        out, key, [recipient], alerts_by_key={key: alerts}, match_targets={key: _journey()},
+        message_inputs={}, webhook_llm=False,
+    )
+    [observation] = out
+    assert observation.alertworthy and observation.cancelled is True
+    subject = observation.subject(observation.recipients[0])
+    assert notification_events.requested_phase(subject) == notification_store.PHASE_CONFIRMED
 
 
 def test_arrival_is_the_boarded_journeys_own_never_another_lines():
@@ -1996,11 +2054,13 @@ def test_arrival_is_the_boarded_journeys_own_never_another_lines():
     mine[1].p_cancel = 0.05
     theirs = _train(MON_0800 + timedelta(minutes=10), jkey="theirs", p_impact_dep=0.40,
                     line="VYG:Line:R13")
-    theirs[1].et_declared_cancelled = True
+    # A bad arrival on the other line, but not a cancelled one: a cancelled destination would make
+    # THAT train the worst trip (2026-10-19), which is a different rule with its own test.
+    theirs[1].p_cancel, theirs[1].p_impact = 0.60, 0.99
     [alert] = match(_journey(), {"S1": mine + theirs})
 
     assert alert.jkey == "mine"
-    assert alert.impact.situations[0].arrival_prediction.cancelled is True  # the other train's
+    assert alert.impact.situations[0].arrival_prediction.cancel_probability == 0.60  # the other train's
     arrival = _payload(alert)["arrival"]
     assert arrival["cancelled"] is False and arrival["cancellation"] == 0.05
 

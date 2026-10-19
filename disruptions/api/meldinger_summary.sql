@@ -88,7 +88,7 @@ joined AS (
     -- A matched row implies o.call_date = s.call_date, and s.call_date is non-NULL for any row that
     -- could match, so this is a reliable "did the join find a verdict row" flag.
     o.call_date IS NOT NULL AS is_labelled,
-    o.verdict, o.actual_trouble, o.et_cancelled, o.alert_lead_min
+    o.verdict, o.actual_trouble, o.et_cancelled, o.destination_cancelled, o.alert_lead_min
   FROM subjects AS s
   LEFT JOIN `disruptions.varsel_decision_outcomes` AS o
     ON  o.call_date BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
@@ -101,7 +101,7 @@ joined AS (
 ),
 labelled AS (
   SELECT
-    verdict, alert_lead_min, actual_trouble, et_cancelled,
+    verdict, alert_lead_min, actual_trouble, et_cancelled, destination_cancelled,
     -- Derived once so the many COUNTIFs below cannot each spell the rule slightly differently. The
     -- removed prefix goes first (see the header). After it, NULL et_cancelled still means
     -- "unsegmented" -- a row written before the flag existed (2026-08-05) belongs to no segment, and
@@ -110,7 +110,7 @@ labelled AS (
     CASE
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
       WHEN et_cancelled IS NULL                              THEN NULL
-      WHEN et_cancelled IS TRUE                              THEN 'relayed'
+      WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
       WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
       ELSE 'predicted'
     END AS provenance,
@@ -152,7 +152,7 @@ hits_per_train AS (
       CASE
         WHEN STARTS_WITH(j.situation_number, 'KIX:PlanRemoved:') THEN 'removed'
         WHEN j.et_cancelled IS NULL                              THEN NULL
-        WHEN j.et_cancelled IS TRUE                              THEN 'relayed'
+        WHEN j.et_cancelled IS TRUE OR j.destination_cancelled IS TRUE THEN 'relayed'
         WHEN STARTS_WITH(j.situation_number, 'KIX:NoSituation:') THEN 'no_sx'
         ELSE 'predicted'
       END AS provenance

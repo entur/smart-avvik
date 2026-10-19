@@ -76,14 +76,14 @@
 -- the buckets partition the labelled rows by construction either way.
 WITH labelled AS (
   SELECT
-    call_date, verdict, alert_lead_min, actual_trouble, et_cancelled,
+    call_date, verdict, alert_lead_min, actual_trouble, et_cancelled, destination_cancelled,
     -- Derived once here so the COUNTIFs below cannot each spell the rule slightly differently.
     -- The removed prefix goes first (see the header); after it, NULL et_cancelled still means
     -- "unsegmented".
     CASE
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:')        THEN 'removed'
       WHEN et_cancelled IS NULL                                     THEN NULL
-      WHEN et_cancelled IS TRUE                                     THEN 'relayed'
+      WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
       WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:')        THEN 'no_sx'
       ELSE 'predicted'
     END AS provenance,
@@ -159,7 +159,7 @@ hits_per_train AS (
     ARRAY_AGG(STRUCT(alert_lead_min, CASE
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
       WHEN et_cancelled IS NULL                              THEN NULL
-      WHEN et_cancelled IS TRUE                              THEN 'relayed'
+      WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
       WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
       ELSE 'predicted'
     END AS provenance) ORDER BY alert_lead_min DESC LIMIT 1)[OFFSET(0)]

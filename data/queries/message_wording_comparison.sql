@@ -124,7 +124,7 @@ SELECT
   CASE
     WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
-    WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
+    WHEN g.et_cancelled IS TRUE OR g.destination_cancelled IS TRUE THEN 'relayed'
     WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
     ELSE 'predicted'
   END                                 AS provenance,
@@ -194,7 +194,7 @@ SELECT
   CASE
     WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
-    WHEN g.et_cancelled IS TRUE                            THEN 'relayed'
+    WHEN g.et_cancelled IS TRUE OR g.destination_cancelled IS TRUE THEN 'relayed'
     WHEN STARTS_WITH(situation_number, 'KIX:NoSituation:') THEN 'no_sx'
     ELSE 'predicted'
   END                             AS provenance,

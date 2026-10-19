@@ -577,6 +577,9 @@ def build_row(
         # the two populations are indistinguishable afterwards and the headline number drifts with
         # the mix between them rather than with anything about the app.
         "et_cancelled": bool(getattr(alert, "cancelled", False)),
+        # The destination half of the same split (2026-10-19): the boarding call ran and ET had
+        # cancelled the call at `to_stop`, so the 1.0s beside it are a relayed fact too.
+        "destination_cancelled": bool(getattr(alert, "destination_cancelled", False)),
         "impact_probability": getattr(alert, "impact_probability", None),
         "cancel_probability": getattr(alert, "cancel_probability", None),
         "ge10_probability": getattr(alert, "ge10_probability", None),
@@ -644,6 +647,7 @@ def rescored(row: dict, alert: Alert) -> dict:
         "decided_at": decided_at.isoformat(),
         "minutes_to_departure": minutes_to_departure,
         "et_cancelled": bool(getattr(alert, "cancelled", False)),
+        "destination_cancelled": bool(getattr(alert, "destination_cancelled", False)),
         "impact_probability": getattr(alert, "impact_probability", None),
         "cancel_probability": getattr(alert, "cancel_probability", None),
         "ge10_probability": getattr(alert, "ge10_probability", None),
