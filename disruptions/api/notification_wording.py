@@ -343,6 +343,10 @@ def deterministic_body(message_input: dict) -> str:
         # (2026-08-05). The input carries no delay figures in this case either -- they meant
         # "if it runs".
         detail = "Innstilt"
+    elif message_input.get("kommer_ikke_fram"):
+        # The vehicle leaves, and ET has cancelled the call where the traveller gets off. As certain
+        # as «Innstilt» and as figure-free, and the body's first line already names the stop.
+        detail = DESTINATION_CANCELLED
     elif cancel_pct is not None:
         detail = f"{cancel_pct} % sjanse for innstilling"
     else:
@@ -378,7 +382,8 @@ def notification_title(
     title = _train_title(message_input)
     if title is None:
         return f"{from_name} → {to_name}"
-    return f"Bekreftet: {title}" if confirmed and message_input.get("innstilt") else title
+    certain = message_input.get("innstilt") or message_input.get("kommer_ikke_fram")
+    return f"Bekreftet: {title}" if confirmed and certain else title
 
 
 def outcome_verb(message_input: dict) -> str:
@@ -392,6 +397,8 @@ def outcome_verb(message_input: dict) -> str:
     """
     if message_input.get("innstilt"):
         return "er innstilt"
+    if message_input.get("kommer_ikke_fram"):
+        return "kjører ikke helt fram"
     if message_input.get("innstilling_prosent") is not None:
         return "kan bli innstilt"
     delay = message_input.get("forsinkelse_min") or {}
@@ -433,7 +440,18 @@ CAUSE_STOP_PHRASES = frozenset({
     "toget står",
     "toget kjører igjen",
 })
-_VERB_ORDER = ("er innstilt", "kan bli innstilt", "kan bli forsinket", "mulig avvik")
+_VERB_ORDER = (
+    "er innstilt",
+    # Certain like the one above and just as much a reason to look for another way (2026-10-19), so
+    # it ranks next to it and ahead of every forecast.
+    "kjører ikke helt fram",
+    "kan bli innstilt",
+    "kan bli forsinket",
+    "mulig avvik",
+)
+#: The template's line for a departure that leaves but never reaches the traveller's stop: ET has
+#: cancelled the call there (`kommer_ikke_fram`). The card and the feedback snapshot say it verbatim.
+DESTINATION_CANCELLED = "Kjører ikke helt fram"
 
 
 @dataclass(frozen=True)
@@ -477,6 +495,7 @@ _NB = _Vocabulary(
 _EN = _Vocabulary(
     verbs={
         "er innstilt": ("is cancelled", "are cancelled"),
+        "kjører ikke helt fram": ("does not run all the way", "do not run all the way"),
         "kan bli innstilt": ("may be cancelled", "may be cancelled"),
         "kan bli forsinket": ("may be delayed", "may be delayed"),
         "mulig avvik": ("possible disruption", "possible disruption"),
@@ -841,6 +860,7 @@ def wording_key(
         getattr(winner, "situation_number", None),
         departure.isoformat() if departure is not None else "",
         bool(getattr(winner, "cancelled", False)),
+        bool(getattr(winner, "destination_cancelled", False)),
         bool(tomorrow),
         alternative_identity(alternative) if alternative is not None else None,
         prompt_version(),

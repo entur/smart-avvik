@@ -1390,7 +1390,9 @@ def _original_candidate(
         # deadline, and is passed to `select_best` separately.
         arrival_time=predicted_arrival,
         aimed_arrival_time=deadline,
-        cancelled=cell.departure.cancelled,
+        # A train that never reaches `to_stop` is as gone as a cancelled one for this trip, so the
+        # selection's materiality gate releases and the traveller is never kept on it.
+        cancelled=cell.departure.cancelled or cell.destination_cancelled,
         risky=_over_alert_gate(cell),
         likely_cancelled=_likely_cancelled(cell.departure.cancel_probability, cell),
         is_original=True,
@@ -1493,7 +1495,9 @@ def _best_remaining_journey(
     # every in-window rival and the offer fell back to a train before the window (prd 2026-09-23:
     # R22 17:00 removed, 16:00 and 16:29 running, offered the 13:00). A rival under the gate is
     # still judged on its own predictions by `score_candidates`.
-    disrupted = [c for c in affected if c.departure.cancelled or _over_alert_gate(c)]
+    disrupted = [
+        c for c in affected if c.departure.cancelled or c.destination_cancelled or _over_alert_gate(c)
+    ]
     affected_refs = {(c.operator, c.jkey) for c in disrupted if c.jkey}
     if subject is not None:
         affected_refs.add(subject)

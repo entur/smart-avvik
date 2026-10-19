@@ -292,6 +292,11 @@ sannsynlighet. Skriv at toget/bussen ER innstilt, aldri «kan bli» eller «sjan
 tilfellet finnes verken `sannsynlighet_prosent` eller `forsinkelse_min` i dataene, og du skal \
 ikke nevne noen prosent eller forsinkelse i det hele tatt – bare innstillingen, og alternativet \
 hvis det finnes.
+- `kommer_ikke_fram: true` betyr at avgangen går fra der den reisende går på, men at stoppet der \
+den reisende skal av (`reise.til`) ALLEREDE ER INNSTILT, så den kommer ikke fram dit. Det er et \
+faktum. Skriv at <transportmiddel> <linje> <avgang_kl> ikke kjører helt fram til `reise.til`, \
+aldri «kan». Det finnes verken prosent eller forsinkelse i dataene; nevn ingen. Nevn alternativet \
+hvis det finnes.
 - Nevn ALDRI `sannsynlighet_prosent`, og oppgi ingen prosent for den. Den er sjansen for \
 innstilling ELLER minst 10 minutters forsinkelse, og hele den setningen må stå der for at tallet \
 skal bety noe – den er for lang og for uklar på en låseskjerm, og kortformene av den («X % sjanse \
@@ -1119,6 +1124,11 @@ def build_message_input(
         payload["situasjoner"] = []
     if certain_cancelled:
         payload["innstilt"] = True
+    elif getattr(alert, "destination_cancelled", False):
+        # The vehicle leaves and ET has cancelled the call at `reise.til` (2026-10-19). A fact like
+        # `innstilt`, and like it the figures beside it are certainties or "if it runs", so none
+        # rides: a 100 % here would read as a forecast and a delay as a promise of arrival.
+        payload["kommer_ikke_fram"] = True
     else:
         # Carried for the RECORD, not for quoting: it is the figure the alert gate fired on, so a
         # decision row without it cannot be re-read against the threshold that produced it. Neither

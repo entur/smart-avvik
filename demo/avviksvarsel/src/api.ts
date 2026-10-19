@@ -89,6 +89,9 @@ export interface Alert {
   // ET has already declared this departure cancelled: a fact, not a forecast. When true the card
   // says "Innstilt" and never a percentage — cancel_probability is 1.0 by construction.
   cancelled?: boolean;
+  // ET has declared the call at the journey's destination cancelled while this departure runs: it
+  // leaves and never gets there. The card says "Kjører ikke helt fram" and no percentage.
+  destination_cancelled?: boolean;
   cancel_probability: number;
   delay_p50_min: number | null; // median delay from the exceedance stack (as /demo shows)
   delay_p90_min: number | null;

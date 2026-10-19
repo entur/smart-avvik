@@ -3175,6 +3175,9 @@ def _message_input_from_alert(alert: Alert) -> dict:
     if alert.cancelled:
         body["innstilt"] = True
         return body
+    if alert.destination_cancelled:
+        body["kommer_ikke_fram"] = True
+        return body
     body["forsinkelse_min"] = {"typisk": alert.delay_p50_min, "verstefall": alert.delay_p90_min}
     if alert.cancel_probability >= _CANCEL_LIKELY:
         body["innstilling_prosent"] = round(alert.cancel_probability * 100)
@@ -3931,7 +3934,7 @@ def cached_wording_and_alternative(
         alternative = _alternatives.get(_subject_key(pair, alert))
         wording = (
             None
-            if (not enabled or alert.cancelled)
+            if (not enabled or alert.trip_cancelled)
             else _messages.get(_message_key(pair, alert))
         )
     return wording, alternative
@@ -4320,7 +4323,7 @@ def _observations_for_key(
             # twice would be a second read of a cache another thread can change mid-pass.
             cached = (
                 None
-                if winner.cancelled
+                if winner.trip_cancelled
                 else _webhook_wording(_message_key(pair, winner), enabled=webhook_llm)
             )
             title, body = notification_wording_for(
@@ -6372,6 +6375,8 @@ def _feedback_detail(alert: Alert) -> str:
         parts.append(train)
     if alert.cancelled:
         parts.append("Innstilt")
+    elif alert.destination_cancelled:
+        parts.append(notification_wording.DESTINATION_CANCELLED)
     elif alert.cancel_probability >= _CANCEL_LIKELY:
         # JavaScript Math.round (used by the card) rounds non-negative .5 values upward; Python's
         # round uses ties-to-even and would make the persisted "exact" text disagree at 50.5 %.

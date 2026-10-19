@@ -82,6 +82,16 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   labeller counts a cancelled destination call as trouble whatever the boarding call did. Measured
   before building it (prd, 30 days to 2026-10-18): 51 alert-worthy Vy train x destination pairs and up
   to 139 never-alert-worthy ones had the destination cancelled with the boarding call running.
+  **Worded as its own certainty, never as «er innstilt»** (the train leaves): `kommer_ikke_fram` in
+  the message input (no figures beside it, like `innstilt`), `outcome_verb` «kjører ikke helt fram»
+  ranked second in `_VERB_ORDER`, «Bekreftet:» on a confirmed title, and
+  `notification_wording.DESTINATION_CANCELLED` verbatim on the template's detail line, the PWA card
+  and the feedback snapshot. Template-only on the webhook and pull paths like a boarding
+  cancellation (`trip_cancelled` in both LLM refusals), and the prompt gained a rule for the
+  browser's model. `destination_cancelled` joined `wording_key`, so a forecast and this certainty
+  never share a cached wording; with the prompt change that re-words every alert once on deploy.
+  The original train competes for its own replacement as `cancelled` (`_original_candidate`), so
+  the selection never keeps the traveller on a train that does not get there.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the leader last
   built (`main.follow_last_build`, since 2026-10-13; it replaced the 2026-09-25 warm start and

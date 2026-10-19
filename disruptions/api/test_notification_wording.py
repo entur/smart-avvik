@@ -1166,6 +1166,24 @@ def test_one_train_is_its_own_title_and_no_train_is_nothing_to_say():
     assert _en([(_mi("07:18", line=None, mode="Ferje"), [_sit("S1")])]) == "at 07:18 may be delayed"
 
 
+def test_a_train_that_never_reaches_the_destination_has_its_own_certain_wording():
+    """«kjører ikke helt fram», never «er innstilt» (it leaves) and never a forecast verb (ET has
+    said so). Ranked next to a cancellation in the summary, confirmed like one in the title, and
+    stated verbatim on the template's detail line."""
+    mi = {"transportmiddel": "Tog", "linje": "R14", "destinasjon": "Asker", "avgang_kl": "10:59",
+          "kommer_ikke_fram": True}
+    assert nw.outcome_verb(mi) == "kjører ikke helt fram"
+    assert nw.notification_title(mi, "Oslo S", "Asker") == "Tog R14 Asker 10:59 kjører ikke helt fram"
+    assert nw.notification_title(mi, "Oslo S", "Asker", confirmed=True).startswith("Bekreftet: ")
+    assert nw.DESTINATION_CANCELLED in nw.deterministic_body(mi)
+    assert _en([(mi, [_sit("S1")])]) == "Train R14 Asker 10:59 does not run all the way"
+    # Worst-first: after a cancellation, ahead of every forecast.
+    trains = [(_mi("08:00"), [_sit("S1")]), (mi, [_sit("S2", summary="Innstilt Skøyen-Asker")]),
+              (_mi("09:00", verb="cancelled"), [_sit("S3", summary="Innstilt Skøyen-Asker")])]
+    assert nw._VERB_ORDER.index("kjører ikke helt fram") == 1
+    assert "kjører ikke helt fram" in _nb(trains)
+
+
 def _msg(number, summary, description, summary_en=None, description_en=None, has_situation=True):
     """One of the payload's `situations`, operator text in both languages."""
     return {"situation_number": number, "summary": summary, "description": description,
