@@ -76,7 +76,7 @@ RUN npm run build
 # distroless runtime below) so the wheels copied across are binary-compatible.
 # The venv is self-contained under /opt/venv; the runtime stage puts its
 # site-packages on PYTHONPATH rather than using the venv's own interpreter.
-FROM python:3.14-slim AS pybuild
+FROM python:3.13-slim AS pybuild
 
 # uv for fast installs (project convention; see CLAUDE.md). only-system pins uv to
 # the image's CPython so the venv is 3.13 (never a uv-downloaded interpreter).
