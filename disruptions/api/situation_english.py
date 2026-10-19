@@ -102,13 +102,22 @@ def english(situation_number: str, summary: str | None, description: str | None)
         return _translated.get(_digest(summary, description))
 
 
-def update(texts: dict[str, tuple[str | None, str | None, str | None, str | None]]) -> None:
+def update(
+    texts: dict[str, tuple[str | None, str | None, str | None, str | None]],
+    *,
+    translate: bool = True,
+) -> None:
     """Swap in this generation's texts -- `situation_number -> (summary, description, summary_en,
     description_en)` -- and submit a translation for each Norwegian text with no English.
 
     Where the operator's English covers every Norwegian field present, it is used as it stands. Where
     it does not, the WHOLE pair is translated rather than the missing half, so the two English fields
     never come from two sources under one `en_machine_translated`.
+
+    `translate=False` is a follower pod's load (zero-downtime KTD12): it swaps in the operator's own
+    English, which is on the table every pod reads, and submits nothing -- otherwise every replica
+    would ask Gemini for the same ~400 situations a day. Machine translations are therefore the
+    lease holder's alone, and a follower serves a text without one as untranslated.
     """
     operator: dict[str, English] = {}
     missing: dict[str, tuple[str | None, str | None]] = {}
@@ -123,7 +132,7 @@ def update(texts: dict[str, tuple[str | None, str | None, str | None, str | None
     with _lock:
         global _operator
         _operator = operator
-        if not _translation_enabled():
+        if not translate or not _translation_enabled():
             return
         for key in [k for k, at in _failed.items() if now - at >= FAILURE_TTL_S]:
             del _failed[key]

@@ -172,6 +172,19 @@ def test_health_probe_access_lines_are_dropped_and_only_the_exact_path():
     assert mute.filter(none_args) is True
 
 
+def test_ready_probe_access_lines_are_dropped_too_and_only_the_exact_path():
+    """The readiness probe moves to /ready (zero-downtime KTD6) at the same few-second cadence."""
+    mute = next(
+        f
+        for f in logging.getLogger("uvicorn.access").filters
+        if isinstance(f, logging_setup._HealthAccessMute)
+    )
+    assert mute.filter(_access_record("/ready")) is False
+    assert mute.filter(_access_record("/ready?x=1")) is False
+    assert mute.filter(_access_record("/readyz")) is True, "exact path only — never a prefix"
+    assert mute.filter(_access_record("/ready/sub")) is True
+
+
 def test_the_mute_and_the_redaction_compose_on_the_access_logger():
     """A /health line is dropped; a record that passes the mute is still rewritten by the
     redaction filter beside it."""

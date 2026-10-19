@@ -95,8 +95,8 @@
     },
     {
       "type": "timeseries",
-      "title": "2 — Rebuild stale",
-      "description": "warning · fires above 3600 for 15m\n\nCycle freshness, not liveness: cycles are event-driven and pause legitimately on quiet nights. If rule 1 is silent the poller is alive — look at poller_phase errors and at whether the SIRI-SX ingestion timestamp is moving.",
+      "title": "1a — No poller leader",
+      "description": "critical · fires below 1 for 5m\n\nNo API pod has led for 5 minutes: no rebuild cycle, no push, no webhook emit, no labelling check. The pods still serve the last-built tables, so reads look healthy while refreshed_at ages. Expected and self-clearing after a SIGKILLed or crashed leader: the successor waits out the 300 s lease TTL plus one 60 s tick, which is longer than this rule's pending window, so a forced kill fires it once. Otherwise look at event=\"poller_lease\" records in ent-kub-<env> namespace kix-avvik (acquire_failed and error mean the Firestore notifications database is failing; refused means some holder's held_until is still in the future) and at /ready's role on each pod. Never delete the lease document. Runbook: docs/operations/poller-lease.md.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -106,6 +106,106 @@
         "w": 12,
         "x": 12,
         "y": 0
+      },
+      "targets": [
+        {
+          "expr": "sum(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "leaders (sum)",
+          "refId": "A"
+        },
+        {
+          "expr": "count(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "pods exporting (count)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "green",
+                "value": 1.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "1b — Two poller leaders",
+      "description": "critical · fires above 1 for 1m\n\nTwo pods have each reported leading for over a minute. The gauge is each pod's own belief, so this is two pods that BOTH think they lead, which a stalled leader does until its next boundary or tick: tolerated for less than the pending minute during a handoff after a stall, and a firing is not. Both may be rebuilding the same tables and pushing the same alerts. Check event=\"poller_lease\" (acquired on one pod, lost or lease_lost on the other) and the duplicate check over event=\"push\" result=\"sent\" per journey and situation. If it persists, delete the stalled pod — the one whose own series reads 1 while its /ready answers role follower (its local deadline has passed; only the gauge has not caught up) — never the lease document. Runbook: docs/operations/poller-lease.md.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "leaders (sum)",
+          "refId": "A"
+        },
+        {
+          "expr": "count(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "legendFormat": "pods exporting (count)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1.0
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "2 — Rebuild stale",
+      "description": "warning · fires above 3600 for 15m\n\nCycle freshness, not liveness: cycles are event-driven and pause legitimately on quiet nights. If rules 1 and 1a are silent a pod is alive and leads — look at poller_phase errors and at whether the SIRI-SX ingestion timestamp is moving.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "$datasource"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
       },
       "targets": [
         {
@@ -150,7 +250,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 8
+        "y": 16
       },
       "targets": [
         {
@@ -195,7 +295,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 8
+        "y": 16
       },
       "targets": [
         {
@@ -240,7 +340,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 16
+        "y": 24
       },
       "targets": [
         {
@@ -285,7 +385,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 16
+        "y": 24
       },
       "targets": [
         {
@@ -326,7 +426,7 @@
     {
       "type": "timeseries",
       "title": "4 — Memory near limit",
-      "description": "critical · fires above 0.85 for 5m\n\nWorking set above 85 % of the container's limit. Since common 2.x the limit EQUALS the request, so the response is raising memory: in that release's values file. An OOM kill on the single API replica is a full outage.",
+      "description": "critical · fires above 0.85 for 5m\n\nWorking set above 85 % of the container's limit. Since common 2.x the limit EQUALS the request, so the response is raising memory: in that release's values file. An OOM kill of an API pod at the autoscaler's minimum of one (and always in tst) is a full outage; at two or three it costs that pod's share of traffic, and if it was the leader, a handoff that waits out the 300 s lease TTL.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -335,7 +435,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 32
       },
       "targets": [
         {
@@ -371,7 +471,7 @@
     {
       "type": "timeseries",
       "title": "5 — Pod not ready",
-      "description": "critical · fires below 1 for 3m\n\nWith one replica, not-ready means the service is down. /health 503s from a dead or stale poller land here too. Check the pod's events and logs.",
+      "description": "critical · fires below 1 for 3m\n\nAt one API pod (the autoscaler's minimum, and always in tst) not-ready means the service is down; at two or three it means one pod is out of rotation. In dev and prd readiness is /ready, which is 503 until the pod's prediction cache and timetable spine have loaded (reason predictions_not_loaded or plan_not_loaded in the body); in tst it is /health, whose dead-or-stale-poller 503s land here. Check the pod's events and logs.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -380,7 +480,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 32
       },
       "targets": [
         {
@@ -425,7 +525,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 40
       },
       "targets": [
         {
@@ -475,7 +575,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 40
       },
       "targets": [
         {
@@ -525,7 +625,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 40
+        "y": 48
       },
       "targets": [
         {
@@ -575,7 +675,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 40
+        "y": 48
       },
       "targets": [
         {
@@ -625,7 +725,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -675,7 +775,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 56
       },
       "targets": [
         {
@@ -725,7 +825,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 56
+        "y": 64
       },
       "targets": [
         {

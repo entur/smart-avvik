@@ -1032,9 +1032,10 @@ def set_client_suspended(
     """Suspend or resume a client. Suspension takes effect within :data:`_ACCOUNT_TTL_S`.
 
     The account cache is cleared for this client rather than left to expire, so an operator who
-    suspends and then checks sees the effect on the pod they are talking to. It is a single-replica
-    deployment (``deployment.forceReplicas: 1``), so that is every pod -- and even if it were not,
-    the TTL is the bound and the clear is the courtesy.
+    suspends and then checks sees the effect on the pod they are talking to. The clear reaches that
+    ONE pod only: dev and prd run one to three API pods behind a rolling update and an autoscaler,
+    and every other pod keeps its cached account until it expires. So the TTL is the bound and the
+    clear is the courtesy.
     """
     instant = now or _now()
     stored = _store().get(ACCOUNTS, client_id)

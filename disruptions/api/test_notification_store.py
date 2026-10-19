@@ -175,11 +175,12 @@ class _Ref:
             transaction.ops.append(("read", self.path))
         return _Snap(self.path, self.client.docs.get(self.path), self.client)
 
-    def set(self, data: dict[str, Any]) -> None:
-        """A write OUTSIDE a transaction, which exactly one caller makes: the migration marker,
-        whose single writer is a startup step under Recreate."""
+    def set(self, data: dict[str, Any], timeout: float | None = None) -> None:
+        """A write OUTSIDE a transaction: the migration marker, whose single writer is a startup
+        step under Recreate, and a feedback context, whose id is a fresh random token."""
         self.client.docs[self.path] = dict(data)
         self.client.direct_sets.append(self.path)
+        self.client.set_timeouts[self.path] = timeout
 
 
 class _Collection:
@@ -287,6 +288,9 @@ class _FakeClient:
         #: Paths written by `_Ref.set`, i.e. outside a transaction. Recorded rather than ignored so
         #: a body that started writing this way is visible.
         self.direct_sets: list[str] = []
+        #: The deadline each `_Ref.set` carried, by path. Recorded, not asserted, because the
+        #: migration marker's startup write has none to carry.
+        self.set_timeouts: dict[str, float | None] = {}
         self.batch_deletes: list[str] = []
         self.fail_with: BaseException | None = None
         # The STORE's clock, which a server stamp resolves against. Deliberately ahead of `NOW` by
@@ -537,7 +541,27 @@ def test_every_transaction_body_reads_before_it_writes():
         lambda t: notification_store._servability_body(
             t, refs, subscription_id=SID, servable=False, expected_version=1, now=NOW
         ),
+        # The poller lease's three (zero-downtime U1). Each is set up to reach its write: the
+        # fixture's lease is held by `_LEASE_HOLDER` under `_LEASE_TOKEN`, and the same holder may
+        # re-acquire its own lease.
+        lambda t: notification_store._acquire_lease_body(
+            t, refs, holder=_LEASE_HOLDER, token="tok-new", heartbeat=_HEARTBEAT, now=NOW
+        ),
+        lambda t: notification_store._renew_lease_body(
+            t, refs, holder=_LEASE_HOLDER, token=_LEASE_TOKEN, heartbeat=_HEARTBEAT, now=NOW
+        ),
+        lambda t: notification_store._release_lease_body(t, refs, holder=_LEASE_HOLDER, now=NOW),
+        # The feedback claim's two (zero-downtime U6). The fixture's context holds `r-held`, so
+        # the claim of `r-new` and the release of `r-held` both reach their write.
+        lambda t: notification_store._claim_feedback_body(
+            t, refs, context_id=_CONTEXT, response_id="r-new", now=NOW
+        ),
+        lambda t: notification_store._release_feedback_body(
+            t, refs, context_id=_CONTEXT, response_id="r-held"
+        ),
     ]
+    client.put(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC, _held_lease())
+    _feedback_context(client, journey_id=SID, **{"r-held": NOW})
     for body in bodies:
         txn = _Txn()
         with _NoClockNoLog():
@@ -647,6 +671,42 @@ def test_no_body_that_increments_a_counter_is_retry_sensitive():
                 t, r, subscription_id=SID, servable=True, expected_version=1, now=NOW
             ),
         ),
+        # The poller lease's three, for `_touch_body`'s reason: none increments anything, and each
+        # writes a deadline derived from an instant -- exactly the place a clock read would creep
+        # in. `_counting_fixture` holds a lease for them to reach their writes against.
+        lambda c: (
+            notification_store._Refs(c),
+            lambda t, r: notification_store._acquire_lease_body(
+                t, r, holder=_LEASE_HOLDER, token="tok-new", heartbeat=_HEARTBEAT, now=NOW
+            ),
+        ),
+        lambda c: (
+            notification_store._Refs(c),
+            lambda t, r: notification_store._renew_lease_body(
+                t, r, holder=_LEASE_HOLDER, token=_LEASE_TOKEN, heartbeat=_HEARTBEAT, now=NOW
+            ),
+        ),
+        lambda c: (
+            notification_store._Refs(c),
+            lambda t, r: notification_store._release_lease_body(
+                t, r, holder=_LEASE_HOLDER, now=NOW
+            ),
+        ),
+        # The feedback claim's two (U6). The claim writes the instant it was handed into a map it
+        # read inside the body -- a map rebuilt from a copy taken outside would double-claim on a
+        # retry as surely as a counter double-counts.
+        lambda c: (
+            notification_store._Refs(c),
+            lambda t, r: notification_store._claim_feedback_body(
+                t, r, context_id=_CONTEXT, response_id="r-new", now=NOW
+            ),
+        ),
+        lambda c: (
+            notification_store._Refs(c),
+            lambda t, r: notification_store._release_feedback_body(
+                t, r, context_id=_CONTEXT, response_id="r-held"
+            ),
+        ),
     ):
         client = _counting_fixture()
         refs, body = build(client)
@@ -719,7 +779,32 @@ def _counting_fixture() -> _FakeClient:
             notification_store.TTL_FIELD: NOW + timedelta(days=7),
         },
     )
+    client.put(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC, _held_lease())
+    _feedback_context(client, journey_id=SID, **{"r-held": NOW})
     return client
+
+
+#: The poller lease fixtures. The heartbeat sits visibly BEFORE `NOW`, so a body that derived
+#: `held_until` from the instant it ran rather than from the heartbeat it was handed is caught by
+#: every equality below rather than only by the one test that looks for it.
+_LEASE_HOLDER = "pod-a"
+_LEASE_TOKEN = "tok-a"
+_HEARTBEAT = NOW - timedelta(seconds=12)
+
+
+def _held_lease(**over: Any) -> dict[str, Any]:
+    """A lease `_LEASE_HOLDER` holds until well after `NOW`, written by the real acquire body."""
+    txn = _Txn()
+    notification_store._acquire_lease_body(
+        txn,
+        notification_store._Refs(_FakeClient()),
+        holder=_LEASE_HOLDER,
+        token=_LEASE_TOKEN,
+        heartbeat=_HEARTBEAT,
+        now=_HEARTBEAT,
+    )
+    ((_kind, _path, doc),) = txn.writes
+    return {**(doc or {}), **over}
 
 
 def test_the_send_and_claim_bodies_also_read_before_they_write():
@@ -1877,6 +1962,12 @@ def test_every_collection_group_has_exactly_one_ttl_field():
     # restart re-decides every rush round still inside its timeliness window.
     assert f'"{notification_store.ROUNDS}"' not in ttl_block, (
         "the togvarsel rounds collection must have NO TTL field: its one document is the live one"
+    )
+    # And the poller lease, for the rounds' reason and one of its own: `held_until` is a deadline
+    # the bodies compare, never a retention horizon, and a TTL deleting a lapsed lease would turn
+    # a release's "cleared, held_until = now" into an absence a reader cannot date.
+    assert f'"{notification_store.POLLER_LEASE}"' not in ttl_block, (
+        "the poller lease collection must have NO TTL field: its one document is the live one"
     )
     assert notification_store.TTL_FIELD == "expires_at"
     assert f'field      = "{notification_store.TTL_FIELD}"' in FIRESTORE_TF
@@ -3703,6 +3794,373 @@ def test_the_round_markers_are_one_document_that_a_write_replaces_whole():
     assert notification_store.ROUNDS not in notification_store.COLLECTIONS
 
 
+# ---- The poller lease's one document (zero-downtime U1) ----------------------------------------
+
+_LEASE_PATH = f"{notification_store.POLLER_LEASE}/{notification_store.POLLER_LEASE_DOC}"
+
+
+def test_a_poller_lease_is_acquired_on_an_absent_document():
+    client = _FakeClient()
+    _install(client)
+    assert notification_store.read_poller_lease() is None, "absent until something acquires it"
+
+    lease = notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    assert lease.status == "acquired"
+    assert lease.holder == _LEASE_HOLDER and lease.token
+    # The heartbeat plus the TTL, not `now` plus it: the lease is an extension of the last beat.
+    assert lease.held_until == _HEARTBEAT + timedelta(seconds=notification_store.POLLER_LEASE_S)
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None
+    assert stored["holder"] == _LEASE_HOLDER and stored["token"] == lease.token
+    assert stored["held_until"] == lease.held_until and stored["acquired_at"] == NOW
+    assert notification_store.TTL_FIELD not in stored, "a lease's deadline is not a retention horizon"
+    # A singleton beside the rounds document, outside the four collections the TTL policy covers.
+    assert [p for p in client.docs if p.startswith(f"{notification_store.POLLER_LEASE}/")] == [
+        _LEASE_PATH
+    ]
+    assert notification_store.POLLER_LEASE not in notification_store.COLLECTIONS
+    assert notification_store.read_poller_lease() == stored
+
+
+def test_a_held_poller_lease_refuses_another_holder_and_writes_nothing():
+    client = _FakeClient()
+    _install(client)
+    first = notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    before = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+
+    later = NOW + timedelta(seconds=5)
+    second = notification_store.acquire_poller_lease("pod-b", heartbeat=later, now=later)
+    assert second.status == "refused"
+    assert second.token is None
+    # The view names who DOES hold it, which is what a follower logs.
+    assert second.holder == _LEASE_HOLDER and second.held_until == first.held_until
+    assert client.transactions[-1].writes == [], "a refusal must write nothing"
+    assert client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC) == before
+
+
+def test_a_lapsed_poller_lease_is_acquired_by_another_holder_with_a_new_token():
+    client = _FakeClient()
+    _install(client)
+    first = notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+
+    lapsed = _HEARTBEAT + timedelta(seconds=notification_store.POLLER_LEASE_S + 1)
+    second = notification_store.acquire_poller_lease("pod-b", heartbeat=lapsed, now=lapsed)
+    assert second.status == "acquired"
+    assert second.holder == "pod-b"
+    assert second.token and second.token != first.token
+    assert second.held_until == lapsed + timedelta(seconds=notification_store.POLLER_LEASE_S)
+    # And the old holder's token no longer renews: the fence a demoted leader runs into.
+    stale = notification_store.renew_poller_lease(
+        _LEASE_HOLDER, first.token or "", heartbeat=lapsed, now=lapsed
+    )
+    assert stale.status == "lost" and stale.holder == "pod-b"
+
+
+def test_a_poller_lease_renewal_extends_the_heartbeat_not_the_renewal_instant():
+    client = _FakeClient()
+    _install(client)
+    lease = notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    ttl = timedelta(seconds=notification_store.POLLER_LEASE_S)
+
+    # A renewal 90 s later whose last beat is 30 s old. `held_until` follows the BEAT: a wedged
+    # leader keeps renewing on its timer, and only this keeps the lease lapsing TTL after the beat.
+    beat = NOW + timedelta(seconds=60)
+    renewed = notification_store.renew_poller_lease(
+        _LEASE_HOLDER, lease.token or "", heartbeat=beat, now=NOW + timedelta(seconds=90)
+    )
+    assert renewed.status == "renewed"
+    assert renewed.held_until == beat + ttl
+    assert renewed.held_until != NOW + timedelta(seconds=90) + ttl
+    assert renewed.token == lease.token
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None and stored["held_until"] == beat + ttl
+    assert stored["acquired_at"] == NOW, "a renewal is not a re-acquisition"
+
+    before = dict(stored)
+    stale = notification_store.renew_poller_lease(
+        _LEASE_HOLDER, "not-the-token", heartbeat=beat, now=NOW + timedelta(seconds=120)
+    )
+    assert stale.status == "lost" and stale.token is None
+    assert client.transactions[-1].writes == [], "a lost renewal must write nothing"
+    assert client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC) == before
+    # The right token under another holder's name is not a match either.
+    impostor = notification_store.renew_poller_lease(
+        "pod-b", lease.token or "", heartbeat=beat, now=NOW + timedelta(seconds=120)
+    )
+    assert impostor.status == "lost"
+
+
+def test_a_poller_lease_release_clears_the_holder_and_never_deletes():
+    client = _FakeClient()
+    _install(client)
+    notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    before = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+
+    # Another holder's release is nothing: no write, the lease stands.
+    other = notification_store.release_poller_lease("pod-b", now=NOW + timedelta(seconds=10))
+    assert other.status == "not_held" and other.holder == _LEASE_HOLDER
+    assert client.transactions[-1].writes == []
+    assert client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC) == before
+
+    # The holder's release matches on the holder ALONE -- no token -- so a process whose acquire
+    # committed but lost its acknowledgement can still hand the lease back at shutdown.
+    released_at = NOW + timedelta(seconds=20)
+    released = notification_store.release_poller_lease(_LEASE_HOLDER, now=released_at)
+    assert released.status == "released"
+    assert released.holder is None and released.held_until == released_at
+    assert all(kind != "delete" for kind, _p, _d in client.transactions[-1].writes)
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None, "a release never deletes the document"
+    assert stored["holder"] is None and stored["held_until"] == released_at
+    # And a released lease is free to the next acquirer at once, not after the TTL.
+    successor = notification_store.acquire_poller_lease("pod-b", heartbeat=released_at, now=released_at)
+    assert successor.status == "acquired"
+
+
+def test_the_poller_lease_keeps_fields_it_does_not_know():
+    """KTD13: two binaries share this document during every rollout, so the shape is additive-only
+    and a write by the older one must not strip what the newer one added."""
+    client = _FakeClient()
+    _install(client)
+    client.put(
+        notification_store.POLLER_LEASE,
+        notification_store.POLLER_LEASE_DOC,
+        {"holder": None, "held_until": NOW - timedelta(seconds=1), "future_field": {"v": 2}},
+    )
+    lease = notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    assert lease.status == "acquired"
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None and stored["future_field"] == {"v": 2}, "lost on acquire"
+    notification_store.renew_poller_lease(
+        _LEASE_HOLDER, lease.token or "", heartbeat=NOW, now=NOW + timedelta(seconds=30)
+    )
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None and stored["future_field"] == {"v": 2}, "lost on renew"
+    notification_store.release_poller_lease(_LEASE_HOLDER, now=NOW + timedelta(seconds=60))
+    stored = client.doc(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC)
+    assert stored is not None and stored["future_field"] == {"v": 2}, "lost on release"
+
+
+def test_the_poller_lease_bodies_may_run_twice_and_write_the_same_thing():
+    """Each body against two fake transactions under a raising clock and logger, from both the
+    absent and the held state -- the two a real retry can land in."""
+    for seeded in (False, True):
+        client = _FakeClient()
+        if seeded:
+            client.put(
+                notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC, _held_lease()
+            )
+        refs = notification_store._Refs(client)
+        for body in (
+            lambda t, r: notification_store._acquire_lease_body(
+                t, r, holder=_LEASE_HOLDER, token="tok-new", heartbeat=_HEARTBEAT, now=NOW
+            ),
+            lambda t, r: notification_store._renew_lease_body(
+                t, r, holder=_LEASE_HOLDER, token=_LEASE_TOKEN, heartbeat=_HEARTBEAT, now=NOW
+            ),
+            lambda t, r: notification_store._release_lease_body(
+                t, r, holder=_LEASE_HOLDER, now=NOW
+            ),
+        ):
+            first, second = _Txn(), _Txn()
+            with _NoClockNoLog():
+                a = body(first, refs)
+                b = body(second, refs)
+            # From the held state every body writes, so the equality below is not vacuous there.
+            assert first.writes or not seeded, f"{body} wrote nothing against a held lease"
+            assert a == b
+            assert first.writes == second.writes
+            assert _no_read_after_write(first), f"a read follows a write: {first.ops}"
+
+
+def test_a_store_failure_on_acquire_reaches_the_caller_unchanged():
+    """No swallowing at this level: the caller's loop decides what a failed acquire means (stay a
+    follower and try next tick), and it can only do that if it sees the failure."""
+    client = _FakeClient()
+    _install(client)
+    boom = RuntimeError("firestore is down")
+    client.fail_with = boom
+    try:
+        notification_store.acquire_poller_lease(_LEASE_HOLDER, heartbeat=_HEARTBEAT, now=NOW)
+    except RuntimeError as exc:
+        assert exc is boom
+    else:
+        raise AssertionError("a store failure on acquire must reach the caller")
+
+
+def test_the_poller_lease_ttl_satisfies_ktd4():
+    """KTD4's two inequalities, pinned as NUMBERS so an edit to any one of them is a failing test
+    here rather than an argument in a comment. The renewal gate and the margin live in U3's loop;
+    the values are the plan's."""
+    ttl = notification_store.POLLER_LEASE_S
+    heartbeat_gate_s, margin_s = 250.0, 30.0
+    longest_beatless_wait_s = 240.0  # the longest single BigQuery call between two beats
+    health_stale_after_s = 600.0  # main.HEALTH_STALE_AFTER_S's default: liveness restarts there
+    assert ttl == 300.0
+    assert heartbeat_gate_s + margin_s < ttl, "a healthy leader would lose its lease mid-renewal"
+    assert longest_beatless_wait_s < ttl, "one long query would cost a healthy leader its lease"
+    assert ttl < health_stale_after_s, "the lease must lapse before liveness gives up on the pod"
+
+
+# ---- Feedback contexts (zero-downtime U6, KTD10) ----------------------------------------------
+
+_CONTEXT = "ctx-1"
+
+
+def _feedback_context(
+    client: _FakeClient,
+    context_id: str = _CONTEXT,
+    *,
+    device_id: str | None = "device-1",
+    journey_id: str | None = None,
+    **claims: Any,
+) -> dict[str, Any]:
+    """A stored context built by the REAL writer, holding `claims` (response id -> instant)."""
+    doc = notification_store._new_feedback_context_doc(
+        context_id,
+        snapshot='{"displayed_text":"Innstilt"}',
+        device_id=device_id,
+        journey_id=journey_id,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    doc["claims"] = dict(claims)
+    client.put(notification_store.FEEDBACK_CONTEXTS, context_id, doc)
+    return client.docs[f"{notification_store.FEEDBACK_CONTEXTS}/{context_id}"]
+
+
+def test_a_feedback_context_round_trips_and_refuses_once_expired():
+    client = _FakeClient()
+    _install(client)
+    notification_store.write_feedback_context(
+        _CONTEXT,
+        snapshot='{"a":1}',
+        device_id="device-1",
+        journey_id="j1",
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    stored = client.doc(notification_store.FEEDBACK_CONTEXTS, _CONTEXT)
+    assert stored is not None
+    assert stored["device_id"] == "device-1"
+    assert stored["journey_id"] == "j1"
+    # On the card-render path, once per alert: a write without a deadline holds the request.
+    path = f"{notification_store.FEEDBACK_CONTEXTS}/{_CONTEXT}"
+    assert client.set_timeouts[path] == notification_store._CALL_DEADLINE_S
+    assert stored[notification_store.TTL_FIELD] == NOW + timedelta(minutes=15)
+    assert notification_store.read_feedback_context(_CONTEXT, now=NOW) == '{"a":1}'
+    # TTL deletes up to ~24 h late, so expiry is tested on the read like every other path here.
+    later = NOW + timedelta(minutes=15)
+    assert notification_store.read_feedback_context(_CONTEXT, now=later) is None
+    assert notification_store.read_feedback_context("nope", now=NOW) is None
+
+
+def test_a_response_is_claimed_once_and_a_release_hands_it_back():
+    client = _FakeClient()
+    _install(client)
+    _feedback_context(client)
+    claim = notification_store.claim_feedback_response
+    assert claim(_CONTEXT, response_id="r-1", now=NOW) == "claimed"
+    assert claim(_CONTEXT, response_id="r-1", now=NOW) == "duplicate"
+    # A second traveller on a shared, device-less rush context is a different response.
+    assert claim(_CONTEXT, response_id="r-2", now=NOW) == "claimed"
+    notification_store.release_feedback_response(_CONTEXT, response_id="r-1")
+    assert claim(_CONTEXT, response_id="r-1", now=NOW) == "claimed"
+    assert claim("gone", response_id="r-1", now=NOW) == "missing"
+    assert claim(_CONTEXT, response_id="r-3", now=NOW + timedelta(minutes=15)) == "missing"
+
+
+def test_a_context_whose_journey_is_gone_is_never_claimed():
+    """A render that read the journey before «Slett alt» can write its context AFTER the erase
+    transaction deleted the device's contexts. The claim reads the journey the context was minted
+    for, so that late context is refused as missing and its route never reaches BigQuery -- while a
+    live journey's context, and the rush card's journey-less one, are admitted."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+        client.put(
+            notification_store.SUBSCRIPTIONS, "erased", dict(_live_doc(), status="deleted")
+        )
+        _feedback_context(client, "live", journey_id=SID)
+        _feedback_context(client, "late", journey_id="erased")
+        _feedback_context(client, "vanished", journey_id="never-stored")
+        _feedback_context(client, "rush", device_id=None)
+        claim = notification_store.claim_feedback_response
+        assert claim("live", response_id="r-1", now=NOW) == "claimed"
+        assert claim("late", response_id="r-1", now=NOW) == "missing"
+        assert claim("vanished", response_id="r-1", now=NOW) == "missing"
+        assert claim("rush", response_id="r-1", now=NOW) == "claimed"
+        assert client.doc(notification_store.FEEDBACK_CONTEXTS, "late")["claims"] == {}
+    finally:
+        _uninstall()
+
+
+def test_erasure_deletes_the_devices_feedback_contexts_in_the_same_transaction():
+    """KTD10: a context holds the traveller's route and typed names for a render nobody tapped, so
+    «Slett alt» takes it in the journeys' own transaction. Another device's identical card and the
+    rush card's device-less one are left alone -- the latter is deleted by expiry alone."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        _device_doc(client)
+        _journey_rows(client, ["j1"])
+        rows = [
+            _feedback_context(client, "mine-1"),
+            _feedback_context(client, "mine-2"),
+            _feedback_context(client, "theirs", device_id="device-2"),
+            _feedback_context(client, "rush", device_id=None),
+        ]
+        client.pages["device_feedback_contexts"] = [
+            (f"{notification_store.FEEDBACK_CONTEXTS}/{row['context_id']}", row) for row in rows
+        ]
+        result = notification_store.erase_device(device_id="device-1", client_id=CLIENT)
+        assert result.complete and result.device_deleted
+        (txn,) = client.transactions
+        assert ("delete", f"{notification_store.FEEDBACK_CONTEXTS}/mine-1") in txn.ops
+        assert _no_read_after_write(txn), f"a read follows a write: {txn.ops}"
+        assert client.doc(notification_store.FEEDBACK_CONTEXTS, "mine-1") is None
+        assert client.doc(notification_store.FEEDBACK_CONTEXTS, "mine-2") is None
+        assert client.doc(notification_store.FEEDBACK_CONTEXTS, "theirs") is not None
+        assert client.doc(notification_store.FEEDBACK_CONTEXTS, "rush") is not None
+        (call,) = [c for c in client.query_calls if c[0] == "device_feedback_contexts"]
+        assert call[1] == {"device_id": "device-1"}
+        # Journeys + contexts + the device must fit one transaction's 500 writes.
+        assert (
+            notification_store.MAX_ERASE_WRITES_PER_TRANSACTION
+            + notification_store.MAX_ERASE_CONTEXTS_PER_TRANSACTION
+            + 1
+            <= 500
+        )
+    finally:
+        _uninstall()
+
+
+def test_erasure_is_not_complete_while_a_full_page_of_contexts_remains():
+    client = _FakeClient()
+    _install(client)
+    bound = notification_store.MAX_ERASE_CONTEXTS_PER_TRANSACTION
+    notification_store.MAX_ERASE_CONTEXTS_PER_TRANSACTION = 1
+    try:
+        _device_doc(client)
+        _journey_rows(client, [])
+        row = _feedback_context(client, "mine-1")
+        client.pages["device_feedback_contexts"] = [
+            (f"{notification_store.FEEDBACK_CONTEXTS}/mine-1", row)
+        ]
+        _tombstoned, deleted, complete = notification_store._erase_device_body(
+            _Txn(),
+            notification_store._Refs(client),
+            notification_store._query("device_journeys", equality={}, limit=400),
+            notification_store._query("device_feedback_contexts", equality={}, limit=1),
+            device_id="device-1",
+            client_id=CLIENT,
+            now=NOW,
+        )
+        assert not complete and not deleted, "the device must wait for the last context"
+    finally:
+        notification_store.MAX_ERASE_CONTEXTS_PER_TRANSACTION = bound
+        _uninstall()
+
+
 # ---- Emulator-backed ---------------------------------------------------------------------------
 
 _EMULATOR_DB: str | None = None
@@ -3807,6 +4265,56 @@ def emulator_test_the_round_marker_document_round_trips_through_the_real_client(
     assert body["areas"]["oslo"]["0630"] == {"level": "yellow", "pushed": True}
     assert body["updated_at"] == NOW
     assert notification_store.TTL_FIELD not in body
+    assert client is not None
+
+
+def emulator_test_concurrent_acquires_admit_exactly_one_poller():
+    """Eight pods reaching an absent lease on the same tick, against a real transaction.
+
+    The property the lease exists for (R4), and the one the fake cannot exercise: it runs a body
+    once. Asserted as the contract, for `emulator_test_concurrent_claims_...`'s reason -- a
+    contended transaction may exhaust the client's five attempts and raise something retryable,
+    which for a follower means "try next tick". What must hold unconditionally is that exactly one
+    acquired, and that the document names that one.
+    """
+    client = _emulator_setup()
+    holders = [f"pod-{i}" for i in range(8)]
+    results: dict[str, notification_store.PollerLease] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _acquire(holder: str) -> None:
+        try:
+            results[holder] = notification_store.acquire_poller_lease(
+                holder, heartbeat=NOW, now=NOW
+            )
+        except BaseException as exc:  # noqa: BLE001 - classified below
+            errors[holder] = exc
+
+    threads = [threading.Thread(target=_acquire, args=(h,)) for h in holders]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+
+    assert len(results) + len(errors) == len(holders), "a thread neither returned nor raised"
+    for holder, exc in errors.items():
+        assert notification_store.is_retryable(exc), f"{holder}: {exc!r}"
+    winners = [h for h, lease in results.items() if lease.status == "acquired"]
+    # At most one is the property. Zero is a legal outcome under contention -- every attempt can
+    # exhaust its retries, which for a follower is "try next tick" (seen once locally) -- so the
+    # next tick is taken here, sequentially, and must be the one that wins.
+    assert len(winners) <= 1, f"acquired by {winners}"
+    if not winners:
+        late = notification_store.acquire_poller_lease("pod-late", heartbeat=NOW, now=NOW)
+        assert late.status == "acquired", late
+        results["pod-late"] = late
+        winners = ["pod-late"]
+    assert {lease.status for h, lease in results.items() if h not in winners} <= {"refused"}
+    stored = notification_store.read_poller_lease()
+    assert stored is not None and stored["holder"] == winners[0]
+    assert stored["token"] == results[winners[0]].token
+    assert stored["held_until"] == NOW + timedelta(seconds=notification_store.POLLER_LEASE_S)
+    print(f"      ({len(results) - 1} refused, {len(errors)} retryable)")
     assert client is not None
 
 
@@ -4023,6 +4531,68 @@ def emulator_test_one_devices_journeys_and_its_erasure_against_a_real_client():
     assert [e.subscription_id for e in live] == ["other"], [e.subscription_id for e in live]
 
 
+def emulator_test_a_feedback_context_is_claimed_once_and_erased_with_its_device():
+    """U6 against a real client: mint, read back, claim once, a second claim refused, and «Slett
+    alt» removing the device's context in the same transaction as its journeys -- while another
+    device's and the rush card's device-less context survive. What only this can say: the
+    single-equality query on `device_id` selects the right documents, and a delete of a queried
+    document reads before it writes under the client's own `ReadAfterWriteError` rule."""
+    _emulator_setup()
+    expires = NOW + timedelta(minutes=15)
+    for context_id, device_id in (("mine", "device-1"), ("theirs", "device-2"), ("rush", None)):
+        notification_store.write_feedback_context(
+            context_id,
+            snapshot='{"displayed_text":"Innstilt"}',
+            device_id=device_id,
+            journey_id=None,
+            expires_at=expires,
+        )
+    assert notification_store.read_feedback_context("mine", now=NOW) == '{"displayed_text":"Innstilt"}'
+    claim = notification_store.claim_feedback_response
+    assert claim("mine", response_id="r-1", now=NOW) == "claimed"
+    assert claim("mine", response_id="r-1", now=NOW) == "duplicate"
+    notification_store.upsert_device(
+        device_id="device-1",
+        client_id=CLIENT,
+        endpoint="https://push.example.com/x/abc",
+        p256dh="BPk",
+        auth="auth",
+        now=NOW,
+    )
+    notification_store.create_subscription(_web_push_spec(subscription_id="j1"), now=NOW)
+    result = notification_store.erase_device(device_id="device-1", client_id=CLIENT, now=NOW)
+    assert result.complete and result.device_deleted and result.passes == 1, result
+    assert notification_store.read_feedback_context("mine", now=NOW) is None
+    assert notification_store.read_feedback_context("theirs", now=NOW) is not None
+    assert notification_store.read_feedback_context("rush", now=NOW) is not None
+
+
+def emulator_test_a_context_minted_after_its_journey_was_erased_is_refused():
+    """The in-flight render: it read the journey before «Slett alt», and its context lands after
+    the erase transaction. The tombstoned journey is what the claim reads, against a real client."""
+    _emulator_setup()
+    notification_store.create_subscription(_web_push_spec(subscription_id="j1"), now=NOW)
+    notification_store.erase_device(device_id="device-1", client_id=CLIENT, now=NOW)
+    notification_store.write_feedback_context(
+        "late",
+        snapshot='{"displayed_text":"Innstilt"}',
+        device_id="device-1",
+        journey_id="j1",
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    claim = notification_store.claim_feedback_response
+    assert claim("late", response_id="r-1", now=NOW) == "missing"
+    notification_store.create_subscription(_web_push_spec(subscription_id="j2"), now=NOW)
+    notification_store.write_feedback_context(
+        "live",
+        snapshot='{"displayed_text":"Innstilt"}',
+        device_id="device-1",
+        journey_id="j2",
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    assert claim("live", response_id="r-1", now=NOW) == "claimed"
+
+
 def emulator_test_a_journey_created_mid_erasure_leaves_no_orphan():
     """A journey created BETWEEN two erase passes is caught by the next one, and the device waits.
 
@@ -4077,9 +4647,12 @@ def emulator_test_a_journey_created_mid_erasure_leaves_no_orphan():
             },
             limit=2,
         )
+        contexts = notification_store._query(
+            "device_feedback_contexts", equality={"device_id": "device-1"}, limit=2
+        )
         tombstoned, deleted, complete = notification_store._run_transaction(
             lambda txn: notification_store._erase_device_body(
-                txn, refs, query, device_id="device-1", client_id=CLIENT, now=NOW
+                txn, refs, query, contexts, device_id="device-1", client_id=CLIENT, now=NOW
             )
         )
         assert tombstoned == ["j1", "j2"] and not deleted and not complete
@@ -5921,6 +6494,39 @@ def test_an_unseeded_mirror_answers_for_nobody_and_seeds_on_first_sync():
     assert mirror.ready is True, "an empty collection must not read as 'still loading'"
 
 
+def test_reset_mirrors_leaves_both_not_ready_and_the_next_sync_seeds_both():
+    """The poller lease's reset (zero-downtime U2, KTD7): a pod that loses the lease forgets both
+    mirrors, and one that acquires resets and SEEDS rather than syncs -- push marks do not stamp the
+    watermark, so a sync would miss what the interim leader pushed."""
+    client = _FakeClient()
+    _install(client)
+    _mirror_page(client, "mirror_seed", [])
+    _subject_seed_page(client, [])
+    notification_store.sync_mirrors(now=NOW)
+    subscriptions = notification_store.subscription_mirror()
+    subjects = notification_store.subject_mirror()
+    assert subscriptions.ready and subjects.ready
+    notification_store.reset_mirrors()
+    assert not subscriptions.ready and not subjects.ready
+    report = notification_store.sync_mirrors(now=NOW)
+    assert report.reseeded and subscriptions.ready and subjects.ready
+
+
+def test_a_late_mint_from_the_old_leader_after_the_new_leaders_is_unchanged():
+    """The lease's TTL cannot fence a commit already in flight when it lapsed (KTD4): at most a
+    pass's worth of the old leader's transactions land after the new leader's. Each is idempotent
+    -- the transaction re-reads the subject -- so the late one changes nothing."""
+    client = _FakeClient()
+    client.put(notification_store.SUBSCRIPTIONS, SID, _live_doc())
+    _install(client)
+    new_leader = notification_store.commit_event(_emit(), now=NOW)
+    before = {k: dict(v) for k, v in client.docs.items()}
+    late = notification_store.commit_event(_emit(), now=NOW - timedelta(seconds=30))
+    assert late.status == "unchanged", late
+    assert (late.event_id, late.revision) == (new_leader.event_id, new_leader.revision)
+    assert client.docs == before, "the old leader's late commit wrote nothing"
+
+
 def test_one_unreadable_document_never_fails_the_mirror():
     """R20, the same per-document rule the load path applies."""
     client = _FakeClient()
@@ -6207,6 +6813,50 @@ def test_a_sync_does_not_overwrite_a_commit_this_process_made_while_it_was_readi
     assert mirror.size() == 0, "a stale read resurrected a subscription this process had deleted"
     assert report.overtaken == 1, "the skip is not reported, so an operator cannot see it happen"
     assert report.sync_age_s == 0.0, "a drained sync must stamp the mirror as just synced"
+
+
+def test_a_mirror_that_never_started_a_seed_records_no_commit():
+    """Zero-downtime U5 (KTD7): the mirror is the LEADER's, and a follower never seeds one.
+
+    Its request path still commits -- creates, deletes, marks -- and without this rule every one of
+    them would land in a mirror nothing reads, growing `_entries` and `_local_applied` for as long
+    as the pod follows. The race protection only needs the apply once a seed has STARTED, so it is
+    driven here too: a tombstone applied while the seed is reading still wins the swap, and a
+    `reset` (a lost lease) stops the recording again.
+    """
+    client = _FakeClient()
+    _install(client)
+    mirror = notification_store.SubscriptionMirror()
+    live = _mirrored(subscription_id="sub-1")
+    mirror.apply_committed(live)
+    mirror.drop_committed(["sub-2"])
+    assert mirror._entries == {} and mirror._local_applied == {}, "a follower's commits accumulated"
+
+    real_stream = notification_store._stream
+    interleaved: list[str] = []
+
+    def _stream_then_delete(query: Any) -> Any:
+        page = real_stream(query)
+        if not interleaved:
+            interleaved.append("sub-1")
+            mirror.apply_committed({**live, "status": "deleted"})
+        return page
+
+    _mirror_page(client, "mirror_seed", [live])
+    notification_store._stream = _stream_then_delete  # type: ignore[assignment]
+    try:
+        mirror.seed(now=NOW)
+    finally:
+        notification_store._stream = real_stream  # type: ignore[assignment]
+    assert interleaved == ["sub-1"], "the competing delete never ran; this test proved nothing"
+    assert mirror.size() == 0, "a delete applied during the seed lost the swap to the stale read"
+
+    mirror.apply_committed(_mirrored(subscription_id="sub-3"))
+    assert mirror.size() == 1, "a seeded mirror stopped learning from its own commits"
+
+    mirror.reset()
+    mirror.apply_committed(_mirrored(subscription_id="sub-4"))
+    assert mirror._entries == {} and mirror._local_applied == {}, "a demoted pod kept recording"
 
 
 def test_an_erasure_drops_its_journeys_from_the_mirror_at_once():

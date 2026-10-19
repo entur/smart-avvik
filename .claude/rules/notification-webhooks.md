@@ -66,10 +66,15 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   10 % «innstilling». It mints nothing, moves neither the gate nor `effect`/`phase`, and is not in
   `message_input` (`llm_message` builds situations from summary and description only).
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
-  lifespan loads the prediction caches and the «I dag» timetable from the tables the previous pod
-  built (`main.warm_caches_from_last_build`), so the public reads' 503s are left for a first deploy
-  or a table past its age bound (10 min for predictions, the rebuild TTLs for the spine and the
-  actuals). The 503 contract is unchanged. Before this, every deploy's cold window could fire dev's
+  lifespan loads the prediction caches and the «I dag» timetable from the tables the leader last
+  built (`main.follow_last_build`, since 2026-10-13; it replaced the 2026-09-25 warm start and
+  its 10-minute age bound), and every follower pod repeats it on each tick when a table's modified
+  time moved. **No age bound**: a live leader on a quiet night legitimately leaves tables hours
+  old, and a pod refusing them would 503 beside a leader serving the same table. So the public
+  reads' 503s are left for a first deploy into an empty dataset, and `/ready` (the readiness probe in
+  dev and prd) keeps a pod out of rotation until both caches have loaded. Every pod stamps a cache
+  with its tables' modified time, so `refreshed_at`/`as_of` agree across pods for one table
+  generation (`docs/operations/poller-lease.md`). The 503 contract is unchanged. Before this, every deploy's cold window could fire dev's
   5xx rule at dev's traffic, and it did when two deploys landed minutes apart that day.
 - **Where the train terminates rides beside the title** (2026-09-25): `payload.destination` (built
   in `varsel._webhook_payload` from `Alert.destination`, so the event, the journey-alerts read and
@@ -234,7 +239,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   was owed and a `confirmed` mint for a train ET has cancelled. At one client with 100 000
   subscriptions that fallback is the steady state. `SubjectMirror` answers it completely from memory,
   **kept current by the poller's own commits rather than a watermark**: subject documents have exactly
-  one writer (KTD6), so every change passes through this process. It is indexed BY SUBSCRIPTION as
+  one writer (KTD6), so every change passes through this process — one LEADER per leadership term
+  since the poller lease, with the mirror seeded on acquisition and lease loss and shutdown waiting
+  for the emit pass lock (bounded by the 255 s shutdown deadline) before it is reset or released; at
+  most `_EMIT_WORKERS` abandoned, idempotent commits can land after a handoff. It is indexed BY SUBSCRIPTION as
   well as by alert id, because the pass asks per subscription and a flat map would make each of
   100 000 questions a scan.
   **U6 BUILT it and U9 WIRED it, and for one deploy it was neither read nor written** — the class,
@@ -267,12 +275,21 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   mirror, because the two mark bodies deliberately do not stamp the watermark field — one push on a
   corridor with a hundred thousand registrations would be a hundred thousand documents through the
   watermark query. That is right about a WATERMARK and wrong about the mirror: a `/varsel`
-  registration has exactly one writer (the request path and the poller are one process, one replica
-  under Recreate, and the delivery worker writes webhook deliveries only), so every commit is
+  registration had exactly one writer (the request path and the poller were one process on one pod,
+  and the delivery worker writes webhook deliveries only), so every commit is
   applied to the mirror from its own RESULT — `SubjectMirror`'s arrangement, one collection along —
   which makes the copy exact rather than approximate and costs no read. The superseded reading
   would have cost a document read per registration per cycle, which at this population IS the
-  cycle. `SUBSCRIPTION_MIRRORING_BODIES` declares the seven bodies that apply and
+  cycle. **Since the poller lease (2026-10-13, `docs/operations/poller-lease.md`) that premise holds
+  per LEADER, not per deployment**: every pod serves `/varsel`, so a registration can be written by
+  a pod whose commits the leader's mirror never sees until its next sync. Both mirrors are the
+  leader's — reset and seeded synchronously on acquisition (push marks do not stamp the watermark,
+  so a sync would miss what an interim leader pushed), reset on loss after the emit pass drains,
+  never seeded on a follower — and the exactness claims hold per leadership term. Request paths read
+  the STORE on every pod (`stored_journey`, the lists), and the leader makes ONE store read per push
+  before sending (`may_send`), refusing a journey that is gone or a push whose situations are all
+  marked; see `.claude/rules/varsel.md` for what it deliberately does not refuse.
+  `SUBSCRIPTION_MIRRORING_BODIES` declares the seven bodies that apply and
   `SUBSCRIPTION_WRITERS_OUTSIDE_THE_MIRROR` the five that deliberately do not (the webhook delivery
   half, which runs in the worker, plus the cleanup that only ever follows a tombstone the mirror has
   already dropped); both are pinned off the source in both directions, and a second test walks each
@@ -854,7 +871,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   unauthenticated browser with a 302, and a machine caller following a redirect into an Entra login
   screen gets HTML where it expected JSON. `/test-events` writes **nothing at all**, because the
   store's pending-event ceiling is exact rather than best-effort *only because the emit path has one
-  writer* — one poller thread, no route invoking the pass, one replica under Recreate — and a route
+  writer* — one poller thread, no route invoking the pass, only the lease-holding pod running the
+  cycle (one LEADER per leadership term) — and a route
   calling `commit_event` would falsify every quota check in that module.
   **What a reader sees in the logs**: `varsel_webhook_load`, `notification_store_load`, `notification_emit`,
   `webhook_delivery_round`, `webhook_delivery`, `notification_quota`,

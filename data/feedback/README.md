@@ -628,6 +628,44 @@ make promotion a flag and to exercise the plumbing, not because tst can evaluate
 to `kubectl exec` into. The evidence is indirect but good: every `NetworkPolicy` in both namespaces is
 `policyTypes: ["Ingress"]` only, and both deployments already reach `api.entur.io` and Vertex AI.
 
+## Running on more than one pod (2026-10-13)
+
+Since the zero-downtime work (`docs/operations/poller-lease.md`) dev and prd run **one to three API
+pods** behind a rolling update and a CPU autoscaler, and any pod may take a card render or a submit.
+Three things above read differently from then on.
+
+**Every capture limit is per pod.** `_GLOBAL_PER_MIN` (60), `_PER_CONTEXT_PER_MIN` (12) and the
+2 000/day budget are counters in one process's memory, and no pod sees another's. Step 6's
+"bind at exactly the documented numbers" still holds, per pod; across the deployment the bound is
+the replica ceiling times each number. At three pods that is **180 a minute, 36 per context a minute
+and an effective 6 000 a day** — the verified 2 000/day hard budget is a per-pod figure, and 6 000 is
+the ceiling to quote for the deployment. Nothing shares the budget between pods; an ingress-wide one
+would be a platform ask.
+
+**The display snapshot lives in Firestore, not one pod's memory** (under
+`VARSEL_STATE_BACKEND=store`, i.e. dev and prd; tst keeps the memory-only path). Each render writes
+a `feedback_contexts` document in the `notifications` database: the snapshot as one canonical JSON
+string, the rendering `device_id` (none for the Rushvarsel card), and the first-tap claims. Its
+`expires_at` is fixed at the render (15 minutes, never sliding) and is also the collection's TTL
+field, so physical deletion follows within ~24 h; every read tests expiry itself. «Slett alt»
+deletes a device's contexts in the same transaction as its journeys. A memory-cached id is reused
+for the same rendering only while more than 7.5 minutes remain, so the **Rushvarsel card's
+`context_id` rotates about every 7.5 minutes** — expect more distinct contexts per rush than before.
+A first tap is claimed on the document per (context, response id), so a submit retried against
+two pods captures once; a claim that fails at the store **fails open** (admits the tap), and a
+failed persist or capture **releases** the claim so the browser's retry is not refused. If the store
+write at render fails, that id lives in the rendering pod's memory only, and a tap that lands on
+another pod is answered `expired`.
+
+**Two of the step 6 measurements were single-pod figures.** The `floor` row (an unknown
+`context_id` refused "before any I/O") now costs one Firestore read under the store backend. And
+`persist`'s early return rides on the in-process `_persisted` set, so a repeat submit that lands on
+a different pod writes the BigQuery context row again: identical content, which the exporter
+reports as `identical_duplicate_context` and resolves to one row — expected after a rollout, not a
+defect. The privacy record's 2026-10-13 addendum
+(`docs/personvern/2026-08-28-varsel-tilbakemelding-personvernvurdering.md`, §6) covers the new
+store.
+
 ## Official API assumptions to verify
 
 The exporter follows PostHog's official [Query API endpoint](https://posthog.com/docs/api/query)

@@ -29,8 +29,12 @@ not changed is a transaction that reads two documents and returns ``unchanged`` 
 transactions are spent, and they are spent only where a write can actually happen. That is reading
 the store to decide what to write -- not re-deriving the pending set -- and it is exact rather than
 best-effort for the reason KTD6 names: the emit path has exactly one writer (one poller thread, no
-route invokes the pass, one replica under the Recreate strategy), so nothing can change a subject
-between the answer and the commit.
+route invokes the pass, and only the pod holding the poller lease runs the cycle), so nothing can
+change a subject between the answer and the commit. Since the zero-downtime work that is one LEADER
+per leadership term, not one replica: the exactness holds per term. At a handoff at most
+`_EMIT_WORKERS` abandoned commits of the old leader's pass can land after the new leader seeded,
+each idempotent; shutdown and lease loss wait for this module's pass lock first
+(:func:`wait_until_idle`), bounded by the shutdown deadline.
 
 **Where that answer comes from moved in U9, and the reason is a ceiling rather than a cost.** It
 was one client-scoped query per client (``notification_store.client_alerts``), which serves at most
@@ -1176,6 +1180,19 @@ def _beat_quietly(beat: Callable[[], None]) -> None:
 #: Held for the whole of one pass, including the part of it this thread has walked away from.
 #: See :func:`emit` for what a second pass over the same store would cost.
 _pass_lock = threading.Lock()
+
+
+def wait_until_idle(timeout_s: float) -> bool:
+    """Wait up to `timeout_s` for any pass still draining -- abandoned workers included -- to end.
+
+    For the poller lease's shutdown and loss (zero-downtime U2, KTD7): the subject mirror learns only
+    from this process's own commits, so the lease is handed on only after this process has stopped
+    committing, or after the bound. Taken and released at once; True when the pass lock was free.
+    """
+    if not _pass_lock.acquire(timeout=max(0.0, timeout_s)):
+        return False
+    _pass_lock.release()
+    return True
 
 
 def emit(

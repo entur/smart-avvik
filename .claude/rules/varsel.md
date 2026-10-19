@@ -491,7 +491,32 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     poller has seeded it; the CYCLE reads the mirror, because at a hundred thousand registrations a
     per-cycle read of the collection IS the cycle. `get_journey` answers both, preferring the mirror
     and falling back to the store while it is not ready, and that is exact in both cases only
-    because every commit this process makes is applied to the mirror from its own result. **The two
+    because every commit this process makes is applied to the mirror from its own result.
+    **"This process" is the LEADER since the poller lease (2026-10-13,
+    `docs/operations/poller-lease.md`).** Every pod in dev and prd serves `/varsel`, so a
+    registration, delete or «Slett alt» can land on a pod whose commits the leader's mirror only
+    learns at its next sync. Four rules follow, each silent if taken the other way. (1) The mirror is
+    the CYCLE's and the leader's alone: reset and seeded synchronously on acquisition (the push marks
+    do not stamp the watermark, so a sync would re-offer what an interim leader pushed), reset on
+    loss, never seeded on a follower. (2) Request paths read the STORE on every pod, the leader
+    included, through `stored_journey` (the delete route's ownership check) and the lists — through
+    the mirror, a journey registered on another pod would refuse its own delete on the leader. (3)
+    Before each send the leader makes ONE store read (`StoreRegistrations.may_send`, outside
+    `_state_lock`) and refuses a journey that is gone or a push whose situations are all already
+    marked — and deliberately NOT a train tag marked under a DIFFERENT situation: that is a
+    replacement the stale mirror did not recognise (an ET cancellation confirming the interim
+    leader's forecast), and refusing it would withhold the confirmation for up to six hours, until
+    the mirror re-seeds; sending costs the «Bekreftet:» prefix and one slot of the day's cap. The
+    blob backend's `may_send` is always True (one process, tst). (4) A follower publishes the stop
+    picker's aliases (`refresh_varsel_stops(heal_registrations=False)`) but never rewrites a stored
+    registration onto a canonical stop; that write is the leader's cycle. Also per pod, not shared:
+    the wording and alternative caches (a follower's card shows the SX summary and no alternative),
+    and the feedback snapshot cache — the snapshots themselves are `feedback_contexts` documents
+    under this backend, bound to the device and deleted in its erase transaction. And
+    **`/togmelding-api/outlook` reads the device's journeys from the store on every call** (it read
+    process memory before), so the rush panel at the top of `/varsel` costs one store query per
+    poll and can trigger the weekly activity renewal write, as the journey list already does —
+    watch it if the PWA's poll rate rises. **The two
     global ceilings moved off the protocol**: `device_count()`/`journey_count()` are gone and
     `put_device`/`create_journey` raise `varsel_state.CapacityExceeded` instead, because a count the
     caller compares against a constant is two things the store cannot do — the ceiling there is the

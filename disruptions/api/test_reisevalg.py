@@ -675,7 +675,8 @@ def test_refresh_baselines_tolerates_missing_table(monkeypatch):
 
     monkeypatch.setattr(reisevalg, "_baselines", {})
     monkeypatch.setattr(reisevalg, "_bq_client", _FailingBQ())
-    reisevalg.refresh_baselines()  # must not raise
+    # Must not raise, and says it failed: a follower pod retries on its next tick (zero-downtime U3).
+    assert reisevalg.refresh_baselines() is False
     assert reisevalg._get_baselines()[0] == {}
 
 
@@ -693,7 +694,7 @@ def test_refresh_baselines_loads_rows(monkeypatch):
     monkeypatch.setattr(reisevalg, "_bq_client", _BQ())
     monkeypatch.setattr(reisevalg, "_baselines", {})
     monkeypatch.setattr(reisevalg, "_baselines_built_at", None)
-    reisevalg.refresh_baselines()
+    assert reisevalg.refresh_baselines() is True
     table, built_at = reisevalg._get_baselines()
     assert table[("97858V180819", 2, 7)]["median"] == 1000
     assert built_at == built

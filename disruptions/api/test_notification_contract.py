@@ -770,6 +770,63 @@ def test_every_worker_values_file_is_linted_and_deployed():
     assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
 
 
+def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_constants():
+    """`api_render.sh` pins the API release's two shapes (Recreate under `forceReplicas`, rolling
+    plus HPA without it), so like the worker's it has to gate the image. And the shutdown deadline
+    `poller_lease` computes from GRACE_S and PRESTOP_S is only right while the chart says the same
+    numbers: a grace raised in Helm alone is harmless, one lowered alone has the kubelet SIGKILL the
+    leader before it releases the lease.
+    """
+    import poller_lease
+
+    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    # Beside the worker script, in the job the worker test already holds to gating `docker`.
+    assert "bash helm/kix-avvik/test/api_render.sh" in ci
+    assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
+
+    helm = REPO_ROOT / "helm" / "kix-avvik"
+    base = (helm / "values.yaml").read_text()
+    grace = re.findall(r"^    terminationGracePeriodSeconds: (\d+)$", base, re.MULTILINE)
+    assert grace == [str(int(poller_lease.GRACE_S))], grace
+    for env in ("dev", "tst", "prd"):
+        text = (helm / "env" / f"values-kub-ent-{env}.yaml").read_text()
+        assert "terminationGracePeriodSeconds" not in text, f"{env} overrides the grace"
+        sleeps = re.findall(r"time\.sleep\((\d+)\)", text)
+        assert sleeps == [str(int(poller_lease.PRESTOP_S))], (env, sleeps)
+
+
+def test_the_leader_smoke_asks_for_the_deployed_build_and_the_image_carries_it():
+    """From step B (RollingUpdate) the terminating OLD pod can answer `/ready` as leader through the
+    public host, so a smoke satisfied by any leader passes a deploy whose new pod never acquires.
+    It must want "leader" and the deployed build in one answer, and that build identity has a chain
+    with three links, any of which breaks it with the smoke merely timing out: ci.yml passes the
+    commit as a build arg, the Dockerfile bakes it into the runtime stage's environment, and main
+    reads that variable.
+    """
+    workflows = REPO_ROOT / ".github" / "workflows"
+    ci = (workflows / "ci.yml").read_text()
+    docker_job = ci[ci.index("  docker:") : ci.index("  docker-scan:")]
+    assert "build_args: GIT_SHA=${{ github.sha }}" in docker_job, docker_job
+
+    dockerfile = (REPO_ROOT / "Dockerfile").read_text()
+    runtime = dockerfile[dockerfile.rindex("\nFROM ") :]
+    assert re.search(r"^ARG GIT_SHA$", runtime, re.MULTILINE), "the runtime stage declares no GIT_SHA"
+    assert re.search(r"^ENV GIT_SHA=\$\{GIT_SHA\}$", runtime, re.MULTILINE), "GIT_SHA is not baked in"
+
+    main_src = (REPO_ROOT / "disruptions" / "api" / "main.py").read_text()
+    assert 'os.environ.get("GIT_SHA")' in main_src
+
+    cd = (workflows / "cd.yml").read_text()
+    steps = cd.split("- name: Wait for /ready, then a leader")[1:]
+    assert len(steps) == 2, "expected the leader wait in smoke-dev and smoke-prd only"
+    for step in steps:
+        step = step.split("- name:", 1)[0]
+        assert "IMAGE: ${{ inputs.image }}" in step, step
+        # Both greps must pass on the same body (the version one is double-quoted to expand $want).
+        assert "grep -qE '\"role\"" in step and 'grep -qE "\\"version\\"' in step, step
+        assert "&& echo \"$body\" | grep" in step, "the two conditions are not ANDed on one answer"
+
+
 def test_the_worker_release_is_never_the_api_release():
     """One transposed name upgrades the API release with the worker's values file: no ingress, no
     VAPID keys, no SSO secret, and `container.args` pointing every replica at the delivery loop. The

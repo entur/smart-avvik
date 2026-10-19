@@ -384,18 +384,21 @@ _baselines_unavailable_warned = False
 _bq_client: Any | None = None  # injected via configure() from main.py
 
 
-def refresh_baselines() -> None:
+def refresh_baselines() -> bool:
     """Reload the (point_id, dow, hour) -> volume-baseline lookup from BigQuery.
 
-    Mirrors main.refresh_impact_lookup (eager tolerant call in lifespan + isolated refresh in
-    the poller tick). Tolerant by design: the table may not exist until the U2 backtest lands —
+    Mirrors main.refresh_impact_lookup (loaded by `main.follow_last_build` and the poller
+    tick). Tolerant by design: the table may not exist until the U2 backtest lands —
     any failure logs and keeps the previous lookup (initially empty), which makes the volume
     provider report the road side as unavailable rather than erroring.
+
+    Returns whether it loaded, since it never raises: a follower pod stamps the load only on True,
+    so a failed one is asked again on its next tick (main._FOLLOWED_LOOKUPS).
     """
     global _baselines_built_at, _baselines_refreshed_at, _baselines_unavailable_warned
     if _bq_client is None:
         logger.info("No BigQuery client configured; svv baselines not loaded")
-        return
+        return False
     try:
         rows = _bq_client.query(_BASELINES_QUERY).result(timeout=_BASELINES_TIMEOUT_S)
         table: dict[tuple[str, int, int], dict[str, Any]] = {}
@@ -422,7 +425,7 @@ def refresh_baselines() -> None:
             exc,
             extra={"fields": {"event": "reisevalg_baselines_unavailable"}},
         )
-        return
+        return False
     with _baselines_lock:
         global _baselines
         _baselines = table
@@ -435,6 +438,7 @@ def refresh_baselines() -> None:
         built_at,
         extra={"fields": {"event": "reisevalg_baselines_refreshed"}},
     )
+    return True
 
 
 def _get_baselines() -> tuple[dict[tuple[str, int, int], dict[str, Any]], datetime | None]:

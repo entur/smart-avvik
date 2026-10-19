@@ -121,6 +121,13 @@ COPY --from=frontends /build/disruptions/api/meldinger_static ./meldinger_static
 COPY --from=frontends /build/disruptions/api/togmelding_static ./togmelding_static
 COPY --from=frontends /build/disruptions/api/rushhistorikk_static ./rushhistorikk_static
 
+# The commit this image was built from (ci.yml passes `GIT_SHA=${{ github.sha }}`). /ready reports
+# it as `version`, which is how the deploy smoke tells the new pod from the old one under
+# RollingUpdate. After every COPY, so a new commit busts no cached layer. A build without the arg (local) gets
+# an empty value, which /ready reports as null.
+ARG GIT_SHA
+ENV GIT_SHA=${GIT_SHA}
+
 # The Helm chart routes traffic to 8080. Single worker on purpose: the app keeps
 # an in-process cache and one background poller thread, so multiple workers would
 # mean duplicate pollers and unshared caches.

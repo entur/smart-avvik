@@ -82,6 +82,12 @@ def targets(expr, nodata):
         display += " or vector(0)"
     if display != expr:
         out.append({"expr": display, "legendFormat": "readable", "refId": "B"})
+    # Rules 1a/1b: the gauge is exported by every pod (followers and the worker at 0), so the sum
+    # is how many lead and the count how many export it. Drawn side by side, a sum of 0 beside a
+    # count of 0 is "no pods", beside a count of 3 it is "pods, but nobody leads".
+    if expr.startswith("sum(kix_poller_leader"):
+        out[0]["legendFormat"] = "leaders (sum)"
+        out.append({"expr": "count" + expr[3:], "legendFormat": "pods exporting (count)", "refId": "B"})
     return out
 
 

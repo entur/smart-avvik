@@ -43,9 +43,11 @@ Seven things here are decisions rather than mechanics.
    is not marked; and the marker rides inside the signed body, which is U6's to emit.
 6. **``/test-events`` sends synchronously and writes NOTHING to the store.** That is not
    convenience: ``notification_store``'s pending-event ceiling is exact rather than best-effort *because
-   the emit path has exactly one writer* -- one poller thread, no route invoking the pass, one
-   replica under the Recreate strategy. A route that called ``commit_event`` would falsify that
-   claim for every quota check in the module. So a test event is signed and dialled here and leaves
+   the emit path has exactly one writer* -- one poller thread, no route invoking the pass, and
+   only the pod holding the poller lease running the cycle (one LEADER per leadership term; the
+   exactness holds per term). Every pod serves this route, so a route that called
+   ``commit_event`` would be a second writer on every pod and falsify that claim for every quota
+   check in the module. So a test event is signed and dialled here and leaves
    no event, no delivery and no alert subject behind.
 7. **Deletion is ordered.** The tombstone lands first, in one transactional write that stops
    routing (the poller's load query filters ``status == "active"``); the events, deliveries and
@@ -1321,9 +1323,9 @@ def send_test_event(principal: _Principal, body: TestEventIn) -> TestEventOut:
 
     Sent synchronously and **nothing is stored**. Not for convenience: ``notification_store``'s
     pending-event ceiling is exact rather than best-effort *because the emit path has exactly one
-    writer* -- one poller thread, no route invoking the pass, one replica under the Recreate
-    strategy -- so a route that called ``commit_event`` would falsify that claim for every quota
-    check in that module. No event, no delivery and no alert subject is written here, and the daily
+    writer* -- one poller thread, no route invoking the pass, and only the lease-holding pod (one
+    LEADER per leadership term) running the cycle -- so a route that called ``commit_event``, on
+    any pod, would falsify that claim for every quota check in that module. No event, no delivery and no alert subject is written here, and the daily
     cap is untouched.
 
     Answers 200 with the outcome rather than mapping a client's own failure onto our status code:

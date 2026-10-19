@@ -181,19 +181,24 @@ class _AccessLogRedaction(logging.Filter):
         return True
 
 
-class _HealthAccessMute(logging.Filter):
-    """Drops uvicorn access records for the /health probe (R9).
+#: The probe paths whose access lines are dropped: liveness on /health, readiness on /ready
+#: (zero-downtime plan 2026-10-13-001, KTD6).
+_PROBE_PATHS = ("/health", "/ready")
 
-    GKE's liveness and readiness probes hit /health every few seconds, so every real request in
+
+class _HealthAccessMute(logging.Filter):
+    """Drops uvicorn access records for the /health and /ready probes (R9).
+
+    GKE's liveness and readiness probes hit them every few seconds, so every real request in
     the access log sits between probe lines — noise that costs ingestion and buries the lines
     worth reading. Only a record matching :func:`_access_request_path`'s contract is examined;
-    anything else passes. The path must be EXACTLY ``/health`` (query string ignored) — never a
+    anything else passes. The path must be EXACTLY a probe path (query string ignored) — never a
     prefix match, which would silently hide a future ``/healthz`` from the log.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
         full_path = _access_request_path(record)
-        return not (full_path is not None and full_path.partition("?")[0] == "/health")
+        return not (full_path is not None and full_path.partition("?")[0] in _PROBE_PATHS)
 
 
 def _log_thread_exception(args: threading.ExceptHookArgs) -> None:

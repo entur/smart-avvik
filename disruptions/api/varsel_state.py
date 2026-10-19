@@ -140,6 +140,7 @@ class RegistrationStore(Protocol):
     def put_device(self, device_id: str, *, subscription: dict, brand: str) -> None: ...
     def forget_device(self, device_id: str, *, reason: str) -> tuple[dict | None, int]: ...
     def device_journeys(self, device_id: str) -> list[tuple[str, dict]]: ...
+    def stored_journey(self, journey_id: str) -> dict | None: ...
     def create_journey(self, journey_id: str, record: dict) -> None: ...
     def delete_journey(self, journey_id: str) -> dict | None: ...
     def erase_device(self, device_id: str) -> Erasure: ...
@@ -155,6 +156,7 @@ class RegistrationStore(Protocol):
     # ---- the push side
     def notified_snapshot(self, journey_ids: Iterable[str]) -> set[str]: ...
     def push_ledger(self, journey_id: str) -> PushLedger: ...
+    def may_send(self, journey_id: str, *, situations: Iterable[str]) -> bool: ...
     def mark_notified(self, journey_id: str, *situation_numbers: str) -> None: ...
     def record_push(
         self,
@@ -649,6 +651,14 @@ class BlobRegistrations:
                 if rec["device_id"] == device_id
             ]
 
+    def stored_journey(self, journey_id: str) -> dict | None:
+        """The request path's read of one registration: the delete route's ownership check.
+
+        Under the blob the durable copy and the cycle's view are the same dicts, so this is
+        :meth:`get_journey`. The store answers it from the document instead (zero-downtime U5).
+        """
+        return self.get_journey(journey_id)
+
     def create_journey(self, journey_id: str, record: dict) -> None:
         """Store one registration, refusing past the global journey ceiling.
 
@@ -730,8 +740,8 @@ class BlobRegistrations:
     def get_journey(self, journey_id: str) -> dict | None:
         """A COPY of one registration, or None.
 
-        Asked by the delivery loop as a liveness re-check and by the delete route as the ownership
-        check. By ID and never by a scan, because under the store that is one document read where
+        Asked by the delivery loop as a liveness re-check, and through :meth:`stored_journey` by
+        the delete route as the ownership check. By ID and never by a scan, because under the store
         "is this journey one of that device's?" would be a query -- and it is asked twice per push.
         """
         with lock:
@@ -799,6 +809,14 @@ class BlobRegistrations:
                 day=day,
                 sent_today=count,
             )
+
+    def may_send(self, journey_id: str, *, situations: Iterable[str]) -> bool:
+        """Always True: the blob has one writer, so the collection-time ledger is still the truth.
+
+        The store's pre-send read exists for a write another pod made (zero-downtime U5); the blob
+        backend runs one replica and its behaviour stays today's, byte for byte.
+        """
+        return True
 
     def mark_notified(self, journey_id: str, *situation_numbers: str) -> None:
         with lock:
@@ -959,10 +977,19 @@ class StoreRegistrations:
     store: a traveller who has just created a journey must see it in the next `list_journeys`, and
     the mirror is at best as fresh as the sync at the start of this cycle -- and, before the poller
     has seeded it, empty. The CYCLE reads the mirror: at a hundred thousand registrations a
-    per-cycle read of the collection is the cycle. The one method that answers both, `get_journey`,
-    prefers the mirror and falls back to the store while it is not ready, which is exact in both
-    cases because every commit this process makes is applied to the mirror from its own result
-    (`notification_store.SUBSCRIPTION_MIRRORING_BODIES`).
+    per-cycle read of the collection is the cycle.
+
+    **The mirror is the leader's cycle view** (zero-downtime U5, KTD7). Every pod serves `/varsel`
+    and only the lease's leader seeds a mirror, so the mirror is exact for the leader's own writes
+    -- each commit is applied from its own result (`notification_store.
+    SUBSCRIPTION_MIRRORING_BODIES`) -- and one cycle late for a registration another pod wrote.
+    Two things follow. A request-path read of one journey, the delete route's ownership check, is
+    :meth:`stored_journey` and goes to the store on every pod, the leader included: a journey
+    registered on another pod is not in the leader's mirror until its next sync, and its owner's
+    delete would be refused. And the push case the lag opens -- a journey deleted, or a train
+    already pushed, on another pod -- is closed by :meth:`may_send`, one document read per push,
+    taken outside `_state_lock`. The cycle's own `get_journey` keeps the mirror, so no store I/O
+    enters that lock.
 
     **The ceilings are the client's, resolved by the CALLER.** This module must not import
     `notification_auth` -- `notification_store` does not either, and U7's pattern is that a quota
@@ -1049,6 +1076,18 @@ class StoreRegistrations:
             device_id, client_id=self._client_id, subscriptions=subs
         )
         return [(sub.subscription_id, _journey_record(sub)) for sub in subs]
+
+    def stored_journey(self, journey_id: str) -> dict | None:
+        """One registration from the STORE, never the mirror (zero-downtime U5, R8).
+
+        Another client's subscription id reads as no registration: `get_subscription` refuses a
+        tenancy mismatch by raising, and to the delete route that is simply not this traveller's.
+        """
+        try:
+            record = notification_store.get_subscription(journey_id, client_id=self._client_id)
+        except notification_store.Forbidden:
+            return None
+        return None if record is None else _journey_record(record)
 
     def create_journey(self, journey_id: str, record: dict) -> None:
         spec = notification_store.SubscriptionSpec(
@@ -1139,11 +1178,12 @@ class StoreRegistrations:
     def get_journey(self, journey_id: str) -> dict | None:
         """One registration, from the mirror when it is ready and from the store when it is not.
 
-        The mirror is EXACT for this process rather than merely fresh -- every commit is applied
-        from its own result -- so the delivery loop's two liveness re-checks, which exist to catch a
-        delete that landed mid-cycle, cost no read. The fallback is what makes the request path
-        correct before the poller has seeded: `/varsel-api` serves from the instant the port binds,
-        and the seed runs on the poller thread minutes later.
+        The cycle's read, and the one asked under `_state_lock`, so it must not reach the store
+        while the mirror is ready. The mirror is exact for this process's own commits and one cycle
+        late for another pod's (see the class), so the delivery loop's liveness re-checks cost no
+        read and catch the leader's own deletes; another pod's delete is :meth:`may_send`'s. The
+        fallback serves a pod whose mirror is not seeded, which since zero-downtime U5 runs no
+        cycle at all; the request path reads :meth:`stored_journey` instead.
         """
         mirror = notification_store.subscription_mirror()
         if mirror.ready:
@@ -1206,8 +1246,9 @@ class StoreRegistrations:
 
         From the mirror and not the store, which reverses what U12 recorded and is the reason the
         mark bodies now apply their own commits: the alternative is a document read per registration
-        per cycle, and the mirror's copy is exact rather than approximate because this process is
-        the only writer of it. See `notification_store.SUBSCRIPTION_MIRRORING_BODIES`.
+        per cycle. The copy is exact for the leader's own marks and one cycle late for a mark another
+        pod wrote, which :meth:`may_send` re-reads before the send. See
+        `notification_store.SUBSCRIPTION_MIRRORING_BODIES`.
 
         Keyed through :meth:`SubscriptionMirror.entry`, never `recipients` -- the pass asks this
         per candidate, and a scan per question is the cost that read exists to remove.
@@ -1233,6 +1274,29 @@ class StoreRegistrations:
                 sent_today=sent,
             )
         return out
+
+    def may_send(self, journey_id: str, *, situations: Iterable[str]) -> bool:
+        """The last look before a send, from the DOCUMENT (zero-downtime U5, AE6).
+
+        One store read per push, which the caller takes outside `_state_lock`. Refused when the
+        registration is gone or every situation the push covers is already marked. The collection
+        read the mirror, which is one cycle late for another pod's writes: a journey deleted there,
+        or a situation the interim leader pushed, is what this catches. A delete landing during the
+        send itself still costs one push, and its mark is dropped by :meth:`mark_notified`.
+
+        **Not refused on the train's tag alone**, though `pushed_trains` is on the same document.
+        A train mark is only ever written beside the situation mark of the same send, so the
+        situation test already refuses that push; a tag marked for a DIFFERENT situation is a
+        replacement the stale mirror did not recognise -- an ET cancellation confirming the interim
+        leader's forecast -- and the mark bodies do not stamp the watermark, so the mirror would not
+        learn it before the six-hourly re-seed. Refusing it would withhold the confirmation for that
+        long; sending it costs the «Bekreftet:» prefix and one slot of the day's cap.
+        """
+        record = notification_store.get_subscription(journey_id, client_id=self._client_id)
+        if record is None:
+            return False
+        covered = set(situations)
+        return not (covered and covered <= set(record.notified))
 
     def mark_notified(self, journey_id: str, *situation_numbers: str) -> None:
         try:

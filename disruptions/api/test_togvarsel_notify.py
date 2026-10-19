@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -788,6 +789,66 @@ def test_push_round_pushes_once_per_device_with_each_brands_assets(monkeypatch):
     assert summary["no_subscription"] == 1 and summary["matched_devices"] == 3
 
 
+def test_push_round_sends_nothing_once_the_lease_says_stop(monkeypatch):
+    """The lease's seam (zero-downtime U2, KTD8): asked before the delivery, so a leader that lost
+    the lease or is stopping pushes nothing for the round — and says so by raising RoundFenced,
+    which is what keeps `evaluate` from persisting a marker for a round nobody delivered."""
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    delivered: list = []
+
+    def deliver(per_device, prepare):
+        delivered.append(per_device)
+        return varsel.deliver_to_devices(per_device, prepare)
+
+    decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
+    devices = {"dev-e": _dev("https://push.example.com/e")}
+    with _push_devices(devices):
+        try:
+            togvarsel_notify.push_round(
+                decision, _issued(), ["j1"], set(devices),
+                **{**_wiring(), "deliver": deliver}, should_continue=lambda: False,
+            )
+        except togvarsel_notify.RoundFenced:
+            pass
+        else:
+            raise AssertionError("a fenced round must say so, or its marker is persisted")
+        assert sent == [] and delivered == [], "no fan-out at all after the lease said stop"
+        togvarsel_notify.push_round(
+            decision, _issued(), ["j1"], set(devices),
+            **{**_wiring(), "deliver": deliver}, should_continue=lambda: True,
+        )
+    assert len(sent) == 1, "a leader that still holds the lease delivers as before"
+
+
+def test_push_round_asks_the_lease_before_every_send(monkeypatch):
+    """Lost mid-fan-out: the lease is asked again before each device's send, so nothing new is
+    submitted after it answers False — and a round only PARTLY delivered is still fenced, because
+    the devices it withdrew would otherwise never hear of the round."""
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    lock = threading.Lock()
+    answers = iter([True, True])  # the pre-check and ONE send, then the lease is gone
+
+    def should_continue():
+        with lock:
+            return next(answers, False)
+
+    decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
+    devices = {f"dev-{i}": _dev(f"https://push.example.com/{i}") for i in range(4)}
+    with _push_devices(devices):
+        try:
+            togvarsel_notify.push_round(
+                decision, _issued(), ["j1"], set(devices), **_wiring(),
+                should_continue=should_continue,
+            )
+        except togvarsel_notify.RoundFenced:
+            pass
+        else:
+            raise AssertionError("a partly-withdrawn round must be fenced")
+    assert len(sent) == 1, "no send is submitted once the lease said stop"
+
+
 def test_a_gone_device_is_dropped_after_grace_and_the_round_completes(monkeypatch):
     results = {
         "https://push.example.com/old": "gone",
@@ -982,6 +1043,53 @@ def test_evaluate_with_nothing_issued_is_a_natural_no_op():
     with _capture_logs():
         togvarsel_notify.evaluate(now=SATURDAY)
     assert store.stores == 0
+
+
+def test_evaluate_asks_the_lease_before_each_rounds_fan_out(monkeypatch):
+    """U4 wires push_round's `should_continue` to the lease through configure: a leader demoted
+    between deciding and delivering sends nothing, persists NO marker, records no round and stops
+    the pass — so the successor, reloading the persisted map, delivers the rounds itself (KTD8: a
+    duplicate in the window is accepted, a lost round is not)."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    asked: list[bool] = []
+    issues = [_issued("1200", "red", scope="ettermiddagsrushet 15:00–18:00"),
+              _issued("1400", "yellow", scope="ettermiddagsrushet 15:00–18:00")]
+    journeys = lambda: {"j1": _j(begin="15:30", end="17:00")}
+    store, fake = _configure_evaluate(issues=issues, journeys=journeys,
+                                      should_continue=lambda: asked.append(False) or False)
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs():
+        togvarsel_notify.evaluate(now=_monday(13, 30))
+    assert sent == []
+    assert store.stores == 0 and MONDAY_STR not in store.by_date, "no marker for an undelivered round"
+    assert fake.rounds == [], "a fenced round is not recorded; the successor records it"
+    assert asked == [False], "the pass stops at the first fenced round"
+    _successor, fake = _configure_evaluate(issues=issues, journeys=journeys, store=store,
+                                           should_continue=lambda: True)
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs():
+        togvarsel_notify.evaluate(now=_monday(13, 31))
+    assert len(sent) == 2
+    assert store.by_date[MONDAY_STR]["1200"] == {"level": "red", "pushed": True}
+    assert store.by_date[MONDAY_STR]["1400"] == {"level": "yellow", "pushed": True}
+    assert {r["issue"] for r in fake.rounds} == {"1200", "1400"}
+
+
+def test_a_fence_after_a_delivered_round_keeps_only_that_rounds_marker(monkeypatch):
+    """A lease lost BETWEEN two rounds: the first is delivered, persisted and recorded; the second's
+    marker (committed in memory before any fan-out) must not ride along on the first's persist."""
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    answers = iter([True, True])  # 1200's pre-check and its one send; 1400 is fenced
+    issues = [_issued("1200", "red", scope="ettermiddagsrushet 15:00–18:00"),
+              _issued("1400", "yellow", scope="ettermiddagsrushet 15:00–18:00")]
+    journeys = lambda: {"j1": _j(begin="15:30", end="17:00")}
+    store, fake = _configure_evaluate(issues=issues, journeys=journeys,
+                                      should_continue=lambda: next(answers, False))
+    with _push_devices({"dev-1": _dev("https://push.example.com/1")}), _capture_logs():
+        togvarsel_notify.evaluate(now=_monday(13, 30))
+    assert len(sent) == 1
+    assert store.by_date[MONDAY_STR] == {"1200": {"level": "red", "pushed": True}}
+    assert [r["issue"] for r in fake.rounds] == ["1200"]
 
 
 def test_evaluate_isolates_a_failing_round_and_never_retries_it(monkeypatch):
@@ -1201,16 +1309,22 @@ def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monke
 
 def _configure_outlook(**overrides):
     """The read-only subset rush_outlook needs, wired the way main does. Deliberately WITHOUT the
-    delivery seams: the panel must work off the four it names and nothing else."""
+    delivery seams: the panel must work off the four it names and nothing else. `journeys` are
+    the STORE's (`device_journeys`, one device per read); the cycle's mirror stays empty, which is
+    every follower's mirror (zero-downtime U4)."""
     issues = overrides.pop("issues", [_issued("0630", "yellow")])
     journeys = overrides.pop("journeys", {"j1": _j()})
+    mirror = overrides.pop("mirror", {})
     fake = _StationsBQ(refs=sorted(STATIONS))
     kwargs = {
         "bq_client": fake,
         "enabled": lambda: True,
         "push_ready": lambda: True,
         "issued_today": lambda: deepcopy(list(issues)),
-        "journeys": lambda: deepcopy(dict(journeys)),
+        "journeys": lambda: deepcopy(dict(mirror)),
+        "device_journeys": lambda device_id: {
+            jid: deepcopy(j) for jid, j in journeys.items() if j.get("device_id") == device_id
+        },
         "expand_refs": _ident,
     }
     kwargs.update(overrides)
@@ -1333,6 +1447,25 @@ def test_the_panel_is_per_rush_and_per_device():
     assert togvarsel_notify.rush_outlook("dev-unknown", now=at) == []  # no registrations at all
 
 
+def test_the_panel_reads_the_store_not_the_cycles_mirror():
+    """A follower's mirror is never seeded (zero-downtime U4), so a panel reading it would be blank
+    on every pod but the leader. The store answers per device on any pod; the mirror is not asked."""
+    mirror = {"j-mirror": _j(device="dev-mirror")}
+    fake = _configure_outlook(issues=[_issued("0700", "red")], journeys={"j1": _j()},
+                              mirror=mirror)
+    _warm_stations(fake, _monday(7, 5))
+    assert [f.rush for f in togvarsel_notify.rush_outlook("dev-1", now=_monday(7, 5))] == ["am"]
+    assert togvarsel_notify.rush_outlook("dev-mirror", now=_monday(7, 5)) == []
+
+
+def test_the_outlook_route_runs_off_the_event_loop():
+    """The store read is a blocking Firestore query (and the weekly renewal write the /varsel
+    journey list also performs), so the route is a plain ``def`` in the threadpool."""
+    import inspect
+
+    assert not inspect.iscoroutinefunction(togvarsel_notify.outlook)
+
+
 def test_the_panel_is_gated_on_the_delivery_flag():
     """The panel's claim is "you are being notified about this", so the delivery flag is what
     turns it on — the same read /varsel-api/config surfaces as togvarsel_notify."""
@@ -1383,10 +1516,14 @@ def test_the_outlook_endpoint_serves_the_panel(monkeypatch):
     app = FastAPI()
     app.include_router(togvarsel_notify.router)
     with TestClient(app) as client:
-        body = client.get("/togmelding-api/outlook", params={"device_id": "dev-1"}).json()
+        body = client.get("/togmelding-api/outlook", params={"device_id": "device-0001"}).json()
         # no device_id at all is a 422, as everywhere else that takes one
         assert client.get("/togmelding-api/outlook").status_code == 422
-    assert asked == ["dev-1"]
+        # and the bounds /varsel-api's DeviceIn holds: each call is a store read on a public route
+        for bad in ("", "short", "x" * 101):
+            assert client.get("/togmelding-api/outlook",
+                              params={"device_id": bad}).status_code == 422, bad
+    assert asked == ["device-0001"]
     assert body == {"rushes": [{"rush": "am", "issue": "0700",
                                 "scope": "morgenrushet 07:00–09:00", "level": "red", "p": 0.44}]}
 
@@ -1409,7 +1546,11 @@ def test_both_routes_404_while_the_master_gate_is_off(monkeypatch):
             os.environ["SHOW_RUSHVARSEL"] = value
             try:
                 assert client.get(
-                    "/togmelding-api/outlook", params={"device_id": "dev-1"}
+                    "/togmelding-api/outlook", params={"device_id": "device-0001"}
+                ).status_code == 404, value
+                # The gate answers before the device_id bounds: a 422 would mention the route.
+                assert client.get(
+                    "/togmelding-api/outlook", params={"device_id": "x"}
                 ).status_code == 404, value
                 assert client.post(
                     "/togmelding-api/test-notify", json={"device_id": "dev-trig-1"}
@@ -1418,7 +1559,7 @@ def test_both_routes_404_while_the_master_gate_is_off(monkeypatch):
                 os.environ["SHOW_RUSHVARSEL"] = "true"
         # And on again: the outlook answers, so the 404s above are the gate and not a broken app.
         assert client.get(
-            "/togmelding-api/outlook", params={"device_id": "dev-1"}
+            "/togmelding-api/outlook", params={"device_id": "device-0001"}
         ).status_code == 200
 
 

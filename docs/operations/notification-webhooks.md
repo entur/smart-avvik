@@ -639,7 +639,8 @@ whose lease lapsed and was re-claimed cannot mark a delivery sent (spending one 
 four for an outcome nobody knows) or set a re-claimed one back to `pending` (releasing the live
 claim's slot). Both outcomes are counted: `leased` is a claim refused because somebody else holds
 it, `lease_lost` a terminal write refused because the holder changed. **They became reachable with
-U11** and were not before — one poller thread, one replica under Recreate — so a non-zero count of
+U11** and were not before — one poller thread on one pod (one LEADER per leadership term since the
+poller lease, `docs/operations/poller-lease.md`) — so a non-zero count of
 either is now information rather than an impossibility: it says two processes read the same pending
 page, which during the rollout window is exactly what is supposed to happen and is the evidence the
 lease works. Outside that window, a steady `lease_lost` means attempts are outliving their 20 s
@@ -751,10 +752,13 @@ healthy one.
 - **`poller_phase{phase="notification_webhooks"}` exceeds half the cycle period** (~148 s against
   the 2026-09-08 measurement), which is the wall-clock bound that still means something — past it a
   slow store makes every cycle the previous one's tail. The ceilings are pinned under it by test;
-- a **second replica** appears (the single-writer argument the emit path's exactness rests on is one
-  poller thread, no route invoking the pass, one replica under the Recreate strategy — and note U9
-  already made the writer 64 threads of ONE pass, which the ledger and `overlap_refused` are what
-  enforce);
+- a **second leader** appears — `sum(kix_poller_leader)` above 1 past its one-minute pending window,
+  alert rule 1b (the single-writer argument the emit path's exactness rests on is one poller thread,
+  no route invoking the pass, and only the pod holding the poller lease running the cycle: one LEADER
+  per leadership term, with the exactness claims holding per term — and note U9 already made the
+  writer 64 threads of ONE pass, which the ledger and `overlap_refused` are what enforce). Extra
+  API **replicas** are no longer the trigger: dev and prd scale 1..3 pods behind the lease, and every
+  follower serves the routes without emitting (`docs/operations/poller-lease.md`);
 - **clients reach single digits.**
 
 Re-measure before raising any ceiling; the numbers above are measurements from 2026-08-21 and
@@ -1459,8 +1463,10 @@ morning is worded by. Neither changes what a client receives, only how much pros
 Two things that do NOT need to change for a hundred thousand commuters: the one-subscription-per-
 commuter grain (a client that prefers one subscription per route can already use the API that way,
 with `daily_cap` raised and its own per-user caps, and the receiver's dispatch hook already fans one
-event out to many recipients), and the single API replica, whose request load at that scale is tens
-of requests a second once the matcher is indexed.
+event out to many recipients), and the API's request capacity, whose load at that scale is tens
+of requests a second once the matcher is indexed — one pod carried it when this was written, and
+since 2026-10-13 dev and prd scale 1..3 pods on CPU behind the poller lease
+(`docs/operations/poller-lease.md`).
 
 ---
 
@@ -1488,8 +1494,9 @@ support the clause, the clause was changed.
 | 15 | The **operator audit is append-only and never expires** | `notification_auth.ADMIN_AUDIT`; the `_Docs` seam has **no `delete`**, and no TTL field config exists for that collection in `terraform/firestore.tf`. Deleting a subscription never touches it. Its `reason` can hold a refused destination's host |
 | 17 | A **`web_push` registration expires 180 days after the traveller was last here** and has no lifetime horizon | `_horizons(..., channel="web_push")` writes `inactivity_expires_at` alone, from `last_seen_at + WEB_PUSH_INACTIVITY_DAYS`, with `expires_at` equal to it; `_horizon_fields()` is what `subscription_is_live` dispatches through, and a document with no `channel` reads as `webhook` and still needs both. **U14 inverted U12's shape** (product owner, 2026-09-13): U12 gave this channel the lifetime horizon alone, which was a clock anchored on creation that nothing could reset — the client never touches, an amendment keeps `created_at`, and the device upsert writes the device document alone — so a commuter opening the app every morning lost the journey on day 181, invisibly. `note_web_push_activity` moves the anchor from the JOURNEY LIST (every app open, including the traveller who never turned notifications on), at most once per `WEB_PUSH_RENEW_AFTER_DAYS`, so the effective expiry is 173–180 days after last use and the PWA's 60 s poll writes nothing; `renew_device` moves the device document on the same event. **This is still a change, not a restatement**: today's GCS blob has no expiry on a registration at all, so 180 days of disuse is a ceiling somebody has to have chosen |
 | 18 | A **device document expires 180 days after the traveller was last here** | `_new_device_doc` and `_upsert_device_body` write `expires_at = now + SUBSCRIPTION_MAX_LIFETIME_DAYS`, refreshed on every upsert, and since U14 also by `renew_device` from the journey list -- which is what covers an install that never turned notifications on and is therefore never upserted at all. `devices` carries a TTL field config in `terraform/firestore.tf`. What the document holds until then is a Web Push endpoint and two keys -- personal data with no reader once the browser is gone. It is renewed by the same event as the journeys, so "a device and its registrations expire together" is a property of the mechanism rather than of the two numbers happening to match |
-| 19 | **«Slett alt» erases within the transaction, not within 24 hours** | `erase_device` -> `_erase_device_body`. The device document is hard-deleted; each journey is TOMBSTONED and redacted in the SAME write -- route, window, typed names, device id and the three push ledgers cleared -- so nothing personal outlives the transaction. That is stricter than clause 11, and deliberately: a client revoking a subscription is administering its own integration, while this is a traveller exercising erasure, and "the route is gone within 24 hours" is not what that answer should be |
-| 20 | A traveller's journeys are **tombstoned rather than deleted, and the reason is the mirror** | `_erase_device_body` is in `MIRROR_STAMPING_BODIES`. A hard-deleted document matches no query, including `mirror_sync`'s watermark query, so a deletion would leave the poller's in-memory mirror holding the journeys for up to `MIRROR_MAX_AGE_S` (6 h) -- still matching, wording and writing decision rows about somebody who asked to be forgotten. What survives the tombstone is an id, a status and a 7-day TTL. **Since U13 the erasure also drops them from the mirror by id, from its own commit**, so the window is not one sync but none: the stamp is what makes a RESTARTED process agree, the drop is what makes this one agree now |
+| 19 | **«Slett alt» erases within the transaction, not within 24 hours** | `erase_device` -> `_erase_device_body`. The device document is hard-deleted; each journey is TOMBSTONED and redacted in the SAME write -- route, window, typed names, device id and the three push ledgers cleared -- so nothing personal outlives the transaction. Since 2026-10-13 the same transaction also deletes the device's **feedback contexts** (clause 21): `_erase_device_body` reads them before its first write and deletes every one naming the device, so a card render nobody tapped does not outlive the erasure on any pod. That is stricter than clause 11, and deliberately: a client revoking a subscription is administering its own integration, while this is a traveller exercising erasure, and "the route is gone within 24 hours" is not what that answer should be |
+| 20 | A traveller's journeys are **tombstoned rather than deleted, and the reason is the mirror** | `_erase_device_body` is in `MIRROR_STAMPING_BODIES`. A hard-deleted document matches no query, including `mirror_sync`'s watermark query, so a deletion would leave the poller's in-memory mirror holding the journeys for up to `MIRROR_MAX_AGE_S` (6 h) -- still matching, wording and writing decision rows about somebody who asked to be forgotten. What survives the tombstone is an id, a status and a 7-day TTL. **Since U13 the erasure also drops them from the mirror by id, from its own commit**, so the window is not one sync but none: the stamp is what makes a RESTARTED process agree, the drop is what makes this one agree now. **Under the poller lease (2026-10-13) "this one" is the pod that took the request**, which need not be the leader: the leader's mirror learns the tombstone at its next sync (the stamp), and until then its pre-send store read (`may_send`) refuses a push to the erased journey, so the window for a PUSH is still none and the window for a decision row is one cycle |
+| 21 | A **feedback context lives 15 minutes**, enforced on read, and is **deleted with the device** | `feedback_contexts` holds one document per card render under the store backend (`_new_feedback_context_doc`: the snapshot as one canonical JSON string, the rendering `device_id` and `journey_id` — both absent for the rush card — and the first-tap claims). `expires_at` is set at mint to 15 minutes and never slides; it is the collection's TTL field, so physical deletion follows within `TTL_RESIDUAL_HOURS`, and `_not_expired` tests it on every read. «Slett alt» deletes the device's contexts in `_erase_device_body` (clause 19), and a context a render in flight writes AFTER that transaction is refused at its first tap, because `_claim_feedback_body` reads its journey in the same transaction and the erasure has tombstoned it. The snapshot holds the traveller's route and typed names for a render nobody may tap, which is why it is bound to the device and erased with it rather than left to expiry. The BigQuery copy `persist` writes on a first tap is the 45-day `varsel_feedback_contexts` row, unchanged, and never carries the device id |
 | 16 | **Rewritten 2026-09-13 (U16).** The 7-day event retention is still shorter than the 10-day outcome-labelling window, and it no longer forecloses anything: client alerts ARE scored, at definition grain in `varsel_decisions`, which holds no client identity and reads no event. The clause it replaces said scoring was foreclosed; what was actually foreclosed was scoring an EVENT retrospectively, and nothing does | `HISTORY_DAYS = 7` still bounds the events collection, unchanged. The score comes from `varsel_decisions` + the nightly ET join, whose own retention is the table's 365-day partition expiry. `channel` and `n_subscriptions` are the whole of what the client side contributes, so lengthening `HISTORY_DAYS` remains a contract change and is not one this needs |
 
 ### Published numbers, and where they come from
@@ -1613,6 +1620,19 @@ spends and nothing else does (R4): its wording ceilings per minute, hour and day
 own latch holder) and its Journey Planner budget (`alternatives._PULL_FETCH_MAX_PER_MIN`). The
 published contract (U5, 2026-09-10) added no row: every number the read publishes was already here,
 and the client contract's rate-limit table quotes these.
+
+**Every number in this table that a process counts is PER POD** (2026-10-13, the poller lease's
+KTD12). dev and prd run one to three API pods behind a rolling update and a CPU autoscaler, every pod
+serves the public read, and no allowance is shared between pods: the read's limiter (`MAX_PER_MIN`,
+`PER_PAIR_PER_MIN`), its wording ledger (`WORDINGS_PER_MIN/HOUR/DAY`), its Journey Planner budget,
+the request limiters and the feedback capture limits are each multiplied by the number of pods, so
+**the replica ceiling, three, is the bound** — three times each row at most. The per-pair limiter
+is therefore 30 per minute per pod, not per deployment. The credentialed API's two limiter tiers
+are in-process as well (`notification_auth`'s windows, a client's `requests_per_minute` included),
+so a client is admitted up to three times its quota across three pods. What is NOT multiplied is everything the poller does:
+the browser and webhook wording, emit, the servability sweep and Gemini translation run on the leader
+only. An ingress-wide budget would be a platform ask. `docs/operations/poller-lease.md` lists the
+allowances with the multiplier.
 
 Two numbers on the receiver's side are TypeScript's and are pinned against
 `integrations/notifications-client/src/client.ts` by the same suite: the **64 KiB** inbound ceiling
