@@ -254,7 +254,9 @@ class SituationImpact(BaseModel):
         "from a different train. Null when the cell carried no journey ref.",
     )
     departure_prediction: StopPrediction = Field(
-        description="Worst-case boarding prediction across the lines this situation affects.",
+        description="Worst-case boarding prediction across the lines this situation affects. "
+        "Carries the certainty (impact and cancellation 1.0, delays null) when "
+        "`destination_cancelled` is true, although its own `cancelled` stays false.",
     )
     arrival_prediction: StopPrediction | None = Field(
         description="Worst-case alighting prediction; null when `to_stop` is omitted.",
@@ -266,6 +268,14 @@ class SituationImpact(BaseModel):
         "and may be another one. It answers \"will the departure I board get me to `to_stop`?\": "
         "a vehicle can leave the boarding stop as planned and still have its later calls "
         "cancelled. Null when `to_stop` is omitted.",
+    )
+    destination_cancelled: bool = Field(
+        default=False,
+        description="ET has declared the ALIGHTING call of the train `departure_prediction` "
+        "describes cancelled while its boarding call runs: it leaves, and never reaches `to_stop`. "
+        "`departure_prediction` then carries the certainty a boarding cancellation would (impact "
+        "and cancellation 1.0, delays null) with its own `cancelled` false, because the boarding "
+        "call itself was not cancelled. Always false when `to_stop` is omitted.",
     )
     has_situation: bool = Field(
         default=True,
@@ -439,6 +449,10 @@ class TripCell:
     # SX one or a synthetic per-journey `KIX:` one, never both.
     has_situation: bool = True
     report_type: str | None = None
+    # ET has declared the ALIGHTING call cancelled while the boarding call runs: the vehicle leaves
+    # but never reaches `to_stop`. `departure` then carries the certainty (see
+    # `_unreachable_departure_prediction`) while its own `cancelled` stays False.
+    destination_cancelled: bool = False
 
 
 def _certainly_cancelled(c: CallPred) -> bool:
@@ -476,6 +490,32 @@ def _cancelled_prediction(c: CallPred, scheduled: datetime | None) -> StopPredic
         ge10_probability=None,
         impact_probability=1.0,
     )
+
+
+def _destination_cancelled(bcall: CallPred, acall: CallPred | None) -> bool:
+    """ET has declared the traveller's ALIGHTING call cancelled while the boarding call runs.
+
+    A fact about the trip rather than about either stop: the vehicle leaves, so the traveller can
+    board it, and it never reaches `to_stop` (R14 on 2026-10-12 left Oslo S 36 min late and was
+    cancelled Lysaker-Asker). Endpoints only and declarations only -- a cancelled stop in between
+    does not stop the traveller, and the alighting call's `p_cancel` is a forecast with no
+    calibration behind it as an alerting score. A boarding cancellation is excluded because it is
+    already the stronger fact.
+    """
+    return acall is not None and _certainly_cancelled(acall) and not _certainly_cancelled(bcall)
+
+
+def _unreachable_departure_prediction(c: CallPred) -> StopPrediction:
+    """The boarding prediction for a trip whose destination call ET has declared cancelled.
+
+    The same three replacements :func:`_cancelled_prediction` makes -- P(cancelled) 1, the alerting
+    score 1, every delay figure dropped -- because for THIS trip the departure is as useless as a
+    cancelled one, and a 1.0 is what carries it through the one alert gate, the alternative lookup's
+    screen and the worst-first selection without a second rule beside each. `cancelled` stays
+    False: that field means ET declared this boarding call cancelled, and it did not -- the vehicle
+    leaves. `TripCell.destination_cancelled` is what says why the certainty is here.
+    """
+    return _cancelled_prediction(c, c.aimed_dep).model_copy(update={"cancelled": False})
 
 
 def _departure_prediction(c: CallPred) -> StopPrediction:
@@ -563,6 +603,14 @@ def _call_severity(c: CallPred) -> tuple[float, int, float]:
         else c.dep_delay_p90_min
     )
     return (c.p_impact_dep or 0.0, p90 or 0, c.p_cancel)
+
+
+def _trip_severity(bcall: CallPred, acall: CallPred | None) -> tuple[float, int, float]:
+    """:func:`_call_severity` for the (boarding, alighting) pair: the certainty when ET has declared
+    the destination cancelled, exactly what :func:`_unreachable_departure_prediction` scores."""
+    if _destination_cancelled(bcall, acall):
+        return (1.0, 0, 1.0)
+    return _call_severity(bcall)
 
 
 def _expected_departure(c: CallPred) -> datetime | None:
@@ -691,13 +739,27 @@ def _trip_cells(
             eligible.append((bcall, acall))
 
         # Per line, keep one eligible train per the selection strategy.
+        #
+        # `worst` ranks the TRIP, not the boarding call: a vehicle that leaves on time and never
+        # reaches `to_stop` must outrank a delayed sibling on the same line, or it is dropped here
+        # before any gate sees it.
+        def pair_better(candidate: tuple[CallPred, CallPred | None], current: tuple[CallPred, CallPred | None]) -> bool:
+            if select == "nearest":
+                return better(candidate[0], current[0])
+            return (
+                _trip_severity(*candidate),
+                -candidate[0].aimed_dep.timestamp(),
+                candidate[0].jkey,
+            ) > (_trip_severity(*current), -current[0].aimed_dep.timestamp(), current[0].jkey)
+
         by_line: dict[str | None, tuple[CallPred, CallPred | None]] = {}
         for bcall, acall in eligible:
             cur = by_line.get(bcall.line)
-            if cur is None or better(bcall, cur[0]):
+            if cur is None or pair_better((bcall, acall), cur):
                 by_line[bcall.line] = (bcall, acall)
 
         for line, (bcall, acall) in by_line.items():
+            unreachable = _destination_cancelled(bcall, acall)
             cells.append(
                 TripCell(
                     situation_number=bcall.situation_number,
@@ -706,8 +768,13 @@ def _trip_cells(
                     line=line,
                     operator=bcall.operator,
                     jkey=bcall.jkey,
-                    departure=_departure_prediction(bcall),
+                    departure=(
+                        _unreachable_departure_prediction(bcall)
+                        if unreachable
+                        else _departure_prediction(bcall)
+                    ),
                     arrival=_arrival_prediction(acall) if acall is not None else None,
+                    destination_cancelled=unreachable,
                     # Reuse the groupings built above rather than re-scanning the situation's whole
                     # call list once per emitted cell (that made a single O(calls) pass into
                     # O(calls x lines), on both the /impact request path and every poller journey).
@@ -873,9 +940,13 @@ def _impact_response(
                 line=worst_cell.line,
                 operator=worst_cell.operator,
                 jkey=worst_cell.jkey,
-                departure_prediction=_worst([c.departure for c in group]),
+                # The worst cell's own departure, read off the same cell as `jkey`, the paired
+                # arrival and `destination_cancelled`, rather than a second `_worst` kept equal to it
+                # by the order of a `max`.
+                departure_prediction=worst_cell.departure,
                 arrival_prediction=_worst([c.arrival for c in group]),
                 paired_arrival_prediction=worst_cell.arrival,
+                destination_cancelled=worst_cell.destination_cancelled,
                 has_situation=group[0].has_situation,
                 report_type=group[0].report_type,
                 alternative_journey=outcome.journey,

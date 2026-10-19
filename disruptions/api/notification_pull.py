@@ -1522,7 +1522,7 @@ def _assembled_entry(
     )
     return JourneyAlertOut(
         severity=rank,
-        phase="confirmed" if entry.winner.cancelled else "predicted",
+        phase="confirmed" if entry.winner.trip_cancelled else "predicted",
         train=entry.train,
         aimed_departure_time=_utc(entry.winner.departure_time),
         expected_departure_time=_utc(entry.expected_departure),

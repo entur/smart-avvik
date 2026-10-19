@@ -63,8 +63,25 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `arrival_prediction` (the worst arrival across lines, possibly another vehicle journey). The event, the
   journey-alerts read and the test event carry it. `probabilities` and `delay` stay the boarding
   call's: on 2026-10-12 an R14 ran from Oslo S but was cancelled Lysaker-Asker, and an app showed
-  10 % «innstilling». It mints nothing, moves neither the gate nor `effect`/`phase`, and is not in
-  `message_input` (`llm_message` builds situations from summary and description only).
+  10 % «innstilling». Not in `message_input` (`llm_message` builds situations from summary and
+  description only).
+- **A DECLARED cancellation of the destination call is a confirmed cancellation of the trip**
+  (2026-10-19). `impact._trip_cells` holds the (boarding, alighting) pair, and when ET has cancelled
+  the alighting call while the boarding call runs (`_destination_cancelled`: endpoints only,
+  declarations only) the cell's departure carries the certainty
+  (`_unreachable_departure_prediction`: impact and cancellation 1.0, delays null) with its own
+  `cancelled` still False, and `worst` ranks the PAIR so such a train beats a delayed sibling on its
+  line. Everything downstream follows from the 1.0 rather than from a second rule: the one gate
+  (`alert_policy.gate` is untouched, so R3 parity holds and this is not `is_material`, which was a
+  webhook-only widening by any cancelled call on the segment), the alternative lookup's screen, and
+  the ranking. `Alert.destination_cancelled` carries the reason and `Alert.trip_cancelled`
+  (boarding OR destination) is what `phase` (`_observations_for_key`, `notification_pull`) and
+  `effect` read; `cancelled` alone stays the boarding call's for the wording and `et_cancelled`.
+  Logged as `destination_cancelled` on `varsel_decisions`, the groups function and the outcomes table
+  (where `actual_destination_cancelled` beside it is the label), segmented as `relayed`, and the
+  labeller counts a cancelled destination call as trouble whatever the boarding call did. Measured
+  before building it (prd, 30 days to 2026-10-18): 51 alert-worthy Vy train x destination pairs and up
+  to 139 never-alert-worthy ones had the destination cancelled with the boarding call running.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the leader last
   built (`main.follow_last_build`, since 2026-10-13; it replaced the 2026-09-25 warm start and

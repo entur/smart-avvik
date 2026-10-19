@@ -1937,6 +1937,13 @@ class Alert(BaseModel):
         "running, as a fact rather than a prediction. The wording states it ('Innstilt') instead of "
         "quoting `cancel_probability`, which is then 1.0 by construction.",
     )
+    destination_cancelled: bool = Field(
+        default=False,
+        description="ET has declared this train's call at the journey's `to_stop` cancelled while "
+        "the boarding call runs: it leaves and never gets there. The figures below then carry the "
+        "certainty (impact and cancellation 1.0, delays null) while `cancelled` stays false. "
+        "`trip_cancelled` is the one to read for anything about the TRAVELLER's trip.",
+    )
     cancel_probability: float = Field(description="Calibrated P(the train is cancelled), 0-1.")
     delay_p50_min: int | None = Field(
         description="Median departure delay (min) if it runs, from the calibrated exceedance stack "
@@ -1957,8 +1964,9 @@ class Alert(BaseModel):
         "declared it "
         "cancelled, P(cancelled) there and the arrival delay if it runs. Every figure above is the "
         "BOARDING call's, and a vehicle can leave on time and still never reach the destination "
-        "(R14 on 2026-10-12: Oslo S ran, Lysaker-Asker was cancelled). Informational only: the "
-        "gate reads `impact_probability` and nothing here. Null when no alighting call resolved.",
+        "(R14 on 2026-10-12: Oslo S ran, Lysaker-Asker was cancelled). A DECLARED cancellation "
+        "here is `destination_cancelled`, which moves the figures, the gate, `effect` and the "
+        "phase; the forecast fields move nothing. Null when no alighting call resolved.",
     )
     alert_threshold: float = Field(
         description="The operator's alerting threshold applied to impact_probability here (as "
@@ -2002,6 +2010,13 @@ class Alert(BaseModel):
     # alternative) rather than just the headline numbers. exclude=True keeps it out of the API
     # response — it is a working reference, not part of the contract.
     impact: ImpactResponse | None = Field(default=None, exclude=True, repr=False)
+
+    @property
+    def trip_cancelled(self) -> bool:
+        """The traveller cannot make this trip on this departure: ET has declared the boarding call
+        or the destination call cancelled. What `phase` and `effect` read; `cancelled` alone stays
+        the boarding call's, which is what the wording and `et_cancelled` mean by it."""
+        return self.cancelled or self.destination_cancelled
 
 
 def match_journey(
@@ -2153,6 +2168,7 @@ def _collect_alerts(
             stop_order=dep.stop_order,
             decided_at=now,
             cancelled=dep.cancelled,
+            destination_cancelled=bool(getattr(sit, "destination_cancelled", False)),
             cancel_probability=dep.cancel_probability,
             delay_p50_min=_typ_delay(dep),
             delay_p90_min=dep.delay_p90_min,
@@ -3998,15 +4014,15 @@ def _webhook_payload(
     "Normal receipt needs no second request to us" is a property of what this carries, which is why
     the figures ride along beside the wording rather than behind a lookup.
 
-    Two shapes, split on a declared cancellation exactly as every other writer in this module splits
-    on it. When ET has already declared the call cancelled the probabilities are 1.0 by construction
-    (``impact._cancelled_prediction``) and the delay figures are **null**, because every one of them
-    meant "if it runs" — the same rule ``_deterministic_body`` and the message input follow, and the
-    same rule ``event.schema.json`` states for ``phase: confirmed``.
+    Two shapes, split on a declared cancellation of the TRIP: the boarding call, or since 2026-10-19
+    the destination call (``Alert.trip_cancelled``). Either way the probabilities are 1.0 by
+    construction (``impact._cancelled_prediction`` / ``_unreachable_departure_prediction``) and the
+    delay figures are **null**, because every one of them meant "if it runs" — the rule
+    ``event.schema.json`` states for ``phase: confirmed``.
     """
     delay = (
         None
-        if alert.cancelled
+        if alert.trip_cancelled
         else {"typical_min": alert.delay_p50_min, "worst_case_min": alert.delay_p90_min}
     )
     alternative = getattr(alert, "alternative_journey", None)
@@ -4044,8 +4060,9 @@ def _webhook_payload(
         # The same vehicle journey at the traveller's destination, beside `call` rather than inside
         # `probabilities` and `delay`, which stay the boarding call's: a client that renders
         # «Sannsynlighet for innstilling» off `probabilities.cancellation` showed 10 % for a train
-        # whose every call past Skøyen was cancelled. Informational only -- it moves neither the
-        # gate, nor `effect`, nor the phase, and it is not in the message input (the wording key).
+        # whose every call past Skøyen was cancelled. Since 2026-10-19 a DECLARED cancellation here
+        # makes the event a confirmed cancellation (`Alert.trip_cancelled`); this object is what
+        # tells it from a boarding one. Not in the message input (the wording key).
         # Aimed, never expected, for `call`'s reason.
         "arrival": (
             None
@@ -4067,9 +4084,11 @@ def _webhook_payload(
         # A two-value vocabulary derived from what we actually know, `null` when neither is
         # established. New wire vocabulary, so U7's typed client and U8's published contract have to
         # match these two literals rather than invent their own.
+        # `trip_cancelled`, so a departure that never reaches the traveller's destination reads
+        # "cancelled" with `arrival` saying which end failed -- the same as `phase` below.
         "effect": (
             "cancelled"
-            if alert.cancelled
+            if alert.trip_cancelled
             else "delayed"
             if (alert.delay_p50_min or alert.delay_p90_min)
             else None
@@ -4387,7 +4406,9 @@ def _observations_for_key(
             notification_events.WebhookObservation(
                 recipients=tuple(routable),
                 alertworthy=bool(winner.alertworthy),
-                cancelled=bool(winner.cancelled),
+                # The TRIP, so the phase goes `confirmed` (an update, cap-exempt over a delivered
+                # forecast) when ET cancels the destination call of a train we warned about.
+                cancelled=bool(winner.trip_cancelled),
                 situations=situations,
                 operator=winner.operator,
                 line=winner.line,

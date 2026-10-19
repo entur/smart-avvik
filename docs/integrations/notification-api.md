@@ -924,9 +924,13 @@ line never mixes languages. Present it as a translation when any of those situat
 the BOARDING call's**, and a vehicle can leave on time and still never reach your destination. On
 2026-10-12 an R14 left Oslo S 36 minutes late with every call from Lysaker to Asker cancelled; a
 client rendering `probabilities.cancellation` showed «Sannsynlighet for innstilling: 10 %» to a
-traveller going to Asker. `arrival.cancelled: true` beside a low `probabilities.cancellation` means
-the traveller cannot complete the journey on this departure, and that is what to show. It applies to every mode (bus, tram, ferry), not only rail. It is
-informational: it does not change `phase`, `effect` or whether an event is sent. `null` when the
+traveller going to Asker. It applies to every mode (bus, tram, ferry), not only rail. **Since
+2026-10-19 a destination call the feed has declared cancelled makes the event a confirmed
+cancellation**: `phase: confirmed`, `effect: "cancelled"`, `probabilities` at 1.0 and the delay
+figures null, exactly as for a cancelled boarding call, and it is sent even when the departure
+itself looked fine. `call` and `arrival` tell the two cases apart: `arrival.cancelled: true` with
+the boarding call running means the vehicle leaves but never gets there. Only a declared
+cancellation does this; `arrival.cancellation` as a forecast moves nothing. `null` when the
 destination call could not be resolved, and absent from an event minted before the field existed.
 
 **`situations[].report_type`** (since 2026-10-05) is SIRI-SX's `reportType` as the
@@ -989,8 +993,10 @@ the flags would publish a rule instead of its result. Putting either on the wire
 
 **`effect`'s vocabulary is `"cancelled"`, `"delayed"` or `null`** — the schema declares the field and
 enumerates no values, so this list is the code's and is stated here rather than left to be discovered.
-`cancelled` means the feed declared it; `delayed` means a delay figure was established; `null` means
-neither was.
+`cancelled` means the feed declared the trip impossible on this departure: the boarding call
+cancelled, or (since 2026-10-19) the destination call cancelled while the vehicle still leaves --
+`arrival.cancelled` says which. `delayed` means a departure delay figure was established; `null`
+means neither was.
 
 `alternative_journey` is the **best remaining way there**, not necessarily a faster one. Read
 `arrives_before_original` rather than assuming a saving; `minutes_saved` is signed.

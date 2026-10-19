@@ -90,9 +90,12 @@ export interface NotificationEvent {
   type: "journey.alert.created" | "journey.alert.updated" | "journey.alert.withdrawn";
   /**
    * `predicted` is a forecast from our models. `confirmed` is a cancellation the operator's own
-   * real-time feed has already declared -- a fact, not a forecast, which is why its probabilities
-   * are 1.0 and its delay figures are null (every one of them meant "if it runs"). `withdrawn`
-   * means the FORECAST changed, not that normal service is guaranteed.
+   * real-time feed has already declared, of the boarding call or (since 2026-10-19) of the
+   * destination call while the vehicle still leaves -- either way the traveller cannot make the
+   * trip on this departure, and `payload.arrival.cancelled` says which end failed. A fact, not a
+   * forecast, which is why its probabilities are 1.0 and its delay figures are null (every one of
+   * them meant "if it runs"). `withdrawn` means the FORECAST changed, not that normal service is
+   * guaranteed.
    */
   phase: "predicted" | "confirmed" | "withdrawn";
   /**
@@ -215,7 +218,9 @@ export interface NotificationEvent {
     call?: { [key: string]: unknown };
     /**
      * Impact and cancellation probabilities at the BOARDING call; `arrival` carries the
-     * destination call's. Both are 1.0 and the delay figures are null when `phase` is `confirmed`.
+     * destination call's. Both are 1.0 and the delay figures are null when `phase` is `confirmed`,
+     * including a confirmed cancellation of the destination call: the trip is then as impossible
+     * as if the boarding call were cancelled.
      */
     probabilities?: { [key: string]: unknown };
     /**
@@ -227,13 +232,14 @@ export interface NotificationEvent {
      * `aimed_arrival_time`, `cancelled` (the real-time feed has declared that call cancelled),
      * `cancellation` (P(cancelled) there, 0-1), `delay_ge10` (P(arrival >= 10 min late | it runs))
      * and `delay` (`{typical_min, worst_case_min}` arrival delay, or null). `probabilities` and
-     * `delay` beside it describe the BOARDING call, and a vehicle can leave on time and still
-     * never reach the destination, so `arrival.cancelled` true beside a low
-     * `probabilities.cancellation` means the traveller cannot complete the journey on this
-     * departure. Like `delay_ge10` and `delay`, every figure that means 'if it runs' is null when
-     * `cancelled` is true. Informational only: it does not move `phase`, `effect` or whether an
-     * event is sent. Null when we could not resolve the destination call, and absent from an event
-     * minted before the field existed.
+     * `delay` beside it describe the BOARDING call. A vehicle can leave and still never reach the
+     * destination: when the feed has declared the destination call cancelled, the event is `phase`
+     * `confirmed` with `effect` `cancelled` and `probabilities` at 1.0 like a boarding
+     * cancellation (since 2026-10-19), and `arrival.cancelled` true beside a running `call` is how
+     * to tell the two apart. A forecast here (`cancellation`) moves nothing. Like `delay_ge10` and
+     * `delay`, every figure that means 'if it runs' is null when `cancelled` is true. Null when we
+     * could not resolve the destination call, and absent from an event minted before the field
+     * existed.
      */
     arrival?: { [key: string]: unknown } | null;
     effect?: string | null;
