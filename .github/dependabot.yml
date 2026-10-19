@@ -38,10 +38,21 @@ updates:
         applies-to: version-updates
         patterns: ["@entur/*"]
         update-types: [major]
+      # firebase and @firebase/rules-unit-testing peer on each other's major, so neither
+      # installs alone.
+      firebase:
+        applies-to: version-updates
+        patterns: ["firebase", "@firebase/*"]
+        update-types: [major]
     cooldown:
       default-days: 7
     commit-message:
       prefix: "chore(deps)"
+    ignore:
+      # @types/node follows the Node major in engines and CI (24). Bump them together by hand,
+      # or it types APIs the runtime does not have.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"

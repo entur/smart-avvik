@@ -31,13 +31,13 @@
     "firebase-functions": "7.4.0"
   },
   "devDependencies": {
-    "@firebase/rules-unit-testing": "^5.0.2",
+    "@firebase/rules-unit-testing": "^6.0.0",
     "@types/express": "^5.0.6",
     "@types/node": "^24.10.1",
-    "firebase": "^12.19.0",
+    "firebase": "^13.0.0",
     "typescript": "^7.0.2"
   },
-  "//": "overrides.@firebase/app: firebase 12.19.0 pins @firebase/app 0.16.2 while the other @firebase packages (0.x peer) stayed on a hoisted 0.16.1, so the client SDK got two app registries and the emulator suite failed with 'Service firestore is not available'. Remove the override once `npm ls @firebase/app` shows a single version without it.",
+  "//": "overrides.@firebase/app: firebase 13.0.0 pins @firebase/app 0.16.3 while the other @firebase packages (0.x peer) dedupe to the 0.16.2 that firebase-admin pulls in through @firebase/database-compat, so the client SDK got two app registries and the emulator suite failed with 'Service firestore is not available'. Remove the override once `npm ls @firebase/app` shows a single version without it.",
   "overrides": {
     "gaxios@6": {
       "uuid": "^11.1.1"
@@ -45,6 +45,6 @@
     "@firebase/firestore": {
       "@grpc/grpc-js": "^1.14.5"
     },
-    "@firebase/app": "0.16.2"
+    "@firebase/app": "0.16.3"
   }
 }
