@@ -1991,6 +1991,13 @@ def test_a_train_that_leaves_but_never_reaches_the_destination_is_a_confirmed_ca
     assert payload["probabilities"]["delay_ge10"] is None
     assert payload["delay"] is None
     assert payload["effect"] == "cancelled"
+    # The wording says what happened and does not hedge it (both writers' input and the template).
+    import notification_wording
+
+    message_input = varsel._message_input_from_alert(alert)
+    assert message_input.get("kommer_ikke_fram") is True and "innstilt" not in message_input
+    assert notification_wording.outcome_verb(message_input) == "kjører ikke helt fram"
+    assert varsel._feedback_detail(alert).endswith(notification_wording.DESTINATION_CANCELLED)
 
 
 def test_a_cancelled_destination_alerts_a_train_whose_departure_looked_fine():

@@ -2738,5 +2738,20 @@ def _run():
     print(f"\n{len(tests)} impact checks passed.")
 
 
+
+def test_a_train_that_never_reaches_the_destination_cannot_be_its_own_alternative():
+    """The selection releases its materiality gate for a cancelled original and never keeps the
+    traveller on it. A train whose destination call ET cancelled is gone for THIS trip in exactly
+    that sense, although its boarding call runs."""
+    board, alight = _train("j1", 8, p_impact_dep=0.3)
+    alight.et_declared_cancelled = True
+    [cell] = _cells(_scope(S1=[board, alight]), select="worst")
+    assert cell.destination_cancelled and not cell.departure.cancelled
+    assert cell.departure.impact_probability == 1.0
+    original = impact._original_candidate(
+        cell, from_stop=A, to_stop=B, deadline=alight.aimed_arr, predicted_arrival=alight.aimed_arr,
+    )
+    assert original.cancelled is True
+
 if __name__ == "__main__":
     _run()

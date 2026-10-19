@@ -343,6 +343,31 @@ def test_a_declared_cancellation_is_stated_not_scored():
     assert payload["situasjoner"][0]["sammendrag"] == "Signalfeil ved Asker"
 
 
+class NeverGetsThere(FakeAlert):
+    """ET has cancelled the destination call while the boarding call runs (2026-10-19):
+    impact._unreachable_departure_prediction hands it over as certain, `cancelled` still False."""
+
+    cancelled = False
+    destination_cancelled = True
+    impact_probability = 1.0
+    cancel_probability = 1.0
+    delay_p50_min = None
+    delay_p90_min = None
+
+
+def test_a_train_that_never_reaches_the_destination_is_stated_not_scored():
+    """R14 on 2026-10-12. Its own key, never `innstilt` -- the train DOES leave, and «er innstilt»
+    would send the traveller to look for a different departure from a platform it is standing at --
+    and like `innstilt` no figure rides with it: 100 % would read as a forecast, a delay as a promise
+    that it arrives."""
+    payload = build_message_input(JOURNEY, FakeImpact(), NeverGetsThere())
+    assert payload["kommer_ikke_fram"] is True
+    assert "innstilt" not in payload
+    for hedge in ("sannsynlighet_prosent", "innstilling_prosent", "mest_sannsynlig_innstilt", "forsinkelse_min"):
+        assert hedge not in payload, f"{hedge} restates a fact as a guess"
+    assert "kommer_ikke_fram: true" in llm_message._SYSTEM_PROMPT
+
+
 def test_the_line_reaches_the_writers_as_a_traveller_reads_it():
     """"L1", not "VYG:Line:L1" — and at the top level, where both wordings look for it.
 
