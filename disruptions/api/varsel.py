@@ -776,7 +776,10 @@ def _drain(results: Iterator[Any], total: int) -> list[Any]:
 
 
 def set_stop_aliases(
-    aliases: dict[str, str], parents: dict[str, tuple[str, ...]] | None = None
+    aliases: dict[str, str],
+    parents: dict[str, tuple[str, ...]] | None = None,
+    *,
+    heal: bool = True,
 ) -> None:
     """Publish "this ref is really that ref" for co-located stops, and heal what is stored.
 
@@ -791,11 +794,15 @@ def set_stop_aliases(
     own canonical ref and only :func:`place_refs` expands it.
 
     Replaced wholesale (never mutated in place) so readers on the request path need no lock.
+
+    `heal=False` publishes the map and rewrites nothing stored: a follower pod's load (zero-downtime
+    U3). It needs the map, because its request path canonicalizes new registrations, but healing
+    what is stored is the lease holder's, or every replica would rewrite the same records.
     """
     global _stop_aliases, _stop_parents
     _stop_aliases = dict(aliases)
     _stop_parents = dict(parents or {})
-    if aliases:
+    if aliases and heal:
         _canonicalize_journeys()
 
 
@@ -1783,6 +1790,13 @@ def journeys_snapshot() -> dict[str, dict]:
     fields, and the seam's own copy keeps a concurrent delete from tearing a record mid-iteration).
     """
     return dict(_registrations.all_journeys())
+
+
+def device_journeys(device_id: str) -> dict[str, dict]:
+    """One device's registrations from the STORE, for togvarsel_notify's rush outlook: the
+    mirror `journeys_snapshot` reads is seeded on the leader only (zero-downtime U4). Under the
+    store backend this is also the weekly activity renewal the /varsel journey list performs."""
+    return dict(_registrations.device_journeys(device_id))
 
 
 # ---- Matcher ---------------------------------------------------------------------------------
@@ -2776,6 +2790,9 @@ def deliver_to_devices(
             subscription, payload = prepared
             result, error_detail = _send_push_result(_send_push(subscription, payload))
             out.append((device_id, item, result, payload, error_detail))
+            # A completed send is progress (U2): a slow push service must not read as a wedged
+            # poller, and its heartbeat is what the lease renews against.
+            _heartbeat()
             if result == "gone":
                 break  # stop this device's remaining pushes this batch
         return out
@@ -4769,8 +4786,18 @@ class _WriteBudget(reserved_budget.ReservedBudget):
             return True
 
 
-def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = None) -> PassOutcome:
+def check_and_notify(
+    by_situation: dict[str, list],
+    *,
+    now: datetime | None = None,
+    should_continue: Callable[[], bool] | None = None,
+) -> PassOutcome:
     """Send a push for every registered journey × newly alert-worthy situation.
+
+    ``should_continue`` is the poller lease's seam beside ``beat`` (zero-downtime U2, KTD4): asked
+    before the delivery and again before every push in the fan-out, so a leader that lost the lease
+    or is stopping submits no new send. A send already in flight finishes within
+    :data:`_PUSH_TIMEOUT_S` and is marked as usual. ``None`` is always-continue, the pass as it was.
 
     Called at the end of main's ingestion-change rebuild with the freshly-refreshed per-call
     snapshot (used here only to prune ``_notified``; the matching itself goes through ``/impact``).
@@ -5567,6 +5594,21 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
                 },
             )
 
+        presend_failed: list[str] = []
+
+        def _still_owed(jid: str, situations: tuple[str, ...]) -> bool:
+            """`may_send`, with a store failure read as "not now". It runs on the fan-out's worker
+            thread, where a raise would fail the device's whole batch; refused, the push is unmarked
+            and the next cycle offers it again. Counted rather than logged per push -- a store
+            outage on a disrupted corridor is every push failing -- and reported once below."""
+            try:
+                return _registrations.may_send(jid, situations=situations)
+            except Exception:
+                presend_failed.append(jid)
+                if len(presend_failed) == 1:
+                    logger.warning("First pre-send read failure this cycle", exc_info=True)
+                return False
+
         def _prepare_alert(
             item: tuple[str, dict, dict, Alert, str, str, bool] | _Digest,
         ) -> tuple[dict, dict] | None:
@@ -5580,7 +5622,18 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
             `_notified` key for a journey that no longer exists. This is the same re-check, moved to
             the latest point that still precedes the network call. It takes `_state_lock` for two dict
             lookups and never across `_send_push`.
+
+            It is also where the lease is asked per push (U2): `None` withdraws the item exactly as
+            a deleted registration does, so no new send is submitted once ``should_continue``
+            answers False and nothing is marked for the items it withdrew.
+
+            And where the DOCUMENT is asked, after the lock is released (zero-downtime U5): the
+            check above reads the leader's mirror, which is one cycle late for another pod's writes,
+            so `may_send` re-reads the registration from the store and refuses a journey deleted
+            there or a situation already marked there. A no-op under the blob backend.
             """
+            if should_continue is not None and not should_continue():
+                return None
             if isinstance(item, _Digest):
                 with _state_lock:
                     if (
@@ -5588,6 +5641,8 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
                         or _registrations.get_device(item.journey["device_id"]) is None
                     ):
                         return None
+                if not _still_owed(item.journey_id, item.situations):
+                    return None
                 return item.subscription, _digest_payload(item, now=cycle_now)
             jid, device, journey, alert, key, brand, replaces = item
             with _state_lock:
@@ -5596,6 +5651,8 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
                     or _registrations.get_device(journey["device_id"]) is None
                 ):
                     return None
+            if not _still_owed(jid, (alert.situation_number,)):
+                return None
             # The PAIR's wording (KTD9) beside this DEFINITION's message input: the text is what
             # every traveller on the corridor is sent, the input is the document this registration's
             # own row records and the template is rendered from.
@@ -5619,7 +5676,7 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
         # The digest's text for the decision rows of the trains it covered (R8), without its route
         # line, as every other row records the wording without it.
         digest_messages: dict[tuple[str, str, str], str] = {}
-        if per_device:
+        if per_device and (should_continue is None or should_continue()):
             for _device_id, item, result, payload, error_detail in deliver_to_devices(
                 per_device, _prepare_alert
             ):
@@ -5696,6 +5753,14 @@ def check_and_notify(by_situation: dict[str, list], *, now: datetime | None = No
                 elif result == "gone":
                     if handle_gone_device(journey["device_id"]):
                         changed = True
+            if presend_failed:
+                logger.warning(
+                    "Pre-send store read failed for %d push(es); withheld this cycle",
+                    len(presend_failed),
+                    extra={
+                        "fields": {"event": "varsel_presend_failed", "withheld": len(presend_failed)}
+                    },
+                )
 
     # BOTH channels since 2026-09-13 (U16, KTD4), at the journey-DEFINITION grain both of them
     # already share. `pushed_keys` is still only ever written by loop 2 above and is still purely
@@ -5811,8 +5876,9 @@ class StopItem(BaseModel):
 # splits a document path on "/": "a/x/b" would write the nested document devices/a/x/b, which the
 # device ceiling, the TTL policy and the export never see. So "/" is refused and nothing else is --
 # no charset, so a UUID, the legacy `dev-<ts>-<rand>` and any other id without "/" stay legal. The
-# body models need at least one character (min_length=8 also keeps out Firestore's "." and ".."); the
-# two query parameters keep accepting the empty string they accepted before.
+# body models need at least one character (min_length=8 also keeps out Firestore's "." and ".."). The
+# query parameters carry the same 8..100 bounds as the body models (zero-downtime review), so the
+# empty string the query pattern still admits never reaches the store either.
 _DEVICE_ID_PATTERN = r"^[^/]+$"
 _DEVICE_ID_QUERY_PATTERN = r"^[^/]*$"
 
@@ -6027,7 +6093,7 @@ def upsert_device(body: DeviceIn) -> dict:
 
 
 @router.delete("/devices/{device_id}", summary="Forget a device's push subscription")
-def delete_device(device_id: str) -> dict:
+def delete_device(device_id: Annotated[str, PathParam(min_length=8, max_length=100)]) -> dict:
     """Remove a device's subscription (e.g. the user turned notifications off). Journeys are kept.
 
     Plain `def`: `_save_state` blocks on GCS. See `upsert_device`.
@@ -6173,6 +6239,7 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
     # builds a new list and never mutates the caller's.
     alerts = one_alert_per_train(_card_alerts(matched))
     feedback_available = feedback.enabled()
+    to_mint: list[tuple[Alert, dict]] = []
     with _state_lock:
         now = datetime.now(UTC)
         for alert in alerts:
@@ -6232,8 +6299,16 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
                     "policy": {"alert_threshold": alert.alert_threshold, "alertworthy": alert.alertworthy},
                     "delivery": {"message_source": source},
                 }
-                alert.feedback_context_id = feedback_contexts.mint(snapshot)
-                alert.feedback_enabled = alert.feedback_context_id is not None
+                to_mint.append((alert, snapshot))
+    # Minted OUTSIDE `_state_lock`: under the store backend a new context is a Firestore write
+    # (zero-downtime U6), and every request thread and the poller take this lock. The device id
+    # binds the context to this traveller so «Slett alt» can delete it; it never reaches the
+    # snapshot, so it never reaches the BigQuery row either.
+    for alert, snapshot in to_mint:
+        alert.feedback_context_id = feedback_contexts.mint(
+            snapshot, device_id=rec.get("device_id"), journey_id=jid
+        )
+        alert.feedback_enabled = alert.feedback_context_id is not None
     return Journey(
         journey_id=jid,
         from_stop=rec["from_stop"],
@@ -6305,7 +6380,13 @@ def _feedback_observation(obs: LatestObservation | None) -> str | None:
 
 @router.get("/journeys", summary="A device's journeys with the disruptions currently hitting them")
 def list_journeys(
-    device_id: str = Query(pattern=_DEVICE_ID_QUERY_PATTERN, description="Client-generated device UUID."),
+    # DeviceIn's bounds, as on every route taking device_id outside a body: each is a store read.
+    device_id: str = Query(
+        min_length=8,
+        max_length=100,
+        pattern=_DEVICE_ID_QUERY_PATTERN,
+        description="Client-generated device UUID.",
+    ),
 ) -> JourneysResponse:
     """Every journey registered by this device, each annotated with the situations currently
     affecting it (the same matcher used for push, but with no dedup — this is the live picture).
@@ -6479,6 +6560,8 @@ def create_journey(body: JourneyIn) -> Journey:
 def delete_journey(
     journey_id: str,
     device_id: str = Query(
+        min_length=8,
+        max_length=100,
         pattern=_DEVICE_ID_QUERY_PATTERN,
         description="The owning device; a journey is only deleted by its owner.",
     ),
@@ -6492,8 +6575,10 @@ def delete_journey(
         # API's rule, while dropping the owner's tombstone with the last of its journeys is a
         # property of how registrations are stored. By ID rather than by listing the device's
         # journeys and looking for this one: that reads the same answer out of a query where a
-        # document read will do, and the store backend is where that difference is a bill.
-        rec = _registrations.get_journey(journey_id)
+        # document read will do, and the store backend is where that difference is a bill. From the
+        # store and never the mirror (zero-downtime U5, R8): a journey registered on another pod is
+        # not in the leader's mirror until its next sync, and its owner's delete would 404.
+        rec = _registrations.stored_journey(journey_id)
         if rec is None or rec["device_id"] != device_id:
             raise HTTPException(status_code=404, detail="Reise ikke funnet.")
         _registrations.delete_journey(journey_id)

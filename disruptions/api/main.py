@@ -33,6 +33,9 @@ import notification_events  # sibling module: this cycle's observations turned i
 import notification_pull  # sibling module: the journey-keyed public read (/notification-api/v1/journey-alerts)
 import notification_servability  # sibling module: R6's freshness half, re-asked on the poller's cadence
 import notification_store  # sibling module: durable webhook subscriptions, events and deliveries
+import poller_follow  # sibling module: how a pod loads the tables the lease holder last built
+import poller_handover  # sibling module: the poller tenure's end (lease lost, shutdown) and its holder id
+import poller_lease  # sibling module: which pod runs the poller (the lease state machine, stdlib only)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import situation_english  # the English beside each situation's Norwegian text
@@ -270,6 +273,11 @@ _disruptions_refreshed_at: datetime | None = None
 # the loop past the threshold and restart-looping the pod against an outage a restart cannot fix.
 # Request-path queries (disruptions_as_of, /demo-api) deliberately keep unbounded waits.
 _POLLER_QUERY_TIMEOUT_S = 240
+# The same ceiling for a table-metadata read (`_tables_built`: every follower tick, the leader's
+# cache loads and `_rush_hydrate`), much shorter because the read is a single cheap GET. Unbounded,
+# one hung read held the tick indefinitely; at 240 s, one per table, a tick could still outlast the
+# 240 s the lease arithmetic assumes. A timeout raises, and each caller already logs and retries.
+_POLLER_METADATA_TIMEOUT_S = 30
 
 # Minimum seconds between two rebuild STARTS (2026-09-24). Since the probe reads BigQuery's
 # streaming buffer (last_ingestion_time.sql), the ingestion timestamp moves on almost every tick:
@@ -312,12 +320,16 @@ def _row_to_cached(r) -> _CachedDisruption:
 def refresh_disruptions_cache(built: datetime | None = None) -> None:
     """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL).
 
-    `built` is when the table was written, given by the startup warm load
-    (:func:`warm_caches_from_last_build`); the poller omits it and stamps the load instant."""
+    `built` is the table's modified time, which every pod's load passes (see
+    :func:`_load_from_last_build`) so two pods holding one build report one stamp; a load of the
+    build the cache already holds is a no-op, as for the spine. Without it (a test, or a metadata
+    read that failed) it stamps the load instant, as every load did before 2026-10-13."""
+    global _disruptions_cache, _disruptions_refreshed_at
+    if built is not None and _disruptions_refreshed_at == built:
+        return
     rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     disruptions = [_row_to_cached(r) for r in rows]
     with _disruptions_lock:
-        global _disruptions_cache, _disruptions_refreshed_at
         _disruptions_cache = disruptions
         _disruptions_refreshed_at = built or datetime.now(UTC)
     logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
@@ -385,14 +397,16 @@ _impact_lock = threading.Lock()
 _MIN_SITUATIONS = 30
 
 
-def refresh_impact_lookup() -> None:
-    """Reload the (category, line, hour) -> impact-profile lookup from BigQuery."""
+def refresh_impact_lookup() -> bool:
+    """Reload the (category, line, hour) -> impact-profile lookup from BigQuery. True when loaded;
+    a failure raises (the bool is the follower lookups' contract, see `_FOLLOWED_LOOKUPS`)."""
     rows = bq_client.query(_ALERT_PROFILES_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     table = {(r["category"], r["line"], r["hour"]): dict(r.items()) for r in rows}
     with _impact_lock:
         global _impact_lookup
         _impact_lookup = table
     logger.info("Refreshed impact lookup: %d cells", len(table))
+    return True
 
 
 def _candidate_keys(category: str, line: str, hour: int) -> list[tuple[str, str, int]]:
@@ -600,6 +614,10 @@ def maybe_refresh_removed_calls() -> None:
         _build_removed_calls(enabled=enabled)
     except Exception as exc:
         if _REMOVED_REFUSAL in str(exc):
+            # The second query of this phase: checked and beaten like any phase boundary (U2), and
+            # before the stamp, so a leader demoted here leaves the refusal for its successor.
+            _fence("rail_removed_calls")
+            _beat()
             _removed_built_for = planned
             try:
                 _build_removed_calls(enabled=False)
@@ -680,11 +698,12 @@ def refresh_planned_spine(built: datetime | None = None) -> None:
     """Load `rail_calls_planned_today` into `journey_status` when the table has been rebuilt since
     the copy it holds. One ~22 000-row SELECT per rebuild, i.e. hourly; a no-op on every other tick.
 
-    Stamped with `_planned_refreshed_at`, the instant the REBUILD finished, not the load: that is
-    how old the timetable the strip draws is, and it is also the guard -- a failed load leaves the
-    engine's stamp behind the table's, so the next tick tries again, while the engine keeps serving
-    the copy it had. `built` overrides the stamp for the startup warm load, which knows the table's
-    own modified time but must not set `_planned_refreshed_at` (that would skip the first rebuild)."""
+    Stamped with when the table was BUILT, not the load: that is how old the timetable the strip
+    draws is, and it is also the guard -- a failed load leaves the engine's stamp behind the
+    table's, so the next tick tries again, while the engine keeps serving the copy it had. Every
+    pod's load passes `built`, the newer of the planned and removed tables' modified times (see
+    `_load_from_last_build`); it never sets `_planned_refreshed_at`, which would skip a rebuild. Without
+    it the stamp is `_planned_refreshed_at`, the instant this process's last rebuild finished."""
     if built is None:
         with _planned_lock:
             built = _planned_refreshed_at
@@ -773,14 +792,28 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
     )
 
 
-def refresh_call_predictions_cache(built: datetime | None = None) -> None:
+def refresh_call_predictions_cache(
+    built: datetime | None = None, *, translate: bool = True, fenced: bool = False
+) -> bool:
     """Reload the per-call predictions cache from BOTH the NSB (call_predictions_today) and the
     bus/GOA (call_predictions_bus_today) tables, keyed by (operator, jkey).
 
     NSB rows are tagged with the lineRef codespace ('VYG'); bus rows carry an explicit `operator`
     column. The bus load is isolated so a missing/failing bus table (e.g. before the first bus
-    predict runs) never blocks NSB serving. `built` as for `refresh_disruptions_cache`: set under
-    the same lock as the indexes, so they and the stamp still publish as one generation."""
+    predict runs) never blocks NSB serving. `built` as for `refresh_disruptions_cache` -- the NEWER
+    of the two tables' modified times, so a move of either is a new stamp -- set under the same lock
+    as the indexes, so they and the stamp still publish as one generation. `translate` is the lease
+    holder's alone (KTD12, see `situation_english.update`). So is `fenced` (U2): the leader's cycle
+    checks the lease and beats between the two queries, so no wait inside this phase is beat-less
+    for longer than one query and a demoted leader does not issue the second. A follower's load
+    holds no lease to lose and, running under `follow_last_build`'s never-raises contract, must not
+    raise one. Returns False when the bus table exists but could not be read: NSB is served all
+    the same, stamped so that the next load of this build is not skipped (see below)."""
+    global _call_pred_by_key, _call_pred_by_jkey_index, _call_pred_by_stop_ref
+    global _call_pred_by_situation, _call_pred_refreshed_at
+    with _call_pred_lock:
+        if built is not None and _call_pred_refreshed_at == built:
+            return True
     by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
     by_situation: dict[str, list[impact_engine.CallPred]] = {}
     by_jkey_index: dict[str, set[str]] = {}
@@ -812,28 +845,39 @@ def refresh_call_predictions_cache(built: datetime | None = None) -> None:
         bq_client.query(_CALL_PREDICTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
         lambda r: _rail_operator(r.lineRef),
     )
-    # Bus/GOA/pooled family: the table carries an explicit operator column.
+    if fenced:
+        _fence("call_predictions_cache")
+        _beat()
+    # Bus/GOA/pooled family: the table carries an explicit operator column. A missing table (before
+    # the first bus predict) is NSB-only as the whole build; any other failure is a partial load.
+    complete = True
     try:
         _ingest(
             bq_client.query(_CALL_PREDICTIONS_BUS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S),
             lambda r: r.operator,
         )
+    except NotFound:
+        logger.info("No bus per-call predictions table yet; serving NSB-only")
     except Exception:
-        logger.exception(
-            "Bus per-call predictions load failed; serving NSB-only this refresh "
-            "(is call_predictions_bus_today built yet?)"
-        )
+        complete = False
+        logger.exception("Bus per-call predictions load failed; serving NSB-only this refresh")
 
+    # A partial load is still served, but never stamped `built`: the same-build guard above and
+    # `_load_from_last_build` would both take that for this build loaded, and followers would serve
+    # NSB-only until the next rebuild. One microsecond earlier instead: BigQuery's modified times
+    # are whole milliseconds, so this is strictly newer than any earlier build's stamp and strictly
+    # older than this one's (KTD6: new contents, new stamp), and a retry of the same build that
+    # fails again holds the same tables and so earns the same stamp.
+    if built is not None and not complete:
+        built -= timedelta(microseconds=1)
     with _call_pred_lock:
-        global _call_pred_by_key, _call_pred_by_jkey_index, _call_pred_by_stop_ref
-        global _call_pred_by_situation, _call_pred_refreshed_at
         _call_pred_by_key = by_key
         _call_pred_by_jkey_index = by_jkey_index
         _call_pred_by_situation = by_situation
         _call_pred_by_stop_ref = by_stop_ref
         _call_pred_refreshed_at = built or datetime.now(UTC)
     try:
-        situation_english.update(texts)
+        situation_english.update(texts, translate=translate)
     except Exception:
         # English is an addition to the payload, never a reason to keep last cycle's predictions.
         logger.exception("Could not update the situations' English text")
@@ -844,50 +888,7 @@ def refresh_call_predictions_cache(built: datetime | None = None) -> None:
         len(by_situation),
         len(by_stop_ref),
     )
-
-
-# How old a prediction table may be and still be served by a fresh process: `/health`'s own
-# default staleness. Older than that, the previous process had stopped rebuilding (or SIRI-SX was
-# quiet for a while), and a 503 until the first cycle is the honest answer, as it was before
-# 2026-09-25. The spine and the actuals use their rebuild TTLs instead, since a healthy poller
-# leaves those tables up to an hour and a quarter of an hour old respectively.
-_WARM_PREDICTIONS_MAX_AGE = timedelta(minutes=10)
-
-
-def warm_caches_from_last_build() -> None:
-    """Load the serving caches from the tables the previous process last built, before the port
-    opens.
-
-    Without this a new pod served ~95 s of empty caches after every deploy (measured in dev
-    2026-09-25): journey-alerts answered 503 `predictions_not_loaded` and journey-status 503
-    `plan_not_loaded` until the first poller cycle had rebuilt tables that already existed, which
-    was enough to fire the 5xx alert. The pod being replaced was serving these same tables seconds
-    earlier, and the first cycle replaces every copy anyway.
-
-    Each cache is stamped with its table's modified time, never the load time, so `refreshed_at`
-    and `as_of` say how old the snapshot really is. The rebuild stamps (`_planned_refreshed_at`,
-    `_rail_calls_refreshed_at`) are deliberately left unset: they gate the ET rebuilds, and the
-    first cycle after a deploy must still rebuild those tables, since the deploy may have changed
-    their SQL. Each load stands alone. A missing, stale or unreadable table (a first deploy, an old
-    schema) leaves that one cache cold, exactly as before, for the first cycle to fill.
-    """
-    now = datetime.now(UTC)
-    for table, load, max_age in (
-        ("disruptions.predictions_today", refresh_disruptions_cache, _WARM_PREDICTIONS_MAX_AGE),
-        ("disruptions.call_predictions_today", refresh_call_predictions_cache, _WARM_PREDICTIONS_MAX_AGE),
-        ("disruptions.rail_calls_planned_today", refresh_planned_spine, _PLANNED_TTL),
-        ("disruptions.rail_calls_today", refresh_rail_actuals, _RAIL_CALLS_TTL),
-    ):
-        try:
-            built = bq_client.get_table(table).modified
-            if built is None or now - built > max_age:
-                logger.info("Warm start skipped %s: built %s, older than %s", table, built, max_age)
-                continue
-            load(built)
-        except NotFound:
-            logger.info("Warm start skipped %s: not built yet", table)
-        except Exception:
-            logger.exception("Warm start could not load %s; the first poller cycle will", table)
+    return complete
 
 
 # ---- Avviksvarsel providers ------------------------------------------------------------------
@@ -899,8 +900,9 @@ _varsel_stops_cache: list[dict] = []
 _varsel_parent_names: list[dict] = []
 
 
-def _varsel_stop_places() -> dict[str, tuple[str, str | None, str | None]]:
-    """NSR ref -> (place_id, region label, registry name). Empty when the registry cannot be read.
+def _varsel_stop_places() -> dict[str, tuple[str, str | None, str | None]] | None:
+    """NSR ref -> (place_id, region label, registry name). None when the registry cannot be read,
+    which the caller serves as empty and reports as a failed load.
 
     Covers every StopPlace, parents included: a parent carries no calls, so the registry is the only
     place its name comes from (see `refresh_varsel_stops`).
@@ -930,6 +932,7 @@ def _varsel_stop_places() -> dict[str, tuple[str, str | None, str | None]]:
             "The national stop registry could not be read; stops keep their own place ids "
             "(same-named stops will be offered separately and carry no region)"
         )
+        return None
     return places
 
 
@@ -950,7 +953,7 @@ def refresh_line_modes() -> None:
     logger.info("Line modes loaded: %d lines", line_modes.set_modes(lines, now))
 
 
-def refresh_varsel_stops() -> None:
+def refresh_varsel_stops(*, heal_registrations: bool = True) -> bool:
     """Reload the stop picker list from the rail AND bus planned call sources (tiny scans).
 
     Each source is queried independently and merged by stop_place, so a missing/failing bus table
@@ -966,7 +969,15 @@ def refresh_varsel_stops() -> None:
     stops (Oslo S and Jernbanetorget), and merging those would answer a search for one with the
     other. `region` on each row is the municipality (see `_varsel_stop_places`), which the picker
     appends to a name that belongs to several places.
+
+    `heal_registrations=False` is a follower's load: the aliases are published, stored registrations
+    are not rewritten onto them (see `varsel.set_stop_aliases`).
+
+    Returns whether EVERY sub-query answered. What it publishes is unchanged by that -- fail-open
+    serves what it could -- but a follower stamps the load only on True, so a partial list is
+    retried on its next tick rather than when the planned table next moves (zero-downtime U3).
     """
+    complete = True
     merged: dict[str, dict] = {}
     for q in (_VARSEL_STOPS_QUERY, _VARSEL_STOPS_BUS_QUERY):
         try:
@@ -981,9 +992,12 @@ def refresh_varsel_stops() -> None:
                 e["has_rail"] = e["has_rail"] or r.has_rail
                 e["has_bus"] = e["has_bus"] or r.has_bus
         except Exception:
+            complete = False
             logger.exception("A varsel stops sub-query failed; continuing with the other source(s)")
 
     places = _varsel_stop_places()
+    if places is None:
+        complete, places = False, {}
     groups: dict[tuple[str, str], list[dict]] = {}
     for e in merged.values():
         place_id, county, _ = places.get(e["stop_place"], (e["stop_place"], None, None))
@@ -1044,13 +1058,119 @@ def refresh_varsel_stops() -> None:
         global _varsel_stops_cache, _varsel_parent_names
         _varsel_stops_cache = stops
         _varsel_parent_names = parent_names
-    varsel.set_stop_aliases(aliases, parents=parents)
+    varsel.set_stop_aliases(aliases, parents=parents, heal=heal_registrations)
     logger.info(
         "Refreshed varsel stops: %d rows (%d refs collapsed onto a co-located primary, "
         "%d parent places)",
         len(stops),
         len(aliases),
         len(parents),
+    )
+    return complete
+
+
+# ---- Following the last build (zero-downtime plan 2026-10-13-001, U3) ------------------------
+# Every pod serves from the tables the lease holder's cycle writes: the leader right after its own
+# CTAS, a follower on its tick, and every pod once in the lifespan before the port binds. All three
+# go through `_load_from_last_build`, which is what makes R7 structural rather than hoped for: a
+# cache is stamped with its source tables' modified time, never the load instant, so two pods that
+# hold one build report one `refreshed_at`, and round-robin can never show a client a stamp that
+# moves backwards. A cache read from two tables is stamped with the NEWER and reloads when EITHER
+# moved, so two loads with different contents never share a stamp -- `impact`'s index guard, the
+# figures cache and the wording key all key on a strictly newer one.
+#
+# The mechanism -- the metadata read, the stamp comparison, the per-load isolation, and why there
+# is no age bound (KTD6) -- is `poller_follow`'s; what is followed, and the loaders, stay here.
+#
+# The ET rebuild gates (`_planned_refreshed_at`, `_rail_calls_refreshed_at`,
+# `_bus_planned_refreshed_at`) are never touched here: they say when THIS process last rebuilt a
+# table, and a pod that becomes leader must still rebuild on its own SQL.
+_PREDICTIONS_TABLE = "disruptions.predictions_today"
+_CALL_PREDICTIONS_TABLES = (
+    "disruptions.call_predictions_today",
+    "disruptions.call_predictions_bus_today",
+)
+_SPINE_TABLES = ("disruptions.rail_calls_planned_today", _RAIL_CALLS_REMOVED_TABLE)
+_ACTUALS_TABLE = "disruptions.rail_calls_today"
+
+# name -> (source tables, the stamp the cache holds, load(built, leader)). Lambdas throughout so a
+# name resolves at call time: the suites swap the globals these read.
+_FOLLOWED_CACHES: dict[str, tuple] = {
+    "disruptions": (
+        (_PREDICTIONS_TABLE,),
+        lambda: _disruptions_refreshed_at,
+        lambda built, leader: refresh_disruptions_cache(built),
+    ),
+    "call_predictions": (
+        _CALL_PREDICTIONS_TABLES,
+        lambda: _call_pred_refreshed_at,
+        lambda built, leader: refresh_call_predictions_cache(built, translate=leader, fenced=leader),
+    ),
+    "spine": (
+        _SPINE_TABLES,
+        lambda: journey_status.spine_refreshed_at(),
+        lambda built, leader: refresh_planned_spine(built),
+    ),
+    "actuals": (
+        (_ACTUALS_TABLE,),
+        lambda: journey_status.actuals_refreshed_at(),
+        lambda built, leader: refresh_rail_actuals(built),
+    ),
+}
+
+# The per-pod lookups a follower reloads only when their table moved (KTD6's follower load set;
+# the rush hydrate and the station set are `_rush_hydrate`'s, keyed by Oslo day as well). The leader's cycle keeps calling these directly,
+# every cycle, as it always has. Stamped in `_lookups_built`, since the lookups keep no stamp of
+# their own, and only on SUCCESS: every loader here returns True when it loaded everything, and
+# False (or a raise) leaves it unstamped for the next tick. `refresh_baselines` and
+# `refresh_varsel_stops` swallow their own failures, which is why the bool exists. A table that is
+# missing is never asked at all -- `svv_baselines` in prd, which therefore logs no
+# `reisevalg_baselines_unavailable` WARNING at startup as it did before 2026-10-13.
+_FOLLOWED_LOOKUPS: dict[str, tuple] = {
+    "impact_lookup": (
+        ("disruptions.category_line_hour_impact",),
+        lambda: refresh_impact_lookup(),
+    ),
+    "svv_baselines": (("disruptions.svv_baselines",), lambda: reisevalg.refresh_baselines()),
+    # The planned-table cadence: the picker list is which stations exist today. The aliases are
+    # published and stored registrations are NOT healed onto them: that write is the leader's,
+    # whose cycle calls `refresh_varsel_stops()` itself (so a sole pod heals on its first cycle).
+    "varsel_stops": (
+        ("disruptions.rail_calls_planned_today", "disruptions.bus_calls_planned_today"),
+        lambda: refresh_varsel_stops(heal_registrations=False),
+    ),
+}
+_lookups_built: dict[str, datetime] = {}
+
+
+def _tables_built(tables: tuple[str, ...]) -> datetime | None:
+    """`poller_follow.tables_built` on this module's client, read at call time (the suites swap
+    it), under the metadata ceiling."""
+    return poller_follow.tables_built(bq_client, tables, timeout_s=_POLLER_METADATA_TIMEOUT_S)
+
+
+def _load_from_last_build(name: str, *, leader: bool) -> str:
+    """Load the `_FOLLOWED_CACHES` entry `name` when its tables moved past the stamp it holds; the
+    outcomes and what `leader` decides are `poller_follow.load_from_last_build`'s."""
+    return poller_follow.load_from_last_build(_FOLLOWED_CACHES[name], _tables_built, leader=leader)
+
+
+def follow_last_build() -> dict[str, str]:
+    """Bring this pod's serving caches and per-pod lookups up to the tables the leader last built.
+
+    Called once in the lifespan before the port binds -- so a new pod serves the tables the pod it
+    replaces was serving, rather than ~95 s of 503s (measured in dev 2026-09-25) -- and, from U2's
+    role loop, on every follower tick. Never raises, so nothing here can fail the lifespan; the
+    per-load isolation and the one `event="follow_last_build"` record are
+    `poller_follow.follow_last_build`'s. The registries are read at call time (the suites swap them).
+    """
+    return poller_follow.follow_last_build(
+        _FOLLOWED_CACHES,
+        _FOLLOWED_LOOKUPS,
+        _lookups_built,
+        load_cache=_load_from_last_build,
+        built_of=_tables_built,
+        refresh_line_modes=refresh_line_modes,
     )
 
 
@@ -1383,7 +1503,7 @@ def _impact_stop_ref_index() -> (
 
 def _varsel_refreshed_at() -> datetime | None:
     """When the per-call prediction table was built, or None before anything has loaded it (the
-    startup warm load, or failing that the poller's first cycle).
+    startup's `follow_last_build`, or failing that the poller's first cycle).
 
     The freshness provider for the journey-keyed public read on `/notification-api/v1`
     (2026-09-10): a cache nobody has loaded yet has no situations in it, and a read that answered
@@ -1507,6 +1627,59 @@ def _rss_bytes() -> int | None:
     return pages * os.sysconf("SC_PAGE_SIZE")
 
 
+class _PollerFenced(BaseException):
+    """The cycle stops here: the lease was lost, or the process is stopping (U2, KTD4).
+
+    A ``BaseException`` on purpose. The rebuild's isolation model is a ``try/except Exception``
+    around nearly every step, each deciding what ITS failure degrades -- and every one of them would
+    swallow an ordinary exception and run the next step, which is exactly the ``CREATE OR REPLACE``
+    a demoted leader must not issue. Caught once, in :func:`_on_ingestion_change`, and around the
+    tick writers in :func:`poll_for_changes`.
+    """
+
+    def __init__(self, reason: str, phase: str) -> None:
+        super().__init__(f"{reason} before {phase}")
+        self.reason = reason
+        self.phase = phase
+
+
+def _still_leading() -> bool:
+    """May this process go on writing? Not stopping, and holding the lease. Never raises, so it can
+    be handed to `varsel` as a plain predicate (the fan-out asks it before every push)."""
+    stop = _poller_stop_event
+    if stop is not None and stop.is_set():
+        return False
+    return _poller_lease.held()
+
+
+def _fence(where: str) -> None:
+    """Raise :class:`_PollerFenced` unless this process may still write. The one check every
+    boundary makes: the top of each `_phase`, between the two queries of a phase that issues two,
+    and before each tick writer. Under `SoleLeader` with no stop requested it is a no-op."""
+    stop = _poller_stop_event
+    if stop is not None and stop.is_set():
+        raise _PollerFenced("stopping", where)
+    if not _poller_lease.held():
+        raise _PollerFenced("lease_lost", where)
+
+
+def _log_fenced(fenced: _PollerFenced) -> None:
+    """The one record a fenced cycle or tick leaves: which boundary it stopped at, and why."""
+    logger.warning(
+        "Poller stopped before %s: %s",
+        fenced.phase,
+        fenced.reason,
+        extra={
+            "fields": {
+                "event": "poller_lease",
+                "result": fenced.reason,
+                "phase": fenced.phase,
+                "holder": getattr(_poller_lease, "holder", None),
+            }
+        },
+    )
+
+
 @contextmanager
 def _phase(name: str, timings: dict[str, int]):
     """Time one step of the poller's rebuild, recording what it cost whether or not it succeeded.
@@ -1540,7 +1713,12 @@ def _phase(name: str, timings: dict[str, int]):
     is the honest reading — it is one interpreter — and a wide pool's CPU can legitimately exceed
     the step's wall clock. `rss_delta_bytes` is omitted rather than zeroed where /proc does not
     exist, so an absent reading cannot be mistaken for a phase that allocated nothing.
+
+    **The lease check is the first line** (U2, KTD4), so a phase added later cannot forget it, and
+    it sits before the clock starts: a phase skipped because the lease was lost or the process is
+    stopping emits no `poller_phase` record, no metric and no beat -- it did not run.
     """
+    _fence(name)
     started = monotonic()
     started_cpu = time.process_time()
     rss_before = _rss_bytes()
@@ -1602,7 +1780,13 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
     # the trace-correlation keys (R17). Non-recording, and costless, when tracing is off.
     with tracing_setup.span("poller_cycle"):
         try:
-            _rebuild_all(timings)
+            try:
+                _rebuild_all(timings)
+            except _PollerFenced as fenced:
+                # The lease was lost or the process is stopping: the cycle ends at this boundary.
+                # It did not finish, so freshness is not stamped below; the summary still is.
+                _log_fenced(fenced)
+                return
             # EPOCH seconds, never `monotonic()` (KTD1's two-clock rule): the runbook's freshness
             # alerts compute `time() - value`, which a monotonic export silently breaks. This
             # gauge measures cache freshness — it moves only when SIRI-SX moves — not liveness;
@@ -1655,9 +1839,13 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         maybe_refresh_rail_calls()
     # The «I dag» strip's recorded calls (journey_status). Its own try: the step above is the one
     # whose failure aborts the rebuild, and a failed LOAD of a table it did build must not.
+    #
+    # This and the three loads below go through `_load_from_last_build`, a follower's own path, so
+    # each cache is stamped with its table's modified time rather than this load's instant (U3,
+    # R7). The metadata read sits inside the phase, so the phase's `ms` carries it.
     try:
         with _phase("rail_actuals_cache", timings):
-            refresh_rail_actuals()
+            _load_from_last_build("actuals", leader=True)
     except Exception:
         logger.exception("Journey-status actuals load failed; serving the previous copy")
     with _phase("disruptions_sql", timings):
@@ -1680,7 +1868,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     with _phase("predict_sql", timings):
         bq_client.query(_PREDICT_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     with _phase("disruptions_cache", timings):
-        refresh_disruptions_cache()
+        _load_from_last_build("disruptions", leader=True)
     # The impact lookup is a static, offline-built table — reloading it here just keeps it
     # current if it was rebuilt. Isolated so a missing/erroring lookup never breaks the feed.
     try:
@@ -1741,7 +1929,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         # previous spine and must not cost this tick its predictions.
         try:
             with _phase("rail_planned_cache", timings):
-                refresh_planned_spine()
+                _load_from_last_build("spine", leader=True)
         except Exception:
             logger.exception("Journey-status spine load failed; serving the previous copy")
         with _phase("predict_calls_rail", timings):
@@ -1761,7 +1949,9 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                 "Bus per-call predictions failed; /journey + /varsel serve NSB-only this tick"
             )
         with _phase("call_predictions_cache", timings):
-            refresh_call_predictions_cache()  # loads whichever of the two tables are present
+            # Whichever of the two tables are present; the lease holder's load is the one that
+            # translates (KTD12).
+            _load_from_last_build("call_predictions", leader=True)
     except Exception:
         logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
     # Journeys flagged "no direct service" at registration: ask again, and drop the warning from any
@@ -1800,7 +1990,11 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # mirrors keep what they had, the pass matches against a slightly older population, and the
     # browser half is untouched. An empty mirror on a transient error would read to every
     # downstream reader as "every client unsubscribed".
-    if webhook_channel := varsel.webhook_channel_enabled():
+    #
+    # Gated on the webhook channel OR the store backend (zero-downtime U5): `/varsel`'s cycle reads
+    # its registrations from the subscription mirror under the store backend too.
+    webhook_channel = varsel.webhook_channel_enabled()
+    if _mirrors_wanted(webhook_channel):
         try:
             with _phase("notification_mirror", timings):
                 report = notification_store.sync_mirrors(beat=_beat)
@@ -1842,7 +2036,9 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     outcome: varsel.PassOutcome | None = None
     try:
         with _phase("varsel_notify", timings):
-            outcome = varsel.check_and_notify(_varsel_snapshot())
+            # `should_continue` is the lease inside the fan-out (KTD4): asked before the delivery
+            # and before every push, so a leader demoted mid-pass submits no new send.
+            outcome = varsel.check_and_notify(_varsel_snapshot(), should_continue=_still_leading)
     except Exception:
         logger.exception("Avviksvarsel notify failed")
     # The client (webhook) channel's two WRITING steps, in their own phase and deliberately after
@@ -2201,14 +2397,9 @@ async def lifespan(app: FastAPI):
         metrics.start(int(os.environ.get("METRICS_PORT", "9464")))
     except Exception:
         logger.exception("Prometheus exporter failed to start; metrics unavailable this process")
-    # Eager initial load so /alert_profile works before the first ingestion change fires
-    # the poller's rebuild. Tolerate failure — the poller retries on every tick.
-    try:
-        refresh_impact_lookup()
-    except Exception:
-        logger.exception("Initial impact lookup load failed; will retry on ingestion poll")
-    # Avviksvarsel: inject providers, load persisted subscriptions/journeys, and eager-load the
-    # stop picker so /varsel is usable before the first ingestion tick. All tolerant of failure.
+    # Avviksvarsel: inject providers and load persisted subscriptions/journeys. The impact lookup,
+    # the stop picker and the SVV baselines it once eager-loaded here are `follow_last_build`'s now,
+    # at the end of this lifespan, once everything they need is configured.
     impact_engine.configure(
         snapshot_provider=_impact_snapshot,
         call_lookup=_impact_journey_calls,
@@ -2340,7 +2531,14 @@ async def lifespan(app: FastAPI):
     decisions.configure(bq_client=bq_client)
     decisions.ensure_table()
     ensure_removed_calls_table()
-    feedback_contexts.configure(bq_client=bq_client)
+    feedback_contexts.configure(
+        bq_client=bq_client,
+        # Contexts go to the store on the LEASE's gate (zero-downtime U6, KTD5/KTD10): with more
+        # than one pod a first tap may land on a pod that did not render the card. `_varsel_store`
+        # was set above by `_registration_store()`, and never `notification_store.enabled()` --
+        # tst names a database it does not have. None is the single-process memory path.
+        store=notification_store if _varsel_store is not None else None,
+    )
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
     rushhistorikk.configure(bq_client=bq_client)
@@ -2352,18 +2550,9 @@ async def lifespan(app: FastAPI):
         bq_client=bq_client, deterministic_writer=varsel._deterministic_body
     )
     varsel.load_state()
-    try:
-        refresh_varsel_stops()
-    except Exception:
-        logger.exception("Initial varsel stops load failed; will retry on ingestion poll")
-    # Reisevalg: inject the read-only per-call snapshot lookup + BigQuery client, then eager-load
-    # the road-volume baselines so the volume provider can serve before the first ingestion tick.
-    # Tolerant of failure (and of the table not existing yet) — the poller retries on every tick.
+    # Reisevalg: inject the read-only per-call snapshot lookup + BigQuery client. Its road-volume
+    # baselines load in `follow_last_build` below.
     reisevalg.configure(snapshot_lookup=_reisevalg_call_predictions, bq_client=bq_client)
-    try:
-        reisevalg.refresh_baselines()
-    except Exception:
-        logger.exception("Initial svv baselines load failed; will retry on ingestion poll")
     # Togmeldingen: BigQuery only (live feature rebuild + ML.PREDICT), driven wall-clock from
     # every poll tick (see poll_for_changes). No eager load — the first tick past an issue time
     # computes it, and a restart back-fills the day's earlier issues as `late` (the features are
@@ -2388,6 +2577,10 @@ async def lifespan(app: FastAPI):
         tag_title=varsel._tag_environment,
         load_markers=varsel.togvarsel_rounds_for,
         store_markers=varsel.store_togvarsel_rounds,
+        # The outlook reads the device's journeys from the store on any pod, and each round's
+        # fan-out asks the lease first (zero-downtime U4).
+        device_journeys=varsel.device_journeys,
+        should_continue=_still_leading,
     )
     # The round log /rushhistorikk scores, created here rather than on first write: evaluate()
     # returns before deciding anything while TOGVARSEL_NOTIFY_ENABLED is off — permanently true in
@@ -2399,11 +2592,33 @@ async def lifespan(app: FastAPI):
     # whole surface until the first rush resolves — which is every environment on the day it ships.
     togvarsel_outcomes.configure(bq_client=bq_client)
     togvarsel_outcomes.ensure_table()
-    # The prediction caches and the «I dag» timetable, from the tables the previous process built,
-    # so a deploy does not serve ~95 s of 503s. Before the poller starts, so its first cycle's loads
-    # always land after these (~12 s of BigQuery reads, measured 2026-09-25).
-    warm_caches_from_last_build()
+    # The whole follower load set, once, before the port binds (KTD6): the prediction caches and
+    # the «I dag» timetable from the tables the leader last built, so a deploy does not serve ~95 s
+    # of 503s, then the impact lookup, the SVV baselines, the stop picker and line modes, so a pod
+    # `/ready` calls Ready answers every route and not only the two it checks. Before the poller
+    # starts, so its first cycle's loads always land after these (~12 s of BigQuery reads for the
+    # caches, measured 2026-09-25). Then the rush forecast and the station set (U4), so /togmelding
+    # and the /varsel rush panel answer on this pod what the leader recorded.
+    follow_last_build()
+    _rush_hydrate()
     stop_event = threading.Event()
+    global _poller_lease, _poller_stop_event
+    _poller_stop_event = stop_event
+    # The lease exists only under the store backend (KTD5): gated on `_varsel_store`, set above by
+    # `_registration_store()`, never on `notification_store.enabled()`. Without it the loop keeps
+    # `SoleLeader` and is the loop as it was. The pod starts as a follower and acquires at its
+    # first tick, after the follower load set above has made it Ready.
+    if _varsel_store is not None:
+        _poller_lease = poller_lease.StoreLease(
+            holder=_poller_holder_id(),
+            acquire=notification_store.acquire_poller_lease,
+            renew=notification_store.renew_poller_lease,
+            release=notification_store.release_poller_lease,
+            heartbeat=lambda: _poller_heartbeat_monotonic,
+            on_acquire=_on_lease_acquired,
+            on_lose=_on_lease_lost,
+        )
+        _poller_lease.start()
     thread = threading.Thread(
         target=poll_for_changes,
         args=(_on_ingestion_change, stop_event),
@@ -2418,8 +2633,9 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        stop_event.set()
-        thread.join(timeout=5)
+        # Stop, join, drain, release -- one deadline from SIGTERM under a lease, the old 5 s join
+        # without one. See `_shutdown_poller`.
+        _shutdown_poller(thread, stop_event, _poller_lease)
         # The pull read's enrichment pool: stop it without waiting, so a task parked on a Vertex or
         # Journey Planner call cannot hold the process open past the poller's own five seconds.
         notification_pull.shutdown()
@@ -2828,6 +3044,99 @@ _poller_heartbeat_monotonic: float | None = None
 _poller_thread: threading.Thread | None = None
 _health_degraded_logged = False  # one health_degraded record per 200→503 transition
 
+# Who runs the cycle (zero-downtime U2, KTD1/KTD5). The lifespan swaps in a `StoreLease` only when
+# `_varsel_store` is set -- the store backend the lease document lives beside -- and never on
+# `notification_store.enabled()`, which is true in tst where no database exists. Every other
+# process, and every hermetic suite, keeps `SoleLeader`, and the loop is byte for byte the loop
+# before leases existed.
+_poller_lease: poller_lease.SoleLeader | poller_lease.StoreLease = poller_lease.SoleLeader()
+# Set by the lifespan to the poller thread's stop event, so the fences can end a cycle at the next
+# boundary on SIGTERM. None outside the lifespan, where nothing ever stops.
+_poller_stop_event: threading.Event | None = None
+# Set by `on_acquire`: the next leader iteration rebuilds whatever the ingestion stamp and the
+# spacing floor say, because the stamp it would compare against is from before this pod led.
+_force_rebuild = False
+
+
+# What the rush hydrate reads, and the (Oslo day, newest modified time) it last loaded them at.
+# Keyed by day as well as by table: `load_issued` is per Oslo day, and nothing need move at midnight
+# for yesterday's forecasts to stop being today's.
+_RUSH_TABLES = (
+    "disruptions.togvarsel_issued",
+    "disruptions.togvarsel_sx_today",
+    "disruptions.togvarsel_calendar",
+)
+_rush_loaded: tuple | None = None
+
+
+def _rush_hydrate(*, force: bool = False, now: datetime | None = None) -> None:
+    """Load the rush-forecast state from its tables on this pod (KTD8, R9): the issued forecasts
+    `togvarsel.load_issued` reads, and the Oslo station set the rush outlook reads from cache.
+
+    Called once in the lifespan before the port binds, on every follower tick, and from
+    `on_acquire` with `force`. Read-only: computing and recording stay the leader's
+    (`togvarsel.refresh`, which reads its own record back). A follower's tick costs metadata reads
+    while nothing moved (R13). Never raises -- a failed load is logged, left unstamped and asked
+    again next tick, and an acquisition must not fail on it: a leader with stale rush state
+    still serves the recorded rows once its own refresh reads them back. The station set is
+    fetched behind the two gates `_evaluate` passes first (the delivery flag and VAPID), so a warm
+    cache still means rounds can be evaluated; `station_set` caches per Oslo day itself.
+    """
+    global _rush_loaded
+    now = (now or datetime.now(_OSLO)).astimezone(_OSLO)
+    try:
+        built = _tables_built(_RUSH_TABLES)
+        stamp = (now.date(), built)
+        if built is not None and (force or stamp != _rush_loaded):
+            togvarsel.load_issued(now.date())
+            _rush_loaded = stamp
+    except Exception:
+        logger.exception("Rush forecast hydrate failed; retrying on next tick")
+    if _togvarsel_notify_enabled() and varsel.push_enabled():
+        togvarsel_notify.station_set(now)
+
+
+# The tenure's end and the holder's name are `poller_handover`'s; bound here under the names the
+# lease wiring and the lifespan's shutdown below use.
+_poller_holder_id = poller_handover.holder_id
+_on_lease_lost = poller_handover.on_lease_lost
+_shutdown_poller = poller_handover.shutdown_poller
+
+
+def _mirrors_wanted(webhook_channel: bool) -> bool:
+    """Does this deployment's cycle read the notification store's mirrors? (zero-downtime U5)
+
+    The webhook channel's pass does, and so does `/varsel` under the store backend, whose cycle
+    reads its registrations from the subscription mirror -- gated on the flag alone, a store-backed
+    deployment with the channel off seeded nothing and `all_journeys()` stayed empty.
+    """
+    return webhook_channel or _varsel_store is not None
+
+
+def _on_lease_acquired() -> None:
+    """`on_acquire` (KTD14), on the poller thread, before the first cycle of a tenure.
+
+    Reset and seed the mirrors, reload the rush round markers, hydrate the rush state, force the
+    next rebuild, then set the gauge. The seed runs synchronously, beating between pages, before any
+    tick writer: this pod's mirrors are from before it led -- or from an earlier tenure, while
+    another pod pushed -- so they are reset and seeded rather than synced (KTD7). The seed sits
+    behind the cycle's own gate, :func:`_mirrors_wanted`: the store backend or the webhook channel.
+    Raises on any failure, with the gauge cleared: the state machine then releases the lease and
+    stays a follower for five ticks.
+    """
+    global _force_rebuild
+    try:
+        notification_store.reset_mirrors()
+        if _mirrors_wanted(varsel.webhook_channel_enabled()):
+            notification_store.sync_mirrors(beat=_beat)
+        varsel_state.load_rounds()
+        _rush_hydrate(force=True)
+    except Exception:
+        metrics.POLLER_LEADER.set(0)
+        raise
+    _force_rebuild = True
+    metrics.POLLER_LEADER.set(1)
+
 
 def _beat() -> None:
     """Record that the poller thread is still making progress — BOTH clocks, always together.
@@ -2896,6 +3205,14 @@ def _poller_health() -> tuple[bool, str | None]:
     return True, None
 
 
+def _wait_tick(stop_event: threading.Event | None, interval: float) -> bool:
+    """Sleep one poller tick; True when the stop event fired during it (the loop then returns)."""
+    if stop_event is not None:
+        return stop_event.wait(interval)
+    time.sleep(interval)
+    return False
+
+
 def poll_for_changes(
     on_change: Callable[[datetime | None], None],
     stop_event: threading.Event | None = None,
@@ -2913,7 +3230,14 @@ def poll_for_changes(
     BigQuery error, or SIRI read access not yet granted to the runtime identity — is
     logged and retried on the next tick rather than killing this daemon thread for good.
     That lets the service self-recover once access lands, without a restart.
+
+    **Every pod runs this loop; the lease decides what an iteration does** (U2, KTD1/KTD2). The
+    lease ticks first, then the iteration branches on `held()`: the holder runs the cycle and the
+    four tick writers, each behind its own lease check, and every other pod follows the last build
+    and hydrates the rush state. Under `SoleLeader` the lease always answers held and this is the
+    loop as it was.
     """
+    global _force_rebuild
     last_seen = None
     seen_any = False
     last_rebuild_started: float | None = None
@@ -2924,13 +3248,29 @@ def poll_for_changes(
         # the iteration (see its docstring), so a slow-but-moving cycle stays healthy and only a
         # step that has stopped finishing reads as a wedge.
         _beat()
+        # The lease's step, on THIS thread: notice a loss (running `on_lose`), else try to
+        # acquire (running `on_acquire`). It never raises; a store failure leaves a follower.
+        _poller_lease.tick()
+        if not _poller_lease.held():
+            # A follower only loads what the leader built: no probe, no rebuild, no tick writer.
+            # Each load stands alone and logs its own failure (`follow_last_build` never raises).
+            follow_last_build()
+            try:
+                _rush_hydrate()
+            except Exception:
+                logger.exception("Rush state hydrate failed this tick; retrying on next tick")
+            _beat()
+            if _wait_tick(stop_event, interval):
+                return
+            continue
         try:
             current = get_last_ingestion_time()
-            if not seen_any or current != last_seen:
+            forced, _force_rebuild = _force_rebuild, False
+            if forced or not seen_any or current != last_seen:
                 since_last = (
                     None if last_rebuild_started is None else monotonic() - last_rebuild_started
                 )
-                if since_last is not None and since_last < _MIN_REBUILD_SPACING_S:
+                if not forced and since_last is not None and since_last < _MIN_REBUILD_SPACING_S:
                     logger.info(
                         "Ingestion moved %.0f s after the last rebuild started; holding until %d s",
                         since_last,
@@ -2945,56 +3285,70 @@ def poll_for_changes(
         except Exception:
             logger.exception("Ingestion poll failed; retrying on next tick")
         _beat()
-        # Togmeldingen (/togmelding-api) runs on EVERY tick, not just ingestion changes: an issue
-        # is due at its clock cutoff (06:30/07:00/12:00/14:00) whether or not new SX arrived, so
-        # it must not hang off the SX cadence. Cheap in-memory no-op on the vast majority of
-        # ticks; on a weekday tick past an un-issued forecast time it rebuilds the live togvarsel
-        # feature row and scores the due models. Isolated so a failure never touches the feed —
-        # the endpoint keeps serving whatever issues the day already has.
+        # The tick writers are the leader's too (KTD2), each behind its own lease check: a leader
+        # demoted between two of them runs none of the rest, logged once as a cut cycle is. The
+        # check is a BaseException, so the per-writer `except Exception` blocks cannot swallow it.
         try:
-            togvarsel.refresh()
-        except Exception:
-            logger.exception(
-                "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
-            )
-        _beat()
-        # Togvarsel pushes ride the same wall-clock tick, AFTER refresh so the tick that issues a
-        # round is the tick that can notify it — and never the SX-ingestion rebuild above.
-        # Isolated the same way: a notify failure costs notifications, never the feed or the tick.
-        try:
-            togvarsel_notify.evaluate()
-        except Exception:
-            logger.exception("Togvarsel notify failed this tick; retrying on next tick")
-        _beat()
-        # The rush outcome resolves on the same wall-clock tick, and for the same reason: a rush
-        # ends at its hour whether or not SX moved. Both of its passes are due-gated internally
-        # (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is a cheap no-op on
-        # all but a few ticks a day. Isolated like the two above: a fasit failure costs
-        # /rushhistorikk a day of verdicts, never the feed, the forecast or the notifications.
-        try:
-            togvarsel_outcomes.refresh()
-        except Exception:
-            logger.exception("Togvarsel outcome refresh failed this tick; retrying on next tick")
-        _beat()
-        # The labelling-freshness detector rides the same wall-clock tick, fourth and last (R8):
-        # the nightly varsel-label-daily job runs OUTSIDE this process, so nothing else in here
-        # would ever notice it dying — and past its 10-day retry window the unlabelled decisions
-        # are lost for good. decisions rate-limits itself to one BigQuery check per 6 h, so this
-        # is a cheap in-memory no-op on all but ~4 ticks a day. Deliberately NOT a _rebuild_all
-        # phase (KTD7): a quiet night with no SX movement — hence no rebuild — is exactly when a
-        # dead labelling job must still be noticed. Isolated like the three blocks above: the
-        # function never raises by design, so this except is belt-and-braces against a defect in
-        # the detector itself, which must cost the check and never the feed, the pushes or the tick.
-        try:
-            decisions.check_labelling_freshness()
-        except Exception:
-            logger.exception("Labelling freshness check failed this tick; retrying on next tick")
-        _beat()
-        if stop_event is not None:
-            if stop_event.wait(interval):
-                return
-        else:
-            time.sleep(interval)
+            # Togmeldingen (/togmelding-api) runs on EVERY tick, not just ingestion changes: an
+            # issue is due at its clock cutoff (06:30/07:00/12:00/14:00) whether or not new SX
+            # arrived, so it must not hang off the SX cadence. Cheap in-memory no-op on the vast
+            # majority of ticks; on a weekday tick past an un-issued forecast time it rebuilds the
+            # live togvarsel feature row and scores the due models. Isolated so a failure never
+            # touches the feed — the endpoint keeps serving whatever issues the day already has.
+            _fence("togvarsel_refresh")
+            try:
+                togvarsel.refresh()
+            except Exception:
+                logger.exception(
+                    "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
+                )
+            _beat()
+            # Togvarsel pushes ride the same wall-clock tick, AFTER refresh so the tick that issues
+            # a round is the tick that can notify it — and never the SX-ingestion rebuild above.
+            # Isolated the same way: a notify failure costs notifications, never the feed or the
+            # tick.
+            _fence("togvarsel_notify")
+            try:
+                togvarsel_notify.evaluate()
+            except Exception:
+                logger.exception("Togvarsel notify failed this tick; retrying on next tick")
+            _beat()
+            # The rush outcome resolves on the same wall-clock tick, and for the same reason: a
+            # rush ends at its hour whether or not SX moved. Both of its passes are due-gated
+            # internally (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is
+            # a cheap no-op on all but a few ticks a day. Isolated like the two above: a fasit
+            # failure costs /rushhistorikk a day of verdicts, never the feed, the forecast or the
+            # notifications.
+            _fence("togvarsel_outcomes")
+            try:
+                togvarsel_outcomes.refresh()
+            except Exception:
+                logger.exception(
+                    "Togvarsel outcome refresh failed this tick; retrying on next tick"
+                )
+            _beat()
+            # The labelling-freshness detector rides the same wall-clock tick, fourth and last
+            # (R8): the nightly varsel-label-daily job runs OUTSIDE this process, so nothing else
+            # in here would ever notice it dying — and past its 10-day retry window the unlabelled
+            # decisions are lost for good. decisions rate-limits itself to one BigQuery check per
+            # 6 h, so this is a cheap in-memory no-op on all but ~4 ticks a day. Deliberately NOT
+            # a _rebuild_all phase (KTD7): a quiet night with no SX movement — hence no rebuild —
+            # is exactly when a dead labelling job must still be noticed. Isolated like the three
+            # blocks above: the function never raises by design, so this except is belt-and-braces
+            # against a defect in the detector itself, which must cost the check and never the
+            # feed, the pushes or the tick.
+            _fence("labelling_freshness")
+            try:
+                decisions.check_labelling_freshness()
+            except Exception:
+                logger.exception(
+                    "Labelling freshness check failed this tick; retrying on next tick"
+                )
+            _beat()
+        except _PollerFenced as fenced:
+            _log_fenced(fenced)
+        if _wait_tick(stop_event, interval):
+            return
 
 
 class Estimate(BaseModel):
@@ -4118,6 +4472,60 @@ async def health(response: Response) -> dict[str, str]:
         )
     response.status_code = 503
     return {"status": "unhealthy", "reason": reason}
+
+
+# The commit this image was built from: the Dockerfile bakes ci.yml's GIT_SHA build arg into the
+# runtime environment. None in a build without the arg (local). `/ready` publishes it so the deploy
+# smoke can tell the new pod's answer from the terminating old one's.
+_BUILD_VERSION = os.environ.get("GIT_SHA") or None
+
+
+def _poller_role() -> tuple[str, float | None]:
+    """`(role, lease_age_s)` for `/ready`'s body (KTD16), from the lease: `leader` with the seconds
+    since the heartbeat the lease was last written with, or `follower` with None. `SoleLeader`
+    answers `("leader", None)`."""
+    return _poller_lease.role()
+
+
+@app.get(
+    "/ready",
+    summary="Readiness check",
+    response_description=(
+        '`{"status": "ready", "role": ..., "lease_age_s": ..., "version": ...}` once the serving '
+        'caches are '
+        'loaded; 503 with a `reason` before. Without a lease backend, `/health`\'s answer.'
+    ),
+    tags=["diagnostics"],
+)
+async def ready(response: Response) -> dict:
+    """Readiness: may this pod be sent traffic? (KTD6; liveness stays `/health`.)
+
+    Ready once the per-call prediction cache and the journey-status spine have each been loaded
+    once -- what journey-alerts and journey-status answer 503 without -- whatever their age: a live
+    leader on a quiet night leaves tables hours old, and refusing them would take a healthy pod out
+    of rotation. By the time the lifespan yields, `follow_last_build` has run the whole follower
+    load set once, so a Ready pod answers every other route too.
+
+    Gated on `_varsel_store`, the store backend the lease lives in (KTD5) -- never on
+    `notification_store.enabled()`, which is true in tst where no database exists. Without it there
+    is no lease and no role to publish, and this is `/health` word for word, so pointing the probe
+    here changes nothing in such a deployment. The body names the role (KTD16) and the build
+    (`version`, the image's commit), so the deploy smoke and an operator can see who leads, and on
+    which build, through the public host.
+    """
+    if _varsel_store is None:
+        return await health(response)
+    role, lease_age_s = _poller_role()
+    reason = None
+    if _varsel_refreshed_at() is None:
+        reason = "predictions_not_loaded"
+    elif journey_status.spine_refreshed_at() is None:
+        reason = "plan_not_loaded"
+    pod = {"role": role, "lease_age_s": lease_age_s, "version": _BUILD_VERSION}
+    if reason is None:
+        return {"status": "ready", **pod}
+    response.status_code = 503
+    return {"status": "not_ready", "reason": reason, **pod}
 
 
 @app.get(

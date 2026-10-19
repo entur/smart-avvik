@@ -46,6 +46,16 @@ POLLER_LAST_CYCLE = Gauge(
     "failing every cycle DOES leave it moving, so pair it with "
     "kix_poller_phase_total{result=\"error\"} rather than reading it as 'every cache is fresh'.",
 )
+POLLER_LEADER = Gauge(
+    "kix_poller_leader",
+    "1 while this pod holds the poller lease and runs the cycle, 0 otherwise (zero-downtime U2). "
+    "Set after on_acquire succeeds and cleared on loss, on a failed acquisition and at shutdown, so "
+    "sum() across pods is the number of leaders: above 1 past a one-minute pending window is two "
+    "writers, 0 for minutes is nobody pushing. Reads 0, not absent, without the lease backend (tst, "
+    "local runs) and on the worker pod: the gauge exports from import and nothing sets it there. "
+    "kix_poller_last_cycle_timestamp_seconds stays leader-only by construction: only the leader "
+    "runs a cycle.",
+)
 POLLER_CYCLE_DURATION = Histogram(
     "kix_poller_cycle_duration_seconds",
     "Wall-clock duration of one full rebuild cycle (the event=\"poller_cycle\" total, in "

@@ -292,7 +292,11 @@ def test_teardown_sweeps_every_collection_a_subscription_touches():
     import notification_store
 
     assert set(gen.TEARDOWN_COLLECTIONS) == {"subscriptions", "events", "deliveries", "subjects"}
-    assert len(gen.TEARDOWN_COLLECTIONS) == len(notification_store.COLLECTIONS)
+    # Every store collection except feedback contexts, which carry no subscription or client id:
+    # a card render mints them, this tool never does, and their own 15-minute TTL removes them.
+    # A new collection that does carry a subscription id still fails this until it is swept.
+    swept = set(notification_store.COLLECTIONS) - {notification_store.FEEDBACK_CONTEXTS}
+    assert len(gen.TEARDOWN_COLLECTIONS) == len(swept)
 
 
 def test_the_api_mode_is_bounded_and_the_store_mode_is_the_default_above_it():

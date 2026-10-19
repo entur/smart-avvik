@@ -190,7 +190,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `{date: {issue: {level, pushed}}}` in the varsel state blob — dedup (a marked round never
   re-fires, suppressions included) and the follow-up baseline in one; markers commit in memory
   before fan-out and persist after, so a crash mid-round inside the timeliness window can
-  duplicate that one round — accepted. Timeliness is strict Oslo wall-clock at evaluation time
+  duplicate that one round — accepted. Only FINISHED rounds' markers are persisted: a round the
+  poller lease fenced (asked before the fan-out and before every send, `RoundFenced`) saves no
+  marker and ends the pass, so the next leader re-pushes it — duplicates for devices already
+  sent, never a lost round (KTD8 of the zero-downtime plan). Timeliness is strict Oslo wall-clock at evaluation time
   (0630 < 07:00, 0700 < 09:00, 1200 < 14:00, 1400 < 18:00; a late back-fill is recorded as
   suppressed and never revisited), and matching is additionally bounded by evaluation time: a
   journey whose registered window has already passed never gets the push, friskmelding included.
@@ -220,8 +223,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `station_set` deliberately has no failure cooldown, which is right on a poller tick and one
   billable scan per page view on a public unauthenticated endpoint. A cold cache therefore yields
   no panel — and that doubles as the VAPID gate, since `_evaluate` reaches the fetch only past
-  both gates. The route is `async def` (every input is already in-process) where `test-notify` is
-  a plain `def`, and the two writes in `station_set` publish `refs` before `date` so the lock-free
+  both gates, and so does `main._rush_hydrate`, which warms the cache on every pod (zero-downtime
+  U4) rather than on the leader alone. Since U4 the device's journeys come from the registration
+  STORE (`varsel.device_journeys`, the follower's mirror is never seeded), so the route is a plain
+  `def` like `test-notify`, and the forecasts every pod serves are hydrated from
+  `togvarsel_issued` (`togvarsel.load_issued`; `refresh` stays the leader's). The two writes in `station_set` publish `refs` before `date` so the lock-free
   read cannot see a date whose refs have not landed. Dev-only test
   trigger: `POST /togmelding-api/test-notify` with `{"device_id": ...}` (same shape as
   `/varsel-api/test`) sends one synthetic yellow round — body marked as testvarsel — through the

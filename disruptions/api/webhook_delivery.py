@@ -6,10 +6,12 @@ no timeout hangs the poller thread and stops ingestion for every other feature -
 below is one of the five bounds KTD6 names against it:
 
 1. **One attempt per pending event per cycle.** The next cycle is the retry, as it is everywhere
-   else in this repo, so there is no outbox lease and no fence token. What makes that safe is a
-   single writer, and the mechanism is nameable rather than assumed: one poller thread calls this,
-   no route invokes it, and the deployment is one replica under the Recreate strategy, so two
-   cycles cannot overlap.
+   else in this repo, so there is no outbox lease of the poller's own and no fence token. What
+   makes that safe is a single writer, and the mechanism is nameable rather than assumed: one poller thread calls this,
+   no route invokes it, and only the pod holding the poller lease runs the cycle (one LEADER per
+   leadership term, not one replica), so two cycles cannot overlap within a term. Across a handoff,
+   and from U11 between the poller and `webhook_worker`, the claim lease (`DELIVERY_LEASE_S` and
+   its token) is what keeps two readers of one pending page from both POSTing.
 2. **A 4-wide pool** -- ``/meldinger``'s width, the repo's narrowest. ``varsel``'s own pools are
    16/16/32 and are the wrong precedent: those run on a cadence nobody triggers, against endpoints
    Entur or a push service owns.

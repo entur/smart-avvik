@@ -31,6 +31,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq
@@ -362,6 +363,96 @@ def test_no_poller_path_bigquery_wait_is_unbounded():
             if re.search(r"insert_rows_json\((?![^)]*timeout=)[^)]*\)", line):
                 offenders.append(f"{name}:{lineno}: {line.strip()}")
     assert not offenders, "unbounded BigQuery wait on the poller thread:\n" + "\n".join(offenders)
+
+
+# ---- Readiness: GET /ready (zero-downtime U3, KTD6/KTD16) --------------------------------------
+
+
+@contextmanager
+def _lease_backend(role=("leader", None)):
+    """A process with the store backend, i.e. with a lease (KTD5), and empty serving caches.
+    Restores the backend, the prediction stamp, the role seam and the spine afterwards."""
+    import journey_status
+
+    before = (main._varsel_store, main._call_pred_refreshed_at, main._poller_role)
+    main._varsel_store = object()
+    main._call_pred_refreshed_at = None
+    main._poller_role = lambda: role
+    journey_status.reset_state()
+    try:
+        yield journey_status
+    finally:
+        main._varsel_store, main._call_pred_refreshed_at, main._poller_role = before
+        journey_status.reset_state()
+
+
+def test_ready_without_a_lease_backend_is_health_word_for_word():
+    """tst and every `gcs` deployment have no lease, and so no role to report: `/ready` is `/health`
+    there, healthy or not, so moving the probe changes nothing until the backend is set."""
+    assert main._varsel_store is None, "this suite never enters the lifespan"
+    for thread in (None, _FakeThread(alive=False)):
+        with _poller_state(thread):
+            health, ready = client.get("/health"), client.get("/ready")
+            assert (ready.status_code, ready.json()) == (health.status_code, health.json()), ready.text
+
+
+def test_ready_waits_for_the_predictions_and_the_spine_whatever_their_age():
+    """KTD6: Ready means journey-alerts and journey-status can answer. Age is no bar -- a live
+    leader on a quiet night leaves tables hours old -- and the body names the role (KTD16)."""
+    old = datetime.now(UTC) - timedelta(hours=3)
+    with _lease_backend() as journey_status:
+        r = client.get("/ready")
+        assert r.status_code == 503 and r.json()["reason"] == "predictions_not_loaded", r.text
+        assert r.json()["role"] == "leader", r.text
+        main._call_pred_refreshed_at = old
+        r = client.get("/ready")
+        assert r.status_code == 503 and r.json()["reason"] == "plan_not_loaded", r.text
+        journey_status.set_spine(journey_status.CallTable([], old))
+        r = client.get("/ready")
+        assert r.status_code == 200, r.text
+        assert r.json() == {"status": "ready", "role": "leader", "lease_age_s": None, "version": None}, r.text
+
+
+def test_ready_publishes_the_role_the_lease_seam_reports():
+    with _lease_backend(role=("follower", 12.5)) as journey_status:
+        main._call_pred_refreshed_at = now = datetime.now(UTC)
+        journey_status.set_spine(journey_status.CallTable([], now))
+        body = client.get("/ready").json()
+        assert (body["role"], body["lease_age_s"]) == ("follower", 12.5), body
+
+
+def test_ready_names_the_build_beside_the_role():
+    """From step B the old pod can still answer /ready as leader while the new one never acquires,
+    so the deploy smoke needs "leader" AND "this build" in ONE answer. The version is the commit the
+    image was built from (the Dockerfile's GIT_SHA build arg); a build without it says null."""
+    before = main._BUILD_VERSION
+    main._BUILD_VERSION = "0123456789abcdef0123456789abcdef01234567"
+    try:
+        with _lease_backend() as journey_status:
+            r = client.get("/ready")
+            assert r.status_code == 503 and r.json()["version"] == main._BUILD_VERSION, r.text
+            main._call_pred_refreshed_at = now = datetime.now(UTC)
+            journey_status.set_spine(journey_status.CallTable([], now))
+            body = client.get("/ready").json()
+            assert (body["role"], body["version"]) == ("leader", main._BUILD_VERSION), body
+    finally:
+        main._BUILD_VERSION = before
+
+
+def test_a_follower_is_live_while_its_loop_beats_and_dead_once_it_stops():
+    """Liveness is the loop's, whatever the role (zero-downtime U2): a follower beats every tick
+    without running a cycle, so it stays 200, and a follower whose thread died is restarted like a
+    leader would be. `/ready` names the role beside it."""
+    import journey_status
+
+    with _lease_backend(role=("follower", None)):
+        main._call_pred_refreshed_at = now = datetime.now(UTC)
+        journey_status.set_spine(journey_status.CallTable([], now))
+        with _poller_state(_FakeThread(alive=True), heartbeat=time.monotonic()):
+            assert client.get("/health").status_code == 200
+            assert client.get("/ready").json()["role"] == "follower"
+        with _poller_state(_FakeThread(alive=False), heartbeat=time.monotonic()):
+            assert client.get("/health").status_code == 503
 
 
 def _run():

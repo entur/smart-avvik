@@ -812,6 +812,66 @@ def test_a_per_journey_read_is_keyed_and_never_a_scan_of_the_mirror(_mp):
     assert store.get_journey("nosuch") is None, "an unknown id must answer without a scan too"
 
 
+def _foreign_write(client: Any, journey_id: str, **fields: Any) -> None:
+    """Another pod's commit: on the document, and never applied to THIS process's mirror."""
+    doc = client.doc(notification_store.SUBSCRIPTIONS, journey_id)
+    client.put(notification_store.SUBSCRIPTIONS, journey_id, {**doc, **fields})
+
+
+def test_the_request_paths_read_of_one_journey_is_the_stores_even_beside_a_seeded_mirror(_mp):
+    """Zero-downtime U5 (R8, KTD7): a journey registered on another pod is in the store and not yet
+    in the leader's mirror, so an ownership check that preferred the mirror would refuse the
+    traveller's own delete until the next sync. The cycle's `get_journey` keeps the mirror."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    store_suite._mirror_page(client, "mirror_seed", [])
+    notification_store.subscription_mirror().seed(now=datetime.now(UTC))
+
+    assert store.get_journey("j1") is None, "the cycle's view should not have this journey yet"
+    record = store.stored_journey("j1")
+    assert record is not None and record["device_id"] == DEVICE
+    assert store.stored_journey("nosuch") is None
+
+    blob = _reset()
+    blob.create_journey("j1", _journey())
+    assert blob.stored_journey("j1") == blob.get_journey("j1")
+    _reset()
+
+
+def test_the_pre_send_read_refuses_a_journey_gone_or_already_marked_in_the_store(_mp):
+    """Zero-downtime U5 (AE6): the leader's mirror is one cycle late for another pod's writes, so
+    the last look before a send reads the document. Gone, or every situation already marked:
+    refused. A train already marked under ANOTHER situation is not refused: that is a replacement
+    (an ET cancellation confirming the interim leader's forecast) the stale mirror did not
+    recognise, and refusing it would withhold the confirmation until the six-hourly re-seed."""
+    store, client = _store()
+    store.put_device(DEVICE, subscription=SUB, brand="entur")
+    store.create_journey("j1", _journey())
+    _seeded_mirror(client)
+    tag = "j1|VYG|t1|A|1"
+
+    assert store.may_send("j1", situations=("S1",))
+    later = datetime.now(UTC) + timedelta(days=1)
+    _foreign_write(client, "j1", notified={"S1": later}, pushed_trains={tag: later})
+    assert not store.may_send("j1", situations=("S1",))
+    assert store.may_send("j1", situations=("S1", "S2")), (
+        "a digest naming a train nobody has been told about is still owed"
+    )
+    assert store.may_send("j1", situations=("S2",)), "the confirmation of a pushed train is owed"
+    _foreign_write(client, "j1", status="deleted")
+    assert not store.may_send("j1", situations=("S2",))
+    assert store.get_journey("j1") is not None, "the mirror was meant to be the stale one here"
+
+    blob = _reset()
+    blob.create_journey("j1", _journey())
+    blob.mark_notified("j1", "S1")
+    assert blob.may_send("j1", situations=("S1",)), (
+        "the blob backend never refuses here: its behaviour is today's, byte for byte"
+    )
+    _reset()
+
+
 def test_the_ceilings_are_the_clients_quotas_under_the_store(_mp):
     """`_MAX_DEVICES` and `_MAX_JOURNEYS` become the reserved client's quotas, resolved per write so
     an operator's `set-quotas` takes effect without a restart. The refusal is the same

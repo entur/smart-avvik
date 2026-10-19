@@ -15,11 +15,15 @@ common:
     # slow start: uvicorn only binds the port after the lifespan hook has
     # finished its initial BigQuery loads (the impact lookup, the stop list and,
     # since 2026-09-25, the prediction caches from the last-built tables).
+    # Readiness is /ready (KTD6): 503 until the prediction cache and the timetable spine are
+    # loaded, so a rolling deploy never routes traffic to a pod with empty caches. Liveness stays
+    # /health. A process without the lease backend answers /ready exactly as /health, so this is
+    # safe anywhere; tst still states /health in its own file.
     probes:
       liveness:
         path: /health
       readiness:
-        path: /health
+        path: /ready
     # Prometheus scrape wiring (2026-09-11): rendered as the pod's prometheus.io/{scrape,path,port}
     # annotations, pointing the platform's annotation-driven scraper at the app's dedicated
     # internal exporter port -- served from the lifespan hook before readiness, so the slow
@@ -32,12 +36,49 @@ common:
       path: /metrics
       port: 9464
 
+  # Rolling and autoscaled (KTD9), INERT while an environment file sets deployment.forceReplicas:
+  # with it the chart renders Recreate, a fixed replica count and no HPA. forceReplicas lives in
+  # each environment file and never here, so dropping it is one environment at a time (KTD15) --
+  # in this file it would flip prd on its next dispatch together with dev.
+  # helm/kix-avvik/test/api_render.sh pins both shapes.
   deployment:
-    # Single instance by design: the app keeps an in-process cache and runs one
-    # background poller thread, so more replicas would mean duplicate pollers
-    # and unshared caches. forceReplicas=1 uses the Recreate strategy and
-    # disables HPA/PDB.
-    forceReplicas: 1
+    # Effective HPA minimum as the PDB sees it: 1 keeps the PDB at minAvailable 0%.
+    minReplicas: 1
+    # A STRING: the chart applies `| default`, which swallows an integer 0 and renders its default
+    # ("25%" since common 2.1.1, 1 before).
+    maxUnavailable: "0%"
+    # Explicit: common 2.1.1 defaults maxSurge to "25%" (2.1.0 rendered 1). One pod at a time is
+    # the rollout this lease handoff was designed for, whatever the chart's default becomes.
+    maxSurge: 1
+    # Covers the longest uninterruptible wait (one 240 s BigQuery call) plus the preStop; equals
+    # poller_lease.GRACE_S (test_notification_contract pins the two together). The preStop hook
+    # itself is in each API environment file, not here: this base file is also the worker
+    # release's, and the worker is behind no Service.
+    terminationGracePeriodSeconds: 270
+
+  # The chart's hpa.spec replaces the whole spec and renders neither min nor max replicas, so both
+  # are stated here (left out, the API server rejects the HPA for a missing maxReplicas). Target
+  # 80 % sits above the leader's own cycle burn, so the poller alone cannot scale out.
+  hpa:
+    spec:
+      minReplicas: 1
+      maxReplicas: 3
+      metrics:
+        - type: Resource
+          resource:
+            name: cpu
+            target:
+              type: Utilization
+              averageUtilization: 80
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 120
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleDown:
+          stabilizationWindowSeconds: 600
 
   ingress:
     enabled: true

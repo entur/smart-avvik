@@ -46,6 +46,20 @@ def test_the_operators_english_is_served_as_it_stands_and_nothing_is_translated(
         assert calls == []
 
 
+def test_a_followers_update_serves_the_operators_english_and_translates_nothing():
+    """KTD12: only the lease holder translates, or N pods would translate the same ~400 situations a
+    day. A follower still swaps in the operator's own English, or its journey-alerts would carry
+    none where the leader's carry it."""
+    with _wired() as calls:
+        se.update(
+            {"NSB:1": ("Innstilt", None, "Cancelled", None), "GCO:1": ("Stengt vei", None, None, None)},
+            translate=False,
+        )
+        assert se.english("NSB:1", "Innstilt", None) == se.English("Cancelled", None, False)
+        assert se.english("GCO:1", "Stengt vei", None) is None
+        assert calls == []
+
+
 def test_a_situation_with_no_english_is_translated_once_per_text_and_shared_by_every_number_using_it():
     with _wired() as calls:
         assert se.english("GCO:1", "Stengt vei", None) is None

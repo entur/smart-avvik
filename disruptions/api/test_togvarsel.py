@@ -80,8 +80,9 @@ class _FakeBQ:
     like the real client does. Records every query for assertions."""
 
     def __init__(self, feature_row=None, sx_rows=(), probs=None, calendar_holiday=False,
-                 fail_rebuild=False):
+                 fail_rebuild=False, issued_rows=()):
         self.feature_row = feature_row
+        self.issued_rows = list(issued_rows)  # the togvarsel_issued rows load_issued reads
         self.sx_rows = list(sx_rows)
         self.probs = probs or {}  # model suffix -> p (a missing model RAISES)
         self.calendar_holiday = calendar_holiday  # None -> the calendar has no row for today
@@ -114,6 +115,8 @@ class _FakeBQ:
             return _FakeJob([self.feature_row] if self.feature_row else [])
         if sql.strip().startswith("SELECT") and "togvarsel_sx_today" in sql:
             return _FakeJob(list(self.sx_rows))
+        if sql.strip().startswith("SELECT") and "togvarsel_issued" in sql:
+            return _FakeJob(list(self.issued_rows))
         # the multi-statement feature rebuild script
         if self.fail_rebuild:
             raise _FakeNotFound("rebuild failed")
@@ -798,6 +801,127 @@ def test_issued_today_snapshots_plain_dicts_for_the_notify_seam():
     assert {"scope", "reasons", "computed_at", "p"} <= set(issue)
     # the next day sees a stale state, not yesterday's issues
     assert togvarsel.issued_today(now=datetime(2026, 9, 1, 7, 10, tzinfo=_OSLO)) == []
+
+
+# ---------------------------------------------------------------------------- hydrate (U4, KTD8)
+
+def _issued_row(issue: str, p: float, *, at: datetime, late: bool = False) -> dict:
+    """One togvarsel_issued row as the client returns it: the leader's write, read back."""
+    spec = togvarsel._SPEC_BY_KEY[issue]
+    return {"issue": issue, "p": p, "level": togvarsel.level_for(p), "scope": spec.scope,
+            "reasons": [f"grunn {issue}"], "computed_at": at, "late": late}
+
+
+_SX_ROW = {"oslo": True, "cls": "buss_for_tog", "summary": "Buss for tog Asker–Sandvika",
+           "planned": True, "n_amj": 3, "n_pmj": 0}
+
+
+def test_load_issued_builds_the_days_state_from_the_leaders_rows():
+    """A follower started after 14:00 serves the three issues the leader recorded, with the
+    leader's p and level, the «kjente avvik» list, and no "delayed" banner for any of them."""
+    at = MONDAY_1430.replace(hour=12, minute=0)
+    rows = [_issued_row("0630", 0.05, at=MONDAY_0635), _issued_row("0700", 0.42, at=MONDAY_0710),
+            _issued_row("1200", 0.2, at=at)]
+    fake = _FakeBQ(issued_rows=rows, sx_rows=[_SX_ROW])
+    _reset(fake)
+    assert togvarsel.load_issued(date(2026, 8, 31)) is True
+    with togvarsel._lock:
+        issues = dict(togvarsel._state["issues"])
+        assert togvarsel._state["generated_at"] == at
+    assert set(issues) == {"0630", "0700", "1200"}
+    assert issues["0700"].p == 0.42 and issues["0700"].level == "red"
+    assert issues["1200"].reasons == ["grunn 1200"]
+    m = togvarsel.build_melding(MONDAY_1430.replace(minute=35))
+    assert "1200" not in m.overdue_issues and "0700" not in m.overdue_issues
+    assert m.overdue_issues == ["1400"]
+    assert [k.summary for k in m.known_deviations] == ["Buss for tog Asker–Sandvika"]
+    # read-only: no rebuild, no prediction, no write
+    assert fake.inserted == [] and fake.ddl == []
+    assert not any("Live togvarsel features" in q or "ML.PREDICT" in q for q in fake.queries)
+
+
+def test_load_issued_on_a_day_with_no_rows_leaves_the_overdue_logic_as_today():
+    """Before the first issue the table has nothing for the day, and yesterday's
+    togvarsel_sx_today must not be served as today's list: the leader's own state is empty
+    until its first rebuild of the day, and the two pods must agree."""
+    fake = _FakeBQ(sx_rows=[_SX_ROW])
+    _reset(fake)
+    assert togvarsel.load_issued(date(2026, 8, 31)) is True
+    m = togvarsel.build_melding(MONDAY_0710.replace(minute=20))
+    assert m.issues == [] and m.known_deviations == []
+    assert m.overdue_issues == ["0630", "0700"]
+    assert m.generated_at is None
+
+
+def test_load_issued_reads_the_holiday_from_the_calendar():
+    fake = _FakeBQ(calendar_holiday=True)
+    _reset(fake)
+    togvarsel.load_issued(date(2026, 8, 31))
+    m = togvarsel.build_melding(MONDAY_0710)
+    assert m.forecast_day is False and "Helligdag" in m.no_forecast_reason
+
+
+def test_load_issued_raises_on_a_failed_read_and_keeps_the_state():
+    """The bool is the follower-lookup contract: a raise is retried next tick, never stamped."""
+    fake = _FakeBQ(issued_rows=[_issued_row("0630", 0.2, at=MONDAY_0635)])
+    _reset(fake)
+    togvarsel.load_issued(date(2026, 8, 31))
+
+    def down(sql, job_config=None):
+        raise RuntimeError("bigquery down")
+
+    fake.query = down
+    try:
+        togvarsel.load_issued(date(2026, 8, 31))
+        raise AssertionError("expected the read failure to raise")
+    except RuntimeError:
+        pass
+    with togvarsel._lock:
+        assert set(togvarsel._state["issues"]) == {"0630"}
+
+
+def test_the_leader_serves_the_recorded_row_not_its_recompute_after_a_restart():
+    """KTD8: the table is first-write-wins, so a restarted leader's back-fill of 06:30 computes a
+    new p that the MERGE discards. The page must then serve what was recorded — and what the
+    pushes and /rushhistorikk already said — not the recompute."""
+    recorded = _issued_row("0630", 0.12, at=MONDAY_0635)
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.42}, issued_rows=[recorded])
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0635.replace(minute=50))
+    assert len(fake.inserted) == 1  # the recompute was offered to the MERGE
+    with togvarsel._lock:
+        issue = togvarsel._state["issues"]["0630"]
+    assert (issue.p, issue.level, issue.computed_at) == (0.12, "yellow", MONDAY_0635)
+
+
+def test_a_failed_record_never_costs_the_leader_its_computed_forecast():
+    """The table row wins where there is one; where the MERGE failed there is none, and the
+    in-memory forecast the traveller was already shown stays."""
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.42})
+    real = fake.query
+
+    def query(sql, job_config=None):
+        if "MERGE" in sql:
+            raise RuntimeError("write failed")
+        return real(sql, job_config)
+
+    fake.query = query
+    _reset(fake)
+    togvarsel.refresh(now=MONDAY_0635)
+    with togvarsel._lock:
+        assert togvarsel._state["issues"]["0630"].p == 0.42
+
+
+def test_a_follower_hydrate_never_records_or_rebuilds():
+    """load_issued is the whole of what a follower does with the forecast: no feature rebuild,
+    no ML.PREDICT, no MERGE — `refresh` is the leader's alone (R4)."""
+    fake = _FakeBQ(feature_row=_feature_row(), probs={"am0630": 0.42},
+                   issued_rows=[_issued_row("0630", 0.2, at=MONDAY_0635)])
+    _reset(fake)
+    for _ in range(3):
+        togvarsel.load_issued(date(2026, 8, 31))
+    assert fake.inserted == [] and fake.ddl == []
+    assert not any("Live togvarsel features" in q or "ML.PREDICT" in q for q in fake.queries)
 
 
 if __name__ == "__main__":

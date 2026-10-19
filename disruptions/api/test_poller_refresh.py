@@ -1398,14 +1398,21 @@ def _spacing(seconds: int):
         main._MIN_REBUILD_SPACING_S = before
 
 
-# ---- The startup warm load (2026-09-25) ---------------------------------------------------------
+# ---- Following the last build: the startup load and a follower's tick (zero-downtime U3) --------
 
 
 @contextmanager
-def _warm_client(ages, rows=None, *, raises=()):
-    """bq_client for `warm_caches_from_last_build`: `ages` maps a table to how long ago it was
-    built (absent: NotFound), `rows` maps a query to its rows, and a query in `raises` fails."""
+def _warm_client(ages, rows=None, *, raises=(), not_found=(), lookups=None):
+    """bq_client for `follow_last_build`: `ages` maps a table to how long ago it was built (absent:
+    NotFound) and is read at CALL time, so a test moves a table by editing the dict; `rows` maps a
+    query to its rows, a query in `raises` fails and one in `not_found` reads a missing table.
+    `metadata` records every `get_table` and `timeouts` the timeout each was given.
+
+    The per-pod lookups are replaced by `lookups` (none by default) -- the real ones would load the
+    stop picker into `varsel` -- and line modes are held fresh, so nothing here reaches Journey
+    Planner."""
     import journey_status
+    import line_modes
 
     now = datetime.now(UTC)
 
@@ -1416,8 +1423,12 @@ def _warm_client(ages, rows=None, *, raises=()):
     class _Client:
         def __init__(self):
             self.queries: list[str] = []
+            self.metadata: list[str] = []
+            self.timeouts: list[float | None] = []
 
-        def get_table(self, ref):
+        def get_table(self, ref, timeout=None):
+            self.metadata.append(ref)
+            self.timeouts.append(timeout)
             if ref not in ages:
                 raise main.NotFound("not there")
             return _Table(now - ages[ref])
@@ -1427,6 +1438,8 @@ def _warm_client(ages, rows=None, *, raises=()):
 
             class _Job:
                 def result(self_inner, timeout=None):
+                    if sql in not_found:
+                        raise main.NotFound("Not found: Table")
                     if sql in raises:
                         raise RuntimeError("Unrecognized name: a column the old table lacks")
                     return list((rows or {}).get(sql, []))
@@ -1437,17 +1450,23 @@ def _warm_client(ages, rows=None, *, raises=()):
         "bq_client", "_disruptions_cache", "_disruptions_refreshed_at", "_call_pred_by_key",
         "_call_pred_by_jkey_index", "_call_pred_by_situation", "_call_pred_by_stop_ref",
         "_call_pred_refreshed_at", "_planned_refreshed_at", "_rail_calls_refreshed_at",
+        "_FOLLOWED_LOOKUPS", "_lookups_built",
     )
     saved = {name: getattr(main, name) for name in names}
+    saved_modes = line_modes._fetched_at
     main.bq_client = client = _Client()
     main._disruptions_refreshed_at = main._call_pred_refreshed_at = None
     main._planned_refreshed_at = main._rail_calls_refreshed_at = None
+    main._FOLLOWED_LOOKUPS = lookups or {}
+    main._lookups_built = {}
+    line_modes._fetched_at = now
     journey_status.reset_state()
     try:
         yield client, now
     finally:
         for name, value in saved.items():
             setattr(main, name, value)
+        line_modes._fetched_at = saved_modes
         journey_status.reset_state()
 
 
@@ -1457,6 +1476,15 @@ _ALL_FRESH = {
     "disruptions.call_predictions_today": _TWO_MIN,
     "disruptions.rail_calls_planned_today": _TWO_MIN,
     "disruptions.rail_calls_today": _TWO_MIN,
+}
+# Every table a follower tick asks the modified time of, once per tick and nothing more.
+_FOLLOWED_TABLES = {
+    "disruptions.predictions_today",
+    "disruptions.call_predictions_today",
+    "disruptions.call_predictions_bus_today",
+    "disruptions.rail_calls_planned_today",
+    "disruptions.rail_calls_removed_today",
+    "disruptions.rail_calls_today",
 }
 
 
@@ -1475,7 +1503,7 @@ def test_a_new_process_serves_the_tables_the_last_one_built_stamped_with_their_a
         ],
     }
     with _warm_client(_ALL_FRESH, rows) as (_client, now):
-        main.warm_caches_from_last_build()
+        main.follow_last_build()
         built = now - _TWO_MIN
         assert main._varsel_refreshed_at() == built, "the pull read answers, stamped with the table"
         assert set(main._impact_snapshot()[0]) == {"S1"}
@@ -1490,35 +1518,492 @@ def test_a_new_process_serves_the_tables_the_last_one_built_stamped_with_their_a
         assert journey_status.spine_refreshed_at() == now
 
 
-def test_a_missing_stale_or_unreadable_table_leaves_only_its_own_cache_cold():
+def test_a_missing_or_unreadable_table_leaves_only_its_own_cache_cold_and_age_is_no_bar():
     """Each load stands alone, and none can fail the lifespan (which would fail readiness and roll
-    the release back): the cold cache it leaves is what every start had before."""
+    the release back). And no age bound (KTD6): a live leader on a quiet night leaves tables older
+    than ten minutes, and a follower that refused them would serve 503 beside a healthy leader."""
     import journey_status
 
     ages = {
         # predictions_today absent: a first deploy.
-        "disruptions.call_predictions_today": main._WARM_PREDICTIONS_MAX_AGE + timedelta(minutes=1),
-        "disruptions.rail_calls_planned_today": timedelta(minutes=50),  # inside its hourly TTL
+        "disruptions.call_predictions_today": timedelta(minutes=11),
+        "disruptions.rail_calls_planned_today": timedelta(minutes=50),
         "disruptions.rail_calls_today": _TWO_MIN,
     }
     with _warm_client(
         ages, {main._JOURNEY_STATUS_SPINE_QUERY: [_planned_row()]},
         raises={main._JOURNEY_STATUS_ACTUALS_QUERY},
     ) as (client, now):
-        main.warm_caches_from_last_build()
+        result = main.follow_last_build()
         assert main._disruptions_refreshed_at is None
-        assert main._varsel_refreshed_at() is None, "a stale snapshot is a 503, not an old answer"
+        assert main._varsel_refreshed_at() == now - timedelta(minutes=11), "loaded, and says how old"
         assert journey_status.spine_refreshed_at() == now - timedelta(minutes=50)
         assert journey_status.actuals_refreshed_at() is None
-        assert client.queries == [main._JOURNEY_STATUS_SPINE_QUERY, main._JOURNEY_STATUS_ACTUALS_QUERY]
+        assert client.queries == [
+            main._CALL_PREDICTIONS_QUERY, main._CALL_PREDICTIONS_BUS_QUERY,
+            main._JOURNEY_STATUS_SPINE_QUERY, main._JOURNEY_STATUS_ACTUALS_QUERY,
+        ]
+        assert result == {
+            "disruptions": "missing", "call_predictions": "loaded", "spine": "loaded",
+            "actuals": "error",
+        }, result
 
 
-def test_the_warm_load_runs_before_the_poller_starts():
-    """After it, the first cycle's loads could land first and be overwritten by an older table."""
+def test_a_follower_tick_with_nothing_moved_reads_metadata_and_runs_no_query():
+    """R13: a follower's BigQuery cost is the metadata reads, until a table actually moves."""
+    with _warm_client(_ALL_FRESH) as (client, _now):
+        main.follow_last_build()
+        loaded_queries = len(client.queries)
+        client.metadata.clear()
+        result = main.follow_last_build()
+        assert len(client.queries) == loaded_queries, client.queries[loaded_queries:]
+        assert sorted(client.metadata) == sorted(_FOLLOWED_TABLES), client.metadata
+        assert set(result.values()) == {"unchanged"}, result
+        # Bounded: one hung metadata read must not hold the tick past what the lease assumes.
+        assert set(client.timeouts) == {main._POLLER_METADATA_TIMEOUT_S}, client.timeouts
+
+
+def test_a_failed_bus_load_serves_nsb_only_and_retries_rather_than_stamping_the_build():
+    """A bus table that exists but cannot be read: the load serves what it could (NSB-only, the
+    leader's long-standing isolation) and reports "error", so the next tick asks again. Its stamp
+    sits strictly between the last full load's and this build's: a new stamp for new contents, and
+    never the build's own, which the same-build guard would take for a load already done."""
+    ages = dict(_ALL_FRESH)
+    ages["disruptions.call_predictions_today"] = timedelta(minutes=6)
+    ages["disruptions.call_predictions_bus_today"] = timedelta(minutes=5)
+    rows = {main._CALL_PREDICTIONS_QUERY: [_PredRow("j1", "S1", "NSR:StopPlace:1", 1, NOON)]}
+    raises: set[str] = set()
+    with _warm_client(ages, rows, raises=raises) as (client, now):
+        main.follow_last_build()
+        full = main._call_pred_refreshed_at
+        assert full == now - timedelta(minutes=5)
+        ages["disruptions.call_predictions_today"] = timedelta(minutes=1)
+        built = now - timedelta(minutes=1)
+        raises.add(main._CALL_PREDICTIONS_BUS_QUERY)
+        result = main.follow_last_build()
+        assert result["call_predictions"] == "error", result
+        assert set(main._impact_snapshot()[0]) == {"S1"}, "NSB is still served"
+        partial = main._call_pred_refreshed_at
+        assert full < partial < built, (full, partial, built)
+        # The next tick retries the same build: failing again keeps the same stamp (same tables,
+        # same contents), and succeeding stamps the build, after which the guard holds.
+        before = len(client.queries)
+        assert main.follow_last_build()["call_predictions"] == "error"
+        assert client.queries[before:] == [
+            main._CALL_PREDICTIONS_QUERY, main._CALL_PREDICTIONS_BUS_QUERY
+        ], "retried, not skipped as unchanged"
+        assert main._call_pred_refreshed_at == partial
+        raises.clear()
+        assert main.follow_last_build()["call_predictions"] == "loaded"
+        assert main._call_pred_refreshed_at == built
+        assert main.follow_last_build()["call_predictions"] == "unchanged"
+
+
+def test_a_missing_bus_table_is_a_complete_load():
+    """Before the first bus predict the bus table does not exist, and NSB-only is the whole build:
+    stamped with it, not retried on every tick."""
+    with _warm_client(_ALL_FRESH, not_found={main._CALL_PREDICTIONS_BUS_QUERY}) as (_c, now):
+        assert main.follow_last_build()["call_predictions"] == "loaded"
+        assert main._call_pred_refreshed_at == now - _TWO_MIN
+
+
+def test_only_the_bus_table_moving_reloads_call_predictions_stamped_with_it():
+    """A cache built from two tables is stamped with the newer and reloads when EITHER moved."""
+    ages = dict(_ALL_FRESH)
+    ages["disruptions.call_predictions_today"] = timedelta(minutes=3)
+    ages["disruptions.call_predictions_bus_today"] = timedelta(minutes=5)
+    with _warm_client(ages) as (client, now):
+        main.follow_last_build()
+        assert main._call_pred_refreshed_at == now - timedelta(minutes=3)
+        before = len(client.queries)
+        ages["disruptions.call_predictions_bus_today"] = timedelta(minutes=1)
+        result = main.follow_last_build()
+        assert client.queries[before:] == [
+            main._CALL_PREDICTIONS_QUERY, main._CALL_PREDICTIONS_BUS_QUERY
+        ], "only the call-prediction cache reloads"
+        assert main._call_pred_refreshed_at == now - timedelta(minutes=1), "the bus table's time"
+        assert result["call_predictions"] == "loaded" and result["spine"] == "unchanged", result
+
+
+def test_two_loads_whose_source_tables_differ_never_carry_the_same_stamp():
+    """The invariant `impact`'s index guard, the figures cache and the wording key all rest on: a
+    stamp names ONE set of contents. The spine is read from two tables; each move of either is a new
+    load with a strictly newer stamp, and a tick on which neither moved loads nothing."""
+    import journey_status
+
+    ages = {
+        "disruptions.rail_calls_planned_today": timedelta(minutes=10),
+        "disruptions.rail_calls_removed_today": timedelta(minutes=8),
+    }
+    with _warm_client(ages) as (client, now):
+        stamps = []
+        for table, age in (
+            (None, None),
+            ("disruptions.rail_calls_planned_today", timedelta(minutes=6)),
+            ("disruptions.rail_calls_removed_today", timedelta(minutes=4)),
+            (None, None),
+        ):
+            if table:
+                ages[table] = age
+            main.follow_last_build()
+            stamps.append(journey_status.spine_refreshed_at())
+        loads = client.queries.count(main._JOURNEY_STATUS_SPINE_QUERY)
+        assert loads == 3, loads
+        assert stamps == [now - timedelta(minutes=m) for m in (8, 6, 4, 4)], stamps
+
+
+def test_the_leader_stamps_with_the_newer_tables_modified_time_and_translates():
+    """The leader loads through the same function as a follower, so two pods holding one table
+    generation report one `refreshed_at` (R7) -- the load instant the leader used to stamp would
+    differ from every follower's and move backwards under round-robin. Only the leader's load asks
+    for translations (KTD12); a follower still swaps in the operator's own English."""
+    import inspect
+
+    import situation_english
+
+    ages = {
+        "disruptions.call_predictions_today": timedelta(minutes=3),
+        "disruptions.call_predictions_bus_today": timedelta(minutes=1),
+    }
+    asked = []
+    real = situation_english.update
+    situation_english.update = lambda texts, *, translate=True: asked.append(translate)
+    try:
+        with _warm_client(ages) as (_client, now):
+            main.follow_last_build()
+            assert asked == [False], "a follower's load translates nothing"
+            ages["disruptions.call_predictions_today"] = timedelta(seconds=10)
+            assert main._load_from_last_build("call_predictions", leader=True) == "loaded"
+            assert main._call_pred_refreshed_at == now - timedelta(seconds=10)
+            assert asked == [False, True]
+    finally:
+        situation_english.update = real
+    source = inspect.getsource(main._rebuild_all)
+    for name in ("disruptions", "call_predictions", "spine", "actuals"):
+        assert f'_load_from_last_build("{name}", leader=True)' in source, name
+    for bare in ("refresh_disruptions_cache()", "refresh_call_predictions_cache()",
+                 "refresh_planned_spine()", "refresh_rail_actuals()"):
+        assert bare not in source, f"the leader still stamps {bare} with the load instant"
+
+
+def test_a_per_pod_lookup_reloads_only_when_its_table_moved():
+    ages = {"disruptions.some_lookup": timedelta(hours=5)}
+    loads = []
+    lookups = {"some_lookup": (("disruptions.some_lookup",), lambda: loads.append(1) or True)}
+    with _warm_client(ages, lookups=lookups):
+        main.follow_last_build()
+        main.follow_last_build()
+        assert len(loads) == 1
+        ages["disruptions.some_lookup"] = timedelta(minutes=1)
+        assert main.follow_last_build()["some_lookup"] == "loaded"
+        assert len(loads) == 2
+
+
+def test_a_failed_lookup_load_is_retried_next_tick_and_stamped_only_once_it_succeeds():
+    """The stop list's table moves once a day; a follower whose load failed (a sub-query down, the
+    registry unreadable) must not wait for it. A loader that swallows its failure says so by
+    returning False, and a raise counts the same."""
+    ages = {"disruptions.some_lookup": timedelta(hours=5)}
+    answers = [False, RuntimeError("down"), True]
+    calls = []
+
+    def load():
+        calls.append(1)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    with _warm_client(ages, lookups={"some_lookup": (("disruptions.some_lookup",), load)}):
+        outcomes = [main.follow_last_build()["some_lookup"] for _ in range(4)]
+        assert outcomes == ["error", "error", "loaded", "unchanged"], outcomes
+        assert len(calls) == 3, "retried every tick until it succeeded, then not again"
+        assert "some_lookup" in main._lookups_built
+
+
+def test_the_follower_lookups_are_the_per_pod_load_set():
+    """KTD6's list; the rush hydrate is `_rush_hydrate`'s (day-keyed, below). Line modes have no
+    table and keep their own 24 h TTL, so they are asked on every tick and not listed here."""
+    import inspect
+
+    assert set(main._FOLLOWED_LOOKUPS) == {"impact_lookup", "svv_baselines", "varsel_stops"}
+    # Every call, un-gated by any table: main hands the hook over and the mechanism calls it.
+    import poller_follow
+
+    assert "refresh_line_modes=refresh_line_modes" in inspect.getsource(main.follow_last_build)
+    assert "refresh_line_modes()" in inspect.getsource(poller_follow.follow_last_build)
+    # A follower's stop list publishes the aliases and rewrites no stored registration.
+    asked = []
+    real = main.refresh_varsel_stops
+    main.refresh_varsel_stops = lambda **kw: asked.append(kw) or True
+    try:
+        main._FOLLOWED_LOOKUPS["varsel_stops"][1]()
+    finally:
+        main.refresh_varsel_stops = real
+    assert asked == [{"heal_registrations": False}], asked
+    assert "refresh_varsel_stops()" in inspect.getsource(main._rebuild_all), "the leader heals"
+
+
+def test_line_modes_refresh_on_a_follower_after_the_ttl_and_not_before():
+    import alternatives
+    import line_modes
+
+    asked = []
+
+    def post(url, payload, headers):
+        asked.append(payload["query"])
+        return {"data": {"lines": [{"id": "RUT:Line:5", "transportMode": "metro"}]}}
+
+    real = alternatives._post_json
+    alternatives._post_json = post
+    try:
+        with _warm_client({}) as (_client, now):
+            line_modes._fetched_at = now - line_modes.TTL + timedelta(minutes=1)
+            main.follow_last_build()
+            assert asked == [], "inside the TTL"
+            line_modes._fetched_at = now - line_modes.TTL - timedelta(seconds=1)
+            main.follow_last_build()
+            assert len(asked) == 1, "past the TTL"
+    finally:
+        alternatives._post_json = real
+        line_modes.reset()
+
+
+def test_the_lifespan_runs_the_follower_load_set_before_the_poller_starts():
+    """After it, the first cycle's loads could land first and be overwritten by an older table; and
+    a pod must answer every route, not only the two `/ready` checks, before it is Ready (KTD6). The
+    lookups are no longer called on their own in the lifespan: `follow_last_build` is the one place,
+    or the first follower tick would load each of them a second time."""
     import inspect
 
     source = inspect.getsource(main.lifespan)
-    assert source.index("warm_caches_from_last_build()") < source.index("thread.start()")
+    assert source.index("follow_last_build()") < source.index("thread.start()")
+    assert source.index("varsel.load_state()") < source.index("follow_last_build()")
+    assert source.index("reisevalg.configure(") < source.index("follow_last_build()")
+    for direct in ("refresh_impact_lookup()", "refresh_varsel_stops()", "refresh_baselines()"):
+        assert direct not in source, direct
+
+
+class _StrictRow:
+    """A row carrying ONLY the given columns (all None). Anything else raises AttributeError, as a
+    BigQuery row from an older leader's table would."""
+
+    def __init__(self, columns):
+        self._columns = set(columns)
+
+    def __getattr__(self, name):
+        if name not in self.__dict__.get("_columns", ()):
+            raise AttributeError(name)
+
+
+# Read as `r.<col>` (strictly) by the row readers as of 2026-10-13. A column added to a prediction
+# table after that date must be read with getattr and a default (KTD13), because a new follower can
+# load a table the old leader built; adding it to these lists instead is the mistake to avoid.
+_CALL_PRED_COLUMNS_2026_10_13 = (
+    "situationNumber", "summary", "description", "jkey", "lineRef", "stop_place", "stop_name",
+    "stop_order", "aimed_dep", "aimed_arr", "et_declared_cancelled", "et_dep_delay_min",
+    "call_source", "p_cancel", "dep_delay_typ_min", "dep_delay_p90_min", "arr_delay_typ_min",
+    "arr_delay_p90_min", "p_arr_ge10", "p_arr_ge20", "arr_delay_p50_stack_min",
+    "arr_delay_p90_stack_min", "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
+    "dep_delay_p90_stack_min", "p_impact_dep",
+)
+_DISRUPTION_COLUMNS_2026_10_13 = (
+    "situationNumber", "summary", "description", "category", "onset_ts", "reopen_ts",
+    "num_affected_stops", "declared_window_min", "pred_reopen_min", "reopen_p50_min",
+    "reopen_p80_min", "reopen_p90_min", "pred_impact_min", "impact_p50_min", "impact_p80_min",
+    "impact_p90_min",
+)
+
+
+def test_a_prediction_row_from_an_older_leader_loads_with_defaults():
+    """KTD13's rollout contract on the reading side. A guard, not a red: no column has been added
+    since 2026-10-13, so this passes today and fails the day a reader adds `r.new_column`."""
+    pred = main._call_pred_from_row(_StrictRow(_CALL_PRED_COLUMNS_2026_10_13), "VYG")
+    assert pred.has_situation is True and pred.report_type is None and pred.boarding_allowed is True
+    cached = main._row_to_cached(_StrictRow(_DISRUPTION_COLUMNS_2026_10_13))
+    assert cached.num_affected_stops == 0
+
+
+
+# ---- The lease gates the loop (zero-downtime U2, KTD2/KTD4) ---------------------------------------
+#
+# Pinned off the SOURCE before the loop body moved (the plan's execution note): a later edit that
+# slid a writer above its check, or the probe above the lease tick, would still pass every
+# behavioural test that happens not to lose the lease at exactly that line.
+
+
+def test_the_loop_ticks_the_lease_before_it_reads_anything_and_branches_on_it():
+    import inspect
+
+    source = inspect.getsource(main.poll_for_changes)
+    poll = source[source.index("while True:") :]  # the body; the docstring names the probe too
+    tick = poll.index("_poller_lease.tick()")
+    held = poll.index("_poller_lease.held()")
+    assert tick < held < poll.index("get_last_ingestion_time()") < poll.index("on_change(current)")
+    # The follower branch is decided by the same answer and leaves the iteration before the probe.
+    follow = poll.index("follow_last_build()")
+    assert held < follow < poll.index("continue", follow) < poll.index("get_last_ingestion_time()")
+
+
+def test_every_tick_writer_is_behind_its_own_lease_check():
+    """KTD2: the four tick writers are leader-only, each checked at its own boundary, so a leader
+    demoted between two of them runs none of the rest."""
+    import inspect
+
+    source = inspect.getsource(main.poll_for_changes)
+    poll = source[source.index("while True:") :]
+    writers = (
+        "togvarsel.refresh()",
+        "togvarsel_notify.evaluate()",
+        "togvarsel_outcomes.refresh()",
+        "decisions.check_labelling_freshness()",
+    )
+    previous = poll.index("on_change(current)")
+    for writer in writers:
+        at = poll.index(writer)
+        check = poll.rindex("_fence(", 0, at)
+        assert previous < check < at, f"{writer} has no lease check of its own before it"
+        previous = at
+
+
+def test_the_phase_checks_the_lease_before_it_times_anything():
+    """One call at the top of `_phase`, so a phase added later cannot forget it, and before the
+    clock starts, so a skipped phase emits no record, no metric and no beat."""
+    import inspect
+
+    source = inspect.getsource(main._phase)
+    assert source.index("_fence(name)") < source.index("started = monotonic()")
+    assert source.index("_fence(name)") < source.index("try:")
+
+
+def test_a_fenced_cycle_is_caught_once_before_it_stamps_freshness():
+    import inspect
+
+    source = inspect.getsource(main._on_ingestion_change)
+    assert source.index("except _PollerFenced") < source.index("metrics.POLLER_LAST_CYCLE.set(")
+    assert issubclass(main._PollerFenced, BaseException)
+    assert not issubclass(main._PollerFenced, Exception), "a per-step except would swallow it"
+
+# ---- the rush hydrate (zero-downtime U4, KTD8) ------------------------------------------------
+
+
+@contextmanager
+def _rush(ages, *, notify=False, load=None):
+    """`_rush_hydrate` against `_warm_client`'s tables, with `togvarsel.load_issued` recorded (or
+    replaced by `load`) and the station fetch reaching a counting fake through the REAL
+    `station_set`. `evaluate` raises if anything reaches it: the hydrate is read-only."""
+    loaded: list = []
+    station_queries: list[str] = []
+
+    class _StationsBQ:
+        def query(self, sql, *a, **k):
+            station_queries.append(sql)
+
+            class _Job:
+                def result(self_inner, timeout=None):
+                    return [{"stop_place": "NSR:StopPlace:337"}]
+
+            return _Job()
+
+    def evaluate(*a, **k):
+        raise AssertionError("the hydrate must never evaluate a round")
+
+    tv, tvn = main.togvarsel, main.togvarsel_notify
+    saved = (tv.load_issued, tvn.evaluate, tvn._bq_client, dict(tvn._station_state),
+             main._rush_loaded, main._togvarsel_notify_enabled, main.varsel.push_enabled)
+    tv.load_issued = load or (lambda d: loaded.append(d) or True)
+    tvn.evaluate = evaluate
+    tvn._bq_client = _StationsBQ()
+    tvn._station_state.clear()
+    main._rush_loaded = None
+    main._togvarsel_notify_enabled = lambda: notify
+    main.varsel.push_enabled = lambda: notify
+    try:
+        with _warm_client(ages):
+            yield loaded, station_queries
+    finally:
+        (tv.load_issued, tvn.evaluate, tvn._bq_client, state, main._rush_loaded,
+         main._togvarsel_notify_enabled, main.varsel.push_enabled) = saved
+        tvn._station_state.clear()
+        tvn._station_state.update(state)
+
+
+def _oslo(day: int, hour: int = 7):
+    from zoneinfo import ZoneInfo
+
+    return datetime(2026, 8, day, hour, 10, tzinfo=ZoneInfo("Europe/Oslo"))
+
+
+def test_the_rush_hydrate_reloads_when_a_table_moves_or_the_oslo_day_turns():
+    """A follower's tick costs a metadata read while nothing moved (R13). The day turning is a
+    reload on its own: `load_issued` is per Oslo day, and the issued table need not move at
+    midnight for yesterday's forecasts to stop being today's."""
+    from datetime import date
+
+    ages = {"disruptions.togvarsel_issued": timedelta(hours=2)}
+    with _rush(ages) as (loaded, _q):
+        main._rush_hydrate(now=_oslo(30))
+        main._rush_hydrate(now=_oslo(30))
+        assert loaded == [date(2026, 8, 30)], loaded
+        ages["disruptions.togvarsel_issued"] = timedelta(minutes=1)  # the leader recorded
+        main._rush_hydrate(now=_oslo(30))
+        assert len(loaded) == 2
+        main._rush_hydrate(now=_oslo(31, hour=0))
+        assert loaded[-1] == date(2026, 8, 31) and len(loaded) == 3
+        main._rush_hydrate(now=_oslo(31), force=True)  # on_acquire: whatever the stamp says
+        assert len(loaded) == 4
+
+
+def test_a_failed_rush_load_is_retried_next_tick_and_never_raises():
+    """`_on_lease_acquired` calls this too, and an acquisition must not fail on it: a new leader
+    with stale rush state still reads the table back after its first recorded issue."""
+    answers = [RuntimeError("bigquery down"), True]
+
+    def load(d):
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    with _rush({"disruptions.togvarsel_issued": timedelta(hours=2)}, load=load):
+        main._rush_hydrate(now=_oslo(31))
+        assert main._rush_loaded is None, "unstamped after a failure"
+        main._rush_hydrate(now=_oslo(31))
+        assert main._rush_loaded is not None and answers == []
+
+
+def test_no_rush_table_means_no_rush_query():
+    with _rush({}) as (loaded, _q):
+        main._rush_hydrate(now=_oslo(31))
+    assert loaded == []
+
+
+def test_the_station_set_is_read_once_per_oslo_day_on_any_pod_and_only_behind_the_gates():
+    """The rush outlook reads the station cache and never queries, so every pod warms it — once
+    per Oslo day — behind the same two gates `_evaluate` passes before it fetches (the delivery
+    flag and VAPID), and without ever evaluating a round."""
+    import togvarsel_notify
+
+    with _rush({}, notify=False) as (_loaded, queries):
+        main._rush_hydrate(now=_oslo(31))
+        assert queries == [] and togvarsel_notify.cached_station_set(_oslo(31)) is None
+    with _rush({}, notify=True) as (_loaded, queries):
+        for hour in (7, 8, 9):
+            main._rush_hydrate(now=_oslo(31, hour=hour))
+        assert len(queries) == 1
+        assert togvarsel_notify.cached_station_set(_oslo(31)) == {"NSR:StopPlace:337"}
+        main._rush_hydrate(now=_oslo(31, hour=23).replace(day=31) + timedelta(hours=2))
+        assert len(queries) == 2, "the next Oslo day fetches again"
+
+
+def test_the_lifespan_hydrates_and_the_notify_chain_is_wired_to_the_store_and_the_lease():
+    import inspect
+
+    lifespan = inspect.getsource(main.lifespan)
+    follow = lifespan.index("    follow_last_build()")
+    assert lifespan.index("    _rush_hydrate()", follow) > follow, "before the port binds"
+    assert "should_continue=_still_leading" in lifespan
+    assert "device_journeys=varsel.device_journeys" in lifespan
 
 
 

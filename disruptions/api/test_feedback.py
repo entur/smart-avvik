@@ -279,6 +279,137 @@ def test_rushvarsel_feedback_is_its_own_event_and_rides_the_receipt_into_a_revis
         assert captured[-2:] == [event, event], (source, captured)
 
 
+def _store_backed(monkeypatch, store, persisted, captured):
+    """A pod under the store backend with no memory of any rendering, persist and capture counted."""
+    from test_feedback_contexts import _fresh_process
+
+    _fresh_process(store)
+    monkeypatch.setattr(feedback, "enabled", lambda: True)
+    monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
+    monkeypatch.setattr(
+        feedback.feedback_contexts,
+        "persist",
+        lambda context_id, **kwargs: (persisted.append(context_id) or True, None),
+    )
+    monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.append(body.response_id))
+    monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
+
+
+def test_a_first_tap_retried_against_another_pod_captures_once(monkeypatch):
+    """AE8: the card was rendered on pod A, the tap lands on pod B and is accepted; the same tap
+    retried on a third pod -- no memory of either -- captures nothing more."""
+    from test_feedback_contexts import FakeStore, _fresh_process
+
+    store = FakeStore()
+    _fresh_process(store)
+    context_id = feedback.feedback_contexts.mint({"display_source": "llm"}, device_id="device-1")
+    persisted, captured = [], []
+    try:
+        _store_backed(monkeypatch, store, persisted, captured)
+        tap = _body(context_id=context_id)
+        assert feedback.submit(tap, environment="dev")["status"] == "saved"
+        _fresh_process(store)
+        # Idempotent, not throttled: the retry is what a lost response looks like, and a receipt
+        # is what the traveller's next revision needs.
+        retried = feedback.submit(tap, environment="dev")
+        assert retried["status"] == "saved" and retried["revision"] == 1, retried
+        assert feedback._verify(retried["receipt"], tap.response_id, context_id) is not None
+        assert len(captured) == 1 and len(persisted) == 1
+        revised = _body(
+            context_id=context_id,
+            response_id=str(tap.response_id),
+            revision=2,
+            receipt=retried["receipt"],
+        )
+        assert feedback.submit(revised, environment="dev")["status"] == "saved"
+        assert len(captured) == 2 and len(persisted) == 1
+    finally:
+        feedback.feedback_contexts._reset_for_tests()
+
+
+def test_two_travellers_on_one_shared_rush_context_are_each_captured_once(monkeypatch):
+    from test_feedback_contexts import FakeStore, _fresh_process
+
+    store = FakeStore()
+    _fresh_process(store)
+    context_id = feedback.feedback_contexts.mint({"display_source": "togvarsel"})
+    persisted, captured = [], []
+    try:
+        _store_backed(monkeypatch, store, persisted, captured)
+        first, second = _body(context_id=context_id), _body(context_id=context_id)
+        assert feedback.submit(first, environment="dev")["status"] == "saved"
+        assert feedback.submit(second, environment="dev")["status"] == "saved"
+        assert feedback.submit(first, environment="dev")["status"] == "saved"
+        assert captured == [first.response_id, second.response_id]
+    finally:
+        feedback.feedback_contexts._reset_for_tests()
+
+
+def test_a_tap_that_failed_downstream_can_be_retried(monkeypatch):
+    """Both front-ends retry `downstream` with the SAME response id, so the claim a failed attempt
+    took must be handed back -- or one PostHog blip locks the traveller out of the card for good."""
+    from test_feedback_contexts import FakeStore, _fresh_process
+
+    store = FakeStore()
+    _fresh_process(store)
+    context_id = feedback.feedback_contexts.mint({"display_source": "llm"}, device_id="device-1")
+    persisted, captured = [], []
+    try:
+        _store_backed(monkeypatch, store, persisted, captured)
+        tap = _body(context_id=context_id)
+        monkeypatch.setattr(
+            feedback, "_capture", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("posthog"))
+        )
+        assert feedback.submit(tap, environment="dev") == {"status": "downstream"}
+        monkeypatch.setattr(
+            feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (False, "downstream")
+        )
+        assert feedback.submit(tap, environment="dev") == {"status": "downstream"}
+        monkeypatch.setattr(
+            feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (True, None)
+        )
+        monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.append(body.response_id))
+        assert feedback.submit(tap, environment="dev")["status"] == "saved"
+        assert captured == [tap.response_id]
+    finally:
+        feedback.feedback_contexts._reset_for_tests()
+
+
+def test_an_erased_context_answers_expired_on_every_pod(monkeypatch):
+    from test_feedback_contexts import FakeStore, _fresh_process
+
+    store = FakeStore()
+    _fresh_process(store)
+    context_id = feedback.feedback_contexts.mint({"display_source": "llm"}, device_id="device-1")
+    persisted, captured = [], []
+    try:
+        _store_backed(monkeypatch, store, persisted, captured)
+        store.erase("device-1")
+        assert feedback.submit(_body(context_id=context_id), environment="dev") == {"status": "expired"}
+        assert captured == [] and persisted == []
+    finally:
+        feedback.feedback_contexts._reset_for_tests()
+
+
+def test_a_store_blip_on_a_first_tap_is_retryable_not_expired(monkeypatch):
+    from test_feedback_contexts import FakeStore, _fresh_process
+
+    store = FakeStore()
+    _fresh_process(store)
+    context_id = feedback.feedback_contexts.mint({"display_source": "llm"}, device_id="device-1")
+    persisted, captured = [], []
+    try:
+        _store_backed(monkeypatch, store, persisted, captured)
+        store.fail_reads = True
+        tap = _body(context_id=context_id)
+        assert feedback.submit(tap, environment="dev") == {"status": "downstream"}
+        assert captured == [] and persisted == []
+        store.fail_reads = False
+        assert feedback.submit(tap, environment="dev")["status"] == "saved"
+    finally:
+        feedback.feedback_contexts._reset_for_tests()
+
+
 class _MonkeyPatch:
     """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
 

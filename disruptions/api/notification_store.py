@@ -107,11 +107,33 @@ ROUNDS = "togvarsel_rounds"
 #: The one document's id. Fixed rather than the Oslo date, which is the obvious alternative and
 #: would accumulate a document per day forever in a collection that has no TTL to clear them.
 ROUNDS_DOC = "current"
+#: WHICH POD RUNS THE POLLER (zero-downtime KTD3). One document, `poller_lease/current`, holding
+#: `holder`, `token`, `acquired_at` and `held_until`. Not in :data:`COLLECTIONS` and WITHOUT a TTL
+#: field, for :data:`ROUNDS`' reason: it holds exactly one document, rewritten in place, and
+#: `held_until` is a deadline the bodies compare rather than a retention horizon -- a TTL could
+#: only delete the live copy. Chosen over a Kubernetes Lease (the namespace has no RoleBinding for
+#: the app's service account) and over a GCS generation-match object (a second store to reason
+#: about). The shape is ADDITIVE-ONLY across releases (KTD13): two binaries share it during every
+#: rollout, so every write keeps the fields it does not know and a reader treats new ones as
+#: optional.
+POLLER_LEASE = "poller_lease"
+POLLER_LEASE_DOC = "current"
+#: The feedback widget's display snapshots (zero-downtime U6, KTD10), one document per context id,
+#: so a first tap resolves on whichever pod the load balancer picks rather than only on the pod
+#: that rendered the card. IN :data:`COLLECTIONS`, unlike the three above, because it is the
+#: opposite case: many short-lived documents nobody rewrites, each holding a traveller's route and
+#: typed names for a render nobody may ever tap -- exactly what a TTL is for. `expires_at` is the
+#: 15-minute display lease and doubles as the TTL, so retention is the lease plus TTL's ~24 h lag;
+#: an ERASED device's contexts go at once, in `_erase_device_body`. The body is `snapshot` (the
+#: canonical JSON as one string -- Firestore refuses nested arrays, and a string comes back byte for
+#: byte), `device_id` and `journey_id` (both absent for the rush card, which carries no route) and
+#: `claims`, a map of response id to the instant its first tap was accepted.
+FEEDBACK_CONTEXTS = "feedback_contexts"
 
-COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES)
+COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS)
 
-# Firestore allows exactly ONE TTL field per collection group, so all four groups use the same
-# field name: the Terraform resource is then one repeated block rather than four bespoke ones, and
+# Firestore allows exactly ONE TTL field per collection group, so every group in `COLLECTIONS`
+# uses the same field name: the Terraform resource is then one repeated block rather than a bespoke one per group, and
 # `_not_expired` is one function every read path can call without knowing which collection it is
 # looking at. Note the field's meaning is retention, never validity -- an event's usable life is
 # `valid_until`, 60 minutes, and deleting on that would destroy the seven-day history.
@@ -215,8 +237,11 @@ MIRROR_FIELD = "mirror_updated_at"
 # Pending events per destination. Enforced with a bounded count BEFORE the emit transaction rather
 # than inside it, which is exact rather than best-effort for one reason that is nameable instead of
 # hoped for: the EMIT path has exactly one writer (KTD6 -- one poller thread, no route invokes the
-# pass, one replica under the Recreate strategy), so nothing can create a pending event between the
-# count and the commit. Emit, precisely: U11 moved DELIVERY to its own Deployment, and the ledger's
+# pass, and only the pod holding the poller lease runs the cycle: one LEADER per leadership term,
+# not one replica), so nothing can create a pending event between the count and the commit. The
+# exactness holds per term; at a handoff at most `_EMIT_WORKERS` abandoned, idempotent commits of
+# the old leader can land, which is why shutdown and lease loss wait for the pass lock first.
+# Emit, precisely: U11 moved DELIVERY to its own Deployment, and the ledger's
 # figure then goes stale HIGH inside a pass -- the worker resolves pending deliveries this process
 # does not hear about -- so it refuses earlier than it needs to, which is the conservative
 # direction. What would break the exactness is a second EMITTER, which is why there is not one.
@@ -289,6 +314,23 @@ RETRY_AFTER_CAP_S = 300
 # workers POSTing the same event. They have different owners, different documents and different
 # failure modes.
 DELIVERY_LEASE_S = 20.0
+# HOW LONG THE POLLER LEASE OUTLIVES ITS HOLDER'S LAST HEARTBEAT (zero-downtime KTD4). The lease is
+# an EXTENSION OF THE LAST HEARTBEAT, never of the renewal: every renewal writes `held_until` as the
+# heartbeat's wall instant plus this, so however many renewals a wedged leader's timer still makes,
+# the lease lapses exactly 300 s after it last made progress. Three inequalities fix the number,
+# and `test_the_poller_lease_ttl_satisfies_ktd4` pins them as numbers:
+#
+# * the renewal gate (renew only while the heartbeat is younger than 250 s) plus the local margin
+#   (30 s, for clock skew and the store's wait) is 280 s, UNDER the TTL -- so a healthy leader
+#   never believes it holds a lease the store already considers lapsed;
+# * the TTL is ABOVE the longest beat-less wait (240 s, one BigQuery call), so a healthy leader
+#   inside its slowest query keeps the lease;
+# * the TTL is UNDER `HEALTH_STALE_AFTER_S` (600 s), so a wedged leader's lease is free before
+#   liveness would restart it, and a Ready follower takes over first (R5).
+#
+# Distinct from `DELIVERY_LEASE_S` above: that one is a hold on one DELIVERY between two webhook
+# workers, this one is a hold on the whole poller cycle between pods.
+POLLER_LEASE_S = 300.0
 # HOW LONG A RESERVED CAP SLOT SURVIVES UNCONFIRMED, and this number is the whole of the scheme's
 # crash safety. `claim_delivery` reserves a slot, the terminal writes confirm or release it, and a
 # process that dies in between leaves a reservation nobody will ever report on. A reservation that
@@ -488,15 +530,21 @@ def _mirror_stamp() -> Any:
 #: because the conclusion flipped.** It read: the cycle cannot use the mirror's copy of `notified`
 #: or `pushed_trains`, so those reads go to the store, per push. That followed from the mirror being
 #: watermark-synced and is right about a watermark -- and wrong about the mirror, because a
-#: watermark is not the only way a mirror can learn. A `/varsel` registration has exactly ONE
-#: writer: the request path and the poller are one process, one replica under Recreate, and the
-#: delivery worker writes webhook deliveries only. So every commit passes through this process and
-#: is applied to the mirror from its own RESULT -- `SubjectMirror`'s arrangement, one collection
+#: watermark is not the only way a mirror can learn. A `/varsel` registration HAD exactly ONE
+#: writer: the request path and the poller were one process on one pod, and the delivery worker
+#: writes webhook deliveries only (narrowed by the paragraph below: one writer per LEADER now). So
+#: every commit THIS process makes is applied to its mirror from its own RESULT -- `SubjectMirror`'s arrangement, one collection
 #: along -- which makes the mirror's copy exact rather than approximate and costs no read at all.
 #: What the superseded reading would have cost is a document read per registration per cycle, which
 #: at the population this plan sizes for is the cycle. See :data:`SUBSCRIPTION_MIRRORING_BODIES`,
 #: which declares the bodies that apply, and `SubscriptionMirror._overtaken`, which is what keeps a
 #: sync that read before a local commit from putting the stale copy back.
+#:
+#: **Since zero-downtime U5 the "one writer" premise holds per LEADER, not per deployment.** Every
+#: pod serves `/varsel`, so a registration can be written by a pod whose commits the leader's mirror
+#: never sees. The mirror stays exact for the leader's own writes and is one cycle late for
+#: another pod's; the per-push reads did come back, but as ONE store read per push, before the
+#: send (`varsel`'s pre-send check), rather than a read per registration per cycle.
 MIRROR_STAMPING_BODIES = (
     "_canonicalize_body",
     "_create_body",
@@ -1110,6 +1158,14 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         equality=("client_id",),
         why="U14's export reads every device of the browser client back into the blob",
     ),
+    QuerySpec(
+        name="device_feedback_contexts",
+        collection=FEEDBACK_CONTEXTS,
+        # One equality and no ordering, so the automatic single-field index on `device_id` serves
+        # it -- which is why that field must never join the exemption list beside `snapshot`.
+        equality=("device_id",),
+        why="«Slett alt» deletes the device's feedback contexts with its journeys (U6)",
+    ),
     # The three cleanup queries filter on `subscription_id` alone, which Firestore's automatic
     # single-field indexes serve -- hence an empty `index_fields` and no entry in
     # firestore.indexes.json. Declared anyway, so "every query in the module is a spec" stays a
@@ -1238,6 +1294,12 @@ class _Refs:
 
     def rounds(self) -> Any:
         return self._client.collection(ROUNDS).document(ROUNDS_DOC)
+
+    def lease(self) -> Any:
+        return self._client.collection(POLLER_LEASE).document(POLLER_LEASE_DOC)
+
+    def feedback_context(self, context_id: str) -> Any:
+        return self._client.collection(FEEDBACK_CONTEXTS).document(context_id)
 
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
@@ -2571,6 +2633,13 @@ class SubscriptionMirror:
         self._entries: dict[str, MirrorEntry] = {}
         self._watermark: datetime | None = None
         self._seeded = False
+        #: A seed has STARTED since the last reset (zero-downtime U5, KTD7). The local apply records
+        #: only from then on: it is the seed's race protection, and a pod that never seeds -- a
+        #: follower, or a leader demoted and reset -- would otherwise grow `_entries` and
+        #: `_local_applied` from its request path's commits for a mirror nothing reads. Cleared only
+        #: by `reset`: a FAILED seed leaves it set on purpose, so the leader retrying it keeps its
+        #: race protection.
+        self._seeding = False
         #: When the last seed or the last COMPLETE sync finished -- what the age bound is measured
         #: from. Never the watermark: that is the newest document's stamp, a property of how recently
         #: anyone wrote a subscription, so on a quiet collection it ages while every sync succeeds.
@@ -2614,6 +2683,7 @@ class SubscriptionMirror:
             self._entries = {}
             self._watermark = None
             self._seeded = False
+            self._seeding = False
             self._synced_at = None
             self._cursor = None
             self._local_applied = {}
@@ -2624,18 +2694,20 @@ class SubscriptionMirror:
         """Record a commit THIS process just made, without waiting for a sync to carry it.
 
         The subscription mirror needs a watermark because a subscription can be written at any time
-        by a caller this process cannot see. That is true of the `webhook` channel's clients and it
-        is NOT true of a `web_push` registration: the request path and the poller are one process,
-        one replica under Recreate, and the delivery worker writes webhook deliveries only -- so
-        every write to a `/varsel` registration passes through here. `SubjectMirror` already rests
-        on exactly that argument (KTD6), and this is the same arrangement one collection along.
+        by a caller this process cannot see. Since zero-downtime U5 that is true of a `web_push`
+        registration too: every pod serves `/varsel`, so a registration is written by whichever pod
+        took the request, and only the lease's LEADER holds a mirror (KTD7). The mirror is the
+        leader's cycle view -- exact for the leader's own writes, which are applied here, and one
+        cycle late for another pod's, which the next sync carries. The push case that lag would
+        open is closed by `varsel`'s pre-send read of the document from the store.
 
         What it buys is not freshness for its own sake. It is what lets the cycle answer three
         questions from memory that would otherwise be a document read per registration per cycle --
         has this situation been pushed, has this train, how many of the day's four are spent -- and
-        it is what makes the two liveness re-checks in the delivery loop exact: a journey deleted
-        mid-cycle is gone from the mirror the instant the delete commits, where a watermark would
-        carry the news at the START OF THE NEXT CYCLE and a push would already have gone out.
+        it is what makes the delivery loop's liveness re-checks exact for the leader's own deletes.
+
+        A no-op until a seed has started (see `_seeding`): on a pod that never seeds there is no
+        race to protect and no reader to serve.
 
         Called on the RESULT of a transaction and never from inside a body, `_mirror_subject`'s rule
         and for its reason: a body may run more than once, so an apply from inside records a state a
@@ -2653,6 +2725,8 @@ class SubscriptionMirror:
             logger.debug("Committed subscription document is unreadable; not mirrored", exc_info=True)
             return
         with self._lock:
+            if not (self._seeding or self._seeded):
+                return
             self._local_applied[entry.subscription_id] = monotonic()
             if entry.liveness.get("status") != "active":
                 self._entries.pop(entry.subscription_id, None)
@@ -2668,6 +2742,8 @@ class SubscriptionMirror:
         about a traveller who pressed «Slett alt».
         """
         with self._lock:
+            if not (self._seeding or self._seeded):
+                return
             instant = monotonic()
             for subscription_id in subscription_ids:
                 self._local_applied[subscription_id] = instant
@@ -2758,7 +2834,10 @@ class SubscriptionMirror:
         pages = skipped = 0
         # Before the first read, and compared against at the swap: a re-seed pages for minutes, and
         # every registration a traveller creates or deletes inside that window is a commit this
-        # process has already applied. See :meth:`_overtaken`.
+        # process has already applied. See :meth:`_overtaken`. `_seeding` is set first, so the
+        # local apply records from before the read begins (zero-downtime U5).
+        with self._lock:
+            self._seeding = True
         started = monotonic()
         while True:
             query = _query("mirror_seed", limit=MIRROR_PAGE_SIZE, start_after=cursor)
@@ -2930,9 +3009,12 @@ class SubscriptionMirror:
 #
 # **Kept current by the poller's own commits, not by a watermark.** The subscription mirror needs a
 # watermark because clients write subscriptions through the API at any time. Subject documents have
-# exactly one writer -- KTD6's single writer: one poller thread, no route invokes the pass, one
-# replica under Recreate -- so every change to a subject passes through this process, and applying
-# it in memory is both cheaper and stronger than re-reading it. **Re-checked at U11, and it holds
+# exactly one writer -- KTD6's single writer: one poller thread, no route invokes the pass, and only
+# the pod holding the poller lease runs the cycle -- so every change to a subject passes through
+# this process, and applying it in memory is both cheaper and stronger than re-reading it. Since the
+# zero-downtime work that is one LEADER per leadership term: the mirror is seeded on acquisition and
+# reset on loss (`main._on_lease_acquired` / `poller_handover.on_lease_lost`), and loss waits for
+# the emit pass to drain before the reset, so the copy is exact per term. **Re-checked at U11, and it holds
 # -- with the sentence narrowed.** Delivery now runs in `webhook_worker`, so what a second process
 # writes to a subject is `delivered_revision`, `delivered_at` and `pending_delivery_id`; none of the
 # three is in the standing set, which carries the phase and the below-threshold run only, and
@@ -3135,9 +3217,19 @@ def subject_mirror() -> SubjectMirror:
     return _subject_mirror
 
 
-def reset_mirrors_for_tests() -> None:
+def reset_mirrors() -> None:
+    """Forget both mirrors; the next :func:`sync_mirrors` seeds both from the store.
+
+    The poller lease's (zero-downtime U2, KTD7): the mirrors are the LEADER's, so a pod resets them
+    when it loses the lease and again when it acquires, before seeding. A sync would not do on
+    acquisition -- push marks do not stamp the watermark, so an incremental sync would miss every
+    train the interim leader pushed and this pod would offer them again.
+    """
     _subscription_mirror.reset()
     _subject_mirror.reset()
+
+
+reset_mirrors_for_tests = reset_mirrors
 
 
 def sync_mirrors(
@@ -3198,10 +3290,11 @@ SUBJECT_WRITERS_OUTSIDE_THE_MIRROR = frozenset({"_sent_body"})
 #: registrations would be a hundred thousand documents through the watermark query -- and U12
 #: therefore recorded that the cycle must read those marks from the store, per push. That reading
 #: costs a document read per registration per cycle at exactly the scale the plan sizes for. The
-#: cheaper and STRONGER answer is `SubjectMirror`'s: a `/varsel` registration has one writer -- the
-#: request path and the poller are one process, one replica under Recreate, and the delivery worker
-#: writes webhook deliveries only -- so every commit passes through here and can be applied from
-#: its own result.
+#: cheaper answer is `SubjectMirror`'s: every commit THIS process makes is applied from its own
+#: result. Since zero-downtime U5 that makes the mirror the leader's cycle view -- exact for the
+#: leader's own writes, one cycle late for a registration another pod wrote -- and `varsel`'s
+#: pre-send read of the document (one per push, outside `_state_lock`) closes the push case the lag
+#: would open: a journey deleted, or a train marked, on another pod is refused before the send.
 #:
 #: Every body that changes a field the cycle reads back is in the set, not only the two mark
 #: bodies: a create, a delete and a servability stamp are all things the cycle must see WITHIN the
@@ -3685,6 +3778,11 @@ def get_device(device_id: str) -> Device | None:
 #: is a loop: the alternative is a transaction that cannot commit at all, i.e. a traveller who
 #: cannot exercise erasure BECAUSE they registered a lot of journeys.
 MAX_ERASE_WRITES_PER_TRANSACTION = 400
+#: How many of the device's feedback contexts one pass deletes beside the journeys (U6). 400 + 90 +
+#: the device is 491, under Firestore's 500. A device rarely holds more than a handful -- one per
+#: distinct card rendered in the last 15 minutes -- and a busier one drains across passes the way
+#: its journeys do, because the device document waits for BOTH pages to come back short.
+MAX_ERASE_CONTEXTS_PER_TRANSACTION = 90
 
 #: How many times :func:`erase_device` will go round. At 400 journeys a pass this is 4 000, well
 #: past `MAX_ACTIVE_SUBSCRIPTIONS_PER_CLIENT`'s per-device share of anything real; it exists so a
@@ -3703,7 +3801,14 @@ class DeviceErasure:
 
 
 def _erase_device_body(
-    transaction: Any, refs: _Refs, journeys_query: Any, *, device_id: str, client_id: str, now: datetime
+    transaction: Any,
+    refs: _Refs,
+    journeys_query: Any,
+    contexts_query: Any,
+    *,
+    device_id: str,
+    client_id: str,
+    now: datetime,
 ) -> tuple[list[str], bool, bool]:
     """One pass of «Slett alt»: tombstone this device's journeys, and delete the device when done.
 
@@ -3733,7 +3838,8 @@ def _erase_device_body(
     journeys, so a retry after a partial pass can still FIND them -- they carry `device_id`, and the
     query is by that field rather than by a list on the device.
     """
-    # BOTH READS FIRST, and the device one is not optional ordering. Firestore refuses a read after
+    # ALL THREE READS FIRST (device, journeys, and since U6 feedback contexts), and the device one
+    # is not optional ordering. Firestore refuses a read after
     # a write inside a transaction (`ReadAfterWriteError`), so reading the device below the
     # tombstone loop raises on every erasure that has anything to erase -- which is every real one.
     # The emulator is what caught it; the hermetic fake records the op order but does not enforce
@@ -3743,7 +3849,18 @@ def _erase_device_body(
     if stored_device and stored_device.get("client_id") != client_id:
         raise Forbidden("device belongs to another client")
     page = _read_query(transaction, journeys_query)
-    complete = len(page) < MAX_ERASE_WRITES_PER_TRANSACTION
+    # The third read, and above every write for the device read's reason. The feedback contexts
+    # this device's cards minted (U6) hold its route and typed names for up to 15 minutes, and on
+    # every pod at once -- so they go in this transaction rather than by TTL a day later. A context
+    # with no device (the rush card) is not in this query and is left to expire.
+    contexts = _read_query(transaction, contexts_query)
+    complete = (
+        len(page) < MAX_ERASE_WRITES_PER_TRANSACTION
+        and len(contexts) < MAX_ERASE_CONTEXTS_PER_TRANSACTION
+    )
+    for snapshot in contexts:
+        # Hard-deleted, not tombstoned: nothing mirrors a context, every read is by id.
+        transaction.delete(snapshot.reference)
     tombstoned: list[str] = []
     for snapshot in page:
         stored = _doc(snapshot)
@@ -3821,11 +3938,18 @@ def erase_device(
             equality={"client_id": client_id, "channel": CHANNEL_WEB_PUSH, "device_id": device_id},
             limit=MAX_ERASE_WRITES_PER_TRANSACTION,
         )
+        # Rebuilt for the journeys' reason: a deleted context drops out of it.
+        contexts_query = _query(
+            "device_feedback_contexts",
+            equality={"device_id": device_id},
+            limit=MAX_ERASE_CONTEXTS_PER_TRANSACTION,
+        )
         ids, device_deleted, complete = _run_transaction(
-            lambda txn, q=journeys_query: _erase_device_body(
+            lambda txn, q=journeys_query, c=contexts_query: _erase_device_body(
                 txn,
                 refs,
                 q,
+                c,
                 device_id=device_id,
                 client_id=client_id,
                 now=instant,
@@ -4057,9 +4181,12 @@ def read_migration(name: str) -> dict[str, Any] | None:
 def write_migration(name: str, data: Mapping[str, Any], *, now: datetime | None = None) -> None:
     """Record that a migration has run. Written LAST, after its invariants have held.
 
-    A plain set rather than a transaction: there is exactly one writer (a startup step, under the
-    Recreate strategy, before the port binds), and what the document has to survive is a restart
-    rather than a concurrent writer.
+    A plain set rather than a transaction: the writer is a startup step before the port binds, and
+    what the document has to survive is a restart rather than a concurrent writer. That premise was
+    "one replica under Recreate"; under RollingUpdate two pods CAN start together, so it now rests
+    on the marker already being written in every environment that selects the store (dev and prd
+    since 2026-09-13), where every start reads it and skips. A fresh environment's first import
+    should still be made with one pod (its `forceReplicas: 1` step), not under a scale-out.
     """
     ref = _Refs(_firestore_client()).migration(name)
     with _span("notification_store.write_migration"):
@@ -5755,6 +5882,280 @@ def claim_delivery(
         cap_remaining=remaining,
         reason=reason,
         token=token if status == "ready" else None,
+    )
+
+
+# ---- The poller lease (zero-downtime U1, KTD3/KTD4) ---------------------------------------------
+
+
+@dataclass(frozen=True)
+class PollerLease:
+    """What one lease call found or left: the stored holder and deadline, and the caller's token.
+
+    ``status`` is ``acquired``/``refused`` from an acquire, ``renewed``/``lost`` from a renew and
+    ``released``/``not_held`` from a release. ``holder`` and ``held_until`` are the document as it
+    stands after the call, so a refused follower can log who does hold it. ``token`` is set only
+    when the caller holds the lease after the call.
+    """
+
+    status: str
+    holder: str | None
+    held_until: datetime | None
+    token: str | None = None
+
+
+def _lease_view(status: str, doc: Mapping[str, Any]) -> tuple[str, str | None, datetime | None]:
+    return status, doc.get("holder"), _as_dt(doc.get("held_until"))
+
+
+def _acquire_lease_body(
+    transaction: Any, refs: _Refs, *, holder: str, token: str, heartbeat: datetime, now: datetime
+) -> tuple[str, str | None, datetime | None]:
+    """Take the lease unless another holder's is still in the future. `_claim_body`'s shape.
+
+    Read and write in ONE transaction is the whole of R4: two followers reaching a lapsed lease on
+    the same tick both read it free, and only the transaction makes the second commit re-read the
+    first's write and refuse. ``now``, ``heartbeat`` and ``token`` all come from the caller, because
+    a body may run more than once and anything minted inside would differ between attempts.
+
+    The same holder re-acquiring its own lease is allowed and takes the new token: a process whose
+    acquire committed but lost its acknowledgement must not lock itself out for a TTL.
+    """
+    stored = _doc(_read(transaction, refs.lease()))
+    held_until = _as_dt(stored.get("held_until"))
+    if stored.get("holder") not in (None, holder) and held_until is not None and held_until > now:
+        return _lease_view("refused", stored)
+    # A `set` of the whole document built FROM the stored one, rather than an `update`: an update
+    # fails on the absent document of the very first acquire, and spreading `stored` keeps every
+    # field a newer binary added (KTD13).
+    doc = {
+        **stored,
+        "holder": holder,
+        "token": token,
+        "acquired_at": now,
+        "held_until": heartbeat + timedelta(seconds=POLLER_LEASE_S),
+        "updated_at": now,
+    }
+    transaction.set(refs.lease(), doc)
+    return _lease_view("acquired", doc)
+
+
+def _renew_lease_body(
+    transaction: Any, refs: _Refs, *, holder: str, token: str, heartbeat: datetime, now: datetime
+) -> tuple[str, str | None, datetime | None]:
+    """Move ``held_until`` to the heartbeat plus the TTL, if the caller still holds the lease.
+
+    Holder AND token must match: the token is what tells this process's tenure apart from a later
+    one under the same holder name, so a leader demoted and re-acquired cannot be renewed by a stale
+    timer of its previous tenure. A mismatch writes nothing -- the lease is somebody else's now.
+    """
+    stored = _doc(_read(transaction, refs.lease()))
+    if not stored or stored.get("holder") != holder or stored.get("token") != token:
+        return _lease_view("lost", stored)
+    doc = {**stored, "held_until": heartbeat + timedelta(seconds=POLLER_LEASE_S), "updated_at": now}
+    transaction.set(refs.lease(), doc)
+    return _lease_view("renewed", doc)
+
+
+def _release_lease_body(
+    transaction: Any, refs: _Refs, *, holder: str, now: datetime
+) -> tuple[str, str | None, datetime | None]:
+    """Hand the lease back at shutdown so a follower takes over now rather than after the TTL.
+
+    Matches the holder ALONE, without the token: a process whose last acquire committed but lost
+    its acknowledgement does not know its token and must still be able to release. Never a delete
+    -- the cleared document with ``held_until = now`` says when it was handed back, an absence does
+    not -- and a different holder means the lease is not ours to touch, so nothing is written.
+    """
+    stored = _doc(_read(transaction, refs.lease()))
+    if not stored or stored.get("holder") != holder:
+        return _lease_view("not_held", stored)
+    doc = {**stored, "holder": None, "held_until": now, "updated_at": now}
+    transaction.set(refs.lease(), doc)
+    return _lease_view("released", doc)
+
+
+def acquire_poller_lease(
+    holder: str, *, heartbeat: datetime, now: datetime | None = None
+) -> PollerLease:
+    """Try to become the pod that runs the poller. ``refused`` while another holder's is live.
+
+    Nothing is caught: a store failure reaches the caller, whose loop stays a follower and asks
+    again next tick.
+    """
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    # Minted outside the body, `claim_delivery`'s rule and reason.
+    token = secrets.token_hex(8)
+    status, stored_holder, held_until = _run_transaction(
+        lambda txn: _acquire_lease_body(
+            txn, refs, holder=holder, token=token, heartbeat=heartbeat, now=instant
+        )
+    )
+    return PollerLease(
+        status, stored_holder, held_until, token if status == "acquired" else None
+    )
+
+
+def renew_poller_lease(
+    holder: str, token: str, *, heartbeat: datetime, now: datetime | None = None
+) -> PollerLease:
+    """Extend the lease to ``heartbeat`` plus :data:`POLLER_LEASE_S`. ``lost`` when it is not ours."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    status, stored_holder, held_until = _run_transaction(
+        lambda txn: _renew_lease_body(
+            txn, refs, holder=holder, token=token, heartbeat=heartbeat, now=instant
+        )
+    )
+    return PollerLease(status, stored_holder, held_until, token if status == "renewed" else None)
+
+
+def release_poller_lease(holder: str, *, now: datetime | None = None) -> PollerLease:
+    """Clear the holder and set ``held_until`` to now. ``not_held`` (and no write) when not ours."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    status, stored_holder, held_until = _run_transaction(
+        lambda txn: _release_lease_body(txn, refs, holder=holder, now=instant)
+    )
+    return PollerLease(status, stored_holder, held_until)
+
+
+def read_poller_lease() -> dict[str, Any] | None:
+    """The lease document as stored, or None before anything has acquired it. :func:`read_rounds`'
+    shape: a bounded read outside a transaction, for status and tests -- a decision to run the
+    poller is only ever made by :func:`acquire_poller_lease`'s transaction."""
+    ref = _Refs(_firestore_client()).lease()
+    with _span("notification_store.read_poller_lease"):
+        doc = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+    return dict(doc) if doc else None
+
+
+# ---- Feedback contexts (zero-downtime U6, KTD10) ----------------------------------------------
+#
+# `feedback_contexts` calls these through an injected handle and never imports this module's
+# configuration: the handle is set only under `VARSEL_STATE_BACKEND=store` (`main._varsel_store`),
+# never on `enabled()`, which is true in tst where the named database does not exist.
+
+
+def _new_feedback_context_doc(
+    context_id: str,
+    *,
+    snapshot: str,
+    device_id: str | None,
+    journey_id: str | None,
+    expires_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "context_id": context_id,
+        "snapshot": snapshot,
+        "device_id": device_id,
+        "journey_id": journey_id,
+        "claims": {},
+        TTL_FIELD: expires_at,
+    }
+
+
+def write_feedback_context(
+    context_id: str,
+    *,
+    snapshot: str,
+    device_id: str | None,
+    journey_id: str | None,
+    expires_at: datetime,
+) -> None:
+    """Store one card render's snapshot. A plain `set`, :func:`write_rounds`' shape: the id is a
+    fresh random token, so there is exactly one writer and nothing to race. Under the per-call
+    deadline because it is on the card-render request path, once per alert."""
+    ref = _Refs(_firestore_client()).feedback_context(context_id)
+    with _span("notification_store.write_feedback_context"):
+        ref.set(
+            _new_feedback_context_doc(
+                context_id,
+                snapshot=snapshot,
+                device_id=device_id,
+                journey_id=journey_id,
+                expires_at=expires_at,
+            ),
+            timeout=_CALL_DEADLINE_S,
+        )
+
+
+def read_feedback_context(context_id: str, *, now: datetime | None = None) -> str | None:
+    """The snapshot JSON, or None when the context expired, was erased or never existed. Only the
+    snapshot: the device id stays in the store, so it cannot reach the BigQuery row `persist`
+    writes from what this returns."""
+    ref = _Refs(_firestore_client()).feedback_context(context_id)
+    with _span("notification_store.read_feedback_context"):
+        doc = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+    if not _not_expired(doc, now or _now()):
+        return None
+    return str(doc["snapshot"])
+
+
+def _claim_feedback_body(
+    transaction: Any, refs: _Refs, *, context_id: str, response_id: str, now: datetime
+) -> str:
+    """Accept a first tap once per (context, response). `_claim_body`'s shape: read, decide, write.
+
+    Keyed by RESPONSE and not by context alone, because the rush card's context is shared by every
+    traveller who sees the same forecast: a context-wide claim would refuse the second traveller.
+    The claim is what makes the same tap, retried against another pod, capture nothing more.
+
+    The JOURNEY is read too, before the write. A render that read the journey before «Slett alt»
+    can write its context after the erase transaction deleted the device's contexts, and that late
+    context would otherwise resolve and persist the erased route. The erasure tombstones the
+    journey, so a context whose journey is no longer live is missing. Not the DEVICE document:
+    a traveller who never turned notifications on has journeys and no device document at all.
+    """
+    stored = _doc(_read(transaction, refs.feedback_context(context_id)))
+    if not _not_expired(stored, now):
+        return "missing"
+    journey_id = stored.get("journey_id")
+    if journey_id and not subscription_is_live(
+        _doc(_read(transaction, refs.subscription(str(journey_id)))), now
+    ):
+        return "missing"
+    claims = dict(stored.get("claims") or {})
+    if response_id in claims:
+        return "duplicate"
+    claims[response_id] = now
+    transaction.update(refs.feedback_context(context_id), {"claims": claims})
+    return "claimed"
+
+
+def _release_feedback_body(
+    transaction: Any, refs: _Refs, *, context_id: str, response_id: str
+) -> None:
+    """Hand back a claim whose capture failed. Both front-ends retry `downstream` with the SAME
+    response id, so a claim kept after a failure would lock the traveller out of the card."""
+    stored = _doc(_read(transaction, refs.feedback_context(context_id)))
+    claims = dict(stored.get("claims") or {})
+    if response_id not in claims:
+        return
+    del claims[response_id]
+    transaction.update(refs.feedback_context(context_id), {"claims": claims})
+
+
+def claim_feedback_response(
+    context_id: str, *, response_id: str, now: datetime | None = None
+) -> str:
+    """``claimed``, ``duplicate`` (this response already has its first tap) or ``missing``."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    return _run_transaction(
+        lambda txn: _claim_feedback_body(
+            txn, refs, context_id=context_id, response_id=response_id, now=instant
+        )
+    )
+
+
+def release_feedback_response(context_id: str, *, response_id: str) -> None:
+    refs = _Refs(_firestore_client())
+    _run_transaction(
+        lambda txn: _release_feedback_body(
+            txn, refs, context_id=context_id, response_id=response_id
+        )
     )
 
 

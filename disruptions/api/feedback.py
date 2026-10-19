@@ -268,7 +268,10 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
             return {"status": "invalid_receipt"}
         context_date, event = verified
     else:
-        snapshot = feedback_contexts.resolve(body.context_id)
+        try:
+            snapshot = feedback_contexts.resolve(body.context_id)
+        except feedback_contexts.StoreUnavailable:
+            return {"status": "downstream"}
         if snapshot is None:
             return {"status": "expired"}
         context_date, event = None, _event(snapshot)
@@ -279,11 +282,23 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
     try:
         submitted = datetime.now(UTC)
         if body.revision == 1:
+            # The cross-pod guard (zero-downtime U6): a first tap retried against another pod, which
+            # has none of this pod's limiter state, captures nothing more. AFTER the in-memory
+            # limiters above, so a spammed submit costs no Firestore transaction.
+            claimed = feedback_contexts.claim(body.context_id, str(body.response_id))
+            if claimed == "missing":
+                return {"status": "expired"}
             context_date = submitted.date().isoformat()
+            if claimed == "duplicate":
+                # This response's first tap already succeeded and its answer was lost: answer it
+                # again, receipt included, and capture nothing. The receipt's date is today's,
+                # which differs from the stored row's only for a retry across midnight.
+                return _saved(body, context_date, submitted, event)
             persisted, reason = feedback_contexts.persist(
                 body.context_id, context_date=context_date
             )
             if not persisted:
+                feedback_contexts.release(body.context_id, str(body.response_id))
                 return {"status": reason or "downstream"}
         try:
             _capture(
@@ -295,9 +310,17 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
             )
         except Exception:
             logger.warning("Feedback capture failed", extra={"fields": {"event": "varsel_feedback", "result": "downstream"}}, exc_info=True)
+            if body.revision == 1:
+                feedback_contexts.release(body.context_id, str(body.response_id))
             return {"status": "downstream"}
     finally:
         _inflight.release()
+    return _saved(body, context_date, submitted, event)
+
+
+def _saved(
+    body: FeedbackIn, context_date: str | None, submitted: datetime, event: str
+) -> dict[str, str | int]:
     result: dict[str, str | int] = {"status": "saved", "revision": body.revision}
     if body.revision == 1:
         result["receipt"] = _receipt(

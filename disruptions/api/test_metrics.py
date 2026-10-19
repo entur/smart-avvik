@@ -179,6 +179,10 @@ def test_domain_metrics_are_declared_with_the_agreed_names_and_labels():
     assert _sample("kix_poller_last_tick_timestamp_seconds") == 1_234.5
     metrics.POLLER_LAST_CYCLE.set(2_345.5)
     assert _sample("kix_poller_last_cycle_timestamp_seconds") == 2_345.5
+    metrics.POLLER_LEADER.set(1)
+    assert _sample("kix_poller_leader") == 1
+    metrics.POLLER_LEADER.set(0)
+    assert _sample("kix_poller_leader") == 0
     metrics.LABELLING_LAST_SUCCESS.set(3_456.5)
     assert _sample("kix_labelling_last_success_timestamp_seconds") == 3_456.5
 

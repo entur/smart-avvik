@@ -462,14 +462,19 @@ def configure(
     tag_title: Callable[[str], str] | None = None,
     load_markers: Callable[[str], Mapping[str, Any]] | None = None,
     store_markers: Callable[[str, Mapping[str, Any]], None] | None = None,
+    device_journeys: Callable[[str], Mapping[str, Mapping[str, Any]]] | None = None,
+    should_continue: Callable[[], bool] | None = None,
 ) -> None:
     """Inject the module's runtime seams: the BigQuery client for :func:`station_set`,
     and — for :func:`evaluate` — the two gates (`enabled` reads the delivery flag, `push_ready`
-    varsel's VAPID state), togvarsel's issued-today snapshot, varsel's journey snapshot,
-    place-alias expander, delivery machinery, brand assets and environment tagger, and the
+    varsel's VAPID state), togvarsel's issued-today snapshot, varsel's journey snapshot (the
+    cycle's mirror), place-alias expander, delivery machinery, brand assets and environment tagger, and the
     round-marker accessor pair (`load_markers(date) -> copy`, `store_markers(date, markers)`
     persists and prunes to that date). Everything past `bq_client` is optional so the station-set
-    tests keep their one-argument call; a partial wiring simply leaves evaluate() a no-op."""
+    tests keep their one-argument call; a partial wiring simply leaves evaluate() a no-op.
+    Two seams sit outside that all-or-nothing set (zero-downtime U4): `device_journeys` is
+    :func:`rush_outlook`'s one-device read of the registration STORE, and `should_continue` is
+    the poller lease :func:`push_round` asks before each round's fan-out (None always delivers)."""
     global _bq_client, _seams
     _bq_client = bq_client
     _seams = {
@@ -485,6 +490,8 @@ def configure(
         "tag_title": tag_title,
         "load_markers": load_markers,
         "store_markers": store_markers,
+        "device_journeys": device_journeys,
+        "should_continue": should_continue,
     }
 
 
@@ -541,9 +548,10 @@ def cached_station_set(now: datetime) -> frozenset[str] | None:
     seen its refs.
 
     A warm cache also means more than "the table was readable". :func:`_evaluate` reaches
-    station_set only past the delivery flag and the VAPID gate, so a warm cache is evidence that
-    rounds are actually being evaluated today — which is what makes it the right gate for a panel
-    whose whole claim is "you are being notified about this".
+    station_set only past the delivery flag and the VAPID gate, and so does main's rush hydrate,
+    which warms it on every pod rather than on the leader alone (zero-downtime U4) — so a warm
+    cache is evidence that rounds can be evaluated today, which is what makes it the right gate
+    for a panel whose whole claim is "you are being notified about this".
     """
     return (
         _station_state["refs"]
@@ -748,14 +756,15 @@ def rush_outlook(device_id: str, now: datetime | None = None) -> list[RushForeca
     Two gates, both closed by default. `enabled()` is the delivery flag, so the panel appears only
     where these pushes are actually sent — the same read /varsel-api/config already surfaces as
     `togvarsel_notify`. And :func:`cached_station_set` must be warm, which additionally implies
-    the poller got past the VAPID gate and is evaluating rounds today; a cold cache yields [], and
+    the poller got past the VAPID gate and rounds can be evaluated today; a cold cache yields [], and
     never a BigQuery query on this request path. The VAPID gate is not consulted directly: a
     device with no push subscription still gets an honest forecast, and the page already says
     push is unavailable.
     """
     seams = _seams
     if any(
-        seams.get(key) is None for key in ("enabled", "issued_today", "journeys", "expand_refs")
+        seams.get(key) is None
+        for key in ("enabled", "issued_today", "device_journeys", "expand_refs")
     ):
         return []
     if not seams["enabled"]():
@@ -768,7 +777,11 @@ def rush_outlook(device_id: str, now: datetime | None = None) -> list[RushForeca
     if not issued:
         return []  # weekend, holiday, or nothing issued yet today
     now_h = now.hour + now.minute / 60 + now.second / 3600
-    affected = affected_rushes(device_id, seams["journeys"](), stations, seams["expand_refs"], now)
+    # The store, not the cycle's mirror, which only the leader seeds (zero-downtime U4): the panel
+    # answers the same on every pod. Under the store this read also renews the registrations'
+    # activity, the same renewal the /varsel journey list performs on every app open.
+    journeys = dict(seams["device_journeys"](device_id))
+    affected = affected_rushes(device_id, journeys, stations, seams["expand_refs"], now)
     if not affected:
         return []
     out: list[RushForecast] = []
@@ -874,6 +887,15 @@ def build_payload(
     }
 
 
+class RoundFenced(Exception):
+    """push_round withheld some or all of a round's sends because the lease said stop (KTD8).
+
+    Raised AFTER the round event is logged, so the counts of whatever did go out stay visible. The
+    caller must not persist the round's marker: the successor then delivers it, a duplicate for
+    any device that was already sent to — accepted — where a persisted marker would lose the round
+    for every device that was not."""
+
+
 def push_round(
     decision: Decision,
     issue: Mapping[str, Any],
@@ -888,8 +910,15 @@ def push_round(
     handle_gone: Callable[[str], bool],
     brand_assets: Mapping[str, Mapping[str, str]],
     tag_title: Callable[[str], str],
+    should_continue: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Deliver one pushing round to its matched devices — one push per device.
+
+    `should_continue` is the poller lease (zero-downtime U2, KTD8), asked before the fan-out and
+    again before every device's send, as check_and_notify's `_prepare_alert` does: a leader that
+    lost the lease or is stopping submits no new send (one in flight finishes), and a round that
+    withheld any send raises :class:`RoundFenced` once its event is logged. None (the dev-only
+    test trigger) always delivers; :func:`evaluate` passes the seam main configures.
 
     Every delivery seam is varsel's, injected by main: `resolve_device`
     (device_subscription — the deleted-while-iterating re-check under varsel's lock), `deliver`
@@ -924,7 +953,19 @@ def push_round(
     # diagnosis. The FIRST failure's detail rides the round event, which is enough to tell a dead
     # push service from a bad keypair without minting a record per device.
     first_error: dict | None = None
-    for device_id, _item, result, _payload, error_detail in deliver(per_device, lambda item: item):
+    withheld: list[Any] = []
+
+    def _prepare(item: Any) -> Any:
+        # On the fan-out's worker threads; list.append is atomic, and any withheld item is enough.
+        if should_continue is not None and not should_continue():
+            withheld.append(item)
+            return None  # deliver_to_devices' "withdrawn": no send, no result tuple
+        return item
+
+    fenced = should_continue is not None and not should_continue()
+    results = [] if fenced else deliver(per_device, _prepare)
+    fenced = fenced or bool(withheld)
+    for device_id, _item, result, _payload, error_detail in results:
         counts[result] = counts.get(result, 0) + 1
         if result == "error" and first_error is None and error_detail:
             first_error = error_detail
@@ -943,6 +984,8 @@ def push_round(
     # Deliberately NOT added to `summary`: that dict is the togvarsel_rounds row, and an
     # unrecognised key there is a silently rejected streamed insert.
     round_fields: dict[str, Any] = {"event": "togvarsel_notify_round", **summary}
+    if fenced:
+        round_fields["fenced"] = True
     if first_error is not None:
         round_fields.update(
             push_error_status=first_error.get("status"),
@@ -963,6 +1006,8 @@ def push_round(
         dropped,
         extra={"fields": round_fields},
     )
+    if fenced:
+        raise RoundFenced(decision.issue)
     return summary
 
 
@@ -978,8 +1023,9 @@ def evaluate(now: datetime | None = None) -> None:
     inside a timeliness window still deliver that round. While the station set is unavailable,
     the same: nothing evaluated, nothing marked. Marker ordering:
     decide_rounds commits every round's marker in memory before any fan-out, and the injected
-    store accessor persists after each pushing round's delivery — plus once at the end of a
-    suppression-only pass. The store's persistence is best-effort (varsel's _save_state never
+    store accessor persists the finished rounds' markers after each pushing round's delivery —
+    plus once at the end of a suppression-only pass. A round the lease fenced persists nothing
+    and ends the pass, so the successor delivers it (KTD8). The store's persistence is best-effort (varsel's _save_state never
     raises), so a lost write costs at most the accepted crash-window duplicate on the next
     restart, never the in-process dedup. Wrapped whole: a failure here is logged and the tick
     goes on (main wraps its call too)."""
@@ -1006,6 +1052,7 @@ def _evaluate(now: datetime) -> None:
         return  # weekend/holiday, or nothing issued yet today — the natural no-op
     date_str = now.date().isoformat()
     markers: dict[str, Any] = dict(s["load_markers"](date_str))
+    persisted = dict(markers)  # what the store may hold: the loaded map plus each FINISHED round
     decisions = decide_rounds(issues, markers, now)
     if not decisions:
         return  # every issued round already carries a marker — nothing changed, nothing to save
@@ -1029,6 +1076,9 @@ def _evaluate(now: datetime) -> None:
     issue_by_key = {str(issue["issue"]): issue for issue in issues}
     journeys = s["journeys"]() if pushes else {}
     summaries: dict[str, Mapping[str, Any]] = {}
+    # Suppressions are finished as decided; a push is finished once its fan-out returns or raises.
+    finished = [d for d in decisions if not d.push]
+    stored: list[Decision] = []  # the decisions whose markers reached the store, and only they
     for decision in pushes:
         try:
             matched, devices = match_journeys(
@@ -1044,7 +1094,19 @@ def _evaluate(now: datetime) -> None:
                 handle_gone=s["handle_gone"],
                 brand_assets=s["brand_assets"],
                 tag_title=s["tag_title"],
+                should_continue=s.get("should_continue"),
             )
+        except RoundFenced:
+            # The lease said stop before or during this round's fan-out (KTD8). Its marker is
+            # NOT persisted, nor any later round's, nor the round recorded — this process may no
+            # longer write — so the successor reloads a map without it and delivers the round
+            # itself: a duplicate for any device already sent to, accepted; a lost round is not.
+            logger.warning(
+                "togvarsel_notify: round %s fenced by the lease; leaving it to the successor",
+                decision.issue,
+                extra={"fields": {"event": "togvarsel_notify_fenced", "issue": decision.issue}},
+            )
+            break
         except Exception:
             logger.exception(
                 "togvarsel_notify: delivering round %s failed; its marker is already committed, "
@@ -1053,11 +1115,17 @@ def _evaluate(now: datetime) -> None:
             )
         # Persist AFTER the round's fan-out: the in-memory commit above already protects
         # this process, and a crash inside the window costs at most one accepted duplicate.
-        s["store_markers"](date_str, markers)
+        # Only FINISHED rounds' markers: decide_rounds committed every round's in memory, and a
+        # later round's riding along here would be lost if the lease fenced it.
+        finished.append(decision)
+        persisted.update({d.issue: markers[d.issue] for d in finished})
+        s["store_markers"](date_str, persisted)
+        stored = list(finished)
     if not pushes:
         s["store_markers"](date_str, markers)  # suppression-only pass: the markers still count
+        stored = decisions
 
-    # Record EVERY decision, here and nowhere else. One loop after both store_markers sites,
+    # Record every decision whose marker reached the store, here and nowhere else. One loop after both store_markers sites,
     # because neither of them reaches a suppression: the sites above are inside the `pushes` loop
     # and in the `not pushes` branch, so on a MIXED pass — a restart back-fill that suppresses
     # 0630 as untimely and pushes 0700 in one tick, the case the marker ordering above exists for
@@ -1068,8 +1136,12 @@ def _evaluate(now: datetime) -> None:
     # function directly on the public dev host with a caller-supplied device_id and a synthetic
     # 0630 decision, and on a first-write-wins MERGE that write would take the day's row and the
     # real 06:30 round would be lost for good.
+    #
+    # Only rounds whose markers were persisted: a fenced pass stopped at its fenced round, and on a
+    # first-write-wins MERGE recording an undelivered round would take the successor's row.
     for decision in decisions:
-        _record_round(now.date(), decision, now, summaries.get(decision.issue))
+        if decision in stored:
+            _record_round(now.date(), decision, now, summaries.get(decision.issue))
 
 
 # ---- HTTP surfaces --------------------------------------------------------------------------
@@ -1087,8 +1159,11 @@ router = APIRouter(dependencies=[Depends(deployment.require_rushvarsel)])
     response_model=RushOutlook,
     summary="Today's rush forecasts a device is notified about",
 )
-async def outlook(
-    device_id: str = Query(description="Client-generated device UUID, as /varsel-api uses."),
+def outlook(
+    # The bounds /varsel-api's DeviceIn holds: every call is a store read on a public route.
+    device_id: str = Query(
+        min_length=8, max_length=100, description="Client-generated device UUID, as /varsel-api uses."
+    ),
 ) -> RushOutlook:
     """The status panel /varsel renders at the top of the page, with its link to /togmelding.
 
@@ -1096,10 +1171,10 @@ async def outlook(
     network-wide, but whether it reaches this traveller depends on their registrations. Nothing
     device-identifying is returned — see :func:`rush_outlook` for the policy and the two gates.
 
-    `async def`, unlike :func:`test_notify` below: every input is already in this process (the
-    poller's station cache, togvarsel's issued snapshot, varsel's journey snapshot), so there is no
-    blocking call to keep off the event loop, and no reason to spend an anyio worker on a page that
-    every /varsel poll asks.
+    A plain ``def`` since zero-downtime U4: the device's journeys are read from the registration
+    store (a Firestore query under the store backend) rather than the in-process mirror, which
+    only the leader seeds, and that blocking read belongs in the threadpool, not on the event
+    loop.
     """
     return RushOutlook(rushes=rush_outlook(device_id))
 

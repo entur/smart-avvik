@@ -203,6 +203,19 @@ def test_a_failing_call_source_still_yields_the_other(monkeypatch):
     assert set(stops) == {"57120"}
 
 
+def test_the_load_says_whether_every_sub_query_answered(monkeypatch):
+    """Fail-open serves what it could, but a follower must know to ask again on its next tick
+    rather than wait a day for the planned table to move (zero-downtime U3)."""
+    good = {"rail": [_rail("157", "Lysaker stasjon", 366)], "bus": [_bus("4377", "Lysaker", 7)],
+            "registry": [_nsr("157", "p", "32"), _nsr("4377", "q", "32")]}
+    for broken, expected in ((None, True), ("rail", False), ("bus", False), ("registry", False)):
+        sources = dict(good)
+        if broken:
+            sources[broken] = RuntimeError(f"{broken} unavailable")
+        monkeypatch.setattr(main, "bq_client", _FakeBQ(**sources))
+        assert main.refresh_varsel_stops() is expected, broken
+
+
 def test_the_primary_does_not_flip_between_refreshes(monkeypatch):
     """Ties break on the ref, not on dict order: a primary that flipped would rewrite the same
     registrations back and forth on every refresh."""

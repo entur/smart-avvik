@@ -813,6 +813,30 @@ def test_a_stored_journey_is_not_collapsed_into_itself():
         assert (varsel._journeys[jid]["from_stop"], varsel._journeys[jid]["to_stop"]) == ("A", "B")
 
 
+def test_a_follower_publishes_the_aliases_without_rewriting_stored_journeys():
+    """Zero-downtime U3: a follower pod loads the stop list too, so its request path canonicalizes a
+    new registration, but rewriting what is STORED is the lease holder's -- N pods healing the same
+    registrations would be N writers of one record."""
+    _reset_state()
+    try:
+        r = client.post(
+            "/varsel-api/journeys",
+            json={"device_id": DEVICE, "from_stop": "A2", "from_name": "Oslo S", "to_stop": "B",
+                  "to_name": "Lillehammer", "begin": "00:00", "end": "23:59",
+                  "days": [0, 1, 2, 3, 4, 5, 6]},
+        )
+        jid = r.json()["journey_id"]
+        varsel.set_stop_aliases({"A2": "A"}, heal=False)
+        assert varsel.canonical_stop("A2") == "A", "the alias is published"
+        with varsel._state_lock:
+            assert varsel._journeys[jid]["from_stop"] == "A2", "but nothing stored was rewritten"
+        varsel.set_stop_aliases({"A2": "A"})
+        with varsel._state_lock:
+            assert varsel._journeys[jid]["from_stop"] == "A"
+    finally:
+        varsel.set_stop_aliases({})
+
+
 def test_journey_crud_and_live_match():
     _reset_state()
     payload = {
@@ -3751,6 +3775,55 @@ def test_transient_410_keeps_fresh_device(monkeypatch):
     assert DEVICE not in varsel._devices
 
 
+def test_a_lease_lost_mid_fan_out_submits_no_new_send_and_marks_the_ones_that_went(monkeypatch):
+    """The poller lease inside the fan-out (zero-downtime U2, KTD4). Two journeys on one device are
+    sent in order; the lease is lost while the first send is in flight. That send completes and is
+    marked like any other; the second is never submitted and nothing is marked for it, so the
+    successor offers it again from the store's marks."""
+    _reset_state()
+    leading = {"yes": True}
+    sent = []
+
+    def _send(sub, payload):
+        sent.append(payload)
+        leading["yes"] = False  # lost while this send was in flight
+        return "sent"
+
+    monkeypatch.setattr(varsel, "_send_push", _send)
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    first = _register_journey(DEVICE)
+    second = client.post(
+        "/varsel-api/journeys",
+        json={
+            "device_id": DEVICE, "from_stop": "A", "from_name": "Oslo S", "to_stop": "B",
+            "to_name": "Lillehammer", "begin": "00:01", "end": "23:59", "days": [0, 1, 2, 3, 4, 5, 6],
+        },
+    ).json()["journey_id"]
+    varsel.check_and_notify(SNAPSHOT, should_continue=lambda: leading["yes"])
+    assert len(sent) == 1, "no new send after the lease said stop"
+    marked = {k.split("|", 1)[0] for k in varsel._notified}
+    assert len(marked & {first, second}) == 1, "the completed send is marked, the withdrawn one not"
+    # Asked before the delivery too: a pass that starts already demoted sends nothing at all.
+    _reset_state()
+    sent.clear()
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    varsel.check_and_notify(SNAPSHOT, should_continue=lambda: False)
+    assert sent == [] and not varsel._notified
+
+
+def test_the_fan_out_beats_once_per_completed_send(monkeypatch):
+    """A slow push service is progress, not a wedge: each completed send beats the heartbeat the
+    lease renews against (U2)."""
+    beats = []
+    monkeypatch.setattr(varsel, "_beat_provider", lambda: beats.append(1))
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    varsel.deliver_to_devices(
+        {"dev-a": [1, 2], "dev-b": [3]}, lambda item: ({"endpoint": "https://p.example/x"}, {})
+    )
+    assert len(beats) == 3
+
+
 def test_deliver_to_devices_stops_a_device_at_gone_but_not_the_others(monkeypatch):
     """Direct pin of the extracted fan-out seam (shared with togvarsel_notify): sends stay
     sequential and ordered WITHIN a device, a "gone" stops that device's REMAINING items only,
@@ -3923,12 +3996,26 @@ def test_delete_all_rejects_out_of_bounds_device_ids():
     assert client.delete("/varsel-api/devices/short/data").status_code == 422
 
 
+def test_every_device_id_parameter_holds_the_body_models_bounds():
+    """The list, the journey delete and «Skru av» take device_id outside a body model, so they
+    restate DeviceIn's 8..100 themselves: each is a store read (or write) on a public route.
+    An empty path segment never reaches the route at all, so only the query form tries ""."""
+    _reset_state()
+    for bad in ("", "short", "x" * 101):
+        assert client.get("/varsel-api/journeys", params={"device_id": bad}).status_code == 422, bad
+        assert client.delete("/varsel-api/journeys/j-1", params={"device_id": bad}).status_code == 422, bad
+    for bad in ("short", "x" * 101):
+        assert client.delete(f"/varsel-api/devices/{bad}").status_code == 422, bad
+    assert client.get("/varsel-api/journeys", params={"device_id": "x" * 100}).status_code == 200
+
+
 def test_a_device_id_carrying_a_slash_is_refused_and_nothing_else_is():
     """A device_id becomes a Firestore document id, and the client splits a document path on "/",
     so "aaaaaaaa/x/bbbbbbbb" would write the nested document devices/aaaaaaaa/x/bbbbbbbb -- outside
     the device ceiling, the TTL policy and the export. Every route that takes the id from a body or
     the query string refuses a "/", and refuses nothing else: the ids the PWA mints, an id with a
-    character outside any charset, and the empty query value all answer as they did before."""
+    character outside any charset still answer as they did before. (The empty query value is refused
+    by the 8..100 bounds, see test_every_device_id_parameter_holds_the_body_models_bounds.)"""
     _reset_state()
     slashed = "aaaaaaaa/x/bbbbbbbb"
 
@@ -3945,7 +4032,7 @@ def test_a_device_id_carrying_a_slash_is_refused_and_nothing_else_is():
     for kept in ("0b6f2c1e-3d4a-4f5b-8c9d-0e1f2a3b4c5d", "dev-1760000000000-k3j4h5g6f7", "dev.12345678"):
         r = client.post("/varsel-api/devices", json={"device_id": kept, "subscription": SUBSCRIPTION})
         assert r.status_code == 200, (kept, r.text)
-    assert client.get("/varsel-api/journeys", params={"device_id": ""}).status_code == 200
+    assert client.get("/varsel-api/journeys", params={"device_id": ""}).status_code == 422
 
 
 def test_delete_all_without_a_device_record_still_deletes_journeys():
@@ -4437,6 +4524,156 @@ def test_a_store_that_cannot_finish_the_erasure_answers_503_rather_than_200(monk
     assert response.status_code == 503, response.text
     failures = _events(records, "varsel_delete_all_persist_failed")
     assert len(failures) == 1 and failures[0]["device_id"] == DEVICE
+
+
+# ---- zero-downtime U5: the leader's mirror beside another pod's writes (R8, F4, AE6) ----------
+
+
+def _foreign_write(fake, jid, **fields) -> None:
+    """Another pod's commit: on the document, never applied to THIS process's mirror."""
+    ns = varsel_state.notification_store
+    fake.put(ns.SUBSCRIPTIONS, jid, {**fake.doc(ns.SUBSCRIPTIONS, jid), **fields})
+
+
+def _seed_empty_cycle_mirror(fake) -> None:
+    """A leader that seeded before the journeys below were registered on another pod."""
+    store_suite._mirror_page(fake, "mirror_seed", [])
+    varsel_state.notification_store.subscription_mirror().seed(now=datetime.now(UTC))
+
+
+def test_a_delete_on_the_leader_of_a_journey_registered_on_another_pod_answers_200(monkeypatch):
+    """R8: the ownership check reads the store. The leader's mirror learns another pod's create
+    only at its next sync, so a check against it refused the traveller's own delete with a 404."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_empty_cycle_mirror(fake)
+    assert backend.get_journey(jid) is None, "the cycle's view was meant to lack this journey"
+
+    response = client.delete(f"/varsel-api/journeys/{jid}?device_id={DEVICE}")
+    assert response.status_code == 200, response.text
+    assert client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"] == []
+    assert client.delete(f"/varsel-api/journeys/{jid}?device_id=someone-else").status_code == 404
+
+
+def test_a_journey_deleted_on_another_pod_after_the_seed_is_not_pushed(monkeypatch):
+    """AE6, first clause: the mirror still holds the journey, the store does not, and the pre-send
+    read is what finds out. Nothing is sent and nothing is marked."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    _foreign_write(fake, jid, status="deleted")
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == [], "a journey deleted on another pod was pushed"
+    stored = fake.doc(varsel_state.notification_store.SUBSCRIPTIONS, jid)
+    assert not stored.get("notified"), "a mark landed on a deleted journey"
+
+
+def test_a_train_another_pod_already_marked_is_not_pushed_again(monkeypatch):
+    """The interim leader's push: its mark is on the document and not in this leader's mirror, so
+    the collection queues the train and the pre-send read refuses it."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    _foreign_write(fake, jid, notified={"S1": datetime.now(UTC) + timedelta(days=1)})
+    assert not backend.push_ledger(jid).notified, "the mirror was meant to be the stale one"
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == [], "a train the store already marks was pushed again"
+
+
+def test_the_pre_send_read_is_one_store_read_per_push_and_never_under_the_state_lock(monkeypatch):
+    """KTD7: no store I/O enters `_state_lock` from the cycle's journey reads, which stay on the
+    mirror, and the pre-send read is the ONE `get_subscription` a push costs, taken outside it.
+    The journey present in both is sent and marked once."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+
+    ns = varsel_state.notification_store
+    real_get = ns.get_subscription
+    held: list[bool] = []
+
+    def _get(*args, **kwargs):
+        held.append(varsel._state_lock._is_owned())
+        return real_get(*args, **kwargs)
+
+    monkeypatch.setattr(ns, "get_subscription", _get)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    assert held == [False], held
+    assert set(fake.doc(ns.SUBSCRIPTIONS, jid)["notified"]) == {"S1"}
+
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1, "marked once means pushed once"
+
+
+def test_a_delete_on_another_pod_during_the_send_costs_one_push_no_mark_and_no_exception(
+    monkeypatch,
+):
+    """AE6, second clause: past the pre-send read nothing can recall the push, and the mark that
+    follows finds the document gone. The store answers NotFound and the seam swallows it."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    jid = _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    sent: list[dict] = []
+
+    def _send(sub, payload):
+        _foreign_write(fake, jid, status="deleted")
+        sent.append(payload)
+        return "sent"
+
+    monkeypatch.setattr(varsel, "_send_push", _send)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1
+    stored = fake.doc(varsel_state.notification_store.SUBSCRIPTIONS, jid)
+    assert not stored.get("notified"), "a mark landed on a journey deleted during its send"
+
+
+def test_a_store_that_fails_the_pre_send_read_withholds_the_push_and_the_cycle_goes_on(monkeypatch):
+    """The read runs on the fan-out's worker thread, where a raise would fail the device's whole
+    batch. Refused instead, unmarked, so the next cycle offers it again."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list[dict] = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    ns = varsel_state.notification_store
+    real_get = ns.get_subscription
+
+    def _broken(*_a, **_k):
+        raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(ns, "get_subscription", _broken)
+    varsel.check_and_notify(SNAPSHOT)
+    assert sent == []
+    monkeypatch.setattr(ns, "get_subscription", real_get)
+    varsel.check_and_notify(SNAPSHOT)
+    assert len(sent) == 1, "the withheld push was not re-offered"
 
 
 class _MonkeyPatch:

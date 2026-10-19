@@ -143,6 +143,13 @@ _CALENDAR_TODAY_SQL = """
 SELECT holiday FROM `disruptions.togvarsel_calendar` WHERE d = CURRENT_DATE('Europe/Oslo')
 """
 
+# The hydrate's two day-scoped reads (load_issued). `d` is a date the caller formats, never input.
+_ISSUED_DAY_SQL = """
+SELECT issue, p, level, scope, reasons, computed_at, late
+FROM `disruptions.togvarsel_issued` WHERE d = DATE '{d}'
+"""
+_CALENDAR_DAY_SQL = "SELECT holiday FROM `disruptions.togvarsel_calendar` WHERE d = DATE '{d}'"
+
 # The study's three-level bins (§14a/§14e): pooled out-of-sample, green ≈ 1–6 % bad days,
 # red ≈ 55–61 %. Fixed cuts on the calibrated probability, not quantiles.
 GREEN_MAX = 0.10
@@ -483,6 +490,45 @@ def _rows(query: str) -> list[dict]:
     return [dict(r) for r in _bq_client.query(query).result(timeout=_READ_TIMEOUT_S)]
 
 
+def load_issued(d: date) -> bool:
+    """Fill the day's state from what the leader recorded -- read-only, on any pod (KTD8).
+
+    The table row wins over an in-memory issue of the same key (first write wins, so it is what
+    the pushes and /rushhistorikk already said), and an in-memory issue with no row is kept: a
+    failed `_record_issue` must not cost the leader a forecast it computed. The «kjente avvik»
+    list is read only once the day has an issue, because `togvarsel_sx_today` is yesterday's until
+    the leader's first rebuild of the day -- the leader's own list is empty until then. Raises on a
+    failed read and returns True otherwise."""
+    rows = [r for r in _rows(_ISSUED_DAY_SQL.format(d=d.isoformat())) if r["issue"] in _SPEC_BY_KEY]
+    sx = _rows(_SX_TODAY_SQL) if rows else []
+    cal = _rows(_CALENDAR_DAY_SQL.format(d=d.isoformat()))
+    issues = {
+        r["issue"]: Issue(
+            issue=r["issue"],
+            scope=r["scope"] or _SPEC_BY_KEY[r["issue"]].scope,
+            p=float(r["p"]),
+            level=r["level"],
+            reasons=list(r["reasons"] or []),
+            computed_at=r["computed_at"],
+            late=bool(r["late"]),
+        )
+        for r in rows
+    }
+    with _lock:
+        if _state.get("date") != d:
+            _state.clear()
+            _state.update(_blank_state(d))
+        _state["issues"].update(issues)
+        if rows:
+            _state["sx"] = known_deviations_for(sx)
+            _state["generated_at"] = max(i.computed_at for i in issues.values())
+        if cal:
+            # No row is left to the leader's probe, which logs the calendar's horizon as an ERROR.
+            _state["holiday"] = _state["holiday"] or bool(cal[0]["holiday"])
+            _state["calendar_checked"] = True
+    return True
+
+
 def _record_issue(d: date, issue: Issue, model: str) -> None:
     """Record the issued forecast for later skill audits (first write per (d, issue) wins).
     Failure is logged, never raised — the forecast the traveller sees must not depend on the
@@ -646,6 +692,14 @@ def refresh(now: datetime | None = None) -> None:
     with _lock:
         _state["sx"] = known_deviations_for(sx)
         _state["generated_at"] = now
+        issued = any(spec.key in _state["issues"] for spec in missing)
+    # Serve the recorded row, not the recompute (KTD8): after a restart the back-fill's MERGE is
+    # discarded in favour of the first write, which the pushes and /rushhistorikk already quote.
+    if issued:
+        try:
+            load_issued(today)
+        except Exception:
+            logger.exception("togvarsel: reading back the issued forecasts failed; serving ours")
 
 
 def issued_today(now: datetime | None = None) -> list[dict[str, Any]]:

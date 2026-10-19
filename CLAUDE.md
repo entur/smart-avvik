@@ -35,9 +35,16 @@ git push origin main                         # builds the image (ci.yml) and dep
 gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispatch-only)
 ```
 
-- **Single always-on instance** (`deployment.forceReplicas: 1` in the Helm chart): the app runs
-  one background poller thread and an in-process cache, so more replicas mean duplicate pollers
-  and unshared caches.
+- **One writer per environment, elected by a lease** (2026-10-13): every API pod serves every route
+  from the tables the poller builds, and only the pod holding the Firestore lease
+  `poller_lease/current` runs the poller cycle, the tick writers and every push. Exactness claims
+  that used to rest on "one replica" (push dedup, the emit ledger, the mirrors) hold per leadership
+  term. dev and prd move to RollingUpdate + HPA 1..3 on CPU in two deploys each (KTD15: the whole
+  `deployment:` block in the env file is deleted only after the lease-aware binary is live there;
+  rollback puts it back before the image); tst has no store, no lease, and keeps one Recreate pod
+  for good. Per-process allowances are per pod (×3 at most). **Read
+  `docs/operations/poller-lease.md` before touching the lease, a deploy's strategy, or anything a
+  follower loads** — it carries the holder-reading, handoff, outage and rollout steps.
 - **What the poller cycle costs is now logged, not inferred** (2026-08-21). Every step of
   `main._rebuild_all` is wrapped in `main._phase`, which emits `event="poller_phase"` with `phase`
   and `ms`, and the cycle ends with one `event="poller_cycle"` carrying the total and a `phases`
@@ -94,11 +101,12 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   dev, the new one projected from the loads' phase timings until a deploy confirms it). Recreate leaves
   no pod for ~40 s, and the new one used to serve another ~95 s of empty caches until its first cycle
   had rebuilt tables that already existed: journey-alerts and journey-status answered 503, and that
-  fired dev's 5xx rule. `main.warm_caches_from_last_build` now loads those caches in the lifespan
-  from the last-built tables. Each is stamped with its table's modified time and skipped past an age
-  bound. The ET rebuild gates are left unarmed, so the first cycle still rebuilds on the deployed SQL.
-  The remaining ~40 s is Recreate itself, and RollingUpdate needs a writer lease first (see
-  `docs/observability/01-review-2026-08-30.md`).
+  fired dev's 5xx rule. `main.follow_last_build` now loads those caches in the lifespan from the
+  last-built tables (and on every follower tick), each stamped with its tables' modified time, with
+  **no age bound** (a live leader on a quiet night leaves tables hours old). The ET rebuild gates are
+  left unarmed, so the first cycle still rebuilds on the deployed SQL. The remaining ~40 s is
+  Recreate itself, which is what tst and a step-A environment still pay; after step B a deploy is
+  rolling, readiness is `/ready`, and the gap should be zero (U9 measures it).
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket

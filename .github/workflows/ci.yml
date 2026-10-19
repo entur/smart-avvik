@@ -71,6 +71,9 @@ jobs:
       # if it ever stops doing so. One fewer third-party action in the path of the image build.
       - uses: actions/checkout@v7
       - run: bash helm/kix-avvik/test/worker_render.sh
+      # The API release's two shapes: Recreate while an environment file sets forceReplicas, and
+      # RollingUpdate + HPA without it (proven for dev and prd before that line is deleted).
+      - run: bash helm/kix-avvik/test/api_render.sh
 
   # --- Build and Test ---
 
@@ -265,6 +268,10 @@ jobs:
       # there is no separate front-end job.
       context: .
       dockerfile: Dockerfile
+      # The commit, baked into the image as GIT_SHA and published as /ready's `version`; cd.yml's
+      # leader smoke waits for an answer from THIS build. The push job tags the same commit
+      # (`<branch>.<date>-SHA<first 7>`), which is what the smoke derives its expectation from.
+      build_args: GIT_SHA=${{ github.sha }}
 
   # Scan and push run in parallel -- a vulnerability finding does not block the
   # push, but the scan results are available for review on the PR

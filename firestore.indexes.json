@@ -188,6 +188,16 @@
       "collectionGroup": "devices",
       "fieldPath": "tombstone",
       "indexes": []
+    },
+    {
+      "collectionGroup": "feedback_contexts",
+      "fieldPath": "snapshot",
+      "indexes": []
+    },
+    {
+      "collectionGroup": "feedback_contexts",
+      "fieldPath": "claims",
+      "indexes": []
     }
   ]
 }
