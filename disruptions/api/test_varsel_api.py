@@ -5663,11 +5663,12 @@ def test_two_situations_about_one_train_yield_one_webhook_subject_carrying_both(
     # Both messages as one text, in the payload's order; neither fixture has a description, so each
     # contributes its summary, and neither has English.
     assert subject.payload["situations_text"] == "Signalfeil. Innstilt Drammen–Skøyen.", subject.payload
-    assert subject.payload["situations_text_en"] is None
-    # KIX-26: the definition's one-sentence summary, in both languages. One train here, so it is the
-    # train's own title (prd: no environment tag on either).
+    assert subject.payload["situations_text_en"] is None and subject.payload["situations_text_nn"] is None
+    # KIX-26: the definition's one-sentence summary, in every language. One train here, so it is the
+    # train's own title (prd: no environment tag on any).
     assert subject.payload["summary"] == subject.title, (subject.payload["summary"], subject.title)
     assert subject.payload["summary_en"].startswith("Train "), subject.payload["summary_en"]
+    assert subject.payload["summary_nn"].startswith("Tog "), subject.payload["summary_nn"]
     # The subject carries the routing the emit step needs, from the LOAD snapshot's version.
     assert subject.subscription_id == "sub-0001" and subject.subscription_version == 1
     assert subject.alertworthy is True

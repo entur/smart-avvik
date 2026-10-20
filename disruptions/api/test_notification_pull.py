@@ -534,11 +534,13 @@ def test_the_summary_counts_every_alive_train_whatever_the_limit():
     assert cut["truncated"] is True and cut["alerts"][0]["train"]["journey_ref"] == "t1"
     assert full["summary"] == cut["summary"] == "Tog R10 08:00 er innstilt, 1 til kan bli forsinket", full["summary"]
     assert full["summary"].startswith(full["alerts"][1]["payload"]["notification"]["title"])
-    # KIX-26: the English twin, in the same shape, and every entry's payload carries the pair the
-    # webhook event would.
+    # KIX-26: the English and nynorsk twins, in the same shape, and every entry's payload carries the
+    # triple the webhook event would.
     assert full["summary_en"] == cut["summary_en"] == "Train R10 08:00 is cancelled, 1 more may be delayed"
+    assert full["summary_nn"] == cut["summary_nn"] == "Tog R10 08:00 er innstilt, 1 til kan bli forseinka"
+    languages = ("summary", "summary_en", "summary_nn")
     for entry in full["alerts"]:
-        assert (entry["payload"]["summary"], entry["payload"]["summary_en"]) == (full["summary"], full["summary_en"])
+        assert tuple(entry["payload"][k] for k in languages) == tuple(full[k] for k in languages)
 
 
 def test_operator_text_every_train_carries_leads_the_summary_and_a_placeholder_never_does():
@@ -577,6 +579,7 @@ def test_operator_text_every_train_carries_leads_the_summary_and_a_placeholder_n
     _use_snapshot({"S_under": _train(dep, p_impact_dep=0.5)})
     body = _get(wait=0).json()
     assert body["n_alerts"] == 0 and body["summary"] is None and body["summary_en"] is None
+    assert body["summary_nn"] is None
 
 
 def test_the_summary_carries_no_environment_tag_even_where_the_titles_do():
@@ -2108,7 +2111,8 @@ def test_journey_status_carries_the_journey_alerts_summary_and_survives_a_matche
     alerts = _get(wait=0).json()
     status = _status().json()
     assert alerts["summary"] is not None
-    assert (status["summary"], status["summary_en"]) == (alerts["summary"], alerts["summary_en"])
+    languages = ("summary", "summary_en", "summary_nn")
+    assert tuple(status[k] for k in languages) == tuple(alerts[k] for k in languages)
 
     _status_reset(_status_train("a", dep))
     _use_snapshot({"S1": _train(STATUS_NOW + timedelta(hours=1), p_cancel=0.3, p_impact_dep=0.9)})
@@ -2120,7 +2124,7 @@ def test_journey_status_carries_the_journey_alerts_summary_and_survives_a_matche
     with _captured() as records:
         r = _status()
     assert r.status_code == 200, r.text
-    assert (r.json()["summary"], r.json()["summary_en"]) == (None, None)
+    assert (r.json()["summary"], r.json()["summary_en"], r.json()["summary_nn"]) == (None, None, None)
     assert [t["jkey"] for t in r.json()["trains"]] == ["a"]
     shipped = [x for x in records if x.levelno >= logging.INFO]
     assert all(NSR_A not in x.getMessage() for x in shipped), "the exception's text never reaches INFO+"

@@ -456,8 +456,8 @@ DESTINATION_CANCELLED = "Kjører ikke helt fram"
 
 @dataclass(frozen=True)
 class _Vocabulary:
-    """The words of one language's summary. The sentence's SHAPE is one function for both, so the
-    Norwegian and the English line cannot count, order or name differently (KIX-26)."""
+    """The words of one language's summary. The sentence's SHAPE is one function for all of them, so
+    the Norwegian, the English and the nynorsk line cannot count, order or name differently (KIX-26)."""
 
     #: per :func:`outcome_verb` key: (singular, plural)
     verbs: dict[str, tuple[str, str]]
@@ -472,6 +472,9 @@ class _Vocabulary:
     tomorrow: str
     and_word: str
     at: str  # the line-less label's «kl»
+    #: the payload situation field a cause is quoted from in this language; None for the Norwegian,
+    #: whose cause is the operator's own `summary`
+    cause_field: str | None
 
 
 _NB = _Vocabulary(
@@ -491,6 +494,7 @@ _NB = _Vocabulary(
     tomorrow="i morgen",
     and_word="og",
     at="kl",
+    cause_field=None,
 )
 _EN = _Vocabulary(
     verbs={
@@ -515,6 +519,34 @@ _EN = _Vocabulary(
     tomorrow="tomorrow",
     and_word="and",
     at="at",
+    cause_field="summary_en",
+)
+#: Nynorsk names a vehicle as bokmål does, so only the verbs and «i morgon» move. A weak participle
+#: agrees in the plural when it is predicative («2 tog er innstilte»); «forseinka» does not inflect.
+_NN = _Vocabulary(
+    verbs={
+        "er innstilt": ("er innstilt", "er innstilte"),
+        "kjører ikke helt fram": ("køyrer ikkje heilt fram", "køyrer ikkje heilt fram"),
+        "kan bli innstilt": ("kan bli innstilt", "kan bli innstilte"),
+        "kan bli forsinket": ("kan bli forseinka", "kan bli forseinka"),
+        "mulig avvik": ("mogleg avvik", "mogleg avvik"),
+    },
+    nouns={
+        "tog": ("tog", "tog"),
+        "buss": ("buss", "bussar"),
+        "t-bane": ("T-bane", "T-banar"),
+        "trikk": ("trikk", "trikkar"),
+        "båt": ("båt", "båtar"),
+    },
+    any_noun=("avgang", "avgangar"),
+    title_nouns={"tog": "Tog", "buss": "Buss", "t-bane": "T-bane", "trikk": "Trikk", "båt": "Båt"},
+    more="til",
+    with_word="med",
+    today="i dag",
+    tomorrow="i morgon",
+    and_word="og",
+    at="kl",
+    cause_field="summary_nn",
 )
 
 
@@ -525,7 +557,7 @@ def _joined(parts: list[str], and_word: str) -> str:
 
 def _summary_title(message_input: dict, v: _Vocabulary) -> str | None:
     """:func:`_train_title` in `v`'s words, from the same fields: the Norwegian one IS that title,
-    and the English one names the train the way it does, with the mode noun translated."""
+    and the others name the train the way it does, with the mode noun translated."""
     if v is _NB:
         return _train_title(message_input)
     hhmm = message_input.get("avgang_kl")
@@ -601,16 +633,16 @@ def _shared_cause(trains: list[tuple[dict, list[dict]]]) -> str | None:
     return None
 
 
-def _english_cause(cause: str, situations: list[dict]) -> str | None:
-    """The English of the Norwegian cause, off the worst train's situation that carries it
-    (`summary_en`, which `varsel._webhook_situations` attaches). The cause is CHOSEN on the
-    Norwegian text, because every rule that picks it is a rule about Norwegian; None when that
-    situation has no English or it runs past :data:`CAUSE_MAX_CHARS`, and the English line then
-    takes the no-cause branch rather than quote one language inside the other."""
+def _translated_cause(cause: str, situations: list[dict], field: str) -> str | None:
+    """The cause in another language, off the worst train's situation that carries it (`field`,
+    `summary_en` or `summary_nn`, which `varsel._webhook_situations` attaches). The cause is CHOSEN
+    on the Norwegian text, because every rule that picks it is a rule about Norwegian; None when that
+    situation has no translation or it runs past :data:`CAUSE_MAX_CHARS`, and that language's line
+    then takes the no-cause branch rather than quote one language inside the other."""
     for situation in situations:
         if (situation.get("summary") or "").strip().rstrip(".") == cause:
-            english = (situation.get("summary_en") or "").strip().rstrip(".")
-            return english if english and len(english) <= CAUSE_MAX_CHARS else None
+            translated = (situation.get(field) or "").strip().rstrip(".")
+            return translated if translated and len(translated) <= CAUSE_MAX_CHARS else None
     return None
 
 
@@ -622,8 +654,8 @@ def _summary(trains: list[tuple[dict, list[dict]]], v: _Vocabulary) -> str | Non
     modes = {(t.get("transportmiddel") or "").lower() for t in inputs}
     noun = v.nouns.get(modes.pop(), v.any_noun) if len(modes) == 1 else v.any_noun
     cause = _shared_cause(trains)
-    if cause and v is not _NB:
-        cause = _english_cause(cause, trains[0][1])
+    if cause and v.cause_field:
+        cause = _translated_cause(cause, trains[0][1], v.cause_field)
     if cause:
         return f"{cause}: {_counted(inputs, noun, v)}"
     worst = outcome_verb(inputs[0])
@@ -638,9 +670,9 @@ def _summary(trains: list[tuple[dict, list[dict]]], v: _Vocabulary) -> str | Non
     return f"{lead}, {_counted(inputs[1:], (v.more, v.more), v, beside_tomorrow=lead_tomorrow)}"
 
 
-def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, str | None]:
+def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, str | None, str | None]:
     """One sentence over every alert-worthy train on a definition, for a favourites row that is
-    skimmed rather than read, as `(Norwegian, English)` (KIX-26). `trains` is `(message_input,
+    skimmed rather than read, as `(Norwegian, English, nynorsk)` (KIX-26). `trains` is `(message_input,
     payload situations)` in WORST-FIRST order over every alive train and not only the listed ones,
     so a truncated answer reads the same as a full one.
 
@@ -656,15 +688,16 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, s
     when «i morgen» is.
 
     The English line is the same sentence in :data:`_EN`'s words ("Train L1 07:18 is cancelled, 2
-    more may be delayed"). Its one divergence is the cause: the operator's English
-    (:func:`_english_cause`) or, when there is none, the no-cause branch.
+    more may be delayed"), and the nynorsk one in :data:`_NN`'s («Tog L1 07:18 er innstilt, 2 til
+    kan bli forseinka»). Their one divergence is the cause: the situation's own translation
+    (:func:`_translated_cause`) or, when there is none, the no-cause branch.
 
-    `(None, None)` for no trains: "nothing to say", never all-clear -- an empty list means no
+    `(None, None, None)` for no trains: "nothing to say", never all-clear -- an empty list means no
     alert-worthy train among the trains the service scores.
     """
     if not trains:
-        return None, None
-    return _summary(trains, _NB), _summary(trains, _EN)
+        return None, None, None
+    return _summary(trains, _NB), _summary(trains, _EN), _summary(trains, _NN)
 
 
 # ---- One text over a train's operator messages (2026-10-18) -------------------------------------
@@ -699,8 +732,8 @@ def _deduped(texts: list[str]) -> str | None:
     return " ".join(out) or None
 
 
-def situations_text(situations: list[dict]) -> tuple[str | None, str | None]:
-    """The operator's messages about one train as ONE text, `(Norwegian, English)`, for a client
+def situations_text(situations: list[dict]) -> tuple[str | None, str | None, str | None]:
+    """The operator's messages about one train as ONE text, `(Norwegian, English, nynorsk)`, for a client
     that would otherwise stack every `description` -- 52 % of alert-worthy trains on prd's
     registered journeys carried two or more over the 14 days to 2026-10-18.
 
@@ -713,18 +746,21 @@ def situations_text(situations: list[dict]) -> tuple[str | None, str | None]:
 
     Only `has_situation` messages contribute, since anything else is text this codebase wrote. The
     situations to keep are chosen once, on the Norwegian, and each language is deduplicated on its
-    own, so the two cannot disagree about which message survived. English is None unless every
-    kept message has its English counterpart, rather than quote Norwegian inside English.
+    own, so the languages cannot disagree about which message survived. A translation is None
+    unless every kept message has its counterpart in that language, rather than quote Norwegian
+    inside English or bokmål inside nynorsk.
     """
     kept = [s for s in situations if s.get("has_situation") and (s.get("description") or s.get("summary"))]
     summaries = {_summary_key(s.get("summary")) for s in kept}
     kept = [s for s in kept if _SUPERSEDED_BY.get(_summary_key(s.get("summary"))) not in summaries]
     kept.sort(key=lambda s: _summary_key(s.get("summary")).startswith("ta "))
-    fields = [("description", "description_en") if s.get("description") else ("summary", "summary_en") for s in kept]
-    english = [s.get(en) for s, (_, en) in zip(kept, fields, strict=True)]
+    fields = ["description" if s.get("description") else "summary" for s in kept]
+    translations = [
+        [s.get(f"{field}_{language}") for s, field in zip(kept, fields, strict=True)] for language in ("en", "nn")
+    ]
     return (
-        _deduped([s[nb] for s, (nb, _) in zip(kept, fields, strict=True)]),
-        _deduped(english) if all(english) else None,
+        _deduped([s[field] for s, field in zip(kept, fields, strict=True)]),
+        *(_deduped(texts) if all(texts) else None for texts in translations),
     )
 
 

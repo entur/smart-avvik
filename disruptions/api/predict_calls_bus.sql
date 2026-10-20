@@ -436,6 +436,9 @@ SELECT
   s.lead_bucket AS platt_lead_bucket,
   sd.summary_en,
   sd.description_en,
+  -- No operator publishes nynorsk (situation_english.py): Gemini's, once it lands.
+  CAST(NULL AS STRING)  AS summary_nn,
+  CAST(NULL AS STRING)  AS description_nn,
   sd.report_type
 FROM curve AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
@@ -518,13 +521,19 @@ SELECT
   -- No model was scored, so no platt layer calibrated anything. Naming a bucket would claim a
   -- calibration that never ran.
   CAST(NULL AS STRING)  AS platt_lead_bucket,
-  -- English beside the Norwegian, written here for the same reason the Norwegian is: no operator
-  -- published either. Stop names stay as ET gives them.
+  -- English and nynorsk beside the Norwegian, written here for the same reason the Norwegian is: no
+  -- operator published any of them. Stop names stay as ET gives them.
   CASE
     WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Cancelled departure'
     WHEN e.seg_from = e.seg_to                  THEN CONCAT('Cancelled from ', e.seg_from)
     ELSE CONCAT('Cancelled ', e.seg_from, '–', e.seg_to)
   END AS summary_en,
   "The departure is marked as cancelled in the operator's real-time data." AS description_en,
+  CASE
+    WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Innstilt avgang'
+    WHEN e.seg_from = e.seg_to                  THEN CONCAT('Innstilt frå ', e.seg_from)
+    ELSE CONCAT('Innstilt ', e.seg_from, '–', e.seg_to)
+  END AS summary_nn,
+  'Avgangen er markert som innstilt i sanntidsdata frå operatøren.' AS description_nn,
   CAST(NULL AS STRING)  AS report_type
 FROM et_only AS e;

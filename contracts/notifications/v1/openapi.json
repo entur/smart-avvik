@@ -1079,6 +1079,7 @@
           "coverage",
           "summary",
           "summary_en",
+          "summary_nn",
           "alerts"
         ],
         "properties": {
@@ -1198,6 +1199,13 @@
               "null"
             ],
             "description": "`summary` in English, the same sentence in the same shape («Train L1 07:18 is cancelled, 2 more may be delayed»). The cause leads only when the operator published it in English too; otherwise this line names the trains without it, so the two can differ there and only there. `null` exactly when `summary` is."
+          },
+          "summary_nn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`summary` in nynorsk, the same sentence in the same shape («Tog L1 07:18 er innstilt, 2 til kan bli forseinka»). The cause leads only once the situation's own `summary_nn` has been translated -- no operator publishes nynorsk, so it is always a machine's -- and otherwise this line names the trains without it, as `summary_en` does. `null` exactly when `summary` is."
           },
           "alerts": {
             "type": "array",
@@ -1443,7 +1451,8 @@
           "journey",
           "coverage",
           "summary",
-          "summary_en"
+          "summary_en",
+          "summary_nn"
         ],
         "properties": {
           "now": {
@@ -1610,6 +1619,13 @@
               "null"
             ],
             "description": "journey-alerts' `summary_en`: `summary` in English."
+          },
+          "summary_nn": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "journey-alerts' `summary_nn`: `summary` in nynorsk."
           }
         }
       },

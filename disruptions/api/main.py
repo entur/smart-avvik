@@ -38,7 +38,7 @@ import poller_handover  # sibling module: the poller tenure's end (lease lost, s
 import poller_lease  # sibling module: which pod runs the poller (the lease state machine, stdlib only)
 import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
-import situation_english  # the English beside each situation's Norwegian text
+import situation_english  # the English and nynorsk beside each situation's Norwegian text
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
 import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
@@ -819,7 +819,8 @@ def refresh_call_predictions_cache(
     by_jkey_index: dict[str, set[str]] = {}
     by_stop_ref: dict[str, list[tuple[str, impact_engine.CallPred]]] = {}
     # One text per situation (it is the situation's first version on every row). getattr for the
-    # rollout rule `_call_pred_from_row` states: a table built before the English columns has none.
+    # rollout rule `_call_pred_from_row` states: a table built before the English or the nynorsk
+    # columns has none.
     texts: dict[str, tuple] = {}
 
     def _ingest(rows, operator_of: Callable[..., str]) -> None:
@@ -828,7 +829,15 @@ def refresh_call_predictions_cache(
             pred = _call_pred_from_row(r, op)
             texts.setdefault(
                 r.situationNumber,
-                (r.summary, r.description, getattr(r, "summary_en", None), getattr(r, "description_en", None)),
+                (
+                    r.summary,
+                    r.description,
+                    *(
+                        getattr(r, f"{field}_{language}", None)
+                        for language in situation_english.LANGUAGES
+                        for field in ("summary", "description")
+                    ),
+                ),
             )
             by_key.setdefault((op, r.jkey), []).append(pred)
             by_situation.setdefault(r.situationNumber, []).append(pred)
@@ -879,8 +888,8 @@ def refresh_call_predictions_cache(
     try:
         situation_english.update(texts, translate=translate)
     except Exception:
-        # English is an addition to the payload, never a reason to keep last cycle's predictions.
-        logger.exception("Could not update the situations' English text")
+        # A translation is an addition to the payload, never a reason to keep last cycle's predictions.
+        logger.exception("Could not update the situations' English and nynorsk text")
     logger.info(
         "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations, "
         "%d stop refs",
