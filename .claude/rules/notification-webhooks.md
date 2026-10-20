@@ -40,6 +40,20 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the module's own pool and never waited for. It is looked up by situation number and never enters
   `message_input` (that is the wording key: English there would re-word every train). Gated on
   `VARSEL_LLM_PROVIDER` alone, not on the wording switches.
+  **Nynorsk beside it since 2026-10-19**: `summary_nn`, `description_nn`, `nn_machine_translated` on
+  every situation, `situations_text_nn` and `summary_nn` on the payload, journey-alerts and
+  journey-status. **No operator publishes nynorsk** (SX languages over the 14 days to 2026-10-19:
+  NO, EN, SV, none), so there is no `'NN'` extraction in `disruptions_*today.sql`; the `KIX:` rows'
+  nynorsk is written in `predict_calls*.sql` beside the English, and everything else is Gemini's.
+  ONE call per Norwegian text answers both languages (`situation_english._translate`, four fields,
+  all-or-nothing), and provided text wins per language, so a Vy situation serves the operator's
+  English beside a machine's nynorsk. That made Gemini's volume every distinct operator text rather
+  than ~400 bus ones a day, which is why the in-flight cap went 25 → 100 and the pool 4 → 8. **A
+  follower never translates** (KTD12), so after zero-downtime step B a follower's read carries no
+  nynorsk on any operator situation; persisting the translations where every pod reads is the fix if
+  that matters. The summary's `_NN` vocabulary keeps bokmål's mode nouns and title shape (nynorsk
+  names a vehicle the same way); the hand-written nynorsk (vocabulary, SQL texts, test event) wants
+  a nynorsk reader's eye. Not in `message_input`.
 - **Each `payload.situations[]` entry carries `report_type`** (2026-10-05, KIX-29): SIRI-SX
   `reportType` (`INCIDENT`/`GENERAL`) off `disruptions_*initial_today` through `predict_calls*.sql`,
   then `CallPred` → `TripCell` → `SituationImpact` → `Alert` like `has_situation`; null on a `KIX:`
@@ -1011,7 +1025,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   client's). `null` for no trains, which is not all-clear.
   **`summary_en` beside it, and the pair on all three surfaces since 2026-10-05** (KIX-26): the
   journey-alerts read, every entry's `payload`, every webhook event's `payload` and journey-status.
-  ONE builder, `alerts_summary` returning `(nb, en)` off a `_Vocabulary` per language, so the two
+  ONE builder, `alerts_summary` returning `(nb, en, nn)` (nynorsk since 2026-10-19) off a `_Vocabulary` per language, so the
   lines cannot count, order or name differently; the one place they may differ is the cause, which is
   CHOSEN on the Norwegian (every rule that picks it is Norwegian) and quoted in English from that
   situation's `summary_en` -- absent or over the cap, the English line takes the no-cause branch

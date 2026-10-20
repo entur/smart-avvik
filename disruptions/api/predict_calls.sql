@@ -896,6 +896,12 @@ SELECT
   IF(s.has_situation, sd.description_en,
      'No situation message has been published for this departure. The assessment is based on '
      || "real-time data: the train's own delay upstream and the state of the line.") AS description_en,
+  -- Nynorsk likewise, except that no operator publishes it (situation_english.py), so a situation
+  -- row's is NULL here and Gemini's once it lands; only this file's own text is written in nynorsk.
+  IF(s.has_situation, NULL, 'Mogleg avvik') AS summary_nn,
+  IF(s.has_situation, NULL,
+     'Ingen situasjonsmelding er publisert for denne avgangen. Vurderinga byggjer på '
+     || 'sanntidsdata: forseinkinga toget sjølv har lenger bak, og tilstanden på linja.') AS description_nn,
   -- NULL on a no-SX row: no `sit` row carries its synthetic number, so `sd` is unmatched.
   sd.report_type
 FROM scored AS s
@@ -991,8 +997,8 @@ SELECT
   -- "predicted an outcome"; this column answers the different question of whether an SX message
   -- existed at all.
   FALSE                 AS has_situation,
-  -- English beside the Norwegian, written here for the same reason the Norwegian is: no operator
-  -- published either. Stop names stay as ET gives them.
+  -- English and nynorsk beside the Norwegian, written here for the same reason the Norwegian is: no
+  -- operator published any of them. Stop names stay as ET gives them.
   CASE
     WHEN e.call_source = 'removed'              THEN "Removed from today's timetable"
     WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Cancelled departure'
@@ -1005,6 +1011,18 @@ SELECT
       || IF(e.bus_for_train, ' Vy has set up rail replacement buses.', '')
     ELSE "The departure is marked as cancelled in the operator's real-time data."
   END AS description_en,
+  CASE
+    WHEN e.call_source = 'removed'              THEN 'Teken ut av rutetabellen i dag'
+    WHEN e.seg_from IS NULL OR e.seg_to IS NULL THEN 'Innstilt avgang'
+    WHEN e.seg_from = e.seg_to                  THEN CONCAT('Innstilt frå ', e.seg_from)
+    ELSE CONCAT('Innstilt ', e.seg_from, '–', e.seg_to)
+  END AS summary_nn,
+  CASE
+    WHEN e.call_source = 'removed' THEN
+      'Toget går vanlegvis på denne vekedagen, men finst ikkje i rutetabellen i dag.'
+      || IF(e.bus_for_train, ' Vy har sett opp buss for tog.', '')
+    ELSE 'Avgangen er markert som innstilt i sanntidsdata frå operatøren.'
+  END AS description_nn,
   -- No operator message, so no report type.
   CAST(NULL AS STRING)  AS report_type
 FROM et_only AS e;

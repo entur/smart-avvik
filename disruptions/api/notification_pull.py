@@ -416,6 +416,12 @@ class JourneyAlertsResponse(BaseModel):
         "English too; otherwise this line takes the no-cause branch, so the two can differ there "
         "and only there. `null` exactly when `summary` is."
     )
+    summary_nn: str | None = Field(
+        description="`summary` in nynorsk, the same sentence in the same shape («Tog L1 07:18 er "
+        "innstilt, 2 til kan bli forseinka»). The cause leads only once the situation's own "
+        "`summary_nn` has been translated; otherwise this line takes the no-cause branch, as "
+        "`summary_en` does. `null` exactly when `summary` is."
+    )
     alerts: list[JourneyAlertOut]
 
 
@@ -436,6 +442,7 @@ class JourneyStatusResponse(journey_status.JourneyStatus):
         "regardless."
     )
     summary_en: str | None = Field(description="journey-alerts' `summary_en`: `summary` in English.")
+    summary_nn: str | None = Field(description="journey-alerts' `summary_nn`: `summary` in nynorsk.")
 
 
 # ---- Validation --------------------------------------------------------------------------------
@@ -1501,7 +1508,11 @@ def _coverage(definition: dict) -> CoverageOut:
 
 
 def _assembled_entry(
-    definition: dict, entry: _Entry, state: _EntryState, rank: int, summary: tuple[str | None, str | None]
+    definition: dict,
+    entry: _Entry,
+    state: _EntryState,
+    rank: int,
+    summary: tuple[str | None, str | None, str | None],
 ) -> JourneyAlertOut:
     """One answer entry from the figures plus what the caches hold: the message input built after
     the alternative, the wording through `varsel.notification_wording_for` (the route line around
@@ -1548,8 +1559,8 @@ def _listed_states(
 
 def _summaries(
     definition: dict, alive: list[_Entry], inputs: dict[int, dict], now: datetime
-) -> tuple[str | None, str | None]:
-    """The definition's sentence as `(Norwegian, English)` (KIX-26), over ALIVE in the worst-first
+) -> tuple[str | None, str | None, str | None]:
+    """The definition's sentence as `(Norwegian, English, nynorsk)` (KIX-26), over ALIVE in the worst-first
     order, so `limit` cannot change what it counts -- `varsel.definition_summary`, the one the
     webhook event carries. A listed entry lends its state's message input (`inputs`, by entry id);
     any other gets its own build, off an `_enriched` winner with no alternative -- the label and the
@@ -1567,9 +1578,9 @@ def _summaries(
 
 def _assemble(
     definition: dict, alive: list[_Entry], states: list[_EntryState], limit: int, now: datetime
-) -> tuple[list[JourneyAlertOut], int, bool, tuple[str | None, str | None]]:
+) -> tuple[list[JourneyAlertOut], int, bool, tuple[str | None, str | None, str | None]]:
     """The answer's list from the figures and their resolved states: the rank, the cut, `complete`,
-    and the one-sentence `summary` as `(Norwegian, English)`.
+    and the one-sentence `summary` as `(Norwegian, English, nynorsk)`.
 
     `alive` is the departure cut already applied against THIS request's clock (`_alive`), because
     `catchable_after` is match time and a cached figure can outlive a departure by a cycle.
@@ -1821,6 +1832,7 @@ async def journey_alerts(
         coverage=_coverage(definition),
         summary=summary[0],
         summary_en=summary[1],
+        summary_nn=summary[2],
         alerts=alerts,
     )
 
@@ -1921,7 +1933,7 @@ async def journey_status_read(
         _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise _retry_later("plan_not_loaded")
     coverage = _coverage(definition).model_copy(update={"operators": list(journey_status.OPERATORS)})
-    summary, summary_en = await _status_summary(definition, now)
+    summary, summary_en, summary_nn = await _status_summary(definition, now)
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE
     _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest, client_name=client)
     return JourneyStatusResponse(
@@ -1930,13 +1942,14 @@ async def journey_status_read(
         coverage=coverage,
         summary=summary,
         summary_en=summary_en,
+        summary_nn=summary_nn,
     )
 
 
-async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, str | None]:
+async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, str | None, str | None]:
     """journey-alerts' sentence for the strip, off the SAME figures cache, so a client reading both
-    for one favourite pays one matcher run. `(None, None)` with a WARNING rather than a 503 when it
-    cannot be had: the strip's contract is the timetable, and a matcher failure must not take it
+    for one favourite pays one matcher run. `(None, None, None)` with a WARNING rather than a 503 when
+    it cannot be had: the strip's contract is the timetable, and a matcher failure must not take it
     down. The exception's type only, as `journey_alerts` logs its matcher.
 
     No `wait` is borrowed from journey-alerts: `_figures_for`'s single-flight parks a second caller
@@ -1945,7 +1958,7 @@ async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, 
     :data:`MAX_WAIT_S`."""
     refreshed_at = _refreshed_at_provider() if _refreshed_at_provider is not None else None
     if refreshed_at is None:
-        return None, None
+        return None, None, None
     key = _cache_key(varsel.journey_key(definition), refreshed_at, now)
     try:
         figures = _cached_figures(key, refreshed_at)
@@ -1955,7 +1968,7 @@ async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, 
     except Exception as exc:
         logger.debug("journey-status summary traceback for a public read", exc_info=True)
         logger.warning("The journey-status summary failed on a public read: %s", type(exc).__name__)
-        return None, None
+        return None, None, None
 
 
 def shutdown() -> None:

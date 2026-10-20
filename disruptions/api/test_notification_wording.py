@@ -977,6 +977,10 @@ def _en(trains):
     return nw.alerts_summary(trains)[1]
 
 
+def _nn(trains):
+    return nw.alerts_summary(trains)[2]
+
+
 def test_the_summary_leads_with_a_cause_every_train_names_and_counts_per_outcome():
     """The cause is operator TEXT every train carries: the matcher keeps one train per situation,
     so the numbers differ by construction and only the operator repeating itself can be shared."""
@@ -1149,7 +1153,7 @@ def test_tomorrows_trains_are_counted_apart_and_the_noun_follows_the_mode():
 def test_one_train_is_its_own_title_and_no_train_is_nothing_to_say():
     """The counts and the entries' titles come from one branch (`outcome_verb`), so a client
     rendering both never sees a summary count a train under a verb its title does not use."""
-    assert nw.alerts_summary([]) == (None, None)
+    assert nw.alerts_summary([]) == (None, None, None)
     for mi in (_mi("07:18", verb="cancelled"), _mi("07:18", verb="likely"), _mi("07:18"), _mi("07:18", verb="none"),
                _mi("07:18", tomorrow=True)):
         title = nw.notification_title(mi, "A", "B")
@@ -1184,10 +1188,47 @@ def test_a_train_that_never_reaches_the_destination_has_its_own_certain_wording(
     assert "kjører ikke helt fram" in _nb(trains)
 
 
-def _msg(number, summary, description, summary_en=None, description_en=None, has_situation=True):
-    """One of the payload's `situations`, operator text in both languages."""
+def test_the_nynorsk_line_is_the_same_sentence_in_nynorsk_words():
+    """`_NN`'s words through the one `_summary`. Nynorsk names a vehicle as bokmål does, so a title
+    differs only in its verb and «i morgon», and a weak participle agrees in the plural."""
+    nynorsk = ["Tog L1 07:18 er innstilt", "Tog L1 07:18 kan bli innstilt", "Tog L1 07:18 kan bli forseinka",
+               "Tog L1 07:18: mogleg avvik", "Tog L1 07:18 i morgon kan bli forseinka"]
+    for mi, title in zip((_mi("07:18", verb="cancelled"), _mi("07:18", verb="likely"), _mi("07:18"),
+                          _mi("07:18", verb="none"), _mi("07:18", tomorrow=True)), nynorsk, strict=True):
+        assert _nn([(mi, [_sit("S1")])]) == title
+    assert _nn([(_mi("07:18", line=None), [_sit("S1")])]) == "Tog kl 07:18 kan bli forseinka"
+    short = {"transportmiddel": "Tog", "linje": "R14", "destinasjon": "Asker", "avgang_kl": "10:59",
+             "kommer_ikke_fram": True}
+    assert _nn([(short, [_sit("S1")])]) == "Tog R14 Asker 10:59 køyrer ikkje heilt fram"
+    trains = [(_mi(hhmm, verb=verb), [_sit(f"S{i}", f"Melding {i}")])
+              for i, (hhmm, verb) in enumerate((("07:03", "cancelled"), ("07:42", "cancelled"),
+                                                ("09:50", "likely"), ("09:51", "likely"), ("09:05", "delay")))]
+    assert _nn(trains) == "2 tog er innstilte, 2 kan bli innstilte og 1 kan bli forseinka"
+    trains = [(_mi("08:18", verb="cancelled"), [_sit("S2")]), (_mi("07:18"), [_sit("S1")]),
+              (_mi("07:48", tomorrow=True), [_sit("S3", "Ta neste tog")])]
+    assert _nn(trains) == "Tog L1 08:18 er innstilt i dag, 1 til kan bli forseinka i dag og 1 i morgon"
+
+
+def test_the_nynorsk_cause_is_the_situations_own_nynorsk_or_none():
+    """Chosen on the Norwegian and quoted from `summary_nn`, as English quotes `summary_en`; with no
+    nynorsk yet (it is a machine's, and lands a cycle later) the line names the trains without it."""
+    bus = [(_mi(hhmm, mode="Buss", line="31"), [_sit("S1")]) for hhmm in ("07:18", "07:48")]
+    assert _nn(bus) == "2 bussar kan bli forseinka"
+    translated = [(mi, [dict(situations[0], summary_nn="Signalfeil ved Asker stasjon")]) for mi, situations in bus]
+    assert _nn(translated) == "Signalfeil ved Asker stasjon: 2 bussar kan bli forseinka"
+    assert _nb(translated) == "Signalfeil ved Asker: 2 busser kan bli forsinket"
+    placeholder = _sit("KIX:NoSituation:VYG:L1", "Mulig avvik", has_situation=False)
+    assert _nn([(_mi("07:18", verb="none"), [placeholder]), (_mi("07:48", verb="none"), [placeholder])]) == (
+        "2 tog med mogleg avvik"
+    )
+
+
+def _msg(number, summary, description, summary_en=None, description_en=None, has_situation=True, *,
+         summary_nn=None, description_nn=None):
+    """One of the payload's `situations`, operator text in every language."""
     return {"situation_number": number, "summary": summary, "description": description,
-            "summary_en": summary_en, "description_en": description_en, "has_situation": has_situation}
+            "summary_en": summary_en, "description_en": description_en,
+            "summary_nn": summary_nn, "description_nn": description_nn, "has_situation": has_situation}
 
 
 def test_situations_text_drops_vys_superseded_forecast_and_says_the_cause_once():
@@ -1203,6 +1244,7 @@ def test_situations_text_drops_vys_superseded_forecast_and_says_the_cause_once()
     assert nw.situations_text([forecast, fact]) == (
         "Toget kjørte 40 minutter forsinket fra Skien. Dette skyldes at togsettet vi trenger er forsinket.",
         "The train departed 40 minutes late from Skien. This is due to the train set we need being delayed.",
+        None,
     )
     # Alone, the forecast is the news and stays.
     assert nw.situations_text([forecast])[0].startswith("Vi forventer")
@@ -1234,11 +1276,18 @@ def test_situations_text_never_mixes_languages_and_is_none_without_an_operator_m
     untranslated = _msg("S3", "Buss for tog", "Vi har bestilt buss.")
     # A message with no description contributes its summary, as a sentence.
     assert nw.situations_text([with_en, no_description]) == (
-        "Signalfeil ved Asker. Innstilt Asker–Skøyen.", "Signal failure at Asker. Cancelled Asker–Skøyen.")
+        "Signalfeil ved Asker. Innstilt Asker–Skøyen.", "Signal failure at Asker. Cancelled Asker–Skøyen.", None)
     # One kept message without English: no English line rather than Norwegian inside it.
-    assert nw.situations_text([with_en, untranslated]) == ("Signalfeil ved Asker. Vi har bestilt buss.", None)
-    assert nw.situations_text([_msg("KIX:ETCancellation:t1", "Innstilt", "Innstilt.", has_situation=False)]) == (None, None)
-    assert nw.situations_text([]) == (None, None)
+    assert nw.situations_text([with_en, untranslated]) == ("Signalfeil ved Asker. Vi har bestilt buss.", None, None)
+    kix = _msg("KIX:ETCancellation:t1", "Innstilt", "Innstilt.", has_situation=False, summary_nn="Innstilt",
+               description_nn="Innstilt.")
+    assert nw.situations_text([kix]) == (None, None, None)
+    assert nw.situations_text([]) == (None, None, None)
+    # Nynorsk is judged on its own: the same kept messages, the same all-or-nothing rule.
+    with_nn = _msg("S4", "Signalfeil", "Signalfeil ved Asker.", description_nn="Det er signalfeil ved Asker.")
+    bus_nn = _msg("S5", "Innstilt Asker–Skøyen", None, summary_nn="Innstilt Asker–Skøyen")
+    assert nw.situations_text([with_nn, bus_nn])[2] == "Det er signalfeil ved Asker. Innstilt Asker–Skøyen."
+    assert nw.situations_text([with_nn, untranslated])[2] is None
 
 
 def _run():

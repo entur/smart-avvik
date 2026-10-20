@@ -97,15 +97,20 @@
           "summary_en": "Test notification from Entur",
           "description_en": "Synthetic event sent from /notification-api/v1/test-events. No real departures are affected.",
           "en_machine_translated": false,
+          "summary_nn": "Testvarsel frå Entur",
+          "description_nn": "Syntetisk hending sendt frå /notification-api/v1/test-events. Ingen verkelege avgangar er råka.",
+          "nn_machine_translated": false,
           "has_situation": false,
           "report_type": null
         }
       ],
       "situations_text": null,
       "situations_text_en": null,
+      "situations_text_nn": null,
       "alternative_journey": null,
       "summary": "Testvarsel: Tog L1 Lillestrøm er innstilt",
-      "summary_en": "Test notification: Train L1 Lillestrøm is cancelled"
+      "summary_en": "Test notification: Train L1 Lillestrøm is cancelled",
+      "summary_nn": "Testvarsel: Tog L1 Lillestrøm er innstilt"
     }
   }
 }

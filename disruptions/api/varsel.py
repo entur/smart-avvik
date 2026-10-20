@@ -110,7 +110,7 @@ import metrics  # sibling leaf module (no main import): the push-delivery counte
 import notification_events  # the webhook channel's typed hand-off type and its emit step
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
-import situation_english  # the English beside each situation's Norwegian text
+import situation_english  # the English and nynorsk beside each situation's Norwegian text
 import varsel_state  # where a registration lives: the seam and today's blob backend (U13)
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
@@ -3977,6 +3977,7 @@ def _webhook_situations(alerts: list[Alert]) -> list[dict]:
             continue
         seen.add(number)
         english = situation_english.english(number, alert.summary, alert.description)
+        nynorsk = situation_english.nynorsk(number, alert.summary, alert.description)
         out.append(
             {
                 "situation_number": number,
@@ -3988,6 +3989,11 @@ def _webhook_situations(alerts: list[Alert]) -> list[dict]:
                 "summary_en": english.summary if english else None,
                 "description_en": english.description if english else None,
                 "en_machine_translated": english.machine_translated if english else None,
+                # Nynorsk the same way, except that no operator publishes it: ours for a `KIX:` row,
+                # else always a Gemini translation, and all three null until it lands.
+                "summary_nn": nynorsk.summary if nynorsk else None,
+                "description_nn": nynorsk.description if nynorsk else None,
+                "nn_machine_translated": nynorsk.machine_translated if nynorsk else None,
                 # False means no SX message named this train at all, so `summary` is text this
                 # codebase wrote rather than an operator's. A receiver presenting it as an
                 # operator's statement would be making the 2026-08-20 mistake one layer out.
@@ -4006,11 +4012,11 @@ def _webhook_payload(
     message_input: dict,
     title: str,
     body: str,
-    summary: tuple[str | None, str | None],
+    summary: tuple[str | None, str | None, str | None],
 ) -> dict:
     """The event payload: the facts plus the Norwegian prose (R7).
 
-    `summary` is the definition's one-sentence summary as `(Norwegian, English)` -- over every
+    `summary` is the definition's one-sentence summary as `(Norwegian, English, nynorsk)` -- over every
     alert-worthy train on the definition, not this one (KIX-26) -- and the caller builds it once per
     definition with :func:`definition_summary`, so every train's payload carries the same pair.
 
@@ -4107,16 +4113,20 @@ def _webhook_payload(
         # (2026-10-18): operator words only, a superseded forecast and repeated sentences left out.
         "situations_text": situations_text[0],
         "situations_text_en": situations_text[1],
+        "situations_text_nn": situations_text[2],
         "alternative_journey": dumped,
         # The journey-alerts read's top-level sentence, so a client holding only events can render
         # the favourites row too. A snapshot at mint: a changed sentence mints nothing, like every
         # other figure here (notification_events' phase rule).
         "summary": summary[0],
         "summary_en": summary[1],
+        "summary_nn": summary[2],
     }
 
 
-def definition_summary(trains: list[tuple[dict, Alert, list[Alert]]]) -> tuple[str | None, str | None]:
+def definition_summary(
+    trains: list[tuple[dict, Alert, list[Alert]]],
+) -> tuple[str | None, str | None, str | None]:
     """`notification_wording.alerts_summary` over a definition's trains, given as `(message_input,
     winner, contributing alerts)` per train in any order: sorted worst-first here by the winner's
     `_alert_rank`, the order the journey-alerts read ranks its entries by, and with the situations
@@ -4272,7 +4282,7 @@ def _observations_for_key(
             contributing.setdefault(train, []).append(alert)
     winners = one_alert_per_train(alerts)
     # The definition's sentence, once, over its alert-worthy trains -- removed-from-plan ones
-    # included, as the journey-alerts read counts them -- so every event carries the same pair.
+    # included, as the journey-alerts read counts them -- so every event carries the same triple.
     summary = definition_summary([
         (
             message_inputs.get(_decision_key(key, w)) or _message_input_from_alert(w),

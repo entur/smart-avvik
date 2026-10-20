@@ -261,14 +261,18 @@ export interface NotificationEvent {
     /**
      * The contributing situations, each with `situation_number`, the Norwegian `summary` and
      * `description`, their English `summary_en` and `description_en`, `en_machine_translated`,
-     * `has_situation` and `report_type`. `report_type` is SIRI-SX's `reportType` as the operator
-     * published it, `INCIDENT` or `GENERAL`, and null for a `KIX:` situation (no operator message)
-     * or one that carried none; absent from an event minted before the field existed. The English
-     * is the operator's own where they published one (Vy does on every situation), the service's
-     * own for a `KIX:` situation (whose Norwegian it also wrote), and otherwise a machine
-     * translation of the Norwegian, with `en_machine_translated` true -- present that as a
-     * translation, not as the operator's words. A translation can land a poller cycle after the
-     * situation first appears, and until one does all three English fields are null.
+     * their nynorsk `summary_nn` and `description_nn`, `nn_machine_translated`, `has_situation`
+     * and `report_type`. `report_type` is SIRI-SX's `reportType` as the operator published it,
+     * `INCIDENT` or `GENERAL`, and null for a `KIX:` situation (no operator message) or one that
+     * carried none; absent from an event minted before the field existed. The English is the
+     * operator's own where they published one (Vy does on every situation), the service's own for
+     * a `KIX:` situation (whose Norwegian it also wrote), and otherwise a machine translation of
+     * the Norwegian, with `en_machine_translated` true -- present that as a translation, not as
+     * the operator's words. The nynorsk is the service's own for a `KIX:` situation and otherwise
+     * ALWAYS a machine translation, with `nn_machine_translated` true, because no operator
+     * publishes nynorsk. A translation can land a poller cycle after the situation first appears,
+     * and until one does that language's three fields are null; the nynorsk fields are absent from
+     * an event minted before they existed.
      */
     situations?: { [key: string]: unknown }[];
     /**
@@ -288,6 +292,13 @@ export interface NotificationEvent {
      */
     situations_text_en?: string | null;
     /**
+     * `situations_text` in nynorsk, from the same messages: null until every one of them has its
+     * nynorsk, rather than mix bokmål into it. Every operator message's nynorsk is a machine
+     * translation (`nn_machine_translated` true), so present this as one. Absent from an event
+     * minted before the field existed.
+     */
+    situations_text_nn?: string | null;
+    /**
      * The journey definition's one-sentence summary, in Norwegian: the same sentence
      * journey-alerts serves as its top-level `summary`, over every alert-worthy train on the
      * definition at mint and not only this one -- for a favourites row («Signalfeil ved Asker: 4
@@ -304,6 +315,13 @@ export interface NotificationEvent {
      * Null exactly when `summary` is. Absent from an event minted before the field existed.
      */
     summary_en?: string | null;
+    /**
+     * `summary` in nynorsk, the same sentence in the same shape («Tog L1 07:18 er innstilt, 2 til
+     * kan bli forseinka»). The cause leads only once the situation's `summary_nn` has been
+     * translated; otherwise this line names the trains without it, as `summary_en` does. Null
+     * exactly when `summary` is. Absent from an event minted before the field existed.
+     */
+    summary_nn?: string | null;
     /**
      * The best remaining way there, which is not necessarily a faster one: for a cancelled train
      * it legitimately arrives later than the timetable promised, so read `arrives_before_original`

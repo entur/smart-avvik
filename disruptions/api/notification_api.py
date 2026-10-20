@@ -1279,6 +1279,12 @@ def _synthetic_event(
                         "No real departures are affected."
                     ),
                     "en_machine_translated": False,
+                    "summary_nn": "Testvarsel frå Entur",
+                    "description_nn": (
+                        "Syntetisk hending sendt frå /notification-api/v1/test-events. "
+                        "Ingen verkelege avgangar er råka."
+                    ),
+                    "nn_machine_translated": False,
                     # False, and truthfully: no SX message named this train, so `summary` is text
                     # this codebase wrote rather than an operator's. A receiver presenting it as an
                     # operator statement would be making the 2026-08-20 mistake one layer out --
@@ -1292,12 +1298,15 @@ def _synthetic_event(
             # operator text to combine.
             "situations_text": None,
             "situations_text_en": None,
+            "situations_text_nn": None,
             "alternative_journey": None,
             # The definition's one-sentence summary (KIX-26): one train, so it is the title above,
-            # tagged as a test the same way, and its English twin. Hand-written like that title:
-            # move both if `notification_wording._train_title`'s shape ever moves.
+            # tagged as a test the same way, and its English and nynorsk twins (nynorsk names this
+            # train in bokmål's words). Hand-written like that title: move all three if
+            # `notification_wording._train_title`'s shape ever moves.
             "summary": "Testvarsel: Tog L1 Lillestrøm er innstilt",
             "summary_en": "Test notification: Train L1 Lillestrøm is cancelled",
+            "summary_nn": "Testvarsel: Tog L1 Lillestrøm er innstilt",
         },
     }
 

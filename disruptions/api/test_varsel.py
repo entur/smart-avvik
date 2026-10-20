@@ -1958,7 +1958,7 @@ def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timesta
 
 def _payload(alert):
     return varsel._webhook_payload(
-        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=(None, None)
+        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=(None, None, None)
     )
 
 
