@@ -69,25 +69,33 @@ common_shape() {
   check; echo "$dep" | grep -A6 'preStop:' | grep -q 'time.sleep(5)' || fail "$label: the preStop does not sleep 5 s"
 }
 
+# Environments whose step B is on main: their committed file is the rolling shape. prd joins this
+# list in its own step-B PR, after its step A is verified live; tst never does.
+STEP_B_COMMITTED="dev"
+
 for env in dev tst prd; do
   values="$CHART/env/values-kub-ent-$env.yaml"
   [ -f "$values" ] || fail "$values is missing"
   readiness=/ready; [ "$env" = "tst" ] && readiness=/health
 
-  # --- Step A, as committed: every environment file still forces one replica. ----------------
-  # Step B on this branch is a later one-line PR per environment, so for now all three must keep it;
-  # tst keeps it for good.
-  check; grep -qE '^    forceReplicas: 1$' "$values" || fail "$env: the environment file does not set forceReplicas: 1"
-  rendered=$(helm template "$RELEASE" "$CHART" -f "$values")
-  dep=$(echo "$rendered" | doc Deployment)
-  common_shape "$env" "$rendered" "$readiness"
-  check; echo "$dep" | grep -q 'type: Recreate$' || fail "$env: not Recreate while forceReplicas is set"
-  check; echo "$dep" | grep -q '^  replicas: 1$' || fail "$env: replicas is not 1 while forceReplicas is set"
-  check; if echo "$rendered" | grep -q '^kind: HorizontalPodAutoscaler$'; then fail "$env: an HPA renders while forceReplicas is set"; fi
+  if [[ " $STEP_B_COMMITTED " == *" $env "* ]]; then
+    # --- Step B, as committed: the WHOLE block is gone, not just the forceReplicas line. -------
+    check; if grep -qE '^  deployment:' "$values"; then fail "$env: step B is committed, so the environment file must carry no deployment: block"; fi
+  else
+    # --- Step A, as committed: the environment file still forces one replica. -----------------
+    # tst keeps it for good.
+    check; grep -qE '^    forceReplicas: 1$' "$values" || fail "$env: the environment file does not set forceReplicas: 1"
+    rendered=$(helm template "$RELEASE" "$CHART" -f "$values")
+    dep=$(echo "$rendered" | doc Deployment)
+    common_shape "$env" "$rendered" "$readiness"
+    check; echo "$dep" | grep -q 'type: Recreate$' || fail "$env: not Recreate while forceReplicas is set"
+    check; echo "$dep" | grep -q '^  replicas: 1$' || fail "$env: replicas is not 1 while forceReplicas is set"
+    check; if echo "$rendered" | grep -q '^kind: HorizontalPodAutoscaler$'; then fail "$env: an HPA renders while forceReplicas is set"; fi
+  fi
 
   [ "$env" = "tst" ] && continue
 
-  # --- Step B, proven before it is committed: the file with its `deployment:` block deleted. --
+  # --- Step B: the file with its `deployment:` block deleted (a no-op cut once it is committed). --
   # The WHOLE block, which is the step-B edit: deleting only the forceReplicas line leaves
   # `deployment:` null, and Helm reads a null override as "delete the key", which drops the base
   # file's entire deployment map (minReplicas, maxUnavailable, the grace) and fails the render.
@@ -115,4 +123,4 @@ for env in dev tst prd; do
   check; echo "$pdb" | grep -q 'minAvailable: 0%$' || fail "$env (rolling): the PDB is not minAvailable 0%"
 done
 
-echo "ok  API release renders Recreate in dev, tst and prd, and RollingUpdate+HPA in dev and prd without forceReplicas ($checks checks)"
+echo "ok  API release renders step B in $STEP_B_COMMITTED, Recreate elsewhere, and RollingUpdate+HPA in dev and prd without forceReplicas ($checks checks)"
