@@ -119,7 +119,7 @@ export default function DecisionCard({ decision }: { decision: Decision }) {
           {noSituation ? (
             <span
               className="vh-tag"
-              title="Ingen avviksmelding var publisert for denne avgangen. Vurderingen bygger på sanntidsdata alene — togets egen forsinkelse oppstrøms og tilstanden på linjen."
+              title="Ingen avviksmelding var publisert for denne avgangen. Vurderingen bygger på sanntidsdata alene — togets egen forsinkelse lenger bak og tilstanden på linjen."
             >
               Sanntidsdata alene
             </span>
