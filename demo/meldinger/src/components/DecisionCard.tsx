@@ -333,7 +333,7 @@ export default function DecisionCard({
           {noSituation ? (
             <span
               className="tb-tag"
-              title="Ingen avviksmelding var publisert for denne avgangen. Vurderingen bygger på sanntidsdata alene — togets egen forsinkelse oppstrøms og tilstanden på linjen."
+              title="Ingen avviksmelding var publisert for denne avgangen. Vurderingen bygger på sanntidsdata alene — togets egen forsinkelse lenger bak og tilstanden på linjen."
             >
               Sanntidsdata alene
             </span>

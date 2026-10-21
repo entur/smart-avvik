@@ -809,7 +809,7 @@ SELECT
   -- operator published a message with no description". Say what the row actually is instead.
   IF(s.has_situation, sd.description,
      'Ingen situasjonsmelding er publisert for denne avgangen. Vurderingen bygger på '
-     || 'sanntidsdata: togets egen forsinkelse oppstrøms og tilstanden på linjen.') AS description,
+     || 'sanntidsdata: togets egen forsinkelse lenger bak og tilstanden på linjen.') AS description,
   s.onset_ts,
   s.jkey, s.lineRef, s.stop_place, s.stop_name, s.stop_order,
   s.aimed_dep, s.aimed_arr, s.is_terminal, s.is_origin, s.min_from_onset,
