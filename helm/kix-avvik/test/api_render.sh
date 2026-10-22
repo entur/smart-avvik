@@ -72,6 +72,10 @@ common_shape() {
 # Environments whose step B is on main: their committed file is the rolling shape. prd joins this
 # list in its own step-B PR, after its step A is verified live; tst never does.
 STEP_B_COMMITTED="dev"
+# The rolling shape's floor per environment: "minReplicas pdbMinAvailable". dev keeps one pod and no
+# disruption budget (the golden path's single-pod dev); prd keeps two and 50 %, as Entur's
+# production hardening asks (>1 pod, PDB 50 %), so a node drain moves one pod at a time.
+declare -A ROLLING_FLOOR=([dev]="1 0%" [prd]="2 50%")
 
 for env in dev tst prd; do
   values="$CHART/env/values-kub-ent-$env.yaml"
@@ -91,17 +95,19 @@ for env in dev tst prd; do
     check; echo "$dep" | grep -q 'type: Recreate$' || fail "$env: not Recreate while forceReplicas is set"
     check; echo "$dep" | grep -q '^  replicas: 1$' || fail "$env: replicas is not 1 while forceReplicas is set"
     check; if echo "$rendered" | grep -q '^kind: HorizontalPodAutoscaler$'; then fail "$env: an HPA renders while forceReplicas is set"; fi
+    # Whatever floor the file stages for its step B, one forced pod must never be protected.
+    check; echo "$rendered" | doc PodDisruptionBudget | grep -q 'minAvailable: 0%$' || fail "$env: the PDB protects the single forced pod"
   fi
 
   [ "$env" = "tst" ] && continue
 
-  # --- Step B: the file with its `deployment:` block deleted (a no-op cut once it is committed). --
-  # The WHOLE block, which is the step-B edit: deleting only the forceReplicas line leaves
-  # `deployment:` null, and Helm reads a null override as "delete the key", which drops the base
-  # file's entire deployment map (minReplicas, maxUnavailable, the grace) and fails the render.
+  # --- Step B: the file with its forceReplicas line deleted (a no-op once it is committed). -----
+  # prd's block keeps its staged floor, so only the line goes. A block left with no key at all is
+  # null, which Helm reads as "delete the key" and the chart fails to render on a nil pointer --
+  # why dev deleted the WHOLE block, and why this render would fail if prd's floor went missing.
   step_b="$tmp/values-kub-ent-$env.yaml"
-  awk '/^  deployment:$/ { skip = 1; next } skip && /^  [^ #]/ { skip = 0 } !skip' "$values" > "$step_b"
-  check; if grep -q 'forceReplicas' "$step_b"; then fail "$env: could not cut the deployment block for the step-B render"; fi
+  grep -vE '^    forceReplicas: ' "$values" > "$step_b"
+  read -r floor_min floor_pdb <<< "${ROLLING_FLOOR[$env]}"
   rendered=$(helm template "$RELEASE" "$CHART" -f "$step_b")
   dep=$(echo "$rendered" | doc Deployment)
   hpa=$(echo "$rendered" | doc HorizontalPodAutoscaler)
@@ -114,13 +120,13 @@ for env in dev tst prd; do
   check; if echo "$dep" | grep -q '^  replicas:'; then fail "$env (rolling): replicas is rendered, so the HPA and the Deployment fight"; fi
   check; [ "$(echo "$rendered" | grep -c '^kind: HorizontalPodAutoscaler$')" = "1" ] || fail "$env (rolling): expected exactly one HPA"
   # hpa.spec replaces the chart's spec and renders neither bound; the chart's own minimum is 2.
-  check; echo "$hpa" | grep -q '^  minReplicas: 1$' || fail "$env (rolling): the HPA minimum is not 1"
+  check; echo "$hpa" | grep -q "^  minReplicas: $floor_min\$" || fail "$env (rolling): the HPA minimum is not $floor_min"
   check; echo "$hpa" | grep -q '^  maxReplicas: 3$' || fail "$env (rolling): the HPA maximum is not 3"
   check; echo "$hpa" | grep -q 'averageUtilization: 80$' || fail "$env (rolling): the CPU target is not 80 %"
   check; echo "$hpa" | grep -A3 'scaleTargetRef:' | grep -q "name: $RELEASE$" || fail "$env (rolling): the HPA does not target $RELEASE"
   check; echo "$hpa" | grep -A6 'scaleUp:' | grep -q 'periodSeconds: 60$' || fail "$env (rolling): scale-up is not one pod per 60 s"
   check; echo "$hpa" | grep -A1 'scaleDown:' | grep -q 'stabilizationWindowSeconds: 600$' || fail "$env (rolling): scale-down is not stabilised 600 s"
-  check; echo "$pdb" | grep -q 'minAvailable: 0%$' || fail "$env (rolling): the PDB is not minAvailable 0%"
+  check; echo "$pdb" | grep -q "minAvailable: $floor_pdb\$" || fail "$env (rolling): the PDB is not minAvailable $floor_pdb"
 done
 
 echo "ok  API release renders step B in $STEP_B_COMMITTED, Recreate elsewhere, and RollingUpdate+HPA in dev and prd without forceReplicas ($checks checks)"
