@@ -644,13 +644,13 @@ def test_warning_payload_is_forecast_framed_with_level_env_prefix_and_reasons():
         "2 tog er innstilt før kl. 06:30. Forsinkelser i morgentimene så langt."
     )
     assert "personalmangel" not in payload["body"]  # leading reasons only — a lock screen is small
-    assert payload["url"] == "/togmelding"  # the entur brand lands on the forecast page
+    assert payload["url"] == "/rushvarsel"  # the entur brand lands on the forecast page
     assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
     assert "situation_number" not in payload
 
 
 def test_none_brand_gets_its_own_icon_and_the_unbranded_varsel_url():
-    """The unbranded install has no /togmelding to land on, so it keeps its own varsel URL —
+    """The unbranded install has no /rushvarsel to land on, so it keeps its own varsel URL —
     the body carries the essentials. The WORDING is identical across brands (varsel precedent)."""
     decision = togvarsel_notify.decide_issue(_issued(), {}, now=_monday(6, 31))
     entur, none = (
@@ -781,7 +781,7 @@ def test_push_round_pushes_once_per_device_with_each_brands_assets(monkeypatch):
     by_endpoint = dict(sent)
     entur = by_endpoint["https://push.example.com/e"]
     none = by_endpoint["https://push.example.com/n"]
-    assert entur["url"] == "/togmelding" and entur["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
+    assert entur["url"] == "/rushvarsel" and entur["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
     assert none["url"] == varsel._BRAND_ASSETS["none"]["url"]
     assert none["icon"] == varsel._BRAND_ASSETS["none"]["icon"]
     assert "situation_number" not in entur and "situation_number" not in none
@@ -1233,12 +1233,12 @@ def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkey
         _deployed_as("ent-kixavvik-dev"),
         _push_devices({"dev-trig-1": _dev("https://push.example.com/t", brand="entur")}),
     ):
-        r = _trigger_client().post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+        r = _trigger_client().post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
     assert r.status_code == 200 and r.json() == {"status": "sent"}
     (payload,) = sent
     assert payload["title"] == "[dev] Rushvarsel: gult nivå for morgenrushet"  # real composition
     assert "testvarsel" in payload["body"].lower()  # clearly a test, never a real forecast
-    assert payload["url"] == "/togmelding"
+    assert payload["url"] == "/rushvarsel"
     assert payload["icon"] == varsel._BRAND_ASSETS["entur"]["icon"]
     assert "situation_number" not in payload
     assert store.stores == 0 and store.by_date == {}  # NEVER touches round markers
@@ -1263,7 +1263,7 @@ def test_the_test_trigger_is_refused_everywhere_but_dev(monkeypatch):
     with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
         for project, override in scenarios:
             with _deployed_as(project, override):
-                r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+                r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
                 assert r.status_code == 404, (project, override, r.status_code)
 
 
@@ -1274,17 +1274,17 @@ def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monke
     client = _trigger_client()
     with _deployed_as("ent-kixavvik-dev"):
         store, _ = _configure_evaluate(issues=[], push_ready=lambda: False)
-        r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+        r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
         assert r.status_code == 503  # VAPID/push not configured
 
         store, _ = _configure_evaluate(issues=[])
         with _push_devices({}):
-            r = client.post("/togmelding-api/test-notify", json={"device_id": "unknown-dev"})
+            r = client.post("/rushvarsel-api/test-notify", json={"device_id": "unknown-dev"})
             assert r.status_code == 404  # no such device
 
         monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "gone")
         with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
-            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
             assert r.status_code == 425  # fresh device saying gone is kept (grace window)
             with varsel._state_lock:
                 assert "dev-trig-1" in varsel._devices
@@ -1292,14 +1292,14 @@ def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monke
         with _push_devices(
             {"dev-trig-1": _dev("https://push.example.com/t", created="2020-01-01T00:00:00+00:00")}
         ):
-            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
             assert r.status_code == 410  # stale device saying gone is dropped
             with varsel._state_lock:
                 assert "dev-trig-1" not in varsel._devices
 
         monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "error")
         with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
-            r = client.post("/togmelding-api/test-notify", json={"device_id": "dev-trig-1"})
+            r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
             assert r.status_code == 502  # transient send error
     assert store.stores == 0  # no failure branch touches the round markers
 
@@ -1350,7 +1350,7 @@ def test_the_rushes_and_their_windows_are_derived_from_the_notify_specs():
 
 
 def test_the_panel_reads_the_pollers_station_cache_and_never_queries():
-    """cached_station_set is read-only: /togmelding-api is public and unauthenticated, and
+    """cached_station_set is read-only: /rushvarsel-api is public and unauthenticated, and
     station_set has no failure cooldown, so one scan per page view during an outage is the thing
     this prevents. A cold cache yields no panel rather than a query."""
     fake = _configure_outlook()
@@ -1373,7 +1373,7 @@ BOTH_RUSHES = {"j1": _j(begin="07:00", end="08:30"), "j2": _j(begin="16:00", end
 
 
 def test_the_panel_serves_the_newest_forecast_per_rush():
-    """A follow-up supersedes its baseline here exactly as it does on /togmelding — otherwise the
+    """A follow-up supersedes its baseline here exactly as it does on /rushvarsel — otherwise the
     two surfaces quote different numbers for one rush, and the reader cannot tell which applies."""
     fake = _configure_outlook(
         issues=[
@@ -1516,12 +1516,12 @@ def test_the_outlook_endpoint_serves_the_panel(monkeypatch):
     app = FastAPI()
     app.include_router(togvarsel_notify.router)
     with TestClient(app) as client:
-        body = client.get("/togmelding-api/outlook", params={"device_id": "device-0001"}).json()
+        body = client.get("/rushvarsel-api/outlook", params={"device_id": "device-0001"}).json()
         # no device_id at all is a 422, as everywhere else that takes one
-        assert client.get("/togmelding-api/outlook").status_code == 422
+        assert client.get("/rushvarsel-api/outlook").status_code == 422
         # and the bounds /varsel-api's DeviceIn holds: each call is a store read on a public route
         for bad in ("", "short", "x" * 101):
-            assert client.get("/togmelding-api/outlook",
+            assert client.get("/rushvarsel-api/outlook",
                               params={"device_id": bad}).status_code == 422, bad
     assert asked == ["device-0001"]
     assert body == {"rushes": [{"rush": "am", "issue": "0700",
@@ -1546,20 +1546,20 @@ def test_both_routes_404_while_the_master_gate_is_off(monkeypatch):
             os.environ["SHOW_RUSHVARSEL"] = value
             try:
                 assert client.get(
-                    "/togmelding-api/outlook", params={"device_id": "device-0001"}
+                    "/rushvarsel-api/outlook", params={"device_id": "device-0001"}
                 ).status_code == 404, value
                 # The gate answers before the device_id bounds: a 422 would mention the route.
                 assert client.get(
-                    "/togmelding-api/outlook", params={"device_id": "x"}
+                    "/rushvarsel-api/outlook", params={"device_id": "x"}
                 ).status_code == 404, value
                 assert client.post(
-                    "/togmelding-api/test-notify", json={"device_id": "dev-trig-1"}
+                    "/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"}
                 ).status_code == 404, value
             finally:
                 os.environ["SHOW_RUSHVARSEL"] = "true"
         # And on again: the outlook answers, so the 404s above are the gate and not a broken app.
         assert client.get(
-            "/togmelding-api/outlook", params={"device_id": "device-0001"}
+            "/rushvarsel-api/outlook", params={"device_id": "device-0001"}
         ).status_code == 200
 
 
@@ -1672,7 +1672,7 @@ def test_recording_failure_costs_neither_the_push_nor_the_markers(monkeypatch):
 
 
 def test_the_test_trigger_records_no_round(monkeypatch):
-    """POST /togmelding-api/test-notify reaches push_round directly on the public dev host with a
+    """POST /rushvarsel-api/test-notify reaches push_round directly on the public dev host with a
     caller-supplied device_id and a synthetic 0630 decision. On a first-write-wins MERGE that write
     would take the day's row and the real 06:30 round would be lost for good — so the recording
     hook lives in _evaluate and nowhere else."""

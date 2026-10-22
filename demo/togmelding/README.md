@@ -1,13 +1,13 @@
-# Rushvarsel (`/togmelding`)
+# Rushvarsel (`/rushvarsel`)
 
 > The product is **Rushvarsel**; the code is `togvarsel` / `togmelding`. The 2026-09-01 rename
 > (from «Togmeldingen») was display-only — the route, the API prefix, this directory, the `disruptions.togvarsel_*`
 > tables, `TOGVARSEL_NOTIFY_ENABLED`, the log events and the two data discriminators all kept their
 > names. Renaming the route would strand every push already sitting on a lock screen.
 
-The rush-hour forecast for the Oslo local network, rendered from `GET /togmelding-api/today`
+The rush-hour forecast for the Oslo local network, rendered from `GET /rushvarsel-api/today`
 (`disruptions/api/togvarsel.py`). React + Vite + [Entur Linje]; served by the disruptions API at
-`/togmelding`.
+`/rushvarsel`.
 
 Four prognoses per weekday — 06:30 and 07:00 for the morning rush, 12:00 and 14:00 for the
 afternoon — each a green / yellow / red level on a calibrated probability, with rule-based reasons
@@ -17,7 +17,7 @@ baseline on the page, so there is at most one card per rush: the newest.
 ## Why it looks like `/varsel`
 
 A traveller usually arrives here by tapping a rush-forecast Web Push from the Smarte reisevarsler PWA
-(`togvarsel_notify.build_payload` sends the Entur-branded install to `/togmelding`), and two
+(`togvarsel_notify.build_payload` sends the Entur-branded install to `/rushvarsel`), and two
 surfaces of one product should not look like two products. So the header band, the card language,
 the type scale and the feedback widget are all `/varsel`'s, and `src/styles.css` is deliberately a
 near-copy of `demo/avviksvarsel/src/styles.css`.
@@ -59,7 +59,7 @@ placeholder in either copy. **Edit both, or that suite fails.**
 
 ```sh
 ./build.sh          # -> disruptions/api/togmelding_static/ (gitignored)
-npm run dev         # local dev; proxies /togmelding-api and /varsel-api to localhost:8000
+npm run dev         # local dev; proxies /rushvarsel-api and /varsel-api to localhost:8000
 ```
 
 The image builds it in the root `Dockerfile`'s node stage. Until 2026-09-01 this page was a single

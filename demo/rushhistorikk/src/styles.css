@@ -17,16 +17,16 @@
    TWO COLOUR SYSTEMS ON ONE PAGE, deliberately, and the shapes keep them apart:
 
      VERDICT chips  — /historikk's flat pastel fills (#c9f0d2 etc). Borderless.
-     RUSH LEVEL     — /togmelding's Linje validation tokens (--stroke-success / --fill-success-muted
+     RUSH LEVEL     — /rushvarsel's Linje validation tokens (--stroke-success / --fill-success-muted
                       and the warning/negative pairs), as a RINGED pill: tint fill plus a 2px
                       stroke.
 
-   The rush levels are the same product's levels as /togmelding's, and two surfaces of one product
+   The rush levels are the same product's levels as /rushvarsel's, and two surfaces of one product
    must not disagree about what red looks like — so they keep those tokens rather than being
    re-expressed in this page's palette. The ring is what stops the two "warning" ambers (Linje's
    canary tint vs #ffe9c2) reading as an accidental mismatch when they sit in the same cell: level is
    ringed, verdict is flat, and the distinction is on purpose. Dark ink on a light tint at all three
-   levels, as /togmelding does — Linje's canary is too light for white text and too light to darken
+   levels, as /rushvarsel does — Linje's canary is too light for white text and too light to darken
    without leaving the palette. */
 
 body {
@@ -297,7 +297,7 @@ body {
   color: var(--basecolors-text-subdued, #6b6b6b);
 }
 
-/* ---- rush level badges: /togmelding's tokens, ringed ------------------------------------- */
+/* ---- rush level badges: /rushvarsel's tokens, ringed ------------------------------------- */
 
 .rh-level {
   display: inline-block;

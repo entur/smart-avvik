@@ -32,7 +32,7 @@ import {
 import IssueCard from './components/IssueCard';
 
 // Rushvarsel: the rush-hour forecast for the Oslo local network, rendered from
-// /togmelding-api/today. Entur-branded and laid out like the Smarte reisevarsler PWA (/varsel) on
+// /rushvarsel-api/today. Entur-branded and laid out like the Smarte reisevarsler PWA (/varsel) on
 // purpose — a traveller arrives here by tapping a rush-forecast push from that app, and two
 // surfaces of one product should not look like two products.
 //

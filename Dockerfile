@@ -1,6 +1,6 @@
 # Image for the /disruptions API plus its front-ends (/demo, /varsel, /historikk,
 # /rushhistorikk,
-# /meldinger, /togmelding).
+# /meldinger, /rushvarsel).
 #
 # Build context is the REPO ROOT (not disruptions/api) because the front-end
 # sources live in demo/reisedemo, demo/avviksvarsel, demo/varselhistorikk,
@@ -12,7 +12,7 @@
 # togmelding_static/ and rushhistorikk_static/ are gitignored, so they are NOT in the checkout and
 # must be built here. (The /eval snapshots are different: they run BigQuery
 # under a developer's ADC, so they are rendered offline and committed under
-# disruptions/api/eval_static/ — see export_eval.sh. /togmelding was that kind
+# disruptions/api/eval_static/ — see export_eval.sh. /rushvarsel was that kind
 # of page too until it moved onto Entur Linje, which needs the npm packages.)
 #
 # Runtime base is distroless (Entur Golden Path for Python; see entur/ai
@@ -111,7 +111,7 @@ COPY --from=pybuild /opt/venv /opt/venv
 # are gitignored (and .dockerignore'd), so they are absent here.
 COPY disruptions/api/ .
 
-# The freshly built /demo, /varsel, /historikk, /meldinger and /togmelding
+# The freshly built /demo, /varsel, /historikk, /meldinger and /rushvarsel
 # bundles from stage 1. Copied last so they always win over any stale
 # locally-built copy that slipped into the context.
 COPY --from=frontends /build/disruptions/api/demo_static ./demo_static

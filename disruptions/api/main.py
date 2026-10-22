@@ -40,7 +40,7 @@ import reisevalg  # sibling module: car vs train corridor recommendation (/reise
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import situation_english  # the English and nynorsk beside each situation's Norwegian text
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
-import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/togmelding-api)
+import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/rushvarsel-api)
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import tracing_setup  # import side effect: OTel tracing when TRACING_ENABLED (fail-open, KTD3)
@@ -2606,7 +2606,7 @@ async def lifespan(app: FastAPI):
     # of 503s, then the impact lookup, the SVV baselines, the stop picker and line modes, so a pod
     # `/ready` calls Ready answers every route and not only the two it checks. Before the poller
     # starts, so its first cycle's loads always land after these (~12 s of BigQuery reads for the
-    # caches, measured 2026-09-25). Then the rush forecast and the station set (U4), so /togmelding
+    # caches, measured 2026-09-25). Then the rush forecast and the station set (U4), so /rushvarsel
     # and the /varsel rush panel answer on this pod what the leader recorded.
     follow_last_build()
     _rush_hydrate()
@@ -2776,7 +2776,7 @@ app.include_router(rushhistorikk.router)
 # (notification_auth.authenticate, KTD8) runs per request at router level instead, so a route added
 # later is gated even if its author forgets the parameter.
 #
-# It is registered unconditionally, unlike /togmelding-api: there is no product-secrecy gate here
+# It is registered unconditionally, unlike /rushvarsel-api: there is no product-secrecy gate here
 # and the whole point of the surface is a published contract, so a client can be provisioned and
 # can register watches before the notification pass is switched on for that environment.
 # Availability is decided per request by notification_auth.available() — store plus pepper — which
@@ -2790,24 +2790,24 @@ app.include_router(notification_api.router)
 # credential cannot live on it; same prefix, so the published contract stays one API.
 app.include_router(notification_pull.router)
 
-# Togmelding API (the rush-hour forecast). Registered before the /togmelding static mount, like
+# Togmelding API (the rush-hour forecast). Registered before the /rushvarsel static mount, like
 # the routers above. Serves from the in-process cache the poller's togvarsel phase maintains.
 #
 # Togvarsel-notify's two routes ride the same gate, both over the seams injected in lifespan above.
-# GET /togmelding-api/outlook is the status panel /varsel shows at the top of its page: today's
+# GET /rushvarsel-api/outlook is the status panel /varsel shows at the top of its page: today's
 # rush levels for a device, gated on the delivery flag and on the poller's station cache, so it
 # only ever claims "you are being notified about this" where that is true.
-# POST /togmelding-api/test-notify is the dev-only test trigger: one synthetic rush-forecast push
+# POST /rushvarsel-api/test-notify is the dev-only test trigger: one synthetic rush-forecast push
 # through the same composition + delivery seams the real rounds use. It gates itself on
 # deployment.environment_label() == "dev" per call — tst, prd and unset labels get a plain 404 —
 # so mounting it everywhere is safe and keeps the image identical across environments.
 #
 # Both routers are gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel), and TWO mechanisms is
 # deliberate rather than belt-and-braces, because they close different things:
-#   - not INCLUDING them, here, is what keeps /togmelding-api out of the public OpenAPI schema.
+#   - not INCLUDING them, here, is what keeps /rushvarsel-api out of the public OpenAPI schema.
 #     `docs_url` is FastAPI's default, so /docs lists every registered route: a router that is
 #     present but 404s would still publish the endpoint names of a product we are not showing, and
-#     a listing is itself a mention. Import-time, like the /togmelding mount below and for the
+#     a listing is itself a mention. Import-time, like the /rushvarsel mount below and for the
 #     same reason — an env flag only moves on a pod restart, which is when this line is re-read.
 #   - the router-level `deployment.require_rushvarsel` dependency inside each module is what makes
 #     the gate hold PER REQUEST wherever the router is mounted — the two test suites mount it on
@@ -2819,7 +2819,7 @@ if deployment.show_rushvarsel():
     app.include_router(togvarsel.router)
     app.include_router(togvarsel_notify.router)
 else:
-    logger.info("SHOW_RUSHVARSEL is off; /togmelding-api not registered (404, and off /docs)")
+    logger.info("SHOW_RUSHVARSEL is off; /rushvarsel-api not registered (404, and off /docs)")
 
 # The SSO login/callback/logout routes (public by construction — they are how a session is made).
 app.include_router(sso.router)
@@ -2971,30 +2971,30 @@ else:
     )
 
 # The Togmelding page (demo/togmelding) — the rush-hour forecast, rendered from
-# /togmelding-api/today. Same generated-directory pattern as the mounts above: it was a single
+# /rushvarsel-api/today. Same generated-directory pattern as the mounts above: it was a single
 # COMMITTED hand-written HTML file until 2026-09-01, when it moved onto Entur Linje to match
 # /varsel — which means npm packages, and therefore a Vite bundle built in the image.
 #
 # Gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel), the master gate over the whole product:
-# with it off the page is simply never mounted, so /togmelding and /togmelding/ both answer a
+# with it off the page is simply never mounted, so /rushvarsel and /rushvarsel/ both answer a
 # plain 404 because no route claims the path, exactly as if the surface had never shipped. Read at
 # import, unlike every other check on this flag — a mount cannot be conditioned per request
-# without a StaticFiles subclass, and Mount's own path regex would answer the bare /togmelding
+# without a StaticFiles subclass, and Mount's own path regex would answer the bare /rushvarsel
 # with a 307 to the trailing slash BEFORE any per-request check could 404 it. An env flag only
 # changes on a pod restart anyway, which is also when this line is re-read.
 _TOGMELDING_STATIC_DIR = Path(__file__).parent / "togmelding_static"
 if not deployment.show_rushvarsel():
-    logger.info("SHOW_RUSHVARSEL is off; /togmelding not mounted (the whole surface 404s)")
+    logger.info("SHOW_RUSHVARSEL is off; /rushvarsel not mounted (the whole surface 404s)")
 elif _TOGMELDING_STATIC_DIR.is_dir():
     app.mount(
-        "/togmelding",
+        "/rushvarsel",
         _VersionedStaticFiles(directory=_TOGMELDING_STATIC_DIR, html=True),
-        name="togmelding",
+        name="rushvarsel",
     )
-    logger.info("Mounted togmelding page at /togmelding from %s", _TOGMELDING_STATIC_DIR)
+    logger.info("Mounted rushvarsel page at /rushvarsel from %s", _TOGMELDING_STATIC_DIR)
 else:
     logger.info(
-        "No togmelding_static/ directory; /togmelding not mounted "
+        "No togmelding_static/ directory; /rushvarsel not mounted "
         "(run demo/togmelding/build.sh)"
     )
 
@@ -3298,7 +3298,7 @@ def poll_for_changes(
         # demoted between two of them runs none of the rest, logged once as a cut cycle is. The
         # check is a BaseException, so the per-writer `except Exception` blocks cannot swallow it.
         try:
-            # Togmeldingen (/togmelding-api) runs on EVERY tick, not just ingestion changes: an
+            # Togmeldingen (/rushvarsel-api) runs on EVERY tick, not just ingestion changes: an
             # issue is due at its clock cutoff (06:30/07:00/12:00/14:00) whether or not new SX
             # arrived, so it must not hang off the SX cadence. Cheap in-memory no-op on the vast
             # majority of ticks; on a weekday tick past an un-issued forecast time it rebuilds the
@@ -3309,7 +3309,7 @@ def poll_for_changes(
                 togvarsel.refresh()
             except Exception:
                 logger.exception(
-                    "Togvarsel refresh failed; /togmelding-api serves the day's existing issues"
+                    "Togvarsel refresh failed; /rushvarsel-api serves the day's existing issues"
                 )
             _beat()
             # Togvarsel pushes ride the same wall-clock tick, AFTER refresh so the tick that issues

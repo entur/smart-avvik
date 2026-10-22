@@ -1,4 +1,4 @@
-"""Checks for /togmelding-api — the rush-hour forecast (togvarsel.py).
+"""Checks for /rushvarsel-api — the rush-hour forecast (togvarsel.py).
 
 Hermetic: BigQuery is replaced with a fake that dispatches on the SQL it is handed and replays
 canned rows — nothing here touches BigQuery, the models, or the network. The checks that matter
@@ -18,7 +18,7 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-# Rushvarsel's master gate, pinned ON before togvarsel is imported: every /togmelding-api route
+# Rushvarsel's master gate, pinned ON before togvarsel is imported: every /rushvarsel-api route
 # carries a router-level dependency on it and 404s while it is off (which is the default, and the
 # posture every deployment is in today). Set at import, the way test_varsel_api pins
 # KIX_ENVIRONMENT — each suite is its own process, deliberately (see the CI note), so this cannot
@@ -533,7 +533,7 @@ def test_a_forecast_is_retired_when_its_rush_ends():
 
 
 def test_the_rush_windows_agree_with_the_notify_chain():
-    """/togmelding retires a card at RUSH_END_H; /varsel's panel drops the same rush at
+    """/rushvarsel retires a card at RUSH_END_H; /varsel's panel drops the same rush at
     togvarsel_notify.RUSH_WINDOWS' end. Two surfaces of one product disagreeing about whether a
     rush is still a live topic is the failure — one showing the morning at 09:30 while the other
     has moved on. Pinned here rather than in test_togvarsel_notify, which stays hermetic."""
@@ -588,7 +588,7 @@ def test_endpoint_serves():
     _reset(fake)
     app = FastAPI()
     app.include_router(togvarsel.router)
-    resp = TestClient(app).get("/togmelding-api/today")
+    resp = TestClient(app).get("/rushvarsel-api/today")
     assert resp.status_code == 200
     body = resp.json()
     assert {"date", "forecast_day", "issues", "known_deviations", "skill_note"} <= set(body)
@@ -598,7 +598,7 @@ def test_the_whole_api_404s_while_the_master_gate_is_off():
     """SHOW_RUSHVARSEL off (its default) 404s EVERY route on this router, not just the payload.
 
     Router-level, so /config goes with /today: while the product is dark the surface must be
-    indistinguishable from one that never shipped, and a /togmelding-api/config that answers 200
+    indistinguishable from one that never shipped, and a /rushvarsel-api/config that answers 200
     tells a reader the page exists and is merely empty. The parse is the delivery-flag allow-list
     (deployment.show_rushvarsel), so "false", "" and anything unrecognised all read as off — the
     closed direction.
@@ -611,17 +611,39 @@ def test_the_whole_api_404s_while_the_master_gate_is_off():
     for value in ("false", "", "0", "off", "disabled"):
         os.environ["SHOW_RUSHVARSEL"] = value
         try:
-            assert client.get("/togmelding-api/today").status_code == 404, value
-            assert client.get("/togmelding-api/config").status_code == 404, value
+            assert client.get("/rushvarsel-api/today").status_code == 404, value
+            assert client.get("/rushvarsel-api/config").status_code == 404, value
         finally:
             os.environ["SHOW_RUSHVARSEL"] = "true"
     # Unset is off too, and needs no helm value to be.
     del os.environ["SHOW_RUSHVARSEL"]
     try:
-        assert client.get("/togmelding-api/today").status_code == 404
+        assert client.get("/rushvarsel-api/today").status_code == 404
     finally:
         os.environ["SHOW_RUSHVARSEL"] = "true"
-    assert client.get("/togmelding-api/today").status_code == 200  # and back on
+    assert client.get("/rushvarsel-api/today").status_code == 200  # and back on
+
+
+def test_the_old_page_path_redirects_permanently_and_only_while_the_gate_is_open():
+    """/togmelding moved to /rushvarsel on 2026-10-22; pushes already delivered still tap through
+    to the old path, bare and without a trailing slash."""
+    app = FastAPI()
+    app.include_router(togvarsel.router)
+    client = TestClient(app)
+    for old, new in (
+        ("/togmelding", "/rushvarsel/"),
+        ("/togmelding/", "/rushvarsel/"),
+        ("/togmelding/assets/index-x.js", "/rushvarsel/assets/index-x.js"),
+        ("/togmelding?brand=entur", "/rushvarsel/?brand=entur"),
+    ):
+        r = client.get(old, follow_redirects=False)
+        assert (r.status_code, r.headers["location"]) == (301, new), (old, r.status_code)
+    assert "/togmelding" not in app.openapi()["paths"]
+    os.environ["SHOW_RUSHVARSEL"] = "false"
+    try:
+        assert client.get("/togmelding", follow_redirects=False).status_code == 404
+    finally:
+        os.environ["SHOW_RUSHVARSEL"] = "true"
 
 
 class _pinned_clock:
@@ -667,8 +689,8 @@ def test_endpoint_mints_one_feedback_context_per_issued_forecast():
         # back-filled afternoon forecast rides along beside the live morning one — which is what
         # puts two forecasts on one payload to compare ids across.
         with _pinned_clock(MONDAY_0710):
-            first = client.get("/togmelding-api/today").json()
-            second = client.get("/togmelding-api/today").json()
+            first = client.get("/rushvarsel-api/today").json()
+            second = client.get("/rushvarsel-api/today").json()
         issues = {i["issue"]: i for i in first["issues"]}
         # 06:30 and 12:00 were issued too; the page carries only what superseded them.
         assert set(issues) == {"0700", "1400"}
@@ -714,7 +736,7 @@ def test_endpoint_offers_no_feedback_when_the_stack_is_off():
         app = FastAPI()
         app.include_router(togvarsel.router)
         with _pinned_clock(MONDAY_0710):
-            (issue,) = TestClient(app).get("/togmelding-api/today").json()["issues"]
+            (issue,) = TestClient(app).get("/rushvarsel-api/today").json()["issues"]
         assert issue["feedback_context_id"] is None and issue["feedback_enabled"] is False
         assert feedback_contexts._by_id == {}
     finally:
@@ -762,7 +784,7 @@ def test_feedback_snapshot_mirrors_the_page():
 
 
 def test_the_level_vocabulary_is_one_copy_per_app_and_the_copies_agree():
-    """/varsel and /togmelding each carry `src/levels.ts` — a guarded duplicate, like personvern.ts,
+    """/varsel and /rushvarsel each carry `src/levels.ts` — a guarded duplicate, like personvern.ts,
     because each front-end is its own npm app and the image's node stage copies only its own
     directory. Until 2026-09-02 the two apps had drifted into GRØNT/GULT/RØDT vs GRØNN/GUL/RØD for
     one concept, and the middle sentence («noe usikkert») measured something else than the two
@@ -779,7 +801,7 @@ def test_the_level_vocabulary_is_one_copy_per_app_and_the_copies_agree():
     assert "'noe usikkert'" not in togmelding_copy
     for label in ("GRØNT", "GULT", "RØDT"):
         assert f"'{label}'" in togmelding_copy
-    # the /varsel panel and the /togmelding card both read the copy rather than their own literals
+    # the /varsel panel and the /rushvarsel card both read the copy rather than their own literals
     for page in (demo / "avviksvarsel" / "src" / "components" / "RushOutlook.tsx",
                  demo / "togmelding" / "src" / "components" / "IssueCard.tsx"):
         assert "levels'" in page.read_text() or "./format'" in page.read_text(), page

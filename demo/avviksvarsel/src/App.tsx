@@ -121,8 +121,8 @@ export default function App({ brand }: { brand: Brand }) {
   // about registrations the server no longer has.
   //
   // Not asked at all where /config says this deployment does not serve rushvarsel
-  // (SHOW_RUSHVARSEL off, or notifications off): /togmelding-api 404s wholesale there, and while
-  // the catch below would leave the panel empty anyway, a failing request named togmelding-api on
+  // (SHOW_RUSHVARSEL off, or notifications off): /rushvarsel-api 404s wholesale there, and while
+  // the catch below would leave the panel empty anyway, a failing request named rushvarsel-api on
   // every poll is itself a mention of a product that is meant to be invisible here.
   const refreshRushes = useCallback(async () => {
     const issuedFor = deviceId;
@@ -436,7 +436,7 @@ export default function App({ brand }: { brand: Brand }) {
                 train-specific avviksvarsel, so a new push class gets announced before it
                 arrives. The Rushvarsel link is Entur-branded and stays off the unbranded
                 variant — matching the pushes themselves, whose unbranded click-through also
-                skips /togmelding. */}
+                skips /rushvarsel. */}
             {config?.togvarsel_notify && (
               <SmallAlertBox variant="information" title="Nytt: Rushvarsel" width="fluid">
                 Varslene omfatter nå også togtrafikken i rushtiden: på hverdager får du beskjed
@@ -446,7 +446,7 @@ export default function App({ brand }: { brand: Brand }) {
                 {brand.id === 'entur' && (
                   <>
                     {' '}
-                    <Link href="/togmelding">Se dagens rushvarsel</Link>
+                    <Link href="/rushvarsel">Se dagens rushvarsel</Link>
                   </>
                 )}
               </SmallAlertBox>

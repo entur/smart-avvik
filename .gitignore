@@ -32,7 +32,7 @@ demo/meldinger/node_modules/
 demo/meldinger/tsconfig.tsbuildinfo
 
 # Built into the image by the root Dockerfile's node stage; not committed. Was a single
-# committed HTML page until 2026-09-01, when /togmelding moved onto Entur Linje — which
+# committed HTML page until 2026-09-01, when /rushvarsel moved onto Entur Linje — which
 # needs the npm packages, and therefore a build step.
 disruptions/api/togmelding_static/
 demo/togmelding/node_modules/

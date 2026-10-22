@@ -3,7 +3,7 @@
 // route would 404 on the direct hits this page exists for (a link from a push, a pasted URL).
 //
 // Every published word on this page comes from src/personvern.ts. Nothing here composes, shortens
-// or re-words a privacy text: the module is the single source that the node suite, the /togmelding
+// or re-words a privacy text: the module is the single source that the node suite, the /rushvarsel
 // parity test and the consent-version hash are all pinned to, and a copy living in this file would
 // be outside every one of those guards.
 

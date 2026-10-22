@@ -23,7 +23,7 @@ partner user never gets as far as the claim check; neither of those two is the l
 What is gated is exactly :data:`PROTECTED_PREFIXES` — entries are absolute path prefixes, so a
 new one MUST start with "/" (every ASGI path does; an unslashed entry matches nothing and the
 surface silently stays public — shipped once, 2026-08-31, pinned by the test suite since).
-Everything else — /varsel, /togmelding, the read-only APIs — is deliberately untouched: those are
+Everything else — /varsel, /rushvarsel, the read-only APIs — is deliberately untouched: those are
 the traveller-facing surfaces, and this gate exists so the internal ones (and the partner demo)
 can stop being public without moving anybody's URL.
 

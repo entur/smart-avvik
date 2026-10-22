@@ -47,8 +47,8 @@ def show_rushvarsel() -> bool:
     """Whether this deployment serves Rushvarsel at all -- ``SHOW_RUSHVARSEL``, unset = OFF.
 
     The master gate over the whole rush-forecast surface, added 2026-09-08 because the product is
-    not ready to be seen: while it is off, no rush-forecast push is sent, ``/togmelding`` and every
-    ``/togmelding-api`` route answer 404, and ``/varsel`` mentions rushvarsel nowhere (the notice
+    not ready to be seen: while it is off, no rush-forecast push is sent, ``/rushvarsel`` and every
+    ``/rushvarsel-api`` route answer 404, and ``/varsel`` mentions rushvarsel nowhere (the notice
     and the outlook panel both follow ``/varsel-api/config``'s ``togvarsel_notify``, which is ANDed
     with this).
 
@@ -83,7 +83,7 @@ def rushvarsel_red_only() -> bool:
 
 
 def require_rushvarsel() -> None:
-    """FastAPI dependency: 404 every ``/togmelding-api`` route while :func:`show_rushvarsel` is off.
+    """FastAPI dependency: 404 every ``/rushvarsel-api`` route while :func:`show_rushvarsel` is off.
 
     Applied at ROUTER level in both togvarsel.py and togvarsel_notify.py, so a route added to
     either one is gated by construction rather than by remembering. Defined here, beside the flag,
