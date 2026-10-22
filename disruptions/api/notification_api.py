@@ -1211,7 +1211,7 @@ def _synthetic_event(
         "payload": {
             "notification": {
                 # Norwegian, like every traveller-facing string in this repo, and marked as a test
-                # in the text itself -- the same choice `/togmelding`'s test round makes, so a
+                # in the text itself -- the same choice `/rushvarsel`'s test round makes, so a
                 # notification that reaches a real lock screen during integration says so.
                 "title": "Testvarsel: Tog L1 Lillestrøm er innstilt",
                 "body": (

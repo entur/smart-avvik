@@ -21,7 +21,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `demo/avviksvarsel/` (React + Vite + Entur Linje). **Renamed on 2026-09-16 from «Avviksvarsel»**,
   which was the traveller-facing name only: the rename moved the displayed strings (masthead, tab
   title, both manifests, the push fallback title, `/varsel/personvern/`, and the places
-  `/togmelding`, `/historikk` and `/meldinger` name the product to a reader) and nothing else. The
+  `/rushvarsel`, `/historikk` and `/meldinger` name the product to a reader) and nothing else. The
   directory `demo/avviksvarsel/`, the `/varsel` and `/varsel-api` paths, every `varsel_*`
   identifier, the `varsel_decisions` tables and the `disruptions/api` docstrings keep the old word — so
   "Avviksvarsel" surviving in this file or in the code is the internal name, not a missed rename.
@@ -515,7 +515,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     the wording and alternative caches (a follower's card shows the SX summary and no alternative),
     and the feedback snapshot cache — the snapshots themselves are `feedback_contexts` documents
     under this backend, bound to the device and deleted in its erase transaction. And
-    **`/togmelding-api/outlook` reads the device's journeys from the store on every call** (it read
+    **`/rushvarsel-api/outlook` reads the device's journeys from the store on every call** (it read
     process memory before), so the rush panel at the top of `/varsel` costs one store query per
     poll and can trigger the weekly activity renewal write, as the journey list already does —
     watch it if the PWA's poll rate rises. **The two

@@ -9,13 +9,13 @@ paths:
   - "docs/{togvarsel,rushvarsel}/**"
 ---
 
-# Rushvarsel — /togmelding, its push rounds, /rushhistorikk
+# Rushvarsel — /rushvarsel, its push rounds, /rushhistorikk
 
 Moved verbatim from the root `CLAUDE.md` on 2026-09-23, where it was a bullet under
 "Deployment". Where the text says "above", "below", "see the … section" or "Conventions", it
 means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
 
-- **Rushvarsel** at `/togmelding` (`/togmelding-api/today`, `disruptions/api/togvarsel.py`) is
+- **Rushvarsel** at `/rushvarsel` (`/rushvarsel-api/today`, `disruptions/api/togvarsel.py`) is
   the rush-hour forecast from `docs/togvarsel/` (§8 of the findings as revised by §14k; the
   implementation is `docs/togvarsel/03-implementasjon.md`). Four weekday issues (06:30, 07:00 for
   the AM rush; 12:00, 14:00 for the PM rush), each a tuned `LOGISTIC_REG` probability on the
@@ -60,7 +60,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   onto Linje to match `/varsel` — a traveller usually arrives here by tapping a rush-forecast push
   from that PWA, and two surfaces of one product should not look like two products. So the header
   band, the card language and the feedback widget are `/varsel`'s, `src/styles.css` is a near-copy
-  of `demo/avviksvarsel/src/styles.css`, and `GET /togmelding-api/config` labels non-prod in the
+  of `demo/avviksvarsel/src/styles.css`, and `GET /rushvarsel-api/config` labels non-prod in the
   heading and tab title exactly as `/historikk` and `/meldinger` do (its own endpoint, not a field
   on `/today`, because `/today` is legitimately empty on a weekend or a failed rebuild and that is
   when "dev or prd?" matters most). Three things the move has to keep right. The level colours are
@@ -77,13 +77,20 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   **The product is called «Rushvarsel» and the code is called togvarsel/togmelding** (renamed
   from «Togmeldingen» on 2026-09-01). The rename is deliberately DISPLAY-ONLY: the page heading,
   `<title>`, meta description, the two no-forecast sentences, the published disclaimer and the two
-  link texts on /varsel. Nothing identifying moved — not the `/togmelding` route (already baked into push
-  payloads sitting on lock screens, where a moved path is a dead tap), not `/togmelding-api`, the
-  modules, `demo/togmelding/`, the `disruptions.togvarsel_*` tables and models,
+  link texts on /varsel. Nothing identifying moved — not the modules, `demo/togmelding/`, the
+  `disruptions.togvarsel_*` tables and models,
   `TOGVARSEL_NOTIFY_ENABLED`, the `togvarsel_*` log events, or the two data discriminators
   (`display_source='togvarsel'`, `KIX:Togvarsel:<date>:<issue>`) — that last pair for the
   meldinger-rename reason: a new name drops the rows out of every export query that already
-  exists. The page intro no longer opens with «Rushtidsvarsel for lokaltogene …» — the phrase the
+  exists. **The paths are the exception: on 2026-10-22 the page moved from `/togmelding` to
+  `/rushvarsel` and the API from `/togmelding-api` to `/rushvarsel-api`.** The page path is baked
+  into push payloads sitting on lock screens, so `/togmelding` (and anything under it, query kept)
+  answers a 301 to `/rushvarsel/` — a route on `togvarsel.router`, so the master gate 404s it with
+  the rest of the product. The API has no alias: nothing outside our own two bundles calls it and no
+  push names it, so the cost is one deploy's worth of open tabs — an old /varsel bundle polls the
+  dead path and shows no rush panel (its ordinary empty state), an old /togmelding bundle shows its
+  fetch error, both until reloaded. The HTTP metrics `path` label counts `rushvarsel`,
+  `rushvarsel-api` and the redirect's `togmelding`. The page intro no longer opens with «Rushtidsvarsel for lokaltogene …» — the phrase the
   name was drawn from, so keeping it would have the intro restate the heading. One thing the name
   buys for free: the push titles already said «Rushvarsel»/«Oppdatert rushvarsel»
   (`togvarsel_notify.compose_message`), so the notifications and the product now carry the same
@@ -150,7 +157,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   Wording is deterministic
   Norwegian from the issue's own fields (no LLM), titled `Rushvarsel`/`Oppdatert
   rushvarsel`/`Friskmelding` so a red morning's SX push and forecast push stay tellable apart;
-  entur-brand pushes click through to `/togmelding`. Delivery is gated by
+  entur-brand pushes click through to `/rushvarsel`. Delivery is gated by
   `TOGVARSEL_NOTIFY_ENABLED` (allow-list parse; **unset = off**; helm base off, dev on since
   launch, prd on since 2026-08-30, tst off), and while off nothing is evaluated and no state
   written, so an enable-restart inside a window still delivers.
@@ -161,20 +168,20 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   _togvarsel_notify_enabled` ANDs the two flags, and that one function is the seam for all THREE
   ways rushvarsel reaches a traveller, so it also empties `/varsel-api/config`'s
   `togvarsel_notify` and with it the PWA's «Nytt: Rushvarsel» notice and its `RushOutlook` panel);
-  `/togmelding` is never mounted and all of `/togmelding-api` 404s. That last one is closed
+  `/rushvarsel` is never mounted and all of `/rushvarsel-api` 404s. That last one is closed
   TWICE, and the two halves close different things: `main` skips `include_router` for both
   routers, which is what keeps the endpoint names out of the OpenAPI schema behind FastAPI's
   default `/docs` — a listing is itself a mention — while each module's own router-level
   `deployment.require_rushvarsel` dependency is what holds the gate PER REQUEST wherever the
   router is mounted, including the two test suites' own apps and the dev-only
-  `POST /togmelding-api/test-notify`, which is deliberately not wired to the `enabled` seam and
+  `POST /rushvarsel-api/test-notify`, which is deliberately not wired to the `enabled` seam and
   would otherwise still send a real push. Three things the gate deliberately does not do. It does **not replace**
   `TOGVARSEL_NOTIFY_ENABLED` — dev's and prd's `"true"` stay exactly where they were, so turning
   the product back on is this one value per environment and nothing else to re-derive. It does
   **not** stop the forecast: `togvarsel.refresh()` and `togvarsel_outcomes.refresh()` keep issuing
   and resolving on the poller tick, because /rushhistorikk is how the model earns its way back on,
   and the BigQuery cost is unchanged. And it is read at call time everywhere except the static
-  mount, which is import-time by necessity — a `Mount` answers the bare `/togmelding` with a 307
+  mount, which is import-time by necessity — a `Mount` answers the bare `/rushvarsel` with a 307
   to the trailing slash before any per-request check could 404 it, so the page is gated by not
   being mounted at all. One consequence to expect on /rushhistorikk: with no round recorded,
   every issue is RECONSTRUCTED, so the «Mangler runde» chip (`n_reconstructed_after_start`) fires
@@ -208,9 +215,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   breaks the registered scheduled query — see Conventions below); if rows come later, discriminate on
   a `KIX:Togvarsel:<date>:<issue>` situationNumber prefix, never a new column.
   **The levels also sit at the top of `/varsel`** (2026-09-01):
-  `GET /togmelding-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) answers with the
+  `GET /rushvarsel-api/outlook?device_id=…` (`togvarsel_notify.rush_outlook`) answers with the
   rushes THIS device is notified about that are not yet over, and `demo/avviksvarsel`'s
-  `RushOutlook` card renders them with a link to `/togmelding` — nothing at all when the list is
+  `RushOutlook` card renders them with a link to `/rushvarsel` — nothing at all when the list is
   empty, which is the ordinary state. It is the push policy read-only, in the same module, so
   there is one definition of "a relevant journey": the same three matching tests, the same
   supersession (the newest issued forecast per rush, so the two surfaces cannot quote different
@@ -229,7 +236,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `def` like `test-notify`, and the forecasts every pod serves are hydrated from
   `togvarsel_issued` (`togvarsel.load_issued`; `refresh` stays the leader's). The two writes in `station_set` publish `refs` before `date` so the lock-free
   read cannot see a date whose refs have not landed. Dev-only test
-  trigger: `POST /togmelding-api/test-notify` with `{"device_id": ...}` (same shape as
+  trigger: `POST /rushvarsel-api/test-notify` with `{"device_id": ...}` (same shape as
   `/varsel-api/test`) sends one synthetic yellow round — body marked as testvarsel — through the
   real composition + delivery path without touching markers; it 404s wherever
   `deployment.environment_label()` is not exactly `"dev"` (tst, prd, unset and unrecognized labels
@@ -285,7 +292,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     resolved BEFORE the deadline check; the recording loop sits at the very END of `_evaluate`,
     because the two sites that persist markers are inside the `pushes` loop and in the `not pushes`
     branch and NEITHER reaches a suppression on a mixed pass; and it is never called from
-    `push_round`, which `POST /togmelding-api/test-notify` reaches directly on the public dev host
+    `push_round`, which `POST /rushvarsel-api/test-notify` reaches directly on the public dev host
     with a caller-supplied `device_id` — on a first-write-wins MERGE that write would take the day's
     row for good.
   - **The fasit is two passes, because no single source serves both timeliness and the models'

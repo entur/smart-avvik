@@ -455,7 +455,7 @@ def test_no_front_end_bundle_names_a_notification_store_field_or_collection():
             offenders[str(path.relative_to(REPO_ROOT))] = hits
     assert not offenders, (
         f"client identifiers reached a front-end bundle: {offenders}. /demo, /varsel, /historikk, "
-        "/meldinger, /togmelding and /rushhistorikk are public pages; none of them has a client."
+        "/meldinger, /rushvarsel and /rushhistorikk are public pages; none of them has a client."
     )
 
 

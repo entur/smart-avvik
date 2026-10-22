@@ -84,7 +84,7 @@ via :func:`configure` (togvarsel's own idiom), the matcher takes varsel's `place
 callable, and :func:`push_round` takes varsel's delivery seams (device_subscription,
 deliver_to_devices, handle_gone_device, the brand-asset table, the environment tagger) the same
 way; the policy core needs none. Two HTTP surfaces, both on a router main mounts:
-GET /togmelding-api/outlook (the panel above) and the dev-only test trigger at the bottom, which
+GET /rushvarsel-api/outlook (the panel above) and the dev-only test trigger at the bottom, which
 refuses everything but the dev deployment and fires one synthetic round through the same
 composition + delivery seams without ever touching the markers.
 """
@@ -542,7 +542,7 @@ def cached_station_set(now: datetime) -> frozenset[str] | None:
     """Today's station set if the poller has already fetched it — and NEVER a query.
 
     The read-only twin of :func:`station_set`, for the request path (:func:`rush_outlook`).
-    /togmelding-api is public and unauthenticated, and station_set deliberately has no failure
+    /rushvarsel-api is public and unauthenticated, and station_set deliberately has no failure
     cooldown — sound on a poller tick, one billable scan per page view during an outage here. No
     lock: the fetch publishes `refs` before `date`, so a reader that sees today's date has already
     seen its refs.
@@ -690,7 +690,7 @@ class RushForecast(BaseModel):
     rush: str = Field(description='"am" (morgenrushet) or "pm" (ettermiddagsrushet)')
     issue: str = Field(
         description="HHMM of the forecast shown — the NEWEST issued for this rush, so a follow-up "
-        "replaces its baseline exactly as it does on /togmelding"
+        "replaces its baseline exactly as it does on /rushvarsel"
     )
     scope: str = Field(description="The window the probability is about, verbatim from togvarsel")
     level: str = Field(description="green | yellow | red")
@@ -749,7 +749,7 @@ def rush_outlook(device_id: str, now: datetime | None = None) -> list[RushForeca
     """Today's rush forecasts this device is notified about, for the rushes not yet over.
 
     Same policy as the pushes, read-only: the level shown is the newest issued forecast for the
-    rush (a follow-up supersedes its baseline, as on /togmelding), the device must have a
+    rush (a follow-up supersedes its baseline, as on /rushvarsel), the device must have a
     registration the round would have matched, and a rush whose window has ended is dropped —
     a level nobody can still act on is noise on a page about catching trains.
 
@@ -823,7 +823,7 @@ _RUSH_NAME = {
 _BODY_REASONS = 2
 # The entur-branded install has the forecast page to land on; the unbranded one does not, so
 # it keeps its own varsel URL — the body carries the essentials, no click-through required.
-_TOGMELDING_URL = "/togmelding"
+_RUSHVARSEL_URL = "/rushvarsel"
 
 
 def _sentence(text: str) -> str:
@@ -873,7 +873,7 @@ def build_payload(
 
     `brand_assets` (varsel's _BRAND_ASSETS) and `tag_title` (varsel's _tag_environment) are
     injected by main. The icon follows the brand exactly as SX pushes do; the URL follows
-    The entur brand lands on /togmelding, the unbranded install keeps its own varsel URL.
+    The entur brand lands on /rushvarsel, the unbranded install keeps its own varsel URL.
     The wording is identical across brands (varsel precedent: only icon and URL ever move). No
     situation_number: this is not an SX situation, and the standalone-push precedent (varsel's
     /varsel-api/test) already omits it."""
@@ -882,7 +882,7 @@ def build_payload(
     return {
         "title": tag_title(title),
         "body": body,
-        "url": assets["url"] if brand == "none" else _TOGMELDING_URL,
+        "url": assets["url"] if brand == "none" else _RUSHVARSEL_URL,
         "icon": assets["icon"],
     }
 
@@ -1132,7 +1132,7 @@ def _evaluate(now: datetime) -> None:
     # — a hook attached to either site would silently drop the suppressed round, and the page
     # would read it as "never evaluated" rather than as the outcome it was.
     #
-    # Deliberately NOT called from push_round: POST /togmelding-api/test-notify reaches that
+    # Deliberately NOT called from push_round: POST /rushvarsel-api/test-notify reaches that
     # function directly on the public dev host with a caller-supplied device_id and a synthetic
     # 0630 decision, and on a first-write-wins MERGE that write would take the day's row and the
     # real 06:30 round would be lost for good.
@@ -1155,7 +1155,7 @@ router = APIRouter(dependencies=[Depends(deployment.require_rushvarsel)])
 
 
 @router.get(
-    "/togmelding-api/outlook",
+    "/rushvarsel-api/outlook",
     response_model=RushOutlook,
     summary="Today's rush forecasts a device is notified about",
 )
@@ -1165,7 +1165,7 @@ def outlook(
         min_length=8, max_length=100, description="Client-generated device UUID, as /varsel-api uses."
     ),
 ) -> RushOutlook:
-    """The status panel /varsel renders at the top of the page, with its link to /togmelding.
+    """The status panel /varsel renders at the top of the page, with its link to /rushvarsel.
 
     Device-scoped because the panel's claim is "you are being notified about this": a rush level is
     network-wide, but whether it reaches this traveller depends on their registrations. Nothing
@@ -1209,7 +1209,7 @@ class TestNotifyIn(BaseModel):
     device_id: str = Field(min_length=8, max_length=100)
 
 
-@router.post("/togmelding-api/test-notify", summary="Send a synthetic togvarsel push (dev only)")
+@router.post("/rushvarsel-api/test-notify", summary="Send a synthetic togvarsel push (dev only)")
 def test_notify(body: TestNotifyIn) -> dict:
     """Send one synthetic rush-forecast push to this device — proves the whole pipe (wording,
     environment tag, brand icon, click-through) without waiting for a real round.

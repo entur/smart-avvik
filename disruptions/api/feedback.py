@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 logger = logging.getLogger(__name__)
 EVENT = "varsel_alert_feedback"
-# Rushvarsel's forecast cards (/togmelding) post here too, under their own event so PostHog can
+# Rushvarsel's forecast cards (/rushvarsel) post here too, under their own event so PostHog can
 # tell the two pages apart; data/feedback's exporter reads both.
 RUSH_EVENT = "rush_alert_feedback"
 _MAX_BODY = 2_048

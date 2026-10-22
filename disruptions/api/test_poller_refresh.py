@@ -445,18 +445,18 @@ def test_the_master_gate_overrides_the_delivery_flag_in_both_directions():
 
 
 def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
-    """With SHOW_RUSHVARSEL off, nothing under /togmelding answers on main's own app.
+    """With SHOW_RUSHVARSEL off, nothing under /rushvarsel answers on main's own app.
 
     Both halves are gated at IMPORT time, unlike every other read of this flag, and for two
     different reasons. The page: a Mount cannot be conditioned per request without first
-    answering the bare /togmelding with a 307 to the trailing slash, so it is gated by not being
+    answering the bare /rushvarsel with a 307 to the trailing slash, so it is gated by not being
     mounted. The API: a router that is registered but 404s would still publish its endpoint names
     on /docs (FastAPI's default docs_url), and a listing is itself a mention of a product we are
     not showing — hence the schema assertion, which is the only one of these that /docs reflects.
 
     Probed by ASKING rather than by scanning app.routes: this FastAPI version keeps an included
     router as one opaque `_IncludedRouter` whose `path` is None, so a scan finds no
-    /togmelding-api route even when the router IS registered and would pass identically either
+    /rushvarsel-api route even when the router IS registered and would pass identically either
     way (test_meldinger.py:2029 documents the same trap). /config endpoints need neither BigQuery
     nor the lifespan, which is what makes 404-vs-200 a clean read on registration alone.
 
@@ -472,17 +472,19 @@ def test_neither_the_page_nor_the_api_answers_while_the_master_gate_is_off():
     client = TestClient(main.app)
     # The API: every route, not just the payload one — /config answering 200 would tell a reader
     # the page exists and is merely empty.
-    assert client.get("/togmelding-api/today").status_code == 404
-    assert client.get("/togmelding-api/config").status_code == 404
-    assert client.get("/togmelding-api/outlook", params={"device_id": "d-1"}).status_code == 404
+    assert client.get("/rushvarsel-api/today").status_code == 404
+    assert client.get("/rushvarsel-api/config").status_code == 404
+    assert client.get("/rushvarsel-api/outlook", params={"device_id": "d-1"}).status_code == 404
     # The page, on both spellings: a per-request gate inside a mounted StaticFiles would answer
     # the first of these with a 307 to the second, which is why the mount is skipped instead.
+    assert client.get("/rushvarsel", follow_redirects=False).status_code == 404
+    assert client.get("/rushvarsel/").status_code == 404
+    # The old path's redirect too: it would hand a reader the new name.
     assert client.get("/togmelding", follow_redirects=False).status_code == 404
-    assert client.get("/togmelding/").status_code == 404
-    # And off /docs: nothing under /togmelding is in the published schema.
+    # And off /docs: nothing under /rushvarsel is in the published schema.
     schema = main.app.openapi()["paths"]
-    assert not [p for p in schema if p.startswith("/togmelding")], [
-        p for p in schema if p.startswith("/togmelding")
+    assert not [p for p in schema if p.startswith(("/rushvarsel", "/togmelding"))], [
+        p for p in schema if p.startswith(("/rushvarsel", "/togmelding"))
     ]
     # The gate is about ONE product: the sibling surfaces still answer and are still published.
     assert client.get("/varsel-api/config").status_code == 200

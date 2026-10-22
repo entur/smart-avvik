@@ -180,7 +180,7 @@ HTTP_REQUESTS_TOTAL = Counter(
 )
 
 #: First path segments allowed as a `path` label value: the app's actual routes, routers, static
-#: mounts and FastAPI's own doc paths (main.py is the source of truth; /togmelding and /metrics
+#: mounts and FastAPI's own doc paths (main.py is the source of truth; /rushvarsel and /metrics
 #: are listed although one is gated on SHOW_RUSHVARSEL and the other lives on the exporter port —
 #: a probe for either on 8080 is still that path, and a constant entry costs nothing). Everything
 #: else — scanners, typos, paths nobody added here — collapses to "other": on a public
@@ -210,9 +210,10 @@ KNOWN_PATH_SEGMENTS = frozenset(
         "reisevalg-api",
         "rushhistorikk",
         "rushhistorikk-api",
+        "rushvarsel",
+        "rushvarsel-api",
         "situation",
         "togmelding",
-        "togmelding-api",
         "varsel",
         "varsel-api",
     }

@@ -119,7 +119,7 @@ forgiving about spelling would silently discard real feedback, and a filter on f
 trusted if what it dropped stays as visible as what it kept. A response with no comment at all
 (`comment: null`, an ordinary thumbs-up) is never matched by it.
 
-## Tell /varsel and /togmelding apart in PostHog
+## Tell /varsel and /rushvarsel apart in PostHog
 
 Both pages post to the same endpoint, and since 2026-09-29 each has its own event:
 **`varsel_alert_feedback`** for Smarte reisevarsler's alert cards and **`rush_alert_feedback`** for

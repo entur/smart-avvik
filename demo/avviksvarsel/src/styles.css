@@ -107,7 +107,7 @@ body {
 }
 
 /* ---- Oslo rush-hour outlook (the panel at the top; see components/RushOutlook.tsx) ----
-   The three level colours are Linje's validation tokens, the same ones /togmelding's level cards
+   The three level colours are Linje's validation tokens, the same ones /rushvarsel's level cards
    use, so the two surfaces cannot drift into different greens. The badge keeps DARK ink on a
    LIGHT tint at all three levels: Linje's canary is too light for white text and too light to
    darken without leaving the palette, so a filled swatch cannot be done consistently. */

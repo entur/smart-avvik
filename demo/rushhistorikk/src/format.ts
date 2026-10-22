@@ -105,7 +105,7 @@ export const VERDICT_HELP: Partial<Record<Verdict, string>> = {
 };
 
 /** togvarsel's own level vocabulary in Norwegian. Adjectival ("grønt nivå"), matching how
- *  /togmelding words its levels. */
+ *  /rushvarsel words its levels. */
 export const LEVEL_LABEL: Record<Level, string> = {
   green: 'grønt',
   yellow: 'gult',

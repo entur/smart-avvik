@@ -1,4 +1,4 @@
-"""/togmelding-api — Togmeldingen: a rush-hour "weather forecast" for the Oslo local network.
+"""/rushvarsel-api — Togmeldingen: a rush-hour "weather forecast" for the Oslo local network.
 
 Implements §8 of docs/togvarsel/02-findings-2026-08-27.md as revised by §14k. Four issues on
 weekdays, each a calibrated probability that the rush is bad on the product bar (a call cancelled
@@ -61,13 +61,14 @@ import deployment
 import feedback  # the /varsel feedback stack; gates and mints are shared, see togmelding_today
 import feedback_contexts
 from deployment import environment_label
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
 # Every route here is gated on SHOW_RUSHVARSEL (deployment.show_rushvarsel): while the product is
-# dark, all of /togmelding-api answers a plain 404. At ROUTER level rather than per route, so a
+# dark, all of /rushvarsel-api answers a plain 404. At ROUTER level rather than per route, so a
 # route added below is gated by construction rather than by remembering to add a decorator.
 router = APIRouter(dependencies=[Depends(deployment.require_rushvarsel)])
 
@@ -228,7 +229,7 @@ class Issue(BaseModel):
         description="Computed more than 10 min after its due time (restart/backoff back-fill, "
         "so it saw post-cutoff reality) — skill audits must exclude these",
     )
-    # Set on the /togmelding-api/today response only, on a COPY (_with_feedback_context): the
+    # Set on the /rushvarsel-api/today response only, on a COPY (_with_feedback_context): the
     # cached Issue is shared with issued_today()'s notify seam and stays a pure forecast.
     feedback_context_id: str | None = Field(
         default=None,
@@ -863,7 +864,7 @@ def _with_feedback_context(issue: Issue, d: date) -> Issue:
     )
 
 
-@router.get("/togmelding-api/config", response_model=ConfigResponse)
+@router.get("/rushvarsel-api/config", response_model=ConfigResponse)
 def togmelding_config() -> ConfigResponse:
     """Which deployment is serving the page, for the "(dev)" it appends to its heading and title.
 
@@ -883,7 +884,7 @@ def _now() -> datetime:
     return datetime.now(_OSLO)
 
 
-@router.get("/togmelding-api/today", response_model=Togmelding)
+@router.get("/rushvarsel-api/today", response_model=Togmelding)
 def togmelding_today() -> Togmelding:
     """The page payload, each issued forecast annotated with a feedback capability when the
     /varsel feedback stack is configured (dev today; the flag and secrets are per-environment).
@@ -893,3 +894,14 @@ def togmelding_today() -> Togmelding:
     if melding.issues and feedback.enabled():
         melding.issues = [_with_feedback_context(i, melding.date) for i in melding.issues]
     return melding
+
+
+# The page moved from /togmelding to /rushvarsel on 2026-10-22. Pushes already sitting on lock
+# screens and bookmarks name the old path, so it answers a permanent redirect, subpath and query
+# kept. On this router so the master gate 404s it with the rest of the product, and off /docs.
+# Relative Location: TLS ends at the ingress, so an absolute URL built here would say http.
+@router.get("/togmelding", include_in_schema=False)
+@router.get("/togmelding/{rest:path}", include_in_schema=False)
+def togmelding_moved(request: Request, rest: str = "") -> RedirectResponse:
+    query = request.url.query
+    return RedirectResponse(f"/rushvarsel/{rest}" + (f"?{query}" if query else ""), status_code=301)

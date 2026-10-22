@@ -14,7 +14,7 @@ export interface Config {
   togvarsel_red_only?: boolean;
 }
 
-// One rush's current level, from GET /togmelding-api/outlook — Togmeldingen's own forecast,
+// One rush's current level, from GET /rushvarsel-api/outlook — Togmeldingen's own forecast,
 // narrowed server-side to the rushes THIS device is notified about and that are not yet over.
 // An empty list is the ordinary state (a deployment that does not send these, a weekend, before
 // the day's first forecast, no registration in the Oslo geography), never an error.
@@ -309,7 +309,7 @@ export function fetchStops(): Promise<StopItem[]> {
 // Served by the Togmelding API rather than /varsel-api because the policy lives with the pushes
 // it describes (disruptions/api/togvarsel_notify.py) — same device id, no new identifier.
 export function fetchRushOutlook(deviceId: string): Promise<{ rushes: RushForecast[] }> {
-  return request(`/togmelding-api/outlook?device_id=${encodeURIComponent(deviceId)}`);
+  return request(`/rushvarsel-api/outlook?device_id=${encodeURIComponent(deviceId)}`);
 }
 
 export function fetchJourneys(deviceId: string): Promise<{ journeys: Journey[] }> {

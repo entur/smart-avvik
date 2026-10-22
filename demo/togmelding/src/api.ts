@@ -1,4 +1,4 @@
-// Typed client for the /togmelding-api endpoints (disruptions/api/togvarsel.py), plus the one
+// Typed client for the /rushvarsel-api endpoints (disruptions/api/togvarsel.py), plus the one
 // endpoint this page shares with the Smarte reisevarsler PWA: POST /varsel-api/feedback.
 //
 // The feedback types below are a deliberate FORK of demo/avviksvarsel/src/api.ts rather than a
@@ -82,13 +82,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export function fetchConfig(): Promise<Config> {
-  return request('/togmelding-api/config');
+  return request('/rushvarsel-api/config');
 }
 
 // `cache: no-store`: the forecast changes four times a weekday and the page polls for exactly
 // that, so a heuristically cached response would show a stale level with no way to tell.
 export function fetchTogmelding(): Promise<Togmelding> {
-  return request('/togmelding-api/today', { cache: 'no-store' });
+  return request('/rushvarsel-api/today', { cache: 'no-store' });
 }
 
 export function submitFeedback(feedback: FeedbackSubmission): Promise<FeedbackResponse> {

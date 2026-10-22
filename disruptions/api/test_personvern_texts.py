@@ -2,7 +2,7 @@
 
 Four things nothing else in this repo detects, all of them silent failures:
 
-1. **Text parity.** `/togmelding` cannot import `demo/avviksvarsel/src/personvern.ts` — the single
+1. **Text parity.** `/rushvarsel` cannot import `demo/avviksvarsel/src/personvern.ts` — the single
    source of every published privacy text. It therefore carries DUPLICATED copies of the sender
    line, its link text, the privacy href and the experiment disclaimer, and the duplication is
    guarded rather than shared (KTD8). The REASON changed on 2026-09-01 and the arrangement did not:
@@ -53,7 +53,7 @@ from pathlib import Path
 _REPO = Path(__file__).resolve().parents[2]
 
 PERSONVERN_TS = _REPO / "demo" / "avviksvarsel" / "src" / "personvern.ts"
-# /togmelding's own copy, and the app sources that have to render it. togmelding_static/ is a build
+# /rushvarsel's own copy, and the app sources that have to render it. togmelding_static/ is a build
 # output now (gitignored, minified, absent in a fresh checkout), so nothing here may read it.
 TOGMELDING_TS = _REPO / "demo" / "togmelding" / "src" / "personvern.ts"
 TOGMELDING_SRC = _REPO / "demo" / "togmelding" / "src"
@@ -63,7 +63,7 @@ MAIN_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "main.tsx"
 PERSONVERN_PAGE_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "personvern-page.tsx"
 HELM_ENV_DIR = _REPO / "helm" / "kix-avvik" / "env"
 
-# The constants /togmelding duplicates. Named here so a rename on either side fails loudly
+# The constants /rushvarsel duplicates. Named here so a rename on either side fails loudly
 # instead of dropping a text out of the guard.
 _SHARED_CONSTANTS = (
     "TOGMELDING_SENDER_LINE",
@@ -106,7 +106,7 @@ def _declaration(source: str, name: str) -> str:
     match = re.search(rf"^(?:export )?const {re.escape(name)}\b[^=\n]*=\s*", source, re.MULTILINE)
     if match is None:
         raise ExtractionError(
-            f"`const {name}` was not found in {PERSONVERN_TS.name}. The /togmelding parity guard "
+            f"`const {name}` was not found in {PERSONVERN_TS.name}. The /rushvarsel parity guard "
             "extracts the shared texts by name; a rename or a reformat must fail here rather than "
             "leave the duplicated copies unguarded."
         )
@@ -204,10 +204,10 @@ def _resolve(expr: str, source: str, depth: int = 0) -> str:
 
 
 def _shared_texts(path: Path = PERSONVERN_TS) -> dict[str, str]:
-    """Every published string /togmelding duplicates, keyed by a label used in failure messages.
+    """Every published string /rushvarsel duplicates, keyed by a label used in failure messages.
 
     Takes the module path so ONE extractor reads both copies — the /varsel source of truth and
-    /togmelding's duplicate. A second, differently-written reader would be a third place for the
+    /rushvarsel's duplicate. A second, differently-written reader would be a third place for the
     vocabulary to drift.
 
     Fails loudly if ANY expected constant is missing or unparseable — the whole point: a guard
@@ -218,7 +218,7 @@ def _shared_texts(path: Path = PERSONVERN_TS) -> dict[str, str]:
     if missing:
         raise ExtractionError(
             f"{path.relative_to(_REPO)} no longer declares {', '.join(missing)}. These are the "
-            "strings /togmelding duplicates (its own npm app, whose Docker stage copies only its "
+            "strings /rushvarsel duplicates (its own npm app, whose Docker stage copies only its "
             "own directory, so it cannot import the /varsel module), so losing them silently "
             "unguards the duplication."
         )
@@ -247,7 +247,7 @@ def _shared_texts(path: Path = PERSONVERN_TS) -> dict[str, str]:
 
 
 def _togmelding_sources() -> str:
-    """Every TypeScript source of the /togmelding app, concatenated.
+    """Every TypeScript source of the /rushvarsel app, concatenated.
 
     Used to assert the app RENDERS what its text module declares. Reads the sources and never
     `togmelding_static/`: that is a Vite output now — gitignored, minified, and absent in a fresh
@@ -321,7 +321,7 @@ def test_the_shared_text_extraction_finds_every_expected_constant():
 
 
 def test_the_togmelding_app_duplicates_the_shared_privacy_texts_verbatim():
-    """KTD8: /togmelding duplicates these strings because it cannot import the module.
+    """KTD8: /rushvarsel duplicates these strings because it cannot import the module.
 
     Its own npm app since 2026-09-01, and the image's node stage copies only `demo/togmelding/`
     into the build — so a relative import into `../avviksvarsel/src/` would resolve on a laptop and
@@ -335,7 +335,7 @@ def test_the_togmelding_app_duplicates_the_shared_privacy_texts_verbatim():
             f"{TOGMELDING_TS.relative_to(_REPO)} disagrees with {PERSONVERN_TS.relative_to(_REPO)} "
             f"on {label}:\n"
             f"  /varsel:     {value!r}\n"
-            f"  /togmelding: {copy[label]!r}\n"
+            f"  /rushvarsel: {copy[label]!r}\n"
             "Edit both, or neither (KTD8)."
         )
 
@@ -365,7 +365,7 @@ def test_the_togmelding_app_links_to_the_privacy_page():
     assert "href={TOGMELDING_PERSONVERN_HREF}" in rendered, (
         f"nothing in {TOGMELDING_SRC.relative_to(_REPO)} links to {href} via "
         "TOGMELDING_PERSONVERN_HREF. The footer's «Slik behandler vi opplysningene» link is how a "
-        "/togmelding visitor reaches the privacy page at all — and a literal path written out "
+        "/rushvarsel visitor reaches the privacy page at all — and a literal path written out "
         "instead of the constant would drift out from under the parity guard above."
     )
 

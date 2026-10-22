@@ -238,7 +238,7 @@ three pods are three times each.
 Gemini translation of operator text is leader-only, so followers do not translate the same ~400
 situations a day. An ingress-wide budget would need the platform; nothing here provides one.
 
-**`/togmelding-api/outlook` now reads the device's journeys from the store on every call** (it read
+**`/rushvarsel-api/outlook` now reads the device's journeys from the store on every call** (it read
 process memory before), so a public outlook read is one store query and can trigger the weekly
 activity renewal write, as the `/varsel` journey list already does. Watch the Firestore read bill if
 the panel's poll rate rises.

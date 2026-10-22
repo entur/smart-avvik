@@ -41,7 +41,7 @@ Served by the disruptions API at **`/varsel`**; data + push endpoints are **`/va
 - Subscriptions + journeys are keyed by a client-generated `device_id` (no login — prototype).
   State persists to a GCS blob so it survives redeploys.
 - **Rush-hour outlook at the top of the page** (`components/RushOutlook.tsx`): today's Oslo
-  green/yellow/red levels from `GET /togmelding-api/outlook`, with a link to `/togmelding`. The
+  green/yellow/red levels from `GET /rushvarsel-api/outlook`, with a link to `/rushvarsel`. The
   server narrows the list to the rushes this device is actually notified about and that are not
   yet over, so an empty list is the ordinary state and the card then renders **nothing at all** —
   no heading, no empty state, no explanation of a feature this traveller does not have. It has its

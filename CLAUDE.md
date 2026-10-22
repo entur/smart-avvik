@@ -25,7 +25,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
-node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/togmelding` and
+node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/rushvarsel` and
 `/rushhistorikk` front-ends (from `demo/reisedemo` + `demo/avviksvarsel` +
 `demo/varselhistorikk` + `demo/meldinger` + `demo/togmelding` + `demo/rushhistorikk`, which is
 why the context is the repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
@@ -203,7 +203,7 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `.claude/rules/historikk.md` — `/historikk` and the decision log (`varsel_decisions`, thinning,
     the nightly labelling scheduled query, the wording-failure budgets).
   - `.claude/rules/meldinger.md` — `/meldinger`, the prompt replay, and its Vertex bounds.
-  - `.claude/rules/rushvarsel.md` — Rushvarsel (`/togmelding`), its push rounds, the
+  - `.claude/rules/rushvarsel.md` — Rushvarsel (`/rushvarsel`), its push rounds, the
     `SHOW_RUSHVARSEL` gate, and `/rushhistorikk`.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the

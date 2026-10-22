@@ -7,7 +7,7 @@
 // sentences match the server's togvarsel._LEVEL_TEXT, which the persisted feedback snapshot quotes.
 //
 // «GRØNT / GULT / RØDT», the neuter form, because every sentence the label sits in is about «nivå»
-// -- /varsel said GRØNT while /togmelding said GRØNN for one concept (design review 2026-09-01,
+// -- /varsel said GRØNT while /rushvarsel said GRØNN for one concept (design review 2026-09-01,
 // finding 12). And the middle sentence is on the same axis as the two beside it (finding 11): «noe
 // usikkert» measured something else, so a reader could not place it between them.
 

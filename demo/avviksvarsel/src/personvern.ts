@@ -1,6 +1,6 @@
 // The single source for every published privacy text in Smarte reisevarsler (plan
 // 2026-08-31-001, U3/KTD9). Components, the /varsel/personvern page, the
-// /togmelding parity test and the node test suite all read from here — no
+// /rushvarsel parity test and the node test suite all read from here — no
 // component carries its own copy of a published wording.
 //
 // IMPORTANT — versioned consent: a registering user consents to the texts in
@@ -291,13 +291,13 @@ export const T6_SLETT_ALT = {
 };
 
 /** T7 — sender line in the footer, rendered in all brand variants (also on
- * /togmelding, where the parity test asserts the duplicated copy matches). */
+ * /rushvarsel, where the parity test asserts the duplicated copy matches). */
 export const T7_AVSENDER: LinkedText = {
   prose: 'Tjenesten leveres av Entur AS.',
   linkText: PERSONVERN_LINK_TEXT,
 };
 
-// Strings shared with /togmelding (demo/togmelding/src/personvern.ts). That is
+// Strings shared with /rushvarsel (demo/togmelding/src/personvern.ts). That is
 // its own npm app, and the image's node stage copies only its own directory, so
 // it cannot import this module and carries duplicated copies instead; a Python
 // parity test (plan U8) resolves both modules and asserts they match. The same

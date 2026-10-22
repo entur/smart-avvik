@@ -1,4 +1,4 @@
-// The published privacy texts /togmelding shows: the experiment disclaimer (T1's togmelding
+// The published privacy texts /rushvarsel shows: the experiment disclaimer (T1's togmelding
 // wording) and the sender footer (T7). A guarded DUPLICATE of demo/avviksvarsel/src/personvern.ts,
 // which is the single source for every published privacy text.
 //
