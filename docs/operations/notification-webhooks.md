@@ -168,10 +168,13 @@ cache and runs on the module's own eight-wide pool, at most `MAX_TRANSLATIONS_PE
 or in flight at once, cached on the Norwegian text and never re-asked for an hour after a failure —
 so it adds nothing to a cycle's wall clock, and a situation's first cycle can mint an event with
 those fields null. Its volume is every distinct operator text now, not only the operators that
-publish no English (about 400 bus situations a day in September 2026), so a restart finds every
-live situation untranslated and drains them in about half an hour. **A follower never translates**
-(KTD12), so once dev or prd runs more than one pod a read served by a follower carries no nynorsk on
-any operator situation, where for English only the bus operators were affected. It follows
+publish no English (about 400 bus situations a day in September 2026). **A follower never
+translates** (KTD12), but since 2026-10-22 every pod serves the leader's translations: the leader
+stores each one in Firestore's `situation_translations` and every pod reads the collection into
+memory on startup, on every follower tick and on taking the lease
+(`docs/plans/2026-10-22-001-feat-shared-translation-store-plan.md`). So a read answers the same
+English and nynorsk whichever pod serves it, and a restart translates only what nobody stored -- it
+used to find every live situation untranslated and drain them in about half an hour. It follows
 `VARSEL_LLM_PROVIDER` alone: the two wording switches choose which prose is SENT, and an operator's
 public message sent to Vertex for translation is not a traveller's data. `off` leaves the operator's
 English and ours in place and stops only the translations.
@@ -530,7 +533,8 @@ silently.
 | `webhook_worker` | the delivery worker PROCESS, not its rounds — those stay `webhook_delivery_round` | `result`: `started` (with `health_port`), `stopping` (with the `signal`), `stopped` (with `rounds`), `unconfigured` (with `missing` — the worker exits non-zero, so this line is followed by a rolled-back release rather than by a running pod) and `error` (a round raised, which `deliver_pending` documents it never does; the loop continues) |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
 | `notification_subscription` | a create, no-op or tombstone | `result`, `client_id`, `subscription_id` |
-| `situation_english` | the situations' English and nynorsk (not a `notification_*` event: it serves the payload, not the channel) | `submitted` and `missing` when a prediction swap handed translations to the pool; `result=error` with the exception class when one failed. Never the text |
+| `situation_english` | the situations' English and nynorsk (not a `notification_*` event: it serves the payload, not the channel) | `submitted` and `missing` when a prediction swap handed translations to the pool; `result=error` with the exception class when one failed, `store_error` when the store write failed (the translation is kept in memory), `follow_error` when a seed or sync could not be read. Never the text |
+| `situation_english_coverage` | per pod, how much machine translation it serves (not a `notification_*` event either) | `role` (`leader`, `follower`, or `follow` after a store read), and per language `needing` (texts with no provided translation) and `covered` (how many of them this pod holds). A follower reading short of the leader for longer than a tick is a stalled sync. Never the text |
 | `notification_cleanup` | a deletion pass | `result`, `subscription_id`, the three deleted counts |
 | `notification_auth` | a refused credential | `reason`, `key_id`. **The secret is logged nowhere at any level** |
 | `notification_admin` | an operator action | `action`, `result`, `actor`, `client_id`, `destination_id`, `key_id`. `action="show_signing_secret"` with `result="disclosed"` is a **credential read** — the audit document beside it carries the generation numbers in `reason`, never the secret |

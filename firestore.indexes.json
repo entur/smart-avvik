@@ -198,6 +198,11 @@
       "collectionGroup": "feedback_contexts",
       "fieldPath": "claims",
       "indexes": []
+    },
+    {
+      "collectionGroup": "situation_translations",
+      "fieldPath": "translations",
+      "indexes": []
     }
   ]
 }

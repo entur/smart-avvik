@@ -1786,6 +1786,35 @@ def test_the_lifespan_runs_the_follower_load_set_before_the_poller_starts():
         assert direct not in source, direct
 
 
+def test_follow_last_build_follows_the_stored_translations_and_returns_the_load_outcomes():
+    """Every follower tick and the lifespan read the leader's translations through here; deleting
+    the call would leave a follower serving only what it translated itself, and pass silently."""
+    import poller_follow
+    import situation_english
+
+    sentinel = {"call_predictions": "loaded"}
+    follows = []
+    saved = (poller_follow.follow_last_build, situation_english.follow)
+    poller_follow.follow_last_build = lambda *a, **k: sentinel
+    situation_english.follow = lambda **k: follows.append(k) or 0
+    try:
+        assert main.follow_last_build() is sentinel
+    finally:
+        poller_follow.follow_last_build, situation_english.follow = saved
+    assert follows == [{}], follows
+
+
+def test_the_lifespan_configures_the_translation_store_before_the_first_follow():
+    """The store exists only behind the `/varsel` store backend (tst has none), and the lifespan's
+    `follow_last_build()` is the first follow: configured after it, a new pod starts with nothing."""
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    configure = "situation_english.configure(store=notification_store if _varsel_store is not None else None)"
+    assert configure in source
+    assert source.index(configure) < source.index("follow_last_build()")
+
+
 class _StrictRow:
     """A row carrying ONLY the given columns (all None). Anything else raises AttributeError, as a
     BigQuery row from an older leader's table would."""

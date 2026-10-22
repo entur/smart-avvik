@@ -48,12 +48,22 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   ONE call per Norwegian text answers both languages (`situation_english._translate`, four fields,
   all-or-nothing), and provided text wins per language, so a Vy situation serves the operator's
   English beside a machine's nynorsk. That made Gemini's volume every distinct operator text rather
-  than ~400 bus ones a day, which is why the in-flight cap went 25 → 100 and the pool 4 → 8. **A
-  follower never translates** (KTD12), so after zero-downtime step B a follower's read carries no
-  nynorsk on any operator situation; persisting the translations where every pod reads is the fix if
-  that matters. The summary's `_NN` vocabulary keeps bokmål's mode nouns and title shape (nynorsk
-  names a vehicle the same way); the hand-written nynorsk (vocabulary, SQL texts, test event) wants
-  a nynorsk reader's eye. Not in `message_input`.
+  than ~400 bus ones a day, which is why the in-flight cap went 25 → 100 and the pool 4 → 8. **Only
+  the lease holder translates, and every pod serves its translations** (2026-10-22,
+  `docs/plans/2026-10-22-001-feat-shared-translation-store-plan.md`): the leader stores each answer
+  in Firestore's `situation_translations` (`create`, first writer wins, a later writer adopts the
+  stored text) and every pod reads the collection into memory with `situation_english.follow` -- a
+  seed in the lifespan, a watermark sync on each follower tick, a follow on taking the lease, so a
+  deploy or handoff no longer translates everything again. Before it, prd's follower answered
+  `summary_nn: null` on every operator situation (measured: 4-6 of 10 reads carried it). The digest
+  includes `TRANSLATION_VERSION` (prompt, schema, model), so a prompt change translates again;
+  documents expire 30 days after creation; requests read memory only; a store failure falls back to
+  leader-only memory and never fails a tick or an acquisition; tst has no store. Each update and
+  follow logs `situation_english_coverage` (per language, texts needing a machine translation and
+  how many the pod holds, with its role) -- a follower reading short of the leader for long is a
+  stalled sync. The summary's `_NN` vocabulary keeps bokmål's mode nouns and title shape (nynorsk
+  names a vehicle the same way); the hand-written and machine nynorsk were reviewed by a nynorsk
+  reader on 2026-10-22. Not in `message_input`.
 - **Each `payload.situations[]` entry carries `report_type`** (2026-10-05, KIX-29): SIRI-SX
   `reportType` (`INCIDENT`/`GENERAL`) off `disruptions_*initial_today` through `predict_calls*.sql`,
   then `CallPred` → `TripCell` → `SituationImpact` → `Alert` like `has_situation`; null on a `KIX:`

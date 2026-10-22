@@ -1172,8 +1172,11 @@ def follow_last_build() -> dict[str, str]:
     role loop, on every follower tick. Never raises, so nothing here can fail the lifespan; the
     per-load isolation and the one `event="follow_last_build"` record are
     `poller_follow.follow_last_build`'s. The registries are read at call time (the suites swap them).
+
+    Then the leader's machine translations from the store (`situation_english.follow`, which never
+    raises either): a seed the first time, a watermark sync on every tick after.
     """
-    return poller_follow.follow_last_build(
+    outcomes = poller_follow.follow_last_build(
         _FOLLOWED_CACHES,
         _FOLLOWED_LOOKUPS,
         _lookups_built,
@@ -1181,6 +1184,8 @@ def follow_last_build() -> dict[str, str]:
         built_of=_tables_built,
         refresh_line_modes=refresh_line_modes,
     )
+    situation_english.follow()
+    return outcomes
 
 
 def _varsel_stops() -> list[dict]:
@@ -2548,6 +2553,9 @@ async def lifespan(app: FastAPI):
         # tst names a database it does not have. None is the single-process memory path.
         store=notification_store if _varsel_store is not None else None,
     )
+    # Machine translations on the same gate (the shared translation store, KTD8): every pod reads
+    # the leader's from Firestore, so two pods serve one English and one nynorsk. None in tst.
+    situation_english.configure(store=notification_store if _varsel_store is not None else None)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
     rushhistorikk.configure(bq_client=bq_client)
@@ -3143,6 +3151,10 @@ def _on_lease_acquired() -> None:
     except Exception:
         metrics.POLLER_LEADER.set(0)
         raise
+    # What another leader translated since this pod last followed, so the first cycle of this tenure
+    # asks Gemini only for what nobody has (AE2). Outside the try: it never raises, and a store that
+    # cannot be read must not cost the acquisition (R5) -- unlike the mirror seed above.
+    situation_english.follow(beat=_beat)
     _force_rebuild = True
     metrics.POLLER_LEADER.set(1)
 

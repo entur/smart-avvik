@@ -177,10 +177,22 @@ class _Ref:
 
     def set(self, data: dict[str, Any], timeout: float | None = None) -> None:
         """A write OUTSIDE a transaction: the migration marker, whose single writer is a startup
-        step under Recreate, and a feedback context, whose id is a fresh random token."""
-        self.client.docs[self.path] = dict(data)
+        step under Recreate, and a feedback context, whose id is a fresh random token. Server
+        stamps are resolved as `create` does: a renewed situation translation carries one."""
+        self.client.docs[self.path] = dict(_resolve_server_timestamps(data, self.client.server_now) or {})
         self.client.direct_sets.append(self.path)
         self.client.set_timeouts[self.path] = timeout
+
+    def create(self, data: dict[str, Any], timeout: float | None = None) -> None:
+        """Firestore's create-if-absent: AlreadyExists when the document is there, the write
+        (server stamps resolved) when it is not. A situation translation's first-writer-wins."""
+        from google.api_core.exceptions import AlreadyExists
+
+        assert timeout == notification_store._CALL_DEADLINE_S, f"create without a deadline: {self.path}"
+        if self.path in self.client.docs:
+            raise AlreadyExists(self.path)
+        self.client.docs[self.path] = dict(_resolve_server_timestamps(data, self.client.server_now) or {})
+        self.client.direct_sets.append(self.path)
 
 
 class _Collection:
@@ -4094,6 +4106,201 @@ def test_a_context_whose_journey_is_gone_is_never_claimed():
         _uninstall()
 
 
+def _translations(en: str = "Cancelled", nn: str = "Innstilt") -> dict[str, dict[str, str | None]]:
+    return {"en": {"summary": en, "description": None}, "nn": {"summary": nn, "description": None}}
+
+
+def _translation_row(digest: str, stamp: datetime, *, expires: datetime | None = None) -> tuple[str, dict]:
+    return (
+        f"{notification_store.SITUATION_TRANSLATIONS}/{digest}",
+        {
+            "digest": digest,
+            "translations": _translations(en=f"en-{digest}"),
+            notification_store.TRANSLATION_STAMP_FIELD: stamp,
+            notification_store.TTL_FIELD: expires or NOW + timedelta(days=1),
+        },
+    )
+
+
+def test_a_situation_translation_is_created_once_and_a_later_writer_adopts_the_stored_one():
+    """Translation store KTD4: first writer wins and every writer converges on the stored text. A
+    second writer -- two leaders across a handoff -- gets the FIRST translation back, so it serves
+    and caches what every other pod will sync, and the document is never overwritten."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        first = notification_store.write_situation_translation(
+            "d1", _translations(), version="v1", model="gemini-x", now=NOW
+        )
+        assert first == _translations()
+        stored = client.doc(notification_store.SITUATION_TRANSLATIONS, "d1")
+        assert stored["digest"] == "d1" and stored["version"] == "v1" and stored["model"] == "gemini-x"
+        assert stored["translations"] == _translations()
+        assert stored[notification_store.TTL_FIELD] == NOW + timedelta(days=30)
+        # The server's clock, not the body's: the watermark is compared against values Firestore
+        # wrote (MIRROR_FIELD's rule), and the fake keeps the two clocks apart to tell them apart.
+        assert stored[notification_store.TRANSLATION_STAMP_FIELD] == client.server_now
+
+        second = notification_store.write_situation_translation(
+            "d1", _translations(en="Something else"), version="v1", model="gemini-x", now=NOW
+        )
+        assert second == _translations(), "the later writer adopts the stored translation"
+        assert client.doc(notification_store.SITUATION_TRANSLATIONS, "d1")["translations"] == _translations()
+    finally:
+        _uninstall()
+
+
+def test_an_expired_situation_translation_is_renewed_rather_than_adopted():
+    """TTL deletes up to ~24 h late, so a recurring text can meet its own expired document. Adopting
+    it would have the leader serve a translation every follower skips as expired; the writer
+    overwrites it with a fresh stamp and horizon and serves its own text instead."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        path, row = _translation_row("d1", NOW - timedelta(days=31), expires=NOW - timedelta(minutes=1))
+        client.docs[path] = row
+        served = notification_store.write_situation_translation(
+            "d1", _translations(en="Fresh"), version="v2", model="gemini-x", now=NOW
+        )
+        assert served == _translations(en="Fresh")
+        stored = client.doc(notification_store.SITUATION_TRANSLATIONS, "d1")
+        assert stored["translations"] == _translations(en="Fresh") and stored["version"] == "v2"
+        assert stored[notification_store.TTL_FIELD] == NOW + timedelta(days=30)
+        assert stored[notification_store.TRANSLATION_STAMP_FIELD] == client.server_now
+    finally:
+        _uninstall()
+
+
+def _recording_cursors(client: _FakeClient) -> list[str | None]:
+    """Wrap the installed fake `_query` so a test can see each page's `start_after` cursor."""
+    cursors: list[str | None] = []
+    query = notification_store._query
+
+    def _query(name: str, **kwargs: Any) -> Any:
+        after = kwargs.get("start_after")
+        cursors.append(after._path if after is not None else None)
+        return query(name, **kwargs)
+
+    notification_store._query = _query  # type: ignore[assignment]
+    return cursors
+
+
+def test_situation_translations_page_with_a_cursor_up_to_the_limit():
+    """`_translation_pages` past one page: the cursor is the previous page's last document, the
+    heartbeat moves per page, a short page ends the read and `limit` caps documents read."""
+    client = _FakeClient()
+    _install(client)
+    page_size = notification_store.TRANSLATION_PAGE_SIZE
+    notification_store.TRANSLATION_PAGE_SIZE = 2
+    try:
+        stamps = [NOW - timedelta(minutes=m) for m in range(5)]
+        rows = [_translation_row(f"d{i}", stamp) for i, stamp in enumerate(stamps)]
+        client.pages["situation_translations_seed"] = rows
+        cursors = _recording_cursors(client)
+        beats: list[int] = []
+
+        entries, watermark = notification_store.seed_situation_translations(
+            limit=10, now=NOW, beat=lambda: beats.append(1)
+        )
+        assert [e.digest for e in entries] == [f"d{i}" for i in range(5)]
+        assert watermark == stamps[0], "the newest stamp, wherever it sat in the read"
+        assert [call[3] for call in client.query_calls] == [2, 2, 2]
+        assert cursors == [None, rows[1][0], rows[3][0]]
+        assert len(beats) == 3, "one beat per page"
+
+        client.query_calls.clear()
+        cursors.clear()
+        bounded, _ = notification_store.seed_situation_translations(limit=3, now=NOW)
+        assert [e.digest for e in bounded] == ["d0", "d1", "d2"]
+        assert [call[3] for call in client.query_calls] == [2, 1], "the last page asks only for the rest"
+        assert cursors == [None, rows[1][0]]
+    finally:
+        notification_store.TRANSLATION_PAGE_SIZE = page_size
+        _uninstall()
+
+
+def test_a_situation_translation_sync_stops_at_its_page_ceiling():
+    """A sync whose every page is full stops at TRANSLATION_SYNC_MAX_PAGES; the next tick resumes
+    from the watermark it returned."""
+    client = _FakeClient()
+    _install(client)
+    page_size, max_pages = notification_store.TRANSLATION_PAGE_SIZE, notification_store.TRANSLATION_SYNC_MAX_PAGES
+    notification_store.TRANSLATION_PAGE_SIZE, notification_store.TRANSLATION_SYNC_MAX_PAGES = 2, 2
+    try:
+        stamps = [NOW - timedelta(minutes=10 - m) for m in range(6)]
+        client.pages["situation_translations_sync"] = [
+            _translation_row(f"d{i}", stamp) for i, stamp in enumerate(stamps)
+        ]
+        entries, watermark = notification_store.sync_situation_translations(
+            since=NOW - timedelta(hours=1), now=NOW
+        )
+        assert [e.digest for e in entries] == ["d0", "d1", "d2", "d3"]
+        assert watermark == stamps[3]
+        assert len(client.query_calls) == 2
+    finally:
+        notification_store.TRANSLATION_PAGE_SIZE = page_size
+        notification_store.TRANSLATION_SYNC_MAX_PAGES = max_pages
+        _uninstall()
+
+
+def test_situation_translations_seed_and_sync_by_the_server_stamp_and_drop_expired():
+    """KTD5: the seed reads newest first up to its limit, the sync reads past the watermark minus the
+    mirror's overlap, both skip an expired document (TTL deletes up to ~24 h late) while still
+    counting its stamp, so the watermark never steps back over it."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        t1, t2, t3 = (NOW - timedelta(minutes=m) for m in (30, 20, 10))
+        client.pages["situation_translations_seed"] = [
+            _translation_row("d3", t3),
+            _translation_row("d2", t2, expires=NOW - timedelta(minutes=1)),
+            _translation_row("d1", t1),
+        ]
+        entries, watermark = notification_store.seed_situation_translations(limit=10, now=NOW)
+        assert [e.digest for e in entries] == ["d3", "d1"]
+        assert entries[0].translations == _translations(en="en-d3")
+        assert watermark == t3
+        name, _eq, inequality, limit = client.query_calls[-1]
+        assert name == "situation_translations_seed" and inequality == {} and limit == 10
+
+        bounded, _ = notification_store.seed_situation_translations(limit=2, now=NOW)
+        assert [e.digest for e in bounded] == ["d3"], "the limit counts documents read, expired included"
+
+        client.pages["situation_translations_sync"] = [_translation_row("d4", NOW)]
+        entries, watermark = notification_store.sync_situation_translations(since=t3, now=NOW)
+        assert [e.digest for e in entries] == ["d4"] and watermark == NOW
+        name, _eq, inequality, _limit = client.query_calls[-1]
+        assert name == "situation_translations_sync"
+        overlap = timedelta(seconds=notification_store.MIRROR_SYNC_OVERLAP_S)
+        assert inequality == {notification_store.TRANSLATION_STAMP_FIELD: t3 - overlap}
+
+        client.pages["situation_translations_sync"] = []
+        entries, watermark = notification_store.sync_situation_translations(since=t3, now=NOW)
+        assert entries == [] and watermark == t3, "an empty sync keeps the watermark it was given"
+    finally:
+        _uninstall()
+
+
+def test_situation_translations_are_read_by_digest_in_one_multi_get_and_expired_ones_are_absent():
+    """A pod's wanted texts the seed's newest `limit` did not reach: one round trip, and an expired
+    document is absent like a missing one (TTL deletes up to ~24 h late)."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        for path, doc in (
+            _translation_row("d1", NOW),
+            _translation_row("d2", NOW, expires=NOW - timedelta(minutes=1)),
+        ):
+            client.docs[path] = doc
+        entries = notification_store.read_situation_translations(["d1", "d2", "gone", "d1"], now=NOW)
+        assert [(e.digest, e.translations) for e in entries] == [("d1", _translations(en="en-d1"))]
+        assert client.get_all_calls == [["d1", "d2", "gone"]]
+        assert notification_store.read_situation_translations([], now=NOW) == []
+        assert len(client.get_all_calls) == 1, "an empty ask costs no call"
+    finally:
+        _uninstall()
+
+
 def test_erasure_deletes_the_devices_feedback_contexts_in_the_same_transaction():
     """KTD10: a context holds the traveller's route and typed names for a render nobody tapped, so
     «Slett alt» takes it in the journeys' own transaction. Another device's identical card and the
@@ -4529,6 +4736,39 @@ def emulator_test_one_devices_journeys_and_its_erasure_against_a_real_client():
     mirror.seed(now=NOW)
     live = mirror.recipients(NOW, channel=notification_store.CHANNEL_WEB_PUSH)
     assert [e.subscription_id for e in live] == ["other"], [e.subscription_id for e in live]
+
+
+def emulator_test_a_situation_translation_is_created_once_and_seeded_and_synced_by_its_stamp():
+    """Translation store U2 against a real client: `create` refuses the second writer with the real
+    AlreadyExists and the writer adopts the first text; the seed's descending order and the sync's
+    range filter run on the real server stamp, which the hermetic fake can only imitate."""
+    client = _emulator_setup()
+    write = notification_store.write_situation_translation
+    assert write("d1", _translations(), version="v1", model="m", now=NOW) == _translations()
+    assert write("d1", _translations(en="Other"), version="v1", model="m", now=NOW) == _translations()
+    write("d2", _translations(en="Second"), version="v1", model="m", now=NOW)
+
+    entries, watermark = notification_store.seed_situation_translations(limit=10, now=NOW)
+    assert [e.digest for e in entries] == ["d2", "d1"], [e.digest for e in entries]
+    assert entries[1].translations == _translations()
+    assert watermark is not None
+
+    synced, later = notification_store.sync_situation_translations(since=watermark, now=NOW)
+    # The overlap re-reads both (they are inside the last 120 s); applying by digest is a no-op.
+    assert {e.digest for e in synced} == {"d1", "d2"} and later == watermark
+
+    # An expired document TTL has not deleted yet is renewed by the next writer, not adopted.
+    client.collection(notification_store.SITUATION_TRANSLATIONS).document("d1").update(
+        {notification_store.TTL_FIELD: NOW - timedelta(minutes=1)}
+    )
+    assert write("d1", _translations(en="Renewed"), version="v1", model="m", now=NOW) == _translations(
+        en="Renewed"
+    )
+    renewed = client.collection(notification_store.SITUATION_TRANSLATIONS).document("d1").get().to_dict()
+    assert renewed["translations"] == _translations(en="Renewed")
+    assert renewed[notification_store.TTL_FIELD] == NOW + notification_store.TRANSLATION_TTL
+    readable = notification_store.read_situation_translations(["d1"], now=NOW)
+    assert [e.translations for e in readable] == [_translations(en="Renewed")]
 
 
 def emulator_test_a_feedback_context_is_claimed_once_and_erased_with_its_device():

@@ -24,6 +24,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 """
 
 import ast
+import logging
 import threading
 import time
 from contextlib import contextmanager
@@ -778,6 +779,61 @@ def test_the_mirrors_are_seeded_under_the_store_backend_with_the_webhook_flag_of
     source = inspect.getsource(main._rebuild_all)
     gate = source.index("if _mirrors_wanted(webhook_channel):")
     assert gate < source.index('_phase("notification_mirror"'), "the phase must sit behind it"
+
+
+def test_on_acquire_follows_the_stored_translations_and_survives_a_store_that_raises():
+    """Translation store R5/AE2: a new leader reads what another leader translated before its first
+    cycle, and a Firestore it cannot read costs it the translations, never the lease."""
+    import situation_english
+
+    class _Raising:
+        def __init__(self):
+            self.calls = []
+
+        def seed_situation_translations(self, *, limit, beat=None):
+            self.calls.append("seed")
+            raise RuntimeError("firestore down")
+
+    store = _Raising()
+    calls: list[str] = []
+    situation_english.configure(store=store)
+    logging.getLogger("situation_english").setLevel(logging.CRITICAL)
+    try:
+        with _hooks(calls):
+            main._on_lease_acquired()
+            assert main._force_rebuild is True
+        assert store.calls == ["seed"]
+        assert _gauge() == 1
+    finally:
+        situation_english.configure(store=None)
+        situation_english.reset_state()
+
+
+def test_on_acquire_seeds_the_stored_translations_with_the_poller_beat():
+    """The seed reads pages of up to CACHE_MAX entries before the first cycle; without the beat a
+    slow read on a large store looks like a hung poller to the liveness probe."""
+    import situation_english
+
+    class _Recording:
+        def __init__(self):
+            self.beats = []
+
+        def seed_situation_translations(self, *, limit, beat=None):
+            self.beats.append(beat)
+            return [], None
+
+    store = _Recording()
+    calls: list[str] = []
+    situation_english.configure(store=store)
+    metrics.POLLER_LEADER.set(0)
+    try:
+        with _hooks(calls):
+            main._on_lease_acquired()
+        assert store.beats == [main._beat], store.beats
+        assert _gauge() == 1
+    finally:
+        situation_english.configure(store=None)
+        situation_english.reset_state()
 
 
 def test_a_failing_on_acquire_clears_the_gauge_and_raises_to_the_state_machine():
