@@ -343,17 +343,27 @@ def test_the_worst_situation_wins_and_ties_break_on_the_situation_number():
 
 
 
-def test_a_situation_that_scores_only_the_boarding_call_is_never_red():
-    """The push matcher pairs a boarding and an alighting call inside ONE situation. A situation
-    whose onset falls mid-trip scores the boarding call only (here the alighting call sits in the
-    no-SX branch), so no push fires; the strip may grade the train but not red it by the gate."""
+def test_a_trip_split_across_two_situations_is_paired_as_the_matcher_pairs_it():
+    """A situation whose onset falls mid-trip scores the boarding call while the alighting call sits
+    in the no-SX branch. Since 2026-10-22 the matcher pairs the two and the push fires on the
+    boarding figure, so the strip reds it by the gate too. With no alighting row in the cache at
+    all, nothing fires, and the strip may grade the train but not red it."""
     dep = _oslo(7, 48)
     board, _ = _scored("a", dep, sit="S1", p_impact_dep=0.95, dep_delay_p50_stack_min=4)
     _, alight = _scored("a", dep, sit="KIX:NoSituation:a", has_situation=False, arr_delay_p50_stack_min=5)
     _install(_train("a", dep), [board, alight])
     t = _strip(_oslo(7, 42))["07:48"]
-    assert (t.state, t.level, t.alert_worthy, t.impact_probability) == ("predicted", "yellow", False, None)
-    assert t.delay_p50_min == 5, "the arrival side's figure, as a paired train's would be"
+    assert (t.state, t.level, t.alert_worthy, t.impact_probability) == ("predicted", "red", True, 0.95)
+    assert t.delay_p50_min == 5, "the arrival side's figure, off the other situation's row"
+    [cell] = impact._trip_cells(
+        {"S1": [board], "KIX:NoSituation:a": [alight]}, FROM, TO, _oslo(7, 0), _oslo(9, 0), select="worst"
+    )
+    assert (cell.situation_number, cell.departure.impact_probability) == ("S1", 0.95)
+
+    _install(_train("a", dep), [board])
+    t = _strip(_oslo(7, 42))["07:48"]
+    # Graded off the boarding call's own 4 min, not red although it scored 0.95.
+    assert (t.state, t.level, t.alert_worthy, t.impact_probability) == ("predicted", "green", False, None)
 
 
 def test_a_train_under_way_is_graded_off_its_alighting_call_once_the_boarding_one_ages_out():
@@ -524,8 +534,9 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
     """The strip restates `impact._trip_cells`' eligibility on the spine's rows (board at the
     from-stop inside the window with boarding open, alight later at the to-stop with alighting
     open), and a restated rule is how two surfaces drift. So the SAME random trains, one situation
-    each so the matcher's per-line pick cannot hide one, go through both, and the train sets must
-    match. Trains call the origin at most once: for a loop the two knowingly differ (see `_trains`).
+    each so the matcher's per-line pick cannot hide one (a split train's second half is in a
+    situation of its own), go through both, and the train sets must match. Trains call the origin
+    at most once: for a loop the two knowingly differ (see `_trains`).
     """
     rng = random.Random(7)
     stops = [MID, TO, "NSR:StopPlace:9"]
@@ -553,12 +564,18 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
             sit = f"KIX:PlanRemoved:j{j}" if removed else f"S{j}"
             certainty = {"et_declared_cancelled": True, "p_cancel": 1.0, "p_impact_dep": 1.0,
                          "call_source": "removed", "has_situation": False} if removed else {}
-            scope[sit] = [
-                _pred(r.jkey, r.stop_order, r.stop_place, r.aimed_dep, r.aimed_arr, sit=sit,
-                      boarding_allowed=r.boarding_allowed, alighting_allowed=r.alighting_allowed,
-                      **certainty)
-                for r in train_rows
-            ]
+            # Some trains have their calls split across two situations, the way `predict_calls.sql`
+            # splits a partial cancellation or an SX message whose onset falls mid-trip. The matcher
+            # pairs across them (2026-10-22), so the split must not change the train set.
+            cut = rng.randint(1, len(train_rows)) if not removed and rng.random() < 0.4 else 0
+            for part, part_rows in ((sit, train_rows[cut:]), (f"N{j}", train_rows[:cut])):
+                if part_rows:
+                    scope[part] = [
+                        _pred(r.jkey, r.stop_order, r.stop_place, r.aimed_dep, r.aimed_arr, sit=part,
+                              boarding_allowed=r.boarding_allowed,
+                              alighting_allowed=r.alighting_allowed, **certainty)
+                        for r in part_rows
+                    ]
         _install(rows)
         strip = {t.jkey for t in js.status_for(DEFINITION, _oslo(8, 0)).trains}
         matcher = {c.jkey for c in impact._trip_cells(scope, FROM, TO, start, end, select="worst")}

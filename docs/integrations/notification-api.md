@@ -781,11 +781,10 @@ Each train carries a `state` and a `level`:
 `level` is `red` for cancelled, 10 min or more late, or a forecast over the same bar a notification
 fires at, applied to the same pairing of a train's two calls. It is `yellow` for 5–9 min, `green`
 below that, and `grey` exactly when nothing can be said. A trip counts as cancelled when either its
-boarding or its alighting call is. That is the one place the two reads can differ: notifications
-fire on the boarding call, so a train cancelled only at the destination is red here and can be
-absent from `journey-alerts`. A forecast that no single operator message scored at both ends is
-graded yellow or green at most, with `impact_probability` null, because no notification can fire
-on it. `now` is the server's
+boarding or its alighting call is, and notifications treat it the same way: a train that leaves
+but never reaches the destination is a confirmed cancellation of the trip. A forecast scored at
+only one end of the trip is graded yellow or green at most, with `impact_probability` null,
+because no notification can fire on it. `now` is the server's
 instant: draw the «now» marker against it, not against the device clock.
 
 **A train taken out of the plan** is listed too: a Vy train that runs on this weekday but is missing

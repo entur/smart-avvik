@@ -1747,7 +1747,7 @@
               "number",
               "null"
             ],
-            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a cancellation. Null on a confirmed or unknown train, and on a forecast no single operator message scored at both ends of the trip -- notifications cannot fire on one, so neither is it red."
+            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a cancellation. Null on a confirmed or unknown train, and on a forecast scored at only one end of the trip -- notifications cannot fire on one, so neither is it red."
           },
           "alert_worthy": {
             "type": "boolean",

@@ -2439,14 +2439,21 @@ def _assert_prune_identity(seeds, *, index_builder=None):
                     situation=situation, with_alternative=False,
                 )
                 full = _generation_state["snapshot"]
+                destinations = None  # unnarrowed: `_trip_cells` reads them off the whole snapshot
                 if situation is not None:
                     reference_scope = {situation: full[situation]} if situation in full else {}
+                    # Narrowing picks the situation, never the alighting calls it may pair with:
+                    # its cell is the one the unnarrowed answer carries for it.
+                    if query["to_stop"] is not None:
+                        destinations = impact._destinations_from(
+                            ((s, c) for s, calls in full.items() for c in calls), query["to_stop"]
+                        )
                 else:
                     reference_scope = full
                 cells = impact._trip_cells(
                     reference_scope, A, query["to_stop"], window_start, window_end,
                     select=query["select"], at=query["at"],
-                    catchable_after=query["catchable_after"],
+                    catchable_after=query["catchable_after"], destinations=destinations,
                 )
                 want = impact._impact_response(
                     cells, from_stop=A, to_stop=query["to_stop"], refreshed_at=stamp, now=got.as_of
@@ -2516,6 +2523,14 @@ def test_the_pruned_scan_answers_exactly_what_the_full_scan_answers():
     8. Dropping the window from the window memo's key, so the first window asked about a pair
        answers every later one. Reported as
        `seed 0, query {'to_stop': ..., 'window': (07:00, 09:00)}: the prune changed the answer`.
+
+    Two more since 2026-10-22, when `_trip_cells` began taking a train's alighting call from any
+    situation:
+
+    9. Keying the prune's alighting set on the situation again, so a situation holding only the
+       boarding call is pruned although the full scan pairs it. Reported at seed 0, `to_stop` B.
+    10. Handing `_trip_cells` the pruned scope's alighting calls rather than the whole snapshot's.
+        Reported at seed 0, `to_stop` C.
 
     And TWO that are deliberately GREEN, both for one reason — a prune may only ever be too
     generous: dropping the operator from the alighting group key, and (7)/(8) asked in the other
@@ -2752,6 +2767,86 @@ def test_a_train_that_never_reaches_the_destination_cannot_be_its_own_alternativ
         cell, from_stop=A, to_stop=B, deadline=alight.aimed_arr, predicted_arrival=alight.aimed_arr,
     )
     assert original.cancelled is True
+
+
+def _split(board_sit, alight_sit, *, board=None, alight=None):
+    """A train whose boarding and alighting calls `predict_calls.sql` put in two situations."""
+    b, a = _train("j1", 8, p_impact_dep=0.3)
+    for call, sit, fields in ((b, board_sit, board), (a, alight_sit, alight)):
+        call.situation_number = sit
+        for name, value in (fields or {}).items():
+            setattr(call, name, value)
+    return {board_sit: [b], alight_sit: [a]}
+
+
+def _both_paths(scope):
+    """`_trip_cells` over the whole snapshot, and `for_trip` through the pruned scan."""
+    direct = _cells(scope, select="worst")
+    _generation(scope, refreshed_at=_at(6))
+    resp = _with_generation(lambda: impact.for_trip(
+        from_stop=A, to_stop=B, window_start=_at(7), window_end=_at(9),
+        select="worst", with_alternative=False,
+    ))
+    return direct, resp.situations
+
+
+def test_a_cancelled_destination_in_another_situation_still_cancels_the_trip():
+    """L1 2216 and 2120 on 2026-10-22 left Oslo S and skipped Bryn. With no SX message,
+    `predict_calls.sql` puts a partially cancelled train's running calls in `KIX:NoSituation:` and
+    its cancelled ones in `KIX:ETCancellation:`. Pairing only inside one situation made the train
+    VANISH for a traveller to the skipped stop: no cancellation, and not even the delay figure the
+    no-SX call carried. The prune keyed the alighting call on the situation as well, so both paths
+    are pinned."""
+    scope = _split("KIX:NoSituation:j1", "KIX:ETCancellation:j1", alight={"et_declared_cancelled": True})
+    [cell], [sit] = _both_paths(scope)
+    assert cell.situation_number == sit.situation_number == "KIX:NoSituation:j1"
+    assert cell.destination_cancelled and sit.destination_cancelled
+    assert cell.departure.impact_probability == sit.departure_prediction.impact_probability == 1.0
+    assert not cell.departure.cancelled, "the boarding call runs; it is the trip that is cancelled"
+
+
+def test_a_cancelled_boarding_call_in_another_situation_than_the_destination_is_relayed():
+    """The mirror: the traveller's own stop was skipped, so the cancelled boarding call is in
+    `KIX:ETCancellation:` and the destination, which runs, in `KIX:NoSituation:`. The relay was as
+    blind to it as the destination case was."""
+    scope = _split("KIX:ETCancellation:j1", "KIX:NoSituation:j1", board={"et_declared_cancelled": True})
+    [cell], [sit] = _both_paths(scope)
+    assert cell.departure.cancelled and sit.departure_prediction.cancelled
+    assert not cell.destination_cancelled
+
+
+def test_an_sx_message_whose_onset_falls_mid_trip_still_scores_the_trip():
+    """An SX message only covers calls after its onset, so one published after the train's aimed
+    time at the boarding stop (L1 2216: «Ny kjørerute» at 08:42:06, aimed from Oslo S at 08:41)
+    leaves the boarding call in the no-SX branch and takes the destination. The boarding call's own
+    situation is the cell, and its figures are the ones the gate reads."""
+    scope = _split("KIX:NoSituation:j1", "NSB:SituationNumber:late", board={"has_situation": False})
+    [cell], [sit] = _both_paths(scope)
+    assert cell.situation_number == "KIX:NoSituation:j1" and cell.has_situation is False
+    assert cell.departure.impact_probability == 0.3 and not cell.destination_cancelled
+    assert sit.arrival_prediction is not None
+
+
+def test_a_situations_own_alighting_call_wins_over_another_situations():
+    """The fallback reaches other situations only when the boarding call's own has no alighting
+    call, so every cell that existed before 2026-10-22 is unchanged."""
+    b, own = _train("j1", 8, p_impact_dep=0.3)
+    other = FakeCall("j1", B, 5, None, aimed_arr=own.aimed_arr, situation_number="S2",
+                     et_declared_cancelled=True)
+    [cell] = _cells(_scope(S1=[b, own], S2=[other]), select="worst")
+    assert not cell.destination_cancelled, "the situation's own row, not the cancelled one in S2"
+
+
+def test_the_fallback_takes_the_first_arrival_after_boarding():
+    """A loop route, or two runs of an undated bus ref, can reach `to_stop` twice after the
+    boarding call. The trip ends at the first."""
+    b = FakeCall("j1", A, 1, _at(8), situation_number="S1")
+    first = FakeCall("j1", B, 5, None, aimed_arr=_at(8, 40), situation_number="S2")
+    again = FakeCall("j1", B, 9, None, aimed_arr=_at(9, 30), situation_number="S2",
+                     et_declared_cancelled=True)
+    [cell] = _cells(_scope(S1=[b], S2=[again, first]), select="worst")
+    assert not cell.destination_cancelled
+    assert cell.arrival.scheduled_time == _at(8, 40)
 
 if __name__ == "__main__":
     _run()
