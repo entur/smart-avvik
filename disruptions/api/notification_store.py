@@ -129,8 +129,27 @@ POLLER_LEASE_DOC = "current"
 #: byte), `device_id` and `journey_id` (both absent for the rush card, which carries no route) and
 #: `claims`, a map of response id to the instant its first tap was accepted.
 FEEDBACK_CONTEXTS = "feedback_contexts"
+#: Gemini's English and nynorsk of operator situation text (the shared translation store,
+#: docs/plans/2026-10-22-001), one document per `situation_english` digest -- the prompt version,
+#: the model and the Norwegian text -- so every pod serves the same machine translation and a
+#: restart does not translate everything again. Written once by the lease holder (`create`, first
+#: writer wins), read into every pod's memory by a seed and a watermark sync, never on a request.
+#: The body is `digest`, `translations` (language -> summary/description, ONE map so one
+#: exemption keeps the text out of every index), `version`, `model`, `created_at`, the server
+#: stamp the sync pages by, and `expires_at` 30 days after creation. Public operator text only.
+SITUATION_TRANSLATIONS = "situation_translations"
 
-COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS)
+COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS, SITUATION_TRANSLATIONS)
+
+#: The server-stamped field the translation sync pages by: MIRROR_FIELD's rule (`SERVER_TIMESTAMP`,
+#: never `now`, because the watermark is compared against values Firestore wrote) on a collection
+#: of its own. Every document is created with it, so ordering by it hides nothing.
+TRANSLATION_STAMP_FIELD = "stored_at"
+#: D4: thirty days from creation, never renewed. A recurring phrase is translated about monthly.
+TRANSLATION_TTL = timedelta(days=30)
+TRANSLATION_PAGE_SIZE = 1000
+#: A sync reads at most this many pages (20 000 documents) -- a day's translations are hundreds.
+TRANSLATION_SYNC_MAX_PAGES = 20
 
 # Firestore allows exactly ONE TTL field per collection group, so every group in `COLLECTIONS`
 # uses the same field name: the Terraform resource is then one repeated block rather than a bespoke one per group, and
@@ -1188,6 +1207,21 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         equality=("subscription_id",),
         why="ordered deletion after a tombstone",
     ),
+    # One field each, so Firestore's automatic single-field index on the server stamp serves both
+    # directions and firestore.indexes.json gains nothing.
+    QuerySpec(
+        name="situation_translations_seed",
+        collection=SITUATION_TRANSLATIONS,
+        order_by=((TRANSLATION_STAMP_FIELD, "DESCENDING"),),
+        why="every pod's memory of the machine translations, newest first (translation store U3)",
+    ),
+    QuerySpec(
+        name="situation_translations_sync",
+        collection=SITUATION_TRANSLATIONS,
+        inequality=((TRANSLATION_STAMP_FIELD, ">"),),
+        order_by=((TRANSLATION_STAMP_FIELD, "ASCENDING"),),
+        why="a follower's tick picks up what the leader translated since its watermark",
+    ),
 )
 
 _SPECS_BY_NAME = {spec.name: spec for spec in QUERY_SPECS}
@@ -1300,6 +1334,9 @@ class _Refs:
 
     def feedback_context(self, context_id: str) -> Any:
         return self._client.collection(FEEDBACK_CONTEXTS).document(context_id)
+
+    def situation_translation(self, digest: str) -> Any:
+        return self._client.collection(SITUATION_TRANSLATIONS).document(digest)
 
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
@@ -6157,6 +6194,164 @@ def release_feedback_response(context_id: str, *, response_id: str) -> None:
             txn, refs, context_id=context_id, response_id=response_id
         )
     )
+
+
+# ---- Situation translations (shared translation store U2) --------------------------------------
+#
+# `situation_english` calls these through an injected handle and never imports this module, like
+# `feedback_contexts`: the handle is set only under the store backend (`main._varsel_store`).
+
+
+@dataclass(frozen=True)
+class StoredTranslation:
+    digest: str
+    translations: dict[str, dict[str, str | None]]
+
+
+def _copy_translations(
+    translations: Mapping[str, Mapping[str, str | None]],
+) -> dict[str, dict[str, str | None]]:
+    return {language: dict(fields) for language, fields in translations.items()}
+
+
+def write_situation_translation(
+    digest: str,
+    translations: Mapping[str, Mapping[str, str | None]],
+    *,
+    version: str,
+    model: str,
+    now: datetime | None = None,
+) -> dict[str, dict[str, str | None]]:
+    """Store one translation unless the digest already has one, and return the STORED one.
+
+    `create`, so the first writer wins and a second -- two leaders across a handoff translating the
+    same text -- gets the first back and serves it, which is what every other pod syncs (KTD4). Not
+    a transaction: one document, one condition, and `create` is that condition. Raises on anything
+    but AlreadyExists; the caller keeps its own translation in memory then.
+
+    A stored document that is expired (TTL deletes up to ~24 h late) or carries no usable text is
+    RENEWED rather than adopted: every reader skips it, so adopting it would have the leader serve
+    a translation no follower can load, for as long as TTL takes to delete it.
+    """
+    from google.api_core.exceptions import AlreadyExists
+
+    instant = now or _now()
+    ref = _Refs(_firestore_client()).situation_translation(digest)
+    document = {
+        "digest": digest,
+        "translations": _copy_translations(translations),
+        "version": version,
+        "model": model,
+        "created_at": instant,
+        TRANSLATION_STAMP_FIELD: _mirror_stamp(),
+        TTL_FIELD: instant + TRANSLATION_TTL,
+    }
+    with _span("notification_store.write_situation_translation"):
+        try:
+            ref.create(document, timeout=_CALL_DEADLINE_S)
+            return document["translations"]
+        except AlreadyExists:
+            stored = _doc(ref.get(timeout=_CALL_DEADLINE_S))
+            kept = stored.get("translations")
+            if _not_expired(stored, instant) and isinstance(kept, Mapping) and kept:
+                return _copy_translations(kept)
+            # A plain set, not a transaction: two leaders renewing at once both write a valid
+            # translation with a fresh stamp, and the sync converges followers on the last to land.
+            ref.set(document, timeout=_CALL_DEADLINE_S)
+    return document["translations"]
+
+
+def _translation_pages(
+    name: str,
+    *,
+    inequality: Mapping[str, Any] | None,
+    limit: int,
+    since: datetime | None,
+    now: datetime,
+    beat: Callable[[], None] | None,
+) -> tuple[list[StoredTranslation], datetime | None]:
+    """Page through one translation query; return the live entries and the newest stamp read.
+
+    The stamp counts every document read, expired ones included, so the watermark never steps back
+    over a document TTL has not deleted yet. With nothing read it is `since`, unchanged.
+    """
+    entries: list[StoredTranslation] = []
+    newest = since
+    cursor = None
+    read = 0
+    while read < limit:
+        want = min(TRANSLATION_PAGE_SIZE, limit - read)
+        page = _stream(_query(name, inequality=inequality, limit=want, start_after=cursor))
+        for snapshot in page:
+            doc = _doc(snapshot)
+            stamp = _as_dt(doc.get(TRANSLATION_STAMP_FIELD))
+            if stamp is not None and (newest is None or stamp > newest):
+                newest = stamp
+            translations = doc.get("translations")
+            if _not_expired(doc, now) and doc.get("digest") and isinstance(translations, Mapping):
+                entries.append(StoredTranslation(str(doc["digest"]), _copy_translations(translations)))
+        read += len(page)
+        if beat is not None:
+            beat()
+        if len(page) < want:
+            break
+        cursor = page[-1]
+    return entries, newest
+
+
+def seed_situation_translations(
+    *, limit: int, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[StoredTranslation], datetime | None]:
+    """The newest `limit` translations, for a pod starting or taking the lease (R2)."""
+    with _span("notification_store.seed_situation_translations"):
+        return _translation_pages(
+            "situation_translations_seed",
+            inequality=None,
+            limit=limit,
+            since=None,
+            now=now or _now(),
+            beat=beat,
+        )
+
+
+def read_situation_translations(
+    digests: Sequence[str], *, now: datetime | None = None
+) -> list[StoredTranslation]:
+    """The live translations for these digests, in ONE multi-get; missing and expired ones are
+    absent. For the texts a pod wants that the seed's newest `limit` did not reach."""
+    wanted = list(dict.fromkeys(digests))
+    if not wanted:
+        return []
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    entries: list[StoredTranslation] = []
+    with _span("notification_store.read_situation_translations"):
+        snapshots = _firestore_client().get_all(
+            [refs.situation_translation(digest) for digest in wanted], timeout=_CALL_DEADLINE_S
+        )
+        for snapshot in snapshots:
+            doc = _doc(snapshot)
+            translations = doc.get("translations") if doc else None
+            if doc and _not_expired(doc, instant) and doc.get("digest") and isinstance(translations, Mapping):
+                entries.append(StoredTranslation(str(doc["digest"]), _copy_translations(translations)))
+    return entries
+
+
+def sync_situation_translations(
+    *, since: datetime, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[StoredTranslation], datetime | None]:
+    """What was stored after `since`, less the mirror's overlap: a transaction that began before
+    the last sync can commit with an earlier stamp than one that sync already saw, and re-reading
+    by digest is a no-op (KTD5)."""
+    with _span("notification_store.sync_situation_translations"):
+        return _translation_pages(
+            "situation_translations_sync",
+            inequality={TRANSLATION_STAMP_FIELD: since - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)},
+            limit=TRANSLATION_PAGE_SIZE * TRANSLATION_SYNC_MAX_PAGES,
+            since=since,
+            now=now or _now(),
+            beat=beat,
+        )
 
 
 @dataclass(frozen=True)

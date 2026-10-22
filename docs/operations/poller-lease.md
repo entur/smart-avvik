@@ -47,7 +47,8 @@ values.
 `main._rebuild_all` (≈0.9 GB of `ML.PREDICT` and six `CREATE OR REPLACE` tables per rebuild),
 `togvarsel.refresh`, `togvarsel_notify.evaluate`, `togvarsel_outcomes.refresh`,
 `decisions.check_labelling_freshness`, the state export, and Gemini translation of operator text
-(`situation_english`). The check (`main._fence`) runs before every `_phase`, between the two queries
+(`situation_english`; every pod SERVES the leader's translations, read from Firestore's
+`situation_translations` on each follower tick -- see "What every pod does"). The check (`main._fence`) runs before every `_phase`, between the two queries
 of a phase that issues two, before every tick writer, before `deliver_to_devices` and per item inside
 its fan-out, and before a rush round's delivery. A demoted or stopping leader stops at the next
 boundary and logs one `poller_lease` record naming it.
@@ -235,8 +236,9 @@ three pods are three times each.
 - the feedback capture limits (60 per minute, 12 per context per minute, 2 000 per day — an
   effective **6 000 a day** at three pods; `data/feedback/README.md`).
 
-Gemini translation of operator text is leader-only, so followers do not translate the same ~400
-situations a day. An ingress-wide budget would need the platform; nothing here provides one.
+Gemini translation of operator text is leader-only, so followers do not translate the same
+situations; they read the leader's from `situation_translations` instead (the shared translation
+store, 2026-10-22), seeded on startup and on taking the lease, synced on every follower tick. An ingress-wide budget would need the platform; nothing here provides one.
 
 **`/rushvarsel-api/outlook` now reads the device's journeys from the store on every call** (it read
 process memory before), so a public outlook read is one store query and can trigger the weekly
