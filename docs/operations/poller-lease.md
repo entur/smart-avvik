@@ -176,9 +176,11 @@ shell with ADC; never write it by hand.
 
 **Force a handoff: delete the leader pod.** `kubectl -n kix-avvik delete pod <leader>` sends SIGTERM,
 the pod releases at the end of its shutdown sequence, and a follower acquires at its next tick. At
-one replica the Deployment's replacement pod acquires once it is Ready. Use `--grace-period=1` only
-to rehearse a crash: the lease is then unreleased and the successor waits ~TTL plus a tick (rule 1a
-fires once).
+one replica (dev) the Deployment's replacement pod acquires once it is Ready, and nothing serves
+until then (~45 s measured). Use `--grace-period=1` only to rehearse a crash: the lease is then
+unreleased and the successor waits out the TTL from the dead leader's LAST HEARTBEAT plus a tick.
+Measured in dev on 2026-10-20 that was 4 min 55 s, and rule 1a went Pending for exactly its 5m and
+cleared without firing, so "fires once" is borderline rather than certain.
 
 **Never delete or edit the lease document.** A deleted document is a free lease: a follower acquires
 at its next tick while the old leader keeps believing it leads until its next renewal answers `lost`
@@ -274,20 +276,39 @@ each of the **three API environment files** (not the base: the base is shared wi
 release, which is behind no Service), and `deployment.forceReplicas: 1` **moved out of the base into
 each environment file**. Every environment is still Recreate, one replica, no HPA. The base file
 carries the rolling and HPA keys (`maxUnavailable: "0%"` as a string, HPA 1..3 on 80 % CPU, one pod
-per 60 s up, 600 s stable before down), inert while an environment file forces one replica.
+per 60 s up, 600 s stable before down), inert while an environment file forces one replica. prd's file
+raises the floor to **2..3 with a 50 % PDB** (`deployment.minReplicas`, `deployment.minAvailable`
+and `hpa.spec.minReplicas`, staged beside its `forceReplicas: 1` and equally inert until step B).
 
 **Step B**, one values-only change per environment, made only after that environment's step A is
-verified live: **delete the WHOLE `deployment:` block** (the key, its comment and `forceReplicas: 1`)
-from `helm/kix-avvik/env/values-kub-ent-<env>.yaml`. Not the `forceReplicas` line alone: an empty
-`deployment:` key is null, Helm reads a null override as "delete the key", the base file's whole
-`deployment` map goes with it, and the chart's startup-cpu-boost template fails the render on a nil
-pointer. `helm/kix-avvik/test/api_render.sh` (CI's `helm-render`, gating the image) renders step B
-exactly that way for dev and prd, so the shape is proven before anyone commits it.
+verified live, and its shape differs per environment:
 
-**A dispatch deploys the values at `main`'s HEAD**, so prd's block is deleted on `main` only after
-prd's step A is verified live; dev's step B merging does not move prd until prd is dispatched. If
-prd's block is ever deleted on `main` before prd's step A, recover with a dispatch from a branch or
-tag at the step A commit.
+- **dev** (done 2026-10-20): **the WHOLE `deployment:` block** was deleted (the key, its comment and
+  `forceReplicas: 1`). Not the line alone: a `deployment:` key left with no keys is null, Helm reads
+  a null override as "delete the key", the base file's whole `deployment` map goes with it, and the
+  chart's startup-cpu-boost template fails the render on a nil pointer. dev rolls at **1..3 pods,
+  PDB 0%** — the golden path's accepted single-pod dev.
+- **prd**: delete **the `forceReplicas: 1` line and its comment only**. The block keeps
+  `minReplicas: 2` and `minAvailable: "50%"`, so it is not null, and `hpa.spec.minReplicas: 2` sits
+  beside it (the base `hpa.spec` states its own minimum of 1, which the chart's `deployment.minReplicas`
+  does not reach). prd rolls at **2..3 pods, PDB 50 %** (one pod of two), which is what Entur's
+  production hardening asks for (`entur/ai` architecture guide: more than one pod in prd, PDB 50 %).
+  The reason is measured, not formal: at one pod a node drain or a cluster-autoscaler scale-down
+  evicts the only pod before its replacement is Ready, and dev lost **41-52 s of 503/404 to each of
+  three such evictions in 26 hours** (2026-10-19 12:32, 2026-10-20 13:49 and 14:33, the last a
+  `ScaleDown` of the node it ran on). Rolling deploys never had that gap; evictions are what a second
+  pod buys out. The cost is a permanent follower: one more pod at prd's 1.0 CPU and 2 GiB, and its
+  follower loads (step 5's measurement).
+
+`helm/kix-avvik/test/api_render.sh` (CI's `helm-render`, gating the image) renders each environment's
+step B by deleting the `forceReplicas` line and asserts its floor (`ROLLING_FLOOR`: dev `1 0%`, prd
+`2 50%`), so the shape is proven before anyone commits it — and a prd block that lost its floor
+fails that render on the nil pointer above.
+
+**A dispatch deploys the values at `main`'s HEAD**, so prd's `forceReplicas` line is deleted on
+`main` only after prd's step A is verified live; dev's step B merging does not move prd until prd is
+dispatched. If prd's line is ever deleted on `main` before prd's step A, recover with a dispatch from
+a branch or tag at the step A commit.
 
 ### Pre-deploy audits (before each environment's step B)
 
@@ -334,9 +355,13 @@ tag at the step A commit.
 6. **Watch** `sum(kix_poller_leader)` in dev for a day.
 7. **prd**, in the same two steps, after rules 1a/1b exist and are proven in prd:
    `gh workflow run terraform.yml -f environment=prd` and confirm the apply; dispatch `cd.yml` with
-   the image in SHORT form (`kix-avvik:main.<date>-SHA<sha>`) and prd's `deployment:` block still in
-   place; confirm `acquired` on the single pod; only then delete prd's block and dispatch again;
-   repeat steps 1 and 6 there.
+   the image in SHORT form (`kix-avvik:main.<date>-SHA<sha>`) and prd's `forceReplicas: 1` still in
+   place; confirm `acquired` on the single pod; only then delete prd's `forceReplicas` line (the
+   block and its 2-pod floor stay) and dispatch again. Expect the rollout to end with **two** pods,
+   one `acquired` and one follower whose `/ready` answers `role: follower`, and
+   `count(kix_poller_leader)` at 3 (two API pods plus the worker) beside `sum` at 1. Repeat steps 1,
+   3 (graceful delete only: with a follower already Ready it should take one tick, with no serving
+   gap) and 6 there.
 
 **Stop and do not promote** if dev showed any `lease_lost` without a cause, two pods emitting
 `poller_cycle` in one window, rule 1b firing, a rollout that needed `helm --wait`'s automatic
@@ -345,7 +370,8 @@ minute at the 80 % target; raise it to 1.0 first.
 
 ### Rollback
 
-**The `deployment:` block back first, the image second** — the reverse of the rollout, for the same
+**`forceReplicas: 1` back first, the image second** (dev: the whole `deployment:` block back, as it
+was; prd: the line back into its block) — the reverse of the rollout, for the same
 reason: a lease-unaware image under RollingUpdate polls and pushes beside the leader. A stalled
 rollout is left to `helm --wait`'s own rollback and **never cancelled**. The lease document needs no cleanup: an expired lease is
 acquirable, and an older binary ignores it. **Keep the `feedback_contexts` TTL field config** until
@@ -365,6 +391,15 @@ is 0 forever). Local runs and every hermetic suite take the same path.
 
 ## Measurements
 
-_Filled in by U9: dev step A and step B observations, handoff times (graceful and forced), the
-5xx count across the first rolling deploy, the first cycle's duration after a handoff, scale-out
-and scale-in timings, follower BigQuery bytes against the leader's, and the prd repeat._
+**dev, 2026-10-19..20** (U9; still owed: scale-out and scale-in timings, follower BigQuery bytes
+against the leader's, the SIGTERM-during-slow-fan-out rehearsal, and the prd repeat):
+
+| What | Measured |
+|---|---|
+| Step A, one Recreate pod (26 h, 5 handoffs) | `released` → `acquired` 42-49 s each; no `lease_lost`, no overlapping `poller_cycle`; cycle ~59 s mean, unchanged |
+| Step B, first rolling deploy | 1 503 in 1 538 requests at 1 rps, at 12:49:06, ~2.5 min after the rollout ended and absent from the app's own logs (an edge 503, not attributable further: no Traefik access logs) |
+| Step B handoff | old pod `refused` the new one, released 5 s after SIGTERM; new pod `acquired` 66 s later (its next tick); first cycle 76 s (cold) |
+| Graceful delete, one pod | handoff 45 s; **46 s** of 503/404 (no surge on a pod delete) |
+| Forced kill (`--grace-period=1`), one pod | no `released`; successor `refused`, then `acquired` 4 min 55 s after the kill; **41 s** of 503/404; rule 1a Pending 5m, did not fire |
+| Cluster-autoscaler scale-down, one pod | leader fenced mid-cycle ("Poller stopped before rail_planned_calls"), `released`, successor `acquired` 47 s later; **52 s** of 503/404 |
+| Duplicate pushes | none in 15 sent since step A — none of them near a handoff, so this proves little yet |

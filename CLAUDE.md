@@ -39,9 +39,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   from the tables the poller builds, and only the pod holding the Firestore lease
   `poller_lease/current` runs the poller cycle, the tick writers and every push. Exactness claims
   that used to rest on "one replica" (push dedup, the emit ledger, the mirrors) hold per leadership
-  term. dev and prd move to RollingUpdate + HPA 1..3 on CPU in two deploys each (KTD15: the whole
-  `deployment:` block in the env file is deleted only after the lease-aware binary is live there;
-  rollback puts it back before the image); tst has no store, no lease, and keeps one Recreate pod
+  term. dev and prd move to RollingUpdate + HPA on CPU in two deploys each (KTD15: `forceReplicas`
+  leaves the env file only after the lease-aware binary is live there — dev's whole `deployment:`
+  block went on 2026-10-20 for 1..3 pods, PDB 0%; prd keeps its block for a 2..3 floor with a 50 %
+  PDB, Entur's production hardening, because one pod loses ~45-50 s to every node eviction;
+  rollback puts the line back before the image); tst has no store, no lease, and keeps one Recreate pod
   for good. Per-process allowances are per pod (×3 at most). **Read
   `docs/operations/poller-lease.md` before touching the lease, a deploy's strategy, or anything a
   follower loads** — it carries the holder-reading, handoff, outage and rollout steps.
