@@ -288,7 +288,11 @@ verified live, and its shape differs per environment:
   a null override as "delete the key", the base file's whole `deployment` map goes with it, and the
   chart's startup-cpu-boost template fails the render on a nil pointer. dev rolls at **1..3 pods,
   PDB 0%** — the golden path's accepted single-pod dev.
-- **prd**: delete **the `forceReplicas: 1` line and its comment only**. The block keeps
+- **prd** (on `main` 2026-10-22; live from the first prd dispatch after it): delete **the
+  `forceReplicas: 1` line and its comment only**. prd's step A had been live since 2026-10-20 13:10
+  (one Recreate pod, one `acquired`, no handoff) and its Terraform was applied on 2026-10-22, two
+  days AFTER step A — the runbook's order (Terraform first) was missed on that dispatch, which left
+  `feedback_contexts` without its TTL config in between. The block keeps
   `minReplicas: 2` and `minAvailable: "50%"`, so it is not null, and `hpa.spec.minReplicas: 2` sits
   beside it (the base `hpa.spec` states its own minimum of 1, which the chart's `deployment.minReplicas`
   does not reach). prd rolls at **2..3 pods, PDB 50 %** (one pod of two), which is what Entur's

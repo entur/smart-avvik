@@ -69,9 +69,9 @@ common_shape() {
   check; echo "$dep" | grep -A6 'preStop:' | grep -q 'time.sleep(5)' || fail "$label: the preStop does not sleep 5 s"
 }
 
-# Environments whose step B is on main: their committed file is the rolling shape. prd joins this
-# list in its own step-B PR, after its step A is verified live; tst never does.
-STEP_B_COMMITTED="dev"
+# Environments whose step B is on main: their committed file is the rolling shape (dev 2026-10-20,
+# prd 2026-10-22). tst never joins.
+STEP_B_COMMITTED="dev prd"
 # The rolling shape's floor per environment: "minReplicas pdbMinAvailable". dev keeps one pod and no
 # disruption budget (the golden path's single-pod dev); prd keeps two and 50 %, as Entur's
 # production hardening asks (>1 pod, PDB 50 %), so a node drain moves one pod at a time.
@@ -83,8 +83,8 @@ for env in dev tst prd; do
   readiness=/ready; [ "$env" = "tst" ] && readiness=/health
 
   if [[ " $STEP_B_COMMITTED " == *" $env "* ]]; then
-    # --- Step B, as committed: the WHOLE block is gone, not just the forceReplicas line. -------
-    check; if grep -qE '^  deployment:' "$values"; then fail "$env: step B is committed, so the environment file must carry no deployment: block"; fi
+    # --- Step B, as committed: no forceReplicas (dev dropped its whole block, prd keeps its floor).
+    check; if grep -qE '^ +forceReplicas:' "$values"; then fail "$env: step B is committed, so the environment file must not set forceReplicas"; fi
   else
     # --- Step A, as committed: the environment file still forces one replica. -----------------
     # tst keeps it for good.
