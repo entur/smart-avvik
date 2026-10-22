@@ -9,9 +9,9 @@ so it is assembled here from three in-memory sources the poller already builds:
   trains exist (KTD3). The prediction cache cannot: it holds calls from 60 min before its build to
   12 h after, so a train cancelled before it ran is gone from it an hour after its time.
 * **the prediction cache** — read per train through `impact._lookup_journey_calls`, every scored
-  call of that train across every situation, then paired within ONE situation as the matcher pairs
-  them (`_paired_prediction`). That is deliberately not `_trip_cells`, which keeps one train per
-  line per situation and would lose two of three trains one SX message names.
+  call of that train across every situation, then paired as the matcher pairs them
+  (`_paired_prediction`). That is deliberately not `_trip_cells`, which keeps one train per line
+  per situation and would lose two of three trains one SX message names.
 * **the actuals** — `rail_calls_today`, loaded every 15 min (U4). Before that loads, the spine's own
   `recorded` calls stand in, up to 60 min stale.
 
@@ -141,8 +141,8 @@ class TrainStatus(BaseModel):
     delay_p50_min: int | None = Field(description="Typical predicted arrival delay (predicted only).")
     impact_probability: float | None = Field(
         description="P(cancelled OR >= 10 min late) at the boarding stop — what the push gates on. "
-        "1.0 when cancelled; null on a confirmed or unknown train, and on a forecast no single "
-        "situation scored at both ends (the push cannot fire on one)."
+        "1.0 when cancelled; null on a confirmed or unknown train, and on a forecast the cache "
+        "scored at one end only (the push cannot fire on one)."
     )
     alert_worthy: bool
     observed_at: datetime | None = Field(
@@ -410,24 +410,26 @@ def _worst_prediction(
 def _paired_prediction(
     preds: list[impact.CallPred], board_order: int, alight_order: int
 ) -> tuple[impact.CallPred, impact.CallPred] | None:
-    """The worst (boarding, alighting) pair scored by ONE situation, as the push matcher pairs them.
+    """The worst (boarding, alighting) pair, paired as the push matcher pairs them.
 
-    The matcher groups a situation's calls per train and needs both the boarding and the alighting
-    call inside that one group (`impact._trip_cells`). A situation whose onset falls mid-trip scores
-    the boarding call and not the alighting one (or the reverse, with the other end in the no-SX
-    branch), and the matcher never alerts on it for this trip. Taking the boarding figure from it
-    anyway would paint red where no push fires, which is the disagreement the gate-derived red exists
-    to rule out.
+    Each situation that scored the boarding call is paired with its own alighting row, or, when it
+    has none, with the worst row any situation scored there (`impact._destination_call`, since
+    2026-10-22). A train whose calls `predict_calls.sql` split across situations, through a partial
+    cancellation or an SX message whose onset falls mid-trip, is still a train the push can fire
+    on. So no pair means one end is not in the cache at all, and a figure read off one end alone may
+    not be red: no push fires on it, and the gate-derived red exists to rule that disagreement out.
     """
-    by_situation: dict[str, dict[int, impact.CallPred]] = {}
+    boards: dict[str, impact.CallPred] = {}
+    alights: dict[str, impact.CallPred] = {}
     for p in preds:
-        if p.stop_order in (board_order, alight_order):
-            by_situation.setdefault(p.situation_number, {})[p.stop_order] = p
-    pairs = [
-        (calls[board_order], calls[alight_order])
-        for calls in by_situation.values()
-        if board_order in calls and alight_order in calls
-    ]
+        if p.stop_order == board_order:
+            boards[p.situation_number] = p
+        elif p.stop_order == alight_order:
+            alights[p.situation_number] = p
+    fallback = _worst_prediction(preds, alight_order)
+    if fallback is None:
+        return None
+    pairs = [(b, alights.get(sit, fallback)) for sit, b in boards.items()]
     return max(pairs, key=lambda pr: (impact._call_severity(pr[0]), pr[0].situation_number), default=None)
 
 
@@ -512,10 +514,10 @@ def _status(
     if pair is not None:
         bpred, apred = pair
     else:
-        # No situation scored both ends. Either the boarding call has aged out of the cache (the
-        # train is under way: it holds calls from 60 min back) or two situations split the trip.
-        # Whatever IS scored still says how late the train looks, but never red by the gate: the
-        # push cannot fire on an unpaired figure, so neither may the strip's forecast red.
+        # One end is not in the cache at all, typically the boarding call aged out (the train is
+        # under way: the cache holds calls from 60 min back). Whatever IS scored still says how late
+        # the train looks, but never red by the gate: the push cannot fire on an unpaired figure,
+        # so neither may the strip's forecast red.
         bpred = _worst_prediction(preds, b.stop_order)
         apred = _worst_prediction(preds, a.stop_order)
     figure = bpred or apred

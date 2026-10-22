@@ -444,9 +444,9 @@ class TripCell:
     arrival: StopPrediction | None
     calls: tuple = ()
     line_calls: tuple = ()
-    # Carried from the calls this cell was built out of, so the gate can be asked the same question
-    # here as at the call level. A cell mixing populations cannot arise: a situation is either an
-    # SX one or a synthetic per-journey `KIX:` one, never both.
+    # Carried from the BOARDING call, so the gate can be asked the same question here as at the
+    # call level. The departure scores all come from that call's situation; only `arrival` may come
+    # from another one (see `_destination_call`).
     has_situation: bool = True
     report_type: str | None = None
     # ET has declared the ALIGHTING call cancelled while the boarding call runs: the vehicle leaves
@@ -627,6 +627,50 @@ def _expected_departure(c: CallPred) -> datetime | None:
     return c.aimed_dep + timedelta(minutes=max(typ or 0, 0))
 
 
+#: Every usable alighting call at one stop, per train `(operator, jkey)`, with the situation that
+#: scored it. One call carries one row per situation that touches it.
+Destinations = dict[tuple[str, str], list[tuple[str, CallPred]]]
+
+
+def _destinations_from(calls: Iterable[tuple[str, CallPred]], to_stop: str) -> Destinations:
+    """The calls at `to_stop` a passenger may alight from, per train, whichever situation scored
+    them. `calls` are (situation key, call) pairs: the snapshot's key, as the stop-ref index carries
+    it, never `CallPred.situation_number` read back."""
+    out: Destinations = {}
+    for sit, c in calls:
+        if c.stop_place == to_stop and c.aimed_arr is not None and c.alighting_allowed:
+            out.setdefault((c.operator, c.jkey), []).append((sit, c))
+    return out
+
+
+def _destination_call(bcall: CallPred, destinations: Destinations) -> CallPred | None:
+    """The train's alighting call at `to_stop` after `bcall`, from ANY situation.
+
+    The fallback for a train whose calls `predict_calls.sql` put in different situations, which is
+    the normal shape of a partial cancellation (2026-10-22): a skip-stop train with no SX message
+    has its running calls in `KIX:NoSituation:` and its cancelled ones in `KIX:ETCancellation:`,
+    and an SX message whose onset falls between the two calls covers only the later one. Pairing
+    inside one situation only made such a train vanish from the trip, and that included the
+    cancelled destination #340 exists to report (L1 2216 and 2120 skipping Bryn).
+
+    The first arrival after boarding, so a loop route or two runs of an undated bus ref cannot pair
+    with a later visit. Then the most severe row, with the situation key as the tie-break. Every row
+    of one call shares its ET declaration, so the pick moves only the figures.
+    """
+    later = [
+        (sit, c)
+        for sit, c in destinations.get((bcall.operator, bcall.jkey), ())
+        if c.stop_order > bcall.stop_order
+    ]
+    if not later:
+        return None
+    first = min(c.aimed_arr for _sit, c in later)
+    return max(
+        ((sit, c) for sit, c in later if c.aimed_arr == first),
+        key=lambda sc: (_call_severity(sc[1]), sc[0]),
+    )[1]
+
+
 def _trip_cells(
     scope: dict[str, list[CallPred]],
     from_stop: str,
@@ -637,6 +681,7 @@ def _trip_cells(
     select: str = "nearest",
     at: datetime | None = None,
     catchable_after: datetime | None = None,
+    destinations: Destinations | None = None,
 ) -> list[TripCell]:
     """Build one (situation × line) cell per line with a departure from `from_stop` in the window.
 
@@ -660,6 +705,12 @@ def _trip_cells(
     would let a departed worst-case train suppress the whole situation, hiding a later train on the
     same line that is both still catchable and alert-worthy. (That is the same ordering trap as the
     `to_stop` eligibility check below — worth stating twice, since it was made twice.)
+
+    The alighting call is the situation's own when it has one, and otherwise the train's call from
+    any other situation (:func:`_destination_call`). `destinations` is where those come from:
+    `for_trip` passes the whole snapshot's, because its pruned `scope` leaves out situations with
+    no boarding call. Left None, they are read off `scope`, which is the same thing when `scope` is
+    the whole snapshot.
     """
     if select == "nearest" and at is None:
         raise ValueError("select='nearest' requires `at` (the intended departure to measure from)")
@@ -675,6 +726,11 @@ def _trip_cells(
             _call_severity(current),
             -current.aimed_dep.timestamp(),
             current.jkey,
+        )
+
+    if to_stop is not None and destinations is None:
+        destinations = _destinations_from(
+            ((sit, c) for sit, calls in scope.items() for c in calls), to_stop
         )
 
     cells: list[TripCell] = []
@@ -733,6 +789,8 @@ def _trip_cells(
                     None,
                 )
                 if acall is None:
+                    acall = _destination_call(bcall, destinations)
+                if acall is None:
                     # No usable alighting call: either the train never reaches `to_stop` in the
                     # travel direction, or it does but nobody may get off there.
                     continue
@@ -780,10 +838,8 @@ def _trip_cells(
                     # O(calls x lines), on both the /impact request path and every poller journey).
                     calls=tuple(by_journey.get((bcall.operator, bcall.jkey), ())),
                     line_calls=tuple(by_line_all.get(line, ())),
-                    # Off the BOARDING call, which is the one every score on this cell is read
-                    # from. A cell cannot straddle the two populations: cells are built per
-                    # situation, and a situation is either an operator's or a synthetic per-journey
-                    # `KIX:` one.
+                    # Off the BOARDING call, which every score the gate reads comes from. The
+                    # arrival can come from the other population when the train's calls are split.
                     has_situation=bcall.has_situation,
                     report_type=bcall.report_type,
                 )
@@ -1793,7 +1849,9 @@ class _Generation:
     does that; test suites do, and :func:`invalidate_generation` is how they say so.
     """
 
-    __slots__ = ("_pairs", "_windows", "by_stop_ref", "refreshed_at", "sit_order", "snapshot")
+    __slots__ = (
+        "_destinations", "_pairs", "_windows", "by_stop_ref", "refreshed_at", "sit_order", "snapshot"
+    )
 
     def __init__(
         self,
@@ -1812,6 +1870,17 @@ class _Generation:
             tuple[str, str | None], tuple[tuple[str, tuple[CallPred, ...]], ...]
         ] = {}
         self._windows: dict[tuple[str, str | None, datetime, datetime], tuple[str, ...]] = {}
+        self._destinations: dict[str, Destinations] = {}
+
+    def destinations(self, to_ref: str) -> Destinations:
+        """The usable alighting calls at `to_ref` across the WHOLE snapshot, per train — what
+        `_trip_cells` pairs a boarding call with when its own situation has none. One posting-list
+        walk, memoised per ref like `_pair`."""
+        found = self._destinations.get(to_ref)
+        if found is None:
+            found = _destinations_from(self.by_stop_ref.get(to_ref, ()), to_ref)
+            self._destinations[to_ref] = found
+        return found
 
     def _pair(
         self, from_ref: str, to_ref: str | None
@@ -1835,15 +1904,13 @@ class _Generation:
                 continue
             boarding.setdefault((sit, c.operator, c.jkey), []).append(c)
         if to_ref is not None:
-            # The group key is `_trip_cells`' own — (situation, operator, jkey) — because a bus
+            # Keyed on the TRAIN, (operator, jkey), not on (situation, operator, jkey): since
+            # 2026-10-22 `_trip_cells` takes the alighting call from any situation when the
+            # boarding call's own has none. The operator stays in the key because a bus
             # ServiceJourney ref is not date-scoped and the alighting call has to be the SAME
             # train's, not another operator's journey that happens to strip to the same jkey.
-            usable: set[tuple[str, str, str]] = set()
-            for sit, c in self.by_stop_ref.get(to_ref, ()):
-                if c.aimed_arr is None or not c.alighting_allowed:
-                    continue
-                usable.add((sit, c.operator, c.jkey))
-            boarding = {k: v for k, v in boarding.items() if k in usable}
+            usable = self.destinations(to_ref)
+            boarding = {k: v for k, v in boarding.items() if k[1:] in usable}
         by_situation: dict[str, list[CallPred]] = {}
         for (sit, _op, _jkey), candidates in boarding.items():
             by_situation.setdefault(sit, []).extend(candidates)
@@ -2003,18 +2070,24 @@ def _pruned_scope(
     window_start: datetime,
     window_end: datetime,
     situation: str | None,
-) -> dict[str, list[CallPred]]:
-    """What `_trip_cells` is handed: the situations that can emit, in the snapshot's own order.
+) -> tuple[dict[str, list[CallPred]], Destinations | None]:
+    """What `_trip_cells` is handed: the situations that can emit, in the snapshot's own order, and
+    the whole snapshot's alighting calls at `to_stop` (None without one).
 
     `situation=` narrowing composes with the prune rather than bypassing it — a named situation that
-    cannot serve the pair yields the empty scope, which is what scanning it would have produced.
+    cannot serve the pair yields the empty scope, which is what scanning it would have produced. It
+    does not narrow the destinations: a situation's cell is the same whether it is asked about
+    alone or with the rest.
     """
     generation = _generation_for(by_situation, refreshed_at)
     with _index_lock:
         candidates = generation.situations(from_stop, to_stop, window_start, window_end)
+        destinations = generation.destinations(to_stop) if to_stop is not None else None
     if situation is not None:
-        return {situation: by_situation[situation]} if situation in set(candidates) else {}
-    return {sit: by_situation[sit] for sit in candidates}
+        scope = {situation: by_situation[situation]} if situation in set(candidates) else {}
+    else:
+        scope = {sit: by_situation[sit] for sit in candidates}
+    return scope, destinations
 
 
 def for_trip(
@@ -2056,7 +2129,7 @@ def for_trip(
     # The inverted index (U2): the situations that could possibly emit a cell for this pair and
     # window, in the snapshot's own order — never the whole cache. See the block above
     # `_index_lock` for why this is a prune and not a second matcher.
-    scope = _pruned_scope(
+    scope, destinations = _pruned_scope(
         by_situation,
         refreshed_at,
         from_stop=from_stop,
@@ -2075,6 +2148,7 @@ def for_trip(
         select=select,
         at=at,
         catchable_after=catchable_after,
+        destinations=destinations,
     )
 
     # One lookup per disrupted train, not one per trip — the guard against a raising Journey Planner

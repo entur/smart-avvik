@@ -106,6 +106,16 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   never share a cached wording; with the prompt change that re-words every alert once on deploy.
   The original train competes for its own replacement as `cancelled` (`_original_candidate`), so
   the selection never keeps the traveller on a train that does not get there.
+  **The pair is per TRAIN, not per situation, since 2026-10-22.** `predict_calls.sql` splits a
+  partially cancelled train across situations: the running calls go to `KIX:NoSituation:`, the
+  cancelled ones to `KIX:ETCancellation:`, and an SX message whose onset falls mid-trip covers only
+  the later calls. `_trip_cells` paired inside one situation, so such a train simply vanished from
+  the trip. That covered the cancelled destination above, the mirror case (a cancelled boarding
+  call with a running destination), and every delay figure. L1 2216 and 2120 skipping Bryn on
+  2026-10-22 were the cases that showed it. The situation's own alighting call still wins.
+  Otherwise `_destination_call` takes the train's first arrival at `to_stop` after boarding, from
+  any situation, and `_Generation._pair` keys its alighting set on `(operator, jkey)` to match.
+  `journey_status._paired_prediction` restates the same rule.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the leader last
   built (`main.follow_last_build`, since 2026-10-13; it replaced the 2026-09-25 warm start and

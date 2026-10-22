@@ -343,9 +343,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   overlaid by `rail_calls_today`, loaded by `main.refresh_rail_actuals` in phase `rail_actuals_cache`
   every 15 min — that table's first live reader; a recorded row outranks a stale cancellation, which
   is how a reinstated train shows), then the prediction cache read per train through
-  `impact._lookup_journey_calls` and PAIRED within one situation as the matcher pairs a boarding and
-  an alighting call — a figure no single situation scored at both ends grades yellow or green at
-  most, with no probability, because no push can fire on it. `test_the_train_set_agrees_with_the_
+  `impact._lookup_journey_calls` and PAIRED as the matcher pairs a boarding and an alighting call.
+  Since 2026-10-22 that means a situation's own alighting row, or else the worst row any situation
+  scored there; see the webhook rules' destination paragraph. A figure scored at one end only (the
+  other is not in the cache at all) grades yellow or green at most, with no probability, because
+  no push can fire on it. `test_the_train_set_agrees_with_the_
   push_matchers_eligibility` holds the restated eligibility rule to `_trip_cells`' own. Two things
   are easy to get backwards. The per-train lookup is
   deliberately NOT `_trip_cells`, which keeps one train per line per situation, so enumerating

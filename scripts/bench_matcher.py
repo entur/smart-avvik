@@ -376,11 +376,13 @@ def run(
     if unpruned:
         # The pass as it was before U2: `_trip_cells` over the WHOLE snapshot, once per definition
         # per window per stop-ref pair. Patched here rather than measured from a git checkout so
-        # both figures come out of one process and one cache.
+        # both figures come out of one process and one cache. No destinations: `_trip_cells` then
+        # reads them off the scope, which is the whole snapshot here.
         impact._pruned_scope = lambda by_situation, refreshed_at, **kw: (
             {kw["situation"]: by_situation[kw["situation"]]}
             if kw.get("situation") is not None and kw["situation"] in by_situation
-            else ({} if kw.get("situation") is not None else by_situation)
+            else ({} if kw.get("situation") is not None else by_situation),
+            None,
         )
     profiler = cProfile.Profile()
     try:
