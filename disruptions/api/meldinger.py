@@ -183,10 +183,11 @@ _HOUR_WINDOW_S = 60.0 * 60
 _DAY_WINDOW_S = 24.0 * 60 * 60
 
 # How many backend calls one attempt is charged for. Helm pins VARSEL_LLM_PROVIDER=gemini in dev,
-# tst, and prd, and a named provider never falls through to another backend. Since 2026-09-20 the
-# google-genai client retries a transient answer once inside the call (`llm_message._RETRY_OPTIONS`),
-# so a charged attempt is up to THREE HTTP requests at Vertex and this ledger reads low by at most
-# that -- in exactly the hour it matters least to be exact. Still 1, because the expected cost is
+# tst, and prd, and a named provider never falls through to another backend. Since 2026-09-20 a
+# transient answer is retried once inside the call (`llm_message._RETRY_OPTIONS`; since 2026-10-23
+# by `_gemini_write` itself, on the fallback model), so a charged attempt is up to TWO HTTP requests
+# at Vertex and this ledger reads low by at most that -- in exactly the hour it matters least to be
+# exact. Still 1, because the expected cost is
 # ~1 + p_fail (~1.1: dev's worst day was 8 failures in 89 calls), so charging the worst case would
 # be ~90 % high
 # on every healthy hour and would halve a public page's real allowance to buy accuracy during a

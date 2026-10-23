@@ -8,6 +8,7 @@ keeps a push going out when the LLM cannot help.
 Run: uv run --with pydantic python test_llm_message.py  (or under pytest)
 """
 
+import contextlib
 import inspect
 import json
 import logging
@@ -15,6 +16,7 @@ import os
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
 
@@ -1592,13 +1594,15 @@ def test_the_subject_on_a_failure_record_is_hashed_on_every_surface():
 
 # ---- one in-call retry, and what it costs every caller on a deadline ----------------------------
 def test_the_gemini_client_is_built_with_the_retry_options():
-    """The retry is a client-construction detail, so nothing behavioural in this suite can see it.
+    """The SDK retry is a client-construction detail, so nothing behavioural in this suite can see it.
 
     google-genai's `retry_args` treats a missing `retry_options` as `stop_after_attempt(1)` — its
     "never retry" strategy — so dropping the keyword is not a syntax error, not a test failure, and
     not visible anywhere except as `result="error"` records arriving again on the next Vertex blip.
     Source-inspected rather than driven, because `genai.Client(...)` resolves ADC and fetches a
-    metadata-server token when constructed, which a hermetic suite must not do.
+    metadata-server token when constructed, which a hermetic suite must not do. Since 2026-10-23
+    the client keeps these options for `situation_english` only; the wording's own two attempts are
+    driven below (`test_a_transient_failure_is_retried_on_the_fallback_model`).
 
     The reason this exists at all: before 2026-09-20 a transient 504 fell straight through to the
     deterministic wording, and the recovery — the next poller cycle, ~296 s later — arrives after
@@ -1633,6 +1637,122 @@ def test_the_gemini_client_is_built_with_the_retry_options():
         "the per-attempt deadline now cuts inside the measured success distribution; trading "
         "model time for another attempt is what this constant came back from"
     )
+
+
+# ---- the second attempt goes to the fallback model (2026-10-23) --------------------------------
+_DELAY_INPUT = {"linje": "L1", "avgang_kl": "08:12", "forsinkelse_min": {"typisk": 5, "verstefall": 9}}
+_DELAY_REPLY = '{"melding": "Tog L1 08:12 kan bli typisk 5–9 min forsinket."}'
+_CANCEL_INPUT = {**_DELAY_INPUT, "mest_sannsynlig_innstilt": True, "innstilling_prosent": 73}
+
+
+def _vertex_error(code):
+    from google.genai import errors as genai_errors
+
+    kind = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+    return kind(code, {"error": {"code": code, "message": "scripted", "status": "SCRIPTED"}})
+
+
+@contextlib.contextmanager
+def _scripted_gemini(*outcomes, fallback="gemini-3.1-flash-lite"):
+    """The REAL `_gemini_write` against a client that answers from a script, one outcome per
+    `generate_content` call: an exception to raise or a reply to return. Yields the calls made as
+    (model, thinking level) and the waits slept between them."""
+    calls, slept, script = [], [], iter(outcomes)
+
+    def generate_content(*, model, contents, config):
+        calls.append((model, config["thinking_config"]["thinking_level"]))
+        outcome = next(script)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")], text=outcome)
+
+    saved = (llm_message._gemini_client, llm_message.sleep, llm_message._GEMINI_FALLBACK_MODEL)
+    llm_message._gemini_client = lambda **_: SimpleNamespace(
+        models=SimpleNamespace(generate_content=generate_content)
+    )
+    llm_message.sleep = slept.append
+    llm_message._GEMINI_FALLBACK_MODEL = fallback
+    _reset(provider="gemini")
+    try:
+        yield calls, slept
+    finally:
+        llm_message._gemini_client, llm_message.sleep, llm_message._GEMINI_FALLBACK_MODEL = saved
+
+
+def test_a_transient_failure_is_retried_on_the_fallback_model():
+    """On 2026-10-23 3.8 timed out on every real wording for hours while 3.1 Flash-Lite answered
+    the same prompt in 1-5 s, so the second attempt goes there -- after the same 1 s wait, inside
+    the same two attempts `_WORST_CASE_CALL_S` reserves. The decision row's `llm_model` comes from
+    `MessageResult.model`, so it must name the model that wrote the text, not the configured one.
+    """
+    primary = llm_message._GEMINI_MODEL
+    with _scripted_gemini(_vertex_error(504), _DELAY_REPLY) as (calls, slept):
+        result = llm_message.write_message_detailed(_DELAY_INPUT)
+    assert result.status == "ok" and result.text == "Tog L1 08:12 kan bli typisk 5–9 min forsinket."
+    assert calls == [(primary, "low"), ("gemini-3.1-flash-lite", "minimal")], calls
+    assert slept == [llm_message._RETRY_OPTIONS["max_delay"]]
+    assert result.model == "gemini-3.1-flash-lite", "the row would credit 3.8 with Flash-Lite's text"
+    # And the attribution cannot outlive its call: the next one fails outright, and must not be
+    # filed under the model that answered the one before.
+    with _scripted_gemini(_vertex_error(504), _vertex_error(504)):
+        assert llm_message.write_message_detailed(_DELAY_INPUT).model == primary
+
+
+def test_a_predicted_cancellation_never_reaches_the_fallback():
+    """Replayed over 100 prd inputs, Flash-Lite quoted the cancellation percentage in none of 32
+    predicted cancellations and wrote 3 of them as certain; 3.8 quoted it in 26 of 26. A wrong
+    certainty is worse than the template, so this population keeps both attempts on 3.8."""
+    primary = llm_message._GEMINI_MODEL
+    with _scripted_gemini(_vertex_error(504), _vertex_error(504)) as (calls, _):
+        assert llm_message.write_message_detailed(_CANCEL_INPUT).status == "error"
+    assert [model for model, _ in calls] == [primary, primary], calls
+    # An input this cannot read stays there too, rather than defaulting into the fallback.
+    assert llm_message._attempt_models("not json") == (primary, primary)
+
+
+def test_without_a_fallback_both_attempts_go_to_the_configured_model():
+    """`VERTEX_GEMINI_FALLBACK_MODEL=""` is the off switch, and off means the 2026-09-21 behaviour
+    exactly: two attempts on `_GEMINI_MODEL`."""
+    primary = llm_message._GEMINI_MODEL
+    with _scripted_gemini(_vertex_error(503), _DELAY_REPLY, fallback="") as (calls, _):
+        result = llm_message.write_message_detailed(_DELAY_INPUT)
+    assert result.status == "ok" and result.model == primary
+    assert calls == [(primary, "low"), (primary, "low")], calls
+
+
+def test_only_a_retriable_failure_earns_a_second_attempt():
+    """A 400 is about the payload, so a second model would only spend a second attempt learning the
+    same thing; and two 504s are the end of it, not the start of a third attempt."""
+    with _scripted_gemini(_vertex_error(400)) as (calls, _):
+        assert llm_message.write_message_detailed(_DELAY_INPUT).status == "error"
+    assert len(calls) == 1, calls
+    with _scripted_gemini(_vertex_error(504), _vertex_error(504)) as (calls, _):
+        assert llm_message.write_message_detailed(_DELAY_INPUT).status == "error"
+    assert len(calls) == llm_message._RETRY_OPTIONS["attempts"], calls
+
+
+def test_a_fallback_that_is_not_served_does_not_latch_the_backend():
+    """A 404 on `_GEMINI_MODEL` latches the backend off for `_LATCH_TTL` -- the model the backend is
+    named for is not there. The same answer from the fallback says nothing about that model, and
+    latching on it would stop every wording for half an hour because a SECOND choice was missing."""
+    with _scripted_gemini(_vertex_error(504), _vertex_error(404)):
+        assert llm_message.write_message_detailed(_DELAY_INPUT).status == "error"
+        assert llm_message._STATE.latched_off == {}, "the fallback's 404 latched the backend"
+    with _scripted_gemini(_vertex_error(404)):
+        llm_message.write_message_detailed(_DELAY_INPUT)
+        assert "gemini" in llm_message._STATE.latched_off, "a 404 on 3.8 itself must still latch"
+
+
+def test_the_retriable_set_is_the_sdks_own():
+    """`_gemini_write` decides retries itself since the fallback, so the set has to stay google-genai's
+    -- restated from private names, which is why it is pinned rather than imported."""
+    from google.genai import _api_client
+
+    assert llm_message._RETRIABLE_CODES == frozenset(_api_client._RETRY_HTTP_STATUS_CODES)
+    for exc in _api_client._HTTPX_TRANSIENT_EXC:
+        assert llm_message._retriable(exc("scripted")), f"{exc.__name__} is retriable for the SDK"
+    assert not llm_message._retriable(_vertex_error(400))
+    assert not llm_message._retriable(ValueError("not transport"))
 
 
 if __name__ == "__main__":

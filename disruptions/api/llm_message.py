@@ -70,7 +70,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from time import monotonic
+from time import monotonic, sleep
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -136,6 +136,26 @@ _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
 # `_TIMEOUT_S`. Replaying 100 recent prd inputs through 3.8 returned `ok` for all 100, p50 2.1-2.3 s,
 # max 8.1 s, with wordings equivalent to 3.7's; `thinking_level: "low"` is accepted.
 _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.8-flash")
+# The model the SECOND attempt goes to when the first failed transiently, since 2026-10-23. That
+# afternoon Vertex EU served 3.8 slowly for hours: a one-word prompt still answered, but the wording
+# prompt did not finish inside the ~7.4 s server cut (`_VERTEX_HEADER_OVERHEAD_S`), so both attempts
+# 504ed and nearly every wording fell back to the template. Probed in dev at 16:23-16:28, 15 rounds
+# of the real prompt per model: 3.8, 3.7 and 3.5 Flash 0 of 15 each, 3.1 Flash-Lite 15 of 15 in
+# 1.1-4.6 s. 3.7 is NOT a candidate: it was the worst of the four in every probe that day, and the
+# model 3.8 replaced on 2026-10-12 for degrading at eu.
+#
+# Replayed over 100 prd inputs (2026-10-22/23, prompt b12a7867) through `write_message_detailed`:
+# 97 `ok`, 3 `ungrounded` (refused, as they should be), p90 1.3 s. But on the 33 predicted
+# cancellations it quoted `innstilling_prosent` in none of 32 wordings and wrote 3 as certain («er
+# innstilt»), where 3.8 quoted it in 26 of 26 -- a miss `_is_grounded` cannot see, since it checks
+# that quoted figures exist and not that required ones were quoted. `_attempt_models` therefore keeps
+# a predicted cancellation on `_GEMINI_MODEL` for both attempts. Empty turns the fallback off.
+# Served at eu in dev and prd (checked 2026-10-23); tst serves no Vertex model at all.
+_GEMINI_FALLBACK_MODEL = os.environ.get("VERTEX_GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
+# Thinking level per model, "low" for any model not named. Flash-Lite at "low" spent anywhere from
+# ~120 to ~1 500 thinking tokens on one wording and hit `_MAX_TOKENS` on 35 of the 100 replayed
+# inputs; at "minimal" none did. It cannot be one value for all: 3.7 Flash refuses "minimal".
+_THINKING_LEVELS = {"gemini-3.1-flash-lite": "minimal"}
 
 # Web Push bodies are truncated by the platform and read on a lock screen. Anything longer than this
 # is a sign the model ignored the brief, so it is rejected rather than silently cut.
@@ -233,7 +253,15 @@ _TIMEOUT_S = 9.5
 # SDK default: `jitter=0` is NOT available, and `initial_delay == max_delay` is how the wait is
 # pinned at exactly 1 s instead of drifting to 1-2 s. The retriable set is the SDK's own (408, 429,
 # 5xx, plus httpx timeouts and connect errors).
+#
+# Since 2026-10-23 the WORDING's attempts are made by `_gemini_write` itself, not by the SDK,
+# because the second one goes to `_GEMINI_FALLBACK_MODEL` -- same count, same 1 s wait
+# (`max_delay`), same retriable set (`_RETRIABLE_CODES`), so `_WORST_CASE_CALL_S` did not move. The
+# SDK still runs these options for `situation_english`, which shares `_gemini_client`.
 _RETRY_OPTIONS = {"attempts": 2, "initial_delay": 1.0, "max_delay": 1.0}
+# google-genai's retriable status codes (`_api_client._RETRY_HTTP_STATUS_CODES`), restated because
+# that name is private and `_gemini_write` now decides retries itself. The suite pins the two.
+_RETRIABLE_CODES = frozenset({408, 429, 500, 502, 503, 504})
 # What one call can cost before it returns, which is what every caller running on a deadline has to
 # reserve: every attempt at its own timeout, plus the waits between them. `varsel` and `meldinger`
 # restate the number rather than importing it -- both are consulted where reading this module may be
@@ -546,6 +574,14 @@ class _CallContext:
 _current_call: contextvars.ContextVar[_CallContext | None] = contextvars.ContextVar(
     "llm_message_call", default=None
 )
+# The model whose reply the last backend call on this thread returned, when that is not simply the
+# backend's configured model -- Gemini's second attempt can be `_GEMINI_FALLBACK_MODEL`. Set by
+# `_gemini_write`, cleared by `_call_backend` BEFORE every call and deliberately not after, because
+# `_model_of` reads it once the call has returned. A pooled worker's next call clears it first, so
+# it cannot describe another call's reply.
+_replied_by: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "llm_message_replied_by", default=None
+)
 
 
 def _replaying() -> bool:
@@ -650,17 +686,18 @@ def _claude_client() -> Any:
     )
 
 
-def _gemini_client() -> Any:
+def _gemini_client(*, sdk_retry: bool = True) -> Any:
+    """`sdk_retry=False` is the wording's client: `_gemini_write` makes its own attempts since
+    2026-10-23 (see `_RETRY_OPTIONS`), and the SDK's retry under them would make a failing wording
+    four attempts and 40 s. `situation_english` keeps the SDK's."""
     from google import genai
 
+    # google-genai takes milliseconds, and PER ATTEMPT
+    http_options: dict[str, Any] = {"timeout": int(_TIMEOUT_S * 1000)}
+    if sdk_retry:
+        http_options["retry_options"] = _RETRY_OPTIONS
     return genai.Client(
-        vertexai=True,
-        project=_PROJECT,
-        location=_GEMINI_LOCATION,
-        http_options={
-            "timeout": int(_TIMEOUT_S * 1000),  # google-genai takes milliseconds, and PER ATTEMPT
-            "retry_options": _RETRY_OPTIONS,
-        },
+        vertexai=True, project=_PROJECT, location=_GEMINI_LOCATION, http_options=http_options
     )
 
 
@@ -763,34 +800,69 @@ def _gemini_write(input_json: str) -> str:
     ``"low"`` and not ``"minimal"``: 3.7 Flash rejects minimal outright with
     ``400 Thinking level is unsupported``, and a 400 is deliberately not latched (below), so it would
     fail every call on every cycle instead of once. Pinning ``VERTEX_GEMINI_MODEL`` to a 2.5 model
-    would 400 the same way, on the other side of the family split.
+    would 400 the same way, on the other side of the family split. Hence ``_THINKING_LEVELS``, which
+    names the one model measured to need ``"minimal"``.
+
+    Up to ``_RETRY_OPTIONS["attempts"]`` attempts, made here rather than by the SDK since 2026-10-23
+    so that the second can go to ``_GEMINI_FALLBACK_MODEL`` (:func:`_attempt_models`). Only a
+    404/403 on ``_GEMINI_MODEL`` latches the backend: the same answer from the fallback says nothing
+    about the model the backend is named for, so it fails this call and no more.
     """
     from google.genai import errors as genai_errors
 
-    client = _backend_client("gemini", _gemini_client)
-    try:
-        response = client.models.generate_content(
-            model=_GEMINI_MODEL,
-            contents=f"<reisedata>\n{input_json}\n</reisedata>",
-            config={
-                "system_instruction": _SYSTEM_PROMPT,
-                "max_output_tokens": _MAX_TOKENS,
-                "thinking_config": {"thinking_level": "low"},
-                "response_mime_type": "application/json",
-                "response_schema": _RESPONSE_SCHEMA,
-            },
-        )
-    # google-genai raises google.genai.errors.ClientError -- which has NO relationship to
-    # google.api_core.exceptions (verified: issubclass(...) is False). Catching the api_core family
-    # here, as this did until review on 2026-07-29, meant a genuinely unavailable Gemini model never
-    # latched off and was retried on every call forever. Only 404/403 are configuration problems;
-    # 400 can be payload-dependent, so it is deliberately NOT latched (see _claude_write).
-    except genai_errors.ClientError as exc:
-        if getattr(exc, "code", None) in (404, 403):
-            raise _ConfigurationError(
-                f"{_GEMINI_MODEL} not available in {_PROJECT}/{_GEMINI_LOCATION}: {exc}"
-            ) from exc
-        raise
+    client = _backend_client("gemini", lambda: _gemini_client(sdk_retry=False))
+    models = _attempt_models(input_json)
+    for attempt, model in enumerate(models):
+        if attempt:
+            sleep(_RETRY_OPTIONS["max_delay"])
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=f"<reisedata>\n{input_json}\n</reisedata>",
+                config={
+                    "system_instruction": _SYSTEM_PROMPT,
+                    "max_output_tokens": _MAX_TOKENS,
+                    "thinking_config": {"thinking_level": _THINKING_LEVELS.get(model, "low")},
+                    "response_mime_type": "application/json",
+                    "response_schema": _RESPONSE_SCHEMA,
+                },
+            )
+            break
+        # google-genai raises google.genai.errors.ClientError -- which has NO relationship to
+        # google.api_core.exceptions (verified: issubclass(...) is False). Catching the api_core
+        # family here, as this did until review on 2026-07-29, meant a genuinely unavailable Gemini
+        # model never latched off and was retried on every call forever. Only 404/403 are
+        # configuration problems; 400 can be payload-dependent, so it is deliberately NOT latched
+        # (see _claude_write).
+        except Exception as exc:
+            if (
+                model == _GEMINI_MODEL
+                and isinstance(exc, genai_errors.ClientError)
+                and getattr(exc, "code", None) in (404, 403)
+            ):
+                raise _ConfigurationError(
+                    f"{model} not available in {_PROJECT}/{_GEMINI_LOCATION}: {exc}"
+                ) from exc
+            if attempt + 1 == len(models) or not _retriable(exc):
+                raise
+            logger.info(
+                "Gemini attempt on %s failed (%s); retrying on %s",
+                model,
+                getattr(exc, "code", None) or type(exc).__name__,
+                models[attempt + 1],
+                extra={
+                    "fields": _log_fields(
+                        _replaying(),
+                        _calling_surface(),
+                        event="llm_message_retry",
+                        provider="gemini",
+                        model=model,
+                        next_model=models[attempt + 1],
+                        error=str(getattr(exc, "code", None) or type(exc).__name__),
+                    )
+                },
+            )
+    _replied_by.set(model)
     # A truncated reply is not a message. Returning it would hand the caller a half-sentence, and
     # _extract_message cannot always tell the difference — so reject it here, at the one place that
     # can see finish_reason, and let the deterministic wording take over.
@@ -805,6 +877,7 @@ def _gemini_write(input_json: str) -> str:
                     _calling_surface(),
                     event="llm_message",
                     provider="gemini",
+                    model=model,
                     result="truncated",
                 )
             },
@@ -813,14 +886,45 @@ def _gemini_write(input_json: str) -> str:
     return response.text or ""
 
 
+def _attempt_models(input_json: str) -> tuple[str, ...]:
+    """The model for each of `_gemini_write`'s attempts: `_GEMINI_MODEL` first, the fallback after.
+
+    A predicted cancellation stays on `_GEMINI_MODEL` throughout, and so does an input this cannot
+    read: the fallback measured unsafe on exactly that population (see `_GEMINI_FALLBACK_MODEL`).
+    `innstilling_prosent` is the marker because `build_message_input` writes it only there.
+    """
+    later = _GEMINI_FALLBACK_MODEL or _GEMINI_MODEL
+    try:
+        if json.loads(input_json).get("innstilling_prosent") is not None:
+            later = _GEMINI_MODEL
+    except (ValueError, AttributeError):
+        later = _GEMINI_MODEL
+    return (_GEMINI_MODEL,) + (later,) * (_RETRY_OPTIONS["attempts"] - 1)
+
+
+def _retriable(exc: Exception) -> bool:
+    """google-genai's own retry predicate (`_api_client.retry_args`), for the attempts
+    `_gemini_write` now makes itself."""
+    import httpx
+    from google.genai import errors as genai_errors
+
+    if isinstance(exc, genai_errors.APIError):
+        return exc.code in _RETRIABLE_CODES
+    return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+
+
 _BACKENDS = {"claude": _claude_write, "gemini": _gemini_write}
 # Preference order for "auto": Sonnet 5 first, Gemini as the fallback the user asked for.
 _AUTO_ORDER = ("claude", "gemini")
 
 
 def _model_of(name: str) -> str:
-    """The model id a backend name resolves to, for the log record and the decision row."""
-    return _CLAUDE_MODEL if name == "claude" else _GEMINI_MODEL
+    """The model id a backend name resolves to, for the log record and the decision row: the one
+    whose reply it is when this thread's last backend call named one (`_replied_by`), the
+    configured one otherwise."""
+    if name == "claude":
+        return _CLAUDE_MODEL
+    return _replied_by.get() or _GEMINI_MODEL
 
 
 def generation_enabled(state: _LatchState | None = None) -> bool:
@@ -1313,6 +1417,7 @@ def _call_backend(
     :class:`_CallContext`).
     """
     token = _current_call.set(_CallContext(state=state, replay=replay, caller=caller))
+    _replied_by.set(None)
     try:
         return _BACKENDS[name](prompt)
     finally:

@@ -636,7 +636,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     control. Note the `/varsel-api` tests pin `KIX_ENVIRONMENT=prd` at import, or a developer with
     `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported fails the push-title assertions.
   - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
-    `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` — the push text is written by an LLM on Vertex AI
+    `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` / `VERTEX_GEMINI_FALLBACK_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
     Every Helm environment pins `VARSEL_LLM_PROVIDER=gemini`; `auto` remains supported by the code
@@ -680,6 +680,23 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     re-serving the cached wordings for free; `MELDINGER_REQUEST_DEADLINE_S` is the lever if that
     becomes tiresome. An `ok` record with `ms >= 7000` is a retry that saved a wording, and that is
     how to tell whether this was worth it.
+    **The second attempt goes to another model since 2026-10-23** (`VERTEX_GEMINI_FALLBACK_MODEL`,
+    default `gemini-3.1-flash-lite`; empty turns it off). That afternoon Vertex EU served 3.8 slowly
+    for hours: a one-word prompt still answered, the wording prompt did not finish inside the ~7.4 s
+    server cut, and nearly every wording in dev and prd went to the template. Probed with the real
+    prompt, 3.8, 3.7 and 3.5 Flash timed out 15 of 15 while 3.1 Flash-Lite answered 15 of 15 in
+    1-5 s. `_gemini_write` now makes the attempts itself (the wording's client is built with
+    `sdk_retry=False`; `situation_english` keeps the SDK's), so the count, the 1 s wait and
+    `_WORST_CASE_CALL_S` did not move -- and note the count is TWO attempts at 9.5 s since
+    2026-09-21, not the three at 6 s described above. Three things are easy to get backwards. **A
+    predicted cancellation never reaches the fallback** (`_attempt_models`, keyed on
+    `innstilling_prosent`): replayed over 100 prd inputs, Flash-Lite quoted that percentage in none
+    of 32 and wrote 3 as certain, a miss `_is_grounded` cannot see. **Flash-Lite needs
+    `thinking_level: "minimal"`** (`_THINKING_LEVELS`): at "low" it hit `_MAX_TOKENS` on 35 of the
+    100. **Only a 404/403 on `_GEMINI_MODEL` latches the backend**; the fallback's own is one failed
+    attempt. `llm_model` on the decision row and `model` on the `ok` record name the model that
+    wrote the text (`_model_of` reads `_replied_by`), and a retry logs `event="llm_message_retry"`
+    with `model`, `next_model` and `error`. A prompt change now has to be replayed on both models.
     Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.
