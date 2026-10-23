@@ -25,7 +25,7 @@
 
 # ---- Stage 1: build the Vite front-ends -----------------------------------
 # Vite 8 needs Node >=20.19 / >=22.12; node:24-slim (the current LTS line) satisfies that.
-FROM node:25-slim AS frontends
+FROM node:24-slim AS frontends
 
 # Each app's vite.config.ts writes its bundle to ../../disruptions/api/<x>_static,
 # i.e. /build/disruptions/api/{demo,varsel,historikk,meldinger,togmelding,rushhistorikk}_static from the
