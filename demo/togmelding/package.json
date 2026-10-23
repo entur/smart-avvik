@@ -20,8 +20,8 @@
     "@entur/menu": "^7.3.1",
     "@entur/tokens": "^4.2.0",
     "@entur/typography": "^3.0.7",
-    "react": "^19.3.0",
-    "react-dom": "^19.3.0"
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
   },
   "devDependencies": {
     "@types/react": "^19.3.0",
