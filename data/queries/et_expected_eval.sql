@@ -32,6 +32,7 @@
 -- started before midnight), leadtime_eval_calls, and the anshar partitions (one day wider at each
 -- end: a 240-min ask on an early call reads the day before, and late journeys spill past midnight).
 -- Two weeks cost ~$1.60, almost all of it the anshar scan (254 GB); statements 1-2 are ~3.7 GB.
+-- Six months (Apr 1 - Oct 12 2026, 8.8 M asks) billed ~$17, again almost all anshar, in ~30 s.
 -- Aug 31 - Sep 13 2026 was picked as a fortnight before Vy's reduced plan began (2026-09-19).
 --
 -- MEASURED 2026-10-23 on that window (743 524 asks), arrival delay >= 10 min, AUC ours / ET:
@@ -91,8 +92,9 @@ line_fair AS (
   FROM asks AS a
   JOIN rc AS r3
     ON r3.lineRef = a.lineRef
-   AND r3.aimed_dep >= TIMESTAMP_TRUNC(TIMESTAMP_SUB(a.call_ts, INTERVAL (a.lead_min + 30) MINUTE), HOUR)
-   AND r3.aimed_dep <  TIMESTAMP_ADD(TIMESTAMP_TRUNC(TIMESTAMP_SUB(a.call_ts, INTERVAL (a.lead_min + 30) MINUTE), HOUR), INTERVAL 1 HOUR)
+   -- the hour bucket as an equality, not a range: BigQuery hashes on it, while a range leaves
+   -- lineRef as the only join key and pairs every call on the line across the whole window
+   AND TIMESTAMP_TRUNC(r3.aimed_dep, HOUR) = TIMESTAMP_TRUNC(TIMESTAMP_SUB(a.call_ts, INTERVAL (a.lead_min + 30) MINUTE), HOUR)
    AND (r3.actual_dep <= a.ask_ts OR (COALESCE(r3.call_cancelled, FALSE) AND r3.aimed_dep <= a.ask_ts))
   GROUP BY 1, 2, 3, 4, 5
 )
