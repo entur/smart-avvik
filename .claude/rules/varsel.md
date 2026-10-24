@@ -511,8 +511,17 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     the mirror re-seeds; sending costs the «Bekreftet:» prefix and one slot of the day's cap. The
     blob backend's `may_send` is always True (one process, tst). (4) A follower publishes the stop
     picker's aliases (`refresh_varsel_stops(heal_registrations=False)`) but never rewrites a stored
-    registration onto a canonical stop; that write is the leader's cycle. Also per pod, not shared:
-    the wording and alternative caches (a follower's card shows the SX summary and no alternative),
+    registration onto a canonical stop; that write is the leader's cycle. The wording and
+    alternative caches (`_messages`, `_message_meta`, `_alternatives`) are the leader's pass's, and
+    every pod serves them since 2026-10-24 (the translation store plan's U7): the leader writes
+    what changed after each pass to Firestore's `varsel_card_cache` (`flush_card_writes`, found
+    by DIFFING the caches against what was last written, so a mutation site added later cannot be
+    missed; a dropped entry is a tombstone), and every pod seeds and syncs it
+    (`follow_card_caches`) as it does the translations. A follower never runs the pass or
+    `_reconcile_caches`, it only applies; a new leader starts from the stored entries. The
+    wording key carries the prediction snapshot, so a new leader's forced first rebuild still
+    re-words every alerting train; what the store saves it is the Journey Planner lookups behind
+    the alternatives. Per pod, not shared: the failure budgets, the decision ledger,
     and the feedback snapshot cache — the snapshots themselves are `feedback_contexts` documents
     under this backend, bound to the device and deleted in its erase transaction. And
     **`/rushvarsel-api/outlook` reads the device's journeys from the store on every call** (it read

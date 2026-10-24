@@ -836,6 +836,37 @@ def test_on_acquire_seeds_the_stored_translations_with_the_poller_beat():
         situation_english.reset_state()
 
 
+def test_on_acquire_follows_the_card_caches_with_the_beat_and_survives_a_store_that_raises():
+    """Translation store U7, R10/R5: a new leader loads the last leader's /varsel card caches
+    before its first cycle, beating between pages, and a store it cannot read costs it those
+    caches, never the lease."""
+    import varsel
+
+    class _Raising:
+        def __init__(self):
+            self.beats = []
+
+        def seed_card_entries(self, *, beat=None):
+            self.beats.append(beat)
+            raise RuntimeError("firestore down")
+
+    store = _Raising()
+    calls: list[str] = []
+    varsel.configure_card_store(store)
+    logging.getLogger("varsel").setLevel(logging.CRITICAL)
+    metrics.POLLER_LEADER.set(0)
+    try:
+        with _hooks(calls):
+            main._on_lease_acquired()
+            assert main._force_rebuild is True
+        assert store.beats == [main._beat], store.beats
+        assert _gauge() == 1
+    finally:
+        logging.getLogger("varsel").setLevel(logging.NOTSET)
+        varsel.configure_card_store(None)
+        varsel.reset_card_store_state()
+
+
 def test_a_failing_on_acquire_clears_the_gauge_and_raises_to_the_state_machine():
     calls: list[str] = []
     metrics.POLLER_LEADER.set(1)

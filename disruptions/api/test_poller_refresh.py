@@ -634,6 +634,8 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "varsel_recheck_service",
         "notification_mirror",
         "varsel_notify",
+        # What the pass changed in the /varsel card caches, written for every other pod (U7).
+        "varsel_card_cache",
         "notification_webhooks",
         "notification_servability",
         "varsel_state_export",
@@ -1794,14 +1796,16 @@ def test_follow_last_build_follows_the_stored_translations_and_returns_the_load_
 
     sentinel = {"call_predictions": "loaded"}
     follows = []
-    saved = (poller_follow.follow_last_build, situation_english.follow)
+    saved = (poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches)
     poller_follow.follow_last_build = lambda *a, **k: sentinel
-    situation_english.follow = lambda **k: follows.append(k) or 0
+    situation_english.follow = lambda **k: follows.append(("translations", k)) or 0
+    # The /varsel card caches (U7) likewise: without it a follower's card shows the SX summary.
+    main.varsel.follow_card_caches = lambda **k: follows.append(("cards", k))
     try:
         assert main.follow_last_build() is sentinel
     finally:
-        poller_follow.follow_last_build, situation_english.follow = saved
-    assert follows == [{}], follows
+        poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches = saved
+    assert follows == [("translations", {}), ("cards", {})], follows
 
 
 def test_the_lifespan_configures_the_translation_store_before_the_first_follow():
@@ -1813,6 +1817,22 @@ def test_the_lifespan_configures_the_translation_store_before_the_first_follow()
     configure = "situation_english.configure(store=notification_store if _varsel_store is not None else None)"
     assert configure in source
     assert source.index(configure) < source.index("follow_last_build()")
+    cards = "varsel.configure_card_store(notification_store if _varsel_store is not None else None)"
+    assert cards in source
+    assert source.index(cards) < source.index("follow_last_build()")
+
+
+def test_the_card_caches_are_written_after_the_pass_and_only_by_a_leader():
+    """U7: the write follows `varsel_notify` (it writes what the pass changed), in its own phase,
+    and behind the lease -- a leader demoted mid-pass must not write over its successor's."""
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    notify = source.index('_phase("varsel_notify"')
+    gate = source.index("if _still_leading():", notify)
+    phase = source.index('_phase("varsel_card_cache"')
+    assert notify < gate < phase < source.index('_phase("notification_webhooks"')
+    assert "varsel.flush_card_writes()" in source[phase:phase + 200]
 
 
 class _StrictRow:

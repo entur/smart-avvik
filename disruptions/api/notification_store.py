@@ -138,8 +138,21 @@ FEEDBACK_CONTEXTS = "feedback_contexts"
 #: exemption keeps the text out of every index), `version`, `model`, `created_at`, the server
 #: stamp the sync pages by, and `expires_at` 30 days after creation. Public operator text only.
 SITUATION_TRANSLATIONS = "situation_translations"
+#: The lease holder's `/varsel` card caches -- `varsel._messages` with `_message_meta`, and
+#: `_alternatives` (the shared translation store's U7, D2) -- so a follower's card shows the
+#: leader's wording and alternative and a new leader starts from them. One document per cache
+#: entry, id a digest of `kind` and the entry's key; `kind` is `message` or `alternative`. The body
+#: is `kind`, `key` and `value` (canonical JSON strings: Firestore refuses nested arrays, and the
+#: keys are nested tuples), `tombstone` for a dropped entry (a deleted document matches no query,
+#: so the sync could never tell a follower), the server stamp the sync pages by, and `expires_at`
+#: 24 h after the write. `message_input` in a message's meta names stop refs and a departure time,
+#: as the registrations in this database do.
+VARSEL_CARD_CACHE = "varsel_card_cache"
 
-COLLECTIONS = (SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS, SITUATION_TRANSLATIONS)
+COLLECTIONS = (
+    SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS, SITUATION_TRANSLATIONS,
+    VARSEL_CARD_CACHE,
+)
 
 #: The server-stamped field the translation sync pages by: MIRROR_FIELD's rule (`SERVER_TIMESTAMP`,
 #: never `now`, because the watermark is compared against values Firestore wrote) on a collection
@@ -150,6 +163,14 @@ TRANSLATION_TTL = timedelta(days=30)
 TRANSLATION_PAGE_SIZE = 1000
 #: A sync reads at most this many pages (20 000 documents) -- a day's translations are hundreds.
 TRANSLATION_SYNC_MAX_PAGES = 20
+#: KTD10: a card entry or tombstone lives a day past its last write -- past the 12 h situation
+#: window, and long enough that a follower's sync sees a tombstone before TTL removes it.
+CARD_TTL = timedelta(hours=24)
+#: Firestore's ceiling on writes in one batch commit.
+CARD_WRITE_BATCH = 500
+#: A seed reads every live entry (the TTL bounds the collection to about a day's writes), up to
+#: this many pages; a sync reads at most TRANSLATION_SYNC_MAX_PAGES.
+CARD_SEED_MAX_PAGES = 50
 
 # Firestore allows exactly ONE TTL field per collection group, so every group in `COLLECTIONS`
 # uses the same field name: the Terraform resource is then one repeated block rather than a bespoke one per group, and
@@ -1222,6 +1243,19 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         order_by=((TRANSLATION_STAMP_FIELD, "ASCENDING"),),
         why="a follower's tick picks up what the leader translated since its watermark",
     ),
+    QuerySpec(
+        name="varsel_card_cache_seed",
+        collection=VARSEL_CARD_CACHE,
+        order_by=((TRANSLATION_STAMP_FIELD, "DESCENDING"),),
+        why="a pod starting or taking the lease loads the leader's card caches (translation store U7)",
+    ),
+    QuerySpec(
+        name="varsel_card_cache_sync",
+        collection=VARSEL_CARD_CACHE,
+        inequality=((TRANSLATION_STAMP_FIELD, ">"),),
+        order_by=((TRANSLATION_STAMP_FIELD, "ASCENDING"),),
+        why="a follower's tick picks up the leader's card cache changes since its watermark",
+    ),
 )
 
 _SPECS_BY_NAME = {spec.name: spec for spec in QUERY_SPECS}
@@ -1337,6 +1371,10 @@ class _Refs:
 
     def situation_translation(self, digest: str) -> Any:
         return self._client.collection(SITUATION_TRANSLATIONS).document(digest)
+
+    def card_entry(self, kind: str, key: str) -> Any:
+        digest = hashlib.sha256(f"{kind}\0{key}".encode()).hexdigest()
+        return self._client.collection(VARSEL_CARD_CACHE).document(digest)
 
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
@@ -6346,6 +6384,114 @@ def sync_situation_translations(
     with _span("notification_store.sync_situation_translations"):
         return _translation_pages(
             "situation_translations_sync",
+            inequality={TRANSLATION_STAMP_FIELD: since - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)},
+            limit=TRANSLATION_PAGE_SIZE * TRANSLATION_SYNC_MAX_PAGES,
+            since=since,
+            now=now or _now(),
+            beat=beat,
+        )
+
+
+# ---- The /varsel card caches (shared translation store U7) --------------------------------------
+#
+# `varsel` calls these through an injected handle and never imports this module. The leader writes
+# what changed after each pass; every other pod seeds and syncs, exactly as the translations do.
+
+
+@dataclass(frozen=True)
+class CardEntry:
+    """One card cache entry: `key` and `value` are canonical JSON, `value` None for a tombstone."""
+
+    kind: str
+    key: str
+    value: str | None
+
+
+def write_card_entries(entries: Sequence[CardEntry], *, now: datetime | None = None) -> None:
+    """Set each entry's document, a tombstone where `value` is None, in batches of
+    `CARD_WRITE_BATCH`. A plain set: the leader is the one writer, and its latest state is the
+    answer. Raises on the first failed commit; the batches before it have landed."""
+    instant = now or _now()
+    client = _firestore_client()
+    refs = _Refs(client)
+    with _span("notification_store.write_card_entries"):
+        for start in range(0, len(entries), CARD_WRITE_BATCH):
+            writer = client.batch()
+            for entry in entries[start:start + CARD_WRITE_BATCH]:
+                document: dict[str, Any] = {
+                    "kind": entry.kind,
+                    "key": entry.key,
+                    "tombstone": entry.value is None,
+                    TRANSLATION_STAMP_FIELD: _mirror_stamp(),
+                    TTL_FIELD: instant + CARD_TTL,
+                }
+                if entry.value is not None:
+                    document["value"] = entry.value
+                writer.set(refs.card_entry(entry.kind, entry.key), document)
+            writer.commit(timeout=_CALL_DEADLINE_S)
+
+
+def _card_pages(
+    name: str,
+    *,
+    inequality: Mapping[str, Any] | None,
+    limit: int,
+    since: datetime | None,
+    now: datetime,
+    beat: Callable[[], None] | None,
+) -> tuple[list[CardEntry], datetime | None]:
+    """`_translation_pages` for the card caches. Tombstones are returned (a follower pops on them);
+    an expired document is skipped, while its stamp still counts toward the watermark."""
+    entries: list[CardEntry] = []
+    newest = since
+    cursor = None
+    read = 0
+    while read < limit:
+        want = min(TRANSLATION_PAGE_SIZE, limit - read)
+        page = _stream(_query(name, inequality=inequality, limit=want, start_after=cursor))
+        for snapshot in page:
+            doc = _doc(snapshot)
+            stamp = _as_dt(doc.get(TRANSLATION_STAMP_FIELD))
+            if stamp is not None and (newest is None or stamp > newest):
+                newest = stamp
+            if not (_not_expired(doc, now) and doc.get("kind") and doc.get("key")):
+                continue
+            tombstone = bool(doc.get("tombstone"))
+            value = doc.get("value")
+            if not tombstone and not isinstance(value, str):
+                continue
+            entries.append(CardEntry(str(doc["kind"]), str(doc["key"]), None if tombstone else value))
+        read += len(page)
+        if beat is not None:
+            beat()
+        if len(page) < want:
+            break
+        cursor = page[-1]
+    return entries, newest
+
+
+def seed_card_entries(
+    *, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[CardEntry], datetime | None]:
+    """Every live card entry, NEWEST first, for a pod starting or taking the lease (R10)."""
+    with _span("notification_store.seed_card_entries"):
+        return _card_pages(
+            "varsel_card_cache_seed",
+            inequality=None,
+            limit=TRANSLATION_PAGE_SIZE * CARD_SEED_MAX_PAGES,
+            since=None,
+            now=now or _now(),
+            beat=beat,
+        )
+
+
+def sync_card_entries(
+    *, since: datetime, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[CardEntry], datetime | None]:
+    """What the leader wrote after `since`, less the mirror's overlap (KTD5), oldest first."""
+    with _span("notification_store.sync_card_entries"):
+        return _card_pages(
+            "varsel_card_cache_sync",
             inequality={TRANSLATION_STAMP_FIELD: since - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)},
             limit=TRANSLATION_PAGE_SIZE * TRANSLATION_SYNC_MAX_PAGES,
             since=since,

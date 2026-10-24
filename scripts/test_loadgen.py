@@ -292,14 +292,15 @@ def test_teardown_sweeps_every_collection_a_subscription_touches():
     import notification_store
 
     assert set(gen.TEARDOWN_COLLECTIONS) == {"subscriptions", "events", "deliveries", "subjects"}
-    # Every store collection except the two that carry no subscription or client id: feedback
+    # Every store collection except the three that carry no subscription or client id: feedback
     # contexts (a card render mints them, this tool never does, and their own 15-minute TTL
-    # removes them) and situation translations (the poller's leader writes them per operator
-    # text, this tool never does, and their 30-day TTL removes them).
+    # removes them), situation translations and the card caches (the poller's leader writes them,
+    # this tool never does, and their 30-day and 24-hour TTLs remove them).
     # A new collection that does carry a subscription id still fails this until it is swept.
     swept = set(notification_store.COLLECTIONS) - {
         notification_store.FEEDBACK_CONTEXTS,
         notification_store.SITUATION_TRANSLATIONS,
+        notification_store.VARSEL_CARD_CACHE,
     }
     assert len(gen.TEARDOWN_COLLECTIONS) == len(swept)
 

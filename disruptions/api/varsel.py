@@ -1612,8 +1612,9 @@ _STATE_BLOB = varsel_state._STATE_BLOB
 # PLACE PAIR since 2026-09-12 and on the journey *definition* before that: what a wording says is a
 # function of the trip's two ends and of the disrupted train, never of the window or weekday set a
 # particular commuter registered, so a corridor with five hundred registrations now costs one
-# backend call per disrupted train rather than five hundred. In-memory only: a redeploy re-writes
-# messages rather than restoring stale advice from before the restart.
+# backend call per disrupted train rather than five hundred. The lease holder's copy is shared with
+# every pod through the store (see "The card caches on every pod" below): a follower's card shows
+# it, and a new leader starts from it, whose first reconcile drops what is stale (R10).
 _messages: dict[tuple, str] = {}
 # The alternative the poller found for that (pair, train), keyed by :func:`_subject_key` — the
 # COARSE key, deliberately: an entry has to be findable on a cycle where no lookup ran, and a key
@@ -1649,6 +1650,234 @@ _message_errors: dict[tuple, int] = {}
 # refused, and once the deterministic wording is stored all three look identical. See
 # decisions.build_row.
 _message_meta: dict[tuple, dict[str, Any]] = {}
+
+# ---- The card caches on every pod (the shared translation store's U7, D2) ----------------------
+#
+# The lease holder writes `_messages` with `_message_meta`, and `_alternatives`, to the store after
+# each pass (`flush_card_writes`); every other pod seeds and then syncs them (`follow_card_caches`),
+# so a follower's card shows the leader's wording and alternative, and a new leader starts from them
+# (R8-R10). Followers never run the pass or `_reconcile_caches`: they only apply.
+#
+# WHAT changed is found by diffing the caches against `_card_baseline` -- what was last written or
+# applied -- rather than by a queue filled beside every mutation (the plan's KTD11). The caches
+# change in pass 1c, `_write_message`, `_remember_message_meta`, `_forget_message`,
+# `_reconcile_caches` and the stale sweep, and a queue misses whichever site a later edit adds; a
+# diff cannot. A dropped entry is written as a tombstone (KTD10). A failed write marks its entries
+# unknown in the baseline, so the next flush writes them again whatever happened in between.
+#
+# Not carried (KTD12): the failure budgets and the decision ledger, which a new leader starts
+# afresh. `_message_meta` IS carried: a follower's card render snapshots it for feedback.
+_CARD_MESSAGE = "message"
+_CARD_ALTERNATIVE = "alternative"
+#: The store handle (`notification_store`), injected by `main` under the store backend only, like
+#: `situation_english`'s. None in tst and in every suite that does not ask for it.
+_card_store: Any = None
+#: (kind, key JSON) -> value JSON as last written or applied. Touched by the poller thread only
+#: (the lifespan's seed runs before that thread starts).
+_card_baseline: dict[tuple[str, str], str] = {}
+_card_watermark: datetime | None = None
+#: Marks a baseline entry whose write failed: it equals no value, so the next flush rewrites it.
+_CARD_UNKNOWN = ""
+
+
+def configure_card_store(store: Any) -> None:
+    """Set the store the card caches are shared through (None = this pod's memory only)."""
+    global _card_store
+    _card_store = store
+
+
+def reset_card_store_state() -> None:
+    """Forget the baseline and the watermark (the suites' reset)."""
+    global _card_watermark
+    _card_baseline.clear()
+    _card_watermark = None
+
+
+def _card_key_json(key: tuple) -> str:
+    """A cache key as canonical JSON; datetimes (the alternative identity's) as ISO strings."""
+    return json.dumps(key, separators=(",", ":"), default=lambda value: value.isoformat())
+
+
+def _card_key(kind: str, text: str) -> tuple:
+    """The exact tuple `_card_key_json` was given: `_subject_key`'s three elements for an
+    alternative, `notification_wording.wording_key`'s nine for a message. A shape that no longer
+    matches raises, and the entry is skipped rather than stored under a key nothing derives."""
+    data = json.loads(text)
+    if kind == _CARD_ALTERNATIVE:
+        pair, situation, departure = data
+        return (tuple(pair), situation, departure)
+    pair, situation, departure, cancelled, destination_cancelled, tomorrow, identity, version, snapshot = data
+    if identity is not None:
+        dep, arr, at_risk, before = identity
+        identity = (
+            datetime.fromisoformat(dep) if dep is not None else None,
+            datetime.fromisoformat(arr) if arr is not None else None,
+            at_risk,
+            before,
+        )
+    return (tuple(pair), situation, departure, cancelled, destination_cancelled, tomorrow, identity,
+            version, snapshot)
+
+
+def _card_message_value(text: str | None, meta: dict[str, Any] | None) -> str:
+    return json.dumps({"text": text, "meta": meta}, sort_keys=True, default=str)
+
+
+def _card_alternative_value(alt: AlternativeJourney) -> str:
+    return json.dumps(alt.model_dump(mode="json"), sort_keys=True)
+
+
+def _card_entries() -> dict[tuple[str, str], str]:
+    """Every entry the caches hold now, keyed and valued as the store holds them.
+
+    Copied under `_state_lock` and serialized outside it. A shallow copy is enough because the
+    only writer of the meta dicts `_remember_message_meta` edits in place is the poller thread,
+    and this runs on that thread after the pass.
+    """
+    with _state_lock:
+        messages = dict(_messages)
+        metas = dict(_message_meta)
+        alternatives = dict(_alternatives)
+    entries = {
+        (_CARD_MESSAGE, _card_key_json(key)): _card_message_value(messages.get(key), metas.get(key))
+        for key in messages.keys() | metas.keys()
+    }
+    for key, alt in alternatives.items():
+        entries[(_CARD_ALTERNATIVE, _card_key_json(key))] = _card_alternative_value(alt)
+    return entries
+
+
+def flush_card_writes() -> None:
+    """Write what the caches changed since the last write, on the leader after the pass.
+
+    On the poller thread and never inside `_state_lock` (KTD11). A store failure is logged and
+    leaves those entries unknown in the baseline; it never reaches the pass, a push or a decision.
+    """
+    store = _card_store
+    if store is None:
+        return
+    # Guarded as a whole, not only the write: this phase has no try of its own in `_rebuild_all`,
+    # so a raise here would cost the cycle every phase after it.
+    try:
+        current = _card_entries()
+        writes = [
+            store.CardEntry(kind, key, value)
+            for (kind, key), value in current.items()
+            if _card_baseline.get((kind, key)) != value
+        ]
+        writes += [store.CardEntry(kind, key, None) for kind, key in _card_baseline.keys() - current.keys()]
+    except Exception:
+        logger.warning(
+            "Could not serialize the card caches; nothing written this pass",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_card_cache", "result": "flush_error"}},
+        )
+        return
+    if not writes:
+        return
+    tombstones = sum(entry.value is None for entry in writes)
+    try:
+        store.write_card_entries(writes)
+    except Exception:
+        for entry in writes:
+            _card_baseline[(entry.kind, entry.key)] = _CARD_UNKNOWN
+        logger.warning(
+            "Could not write the card caches; the next pass writes them again",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_card_cache", "result": "store_error",
+                              "entries": len(writes)}},
+        )
+        return
+    _card_baseline.clear()
+    _card_baseline.update(current)
+    logger.info(
+        "Card caches written",
+        extra={"fields": {"event": "varsel_card_cache", "result": "written",
+                          "written": len(writes) - tombstones, "tombstones": tombstones}},
+    )
+
+
+def apply_card_entries(entries: Iterable[Any]) -> int:
+    """Set or pop each stored entry in the caches, and record it as the baseline. Returns how many
+    were applied; an entry that does not parse is skipped and counted in the log."""
+    parsed: list[tuple[Any, tuple, Any]] = []
+    skipped = 0
+    for entry in entries:
+        try:
+            key = _card_key(entry.kind, entry.key)
+            if entry.value is None:
+                value = None
+            elif entry.kind == _CARD_MESSAGE:
+                value = json.loads(entry.value)
+            elif entry.kind == _CARD_ALTERNATIVE:
+                value = AlternativeJourney.model_validate(json.loads(entry.value))
+            else:
+                raise ValueError(f"unknown card cache kind {entry.kind!r}")
+        except Exception:  # noqa: BLE001 - one unreadable entry must not cost the page; counted below
+            skipped += 1
+            continue
+        parsed.append((entry, key, value))
+    with _state_lock:
+        for entry, key, value in parsed:
+            if entry.kind == _CARD_ALTERNATIVE:
+                if value is None:
+                    _alternatives.pop(key, None)
+                else:
+                    _alternatives[key] = value
+                continue
+            text = value.get("text") if value else None
+            meta = value.get("meta") if value else None
+            if text is None:
+                _messages.pop(key, None)
+            else:
+                _messages[key] = text
+            if meta is None:
+                _message_meta.pop(key, None)
+            else:
+                _message_meta[key] = meta
+    for entry, _key, _value in parsed:
+        if entry.value is None:
+            _card_baseline.pop((entry.kind, entry.key), None)
+        else:
+            _card_baseline[(entry.kind, entry.key)] = entry.value
+    if skipped:
+        logger.warning(
+            "Skipped card cache entries that did not parse",
+            extra={"fields": {"event": "varsel_card_cache", "result": "skipped", "skipped": skipped}},
+        )
+    return len(parsed)
+
+
+def follow_card_caches(*, beat: Callable[[], None] | None = None) -> None:
+    """Load the leader's card caches: every live entry the first time, then what changed since the
+    watermark. On startup, on each follower tick and on taking the lease. Never raises: a store
+    that cannot be read leaves this pod's caches as they were (R5)."""
+    global _card_watermark
+    store = _card_store
+    if store is None:
+        return
+    seed = _card_watermark is None
+    try:
+        if seed:
+            entries, newest = store.seed_card_entries(beat=beat)
+        else:
+            entries, newest = store.sync_card_entries(since=_card_watermark, beat=beat)
+        applied = apply_card_entries(entries)
+    except Exception:
+        logger.warning(
+            "Could not read the card caches; serving this pod's own",
+            exc_info=True,
+            extra={"fields": {"event": "varsel_card_cache", "result": "follow_error"}},
+        )
+        return
+    if newest is not None:
+        _card_watermark = newest
+    if seed or applied:
+        logger.info(
+            "Card caches followed",
+            extra={"fields": {"event": "varsel_card_cache", "result": "seeded" if seed else "synced",
+                              "applied": applied}},
+        )
 
 # ---- The decision log's thinning ledger (KTD15, R11) --------------------------------------------
 #

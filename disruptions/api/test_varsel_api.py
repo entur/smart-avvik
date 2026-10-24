@@ -51,6 +51,7 @@ os.environ.update(
     GOOGLE_CLOUD_PROJECT=os.environ.get("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test"),
 )
 
+import copy
 import json
 import logging
 from contextlib import contextmanager
@@ -205,6 +206,10 @@ def _reset_state():
         # Why a record went away (2026-09-04). A leaked tombstone makes a fresh registration in the
         # next test inherit an old `created_ts`, which reads like the restore logic misfiring.
         varsel._device_tombstones.clear()
+    # The card caches' store handle, baseline and watermark (translation store U7). A leaked baseline
+    # reads exactly like a flush that silently stopped writing.
+    varsel.configure_card_store(None)
+    varsel.reset_card_store_state()
     # llm_message's backend latch is PROCESS-global and survives a monkeypatch undo, so a test that
     # drives both backends into `_latched_off` (the 404/configuration path) silently disables
     # generation for every test that runs after it. That was invisible until 2026-08-07, when
@@ -7645,6 +7650,303 @@ def test_one_definitions_failed_removed_trains_read_costs_only_its_own_digest(mo
     (push,) = _digests(sent)
     assert push["url"].endswith(f"journey={evening}"), push["url"]
     assert "L1 19:40 går ikke i dag" in push["body"] and "07:10" not in push["body"]
+
+
+# ---- The card caches on every pod (translation store U7) ---------------------------------------
+
+
+class _CardStore:
+    """`notification_store`'s card half in memory: one document per (kind, key), each write
+    stamped by a server clock, the seed returning every document and the sync those past `since`."""
+
+    CardEntry = varsel_state.notification_store.CardEntry
+
+    def __init__(self) -> None:
+        self.docs: dict[tuple[str, str], tuple[object, datetime]] = {}
+        self.clock = datetime(2026, 10, 24, 8, 0, tzinfo=UTC)
+        self.writes: list[list] = []
+        self.fail = False
+
+    def write_card_entries(self, entries):
+        if self.fail:
+            raise RuntimeError("firestore down")
+        self.writes.append(list(entries))
+        for entry in entries:
+            self.clock += timedelta(seconds=1)
+            self.docs[(entry.kind, entry.key)] = (entry, self.clock)
+
+    def _read(self, since):
+        rows = [(e, t) for e, t in self.docs.values() if since is None or t > since]
+        return [e for e, _ in rows], max((t for _, t in rows), default=since)
+
+    def seed_card_entries(self, *, beat=None):
+        return self._read(None)
+
+    def sync_card_entries(self, *, since, beat=None):
+        return self._read(since)
+
+    def live(self):
+        return {key: entry.value for key, (entry, _) in self.docs.items() if entry.value is not None}
+
+
+_CARD_STATE = ("_messages", "_message_meta", "_alternatives", "_card_baseline")
+
+
+@contextmanager
+def _pod(state: dict):
+    """Run as another pod: its own card caches, baseline and watermark, the same registrations and
+    store. Swaps the module globals the card code reads by name, and restores them after."""
+    saved = {name: getattr(varsel, name) for name in _CARD_STATE}
+    saved_watermark = varsel._card_watermark
+    for name in _CARD_STATE:
+        setattr(varsel, name, state.setdefault(name, {}))
+    varsel._card_watermark = state.get("watermark")
+    try:
+        yield
+    finally:
+        state["watermark"] = varsel._card_watermark
+        for name, value in saved.items():
+            setattr(varsel, name, value)
+        varsel._card_watermark = saved_watermark
+
+
+def _card() -> dict:
+    """The listed alert less `decided_at`, which is the request's own clock."""
+    return {k: v for k, v in _listed_alert().items() if k != "decided_at"}
+
+
+def _card_caches() -> tuple[dict, dict, dict]:
+    with varsel._state_lock:
+        return dict(varsel._messages), copy.deepcopy(varsel._message_meta), dict(varsel._alternatives)
+
+
+def test_a_card_cache_key_round_trips_to_the_same_tuple():
+    """A follower looks entries up with keys it derives itself, so the stored key must come back as
+    the identical, equally hashed tuple -- the wording key's nested alternative identity included,
+    with its two minute-rounded aware datetimes."""
+    from types import SimpleNamespace
+
+    alert = SimpleNamespace(
+        situation_number="S1", departure_time=DEP, cancelled=False, destination_cancelled=True,
+        impact=SimpleNamespace(refreshed_at=DEP - timedelta(hours=1)),
+    )
+    pair = ("NSR:StopPlace:1", "NSR:StopPlace:2")
+    wording = varsel.notification_wording.wording_key(pair, alert, _some_alternative(), tomorrow=True)
+    subject = varsel._subject_key(pair, alert)
+    for kind, key in ((varsel._CARD_MESSAGE, wording), (varsel._CARD_ALTERNATIVE, subject)):
+        rebuilt = varsel._card_key(kind, varsel._card_key_json(key))
+        assert rebuilt == key and hash(rebuilt) == hash(key), (rebuilt, key)
+    assert wording[6] is not None and isinstance(wording[6][0], datetime)
+
+
+def test_an_alternative_round_trips_through_its_stored_json():
+    """Nothing persisted an `AlternativeJourney` before U7; a field that does not survive JSON would
+    reach the follower's card changed, or fail to parse and never reach it."""
+    alt = alternatives.AlternativeJourney(
+        departure_time=DEP, arrival_time=DEP + timedelta(minutes=30), duration_min=30,
+        minutes_saved=-4, arrives_before_original=False, at_risk=True, minutes_after_original=4,
+        legs=[alternatives.AlternativeLeg(mode="rail", line="VYG:Line:R11", public_code="R11",
+                                          from_name="Oslo S", to_name="Asker", destination="Skien",
+                                          start_time=DEP, end_time=DEP + timedelta(minutes=30))],
+    )
+    stored = varsel._card_alternative_value(alt)
+    assert alternatives.AlternativeJourney.model_validate(json.loads(stored)) == alt
+    assert varsel._card_alternative_value(
+        alternatives.AlternativeJourney.model_validate(json.loads(stored))
+    ) == stored, "a re-serialized copy must equal the stored one, or a new leader rewrites it"
+
+
+def test_a_follower_fed_from_the_store_holds_and_renders_the_leaders_card_caches(monkeypatch):
+    """R8, and the differential half of the diff-based write: whatever the pass did to the three
+    caches, a pod that only follows the store ends up holding exactly the leader's entries -- and
+    its card shows the leader's wording and alternative. A follower that has applied them, or a new
+    leader that has, writes nothing back."""
+    _reset_state()
+    store = _CardStore()
+    varsel.configure_card_store(store)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _numbered_messages(monkeypatch)
+    outcome = _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+
+    leader, follower = {}, {}
+    with _pod(leader):
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+        # A second pass reuses the wording, which records its meta (`ok_cached`) in place.
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+        leader_card = _card()
+        leader_caches = _card_caches()
+    assert leader_card["message"] == "Melding 1." and leader_card["alternative_journey"] is not None
+    assert all(leader_caches), "the passes should have filled all three caches"
+    assert len(store.writes) == 2, "the in-place meta change is a change"
+
+    with _pod(follower):
+        assert _listed_alert()["message"] is None, "before following, the follower has nothing"
+        varsel.follow_card_caches()
+        assert _card_caches() == leader_caches
+        assert _card() == leader_card
+        writes = len(store.writes)
+        varsel.flush_card_writes()
+        assert len(store.writes) == writes, "applied entries are the baseline, not changes"
+
+    # The alternative moves: the pass forgets the old wording and writes a new one.
+    outcome["value"] = (_some_alternative(minutes_out=9), False, _ALT_SUBJECT)
+    with _pod(leader):
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+        leader_card = _card()
+        leader_caches = _card_caches()
+    assert leader_card["message"] == "Melding 2."
+    with _pod(follower):
+        varsel.follow_card_caches()
+        assert _card_caches() == leader_caches, "the superseded wording went as a tombstone"
+        assert _card() == leader_card
+
+
+def test_what_the_leader_drops_reaches_the_follower_as_a_tombstone(monkeypatch):
+    """R9: a wording or alternative the leader drops -- here the situation easing below the gate, so
+    `_reconcile_caches` pops both -- is written as a tombstone and popped on the follower. A deleted
+    document would match no sync query, and the follower would keep advising it."""
+    _reset_state()
+    store = _CardStore()
+    varsel.configure_card_store(store)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _numbered_messages(monkeypatch)
+    _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+    leader, follower = {}, {}
+    with _pod(leader):
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+    with _pod(follower):
+        varsel.follow_card_caches()
+        assert varsel._messages and varsel._alternatives
+
+    _use_snapshot(SNAPSHOT_EASED)
+    with _pod(leader):
+        varsel.check_and_notify(SNAPSHOT_EASED)
+        varsel.flush_card_writes()
+        assert not varsel._messages and not varsel._alternatives
+    assert any(entry.value is None for entry in store.writes[-1]), "the drop is written as tombstones"
+    assert not any(kind == varsel._CARD_ALTERNATIVE for kind, _ in store.live())
+    with _pod(follower):
+        varsel.follow_card_caches()
+        assert not varsel._messages and not varsel._alternatives
+
+
+def test_a_new_leader_starts_from_the_stored_caches_and_its_first_pass_drops_what_is_stale(monkeypatch):
+    """R10: a pod taking the lease seeds the last leader's wording and alternative, so its card
+    shows them before its first cycle; that cycle's reconcile then drops the alternative the
+    selection has since decided against, as it would its own, and writes the tombstone."""
+    _reset_state()
+    store = _CardStore()
+    varsel.configure_card_store(store)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _numbered_messages(monkeypatch)
+    outcome = _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+    with _pod({}):
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+        old_card = _card()
+
+    successor = {}
+    with _pod(successor):
+        varsel.follow_card_caches()
+        assert _card() == old_card, "the new leader serves the stored card before its first cycle"
+        outcome["value"] = (None, True, None)  # "stay on your own train": a verdict, not silence
+        varsel.check_and_notify(SNAPSHOT)
+        assert not varsel._alternatives
+        varsel.flush_card_writes()
+    assert not any(kind == varsel._CARD_ALTERNATIVE for kind, _ in store.live())
+
+
+def test_a_store_that_fails_costs_nothing_and_the_next_flush_writes_what_it_missed(monkeypatch):
+    """KTD11 and R5: a failed write never reaches the pass, its pushes or its decision rows, and it
+    is not dropped: the entries are marked unknown, so the next flush writes them -- including a
+    tombstone for one the pass dropped in between, which a baseline left as it was would forget."""
+    _reset_state()
+    store = _CardStore()
+    varsel.configure_card_store(store)
+    sent = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _numbered_messages(monkeypatch)
+    _selection_outcome(monkeypatch, (_some_alternative(), False, _ALT_SUBJECT))
+    _register(DEVICE)
+    logging.getLogger("varsel").disabled = True
+    try:
+        store.fail = True
+        varsel.check_and_notify(SNAPSHOT)
+        varsel.flush_card_writes()
+        assert sent and store.docs == {}
+        assert set(varsel._card_baseline.values()) == {varsel._CARD_UNKNOWN}
+
+        store.fail = False
+        with varsel._state_lock:
+            varsel._alternatives.clear()
+        varsel.flush_card_writes()
+    finally:
+        logging.getLogger("varsel").disabled = False
+    assert any(kind == varsel._CARD_MESSAGE for kind, _ in store.live())
+    tombstoned = [entry for entry in store.writes[-1] if entry.value is None]
+    assert [entry.kind for entry in tombstoned] == [varsel._CARD_ALTERNATIVE], tombstoned
+
+
+def test_a_flush_that_cannot_serialize_returns_rather_than_raising():
+    """The card cache phase has no try of its own in `main._rebuild_all`, so anything that raises
+    while building the writes -- not only the store call -- must stay inside the flush, or the
+    webhook, servability and export phases after it would be skipped for the cycle."""
+    _reset_state()
+    store = _CardStore()
+    varsel.configure_card_store(store)
+    with varsel._state_lock:
+        varsel._alternatives[(("A", "B"), "S1", "")] = object()  # will not dump
+    logging.getLogger("varsel").disabled = True
+    try:
+        varsel.flush_card_writes()
+    finally:
+        logging.getLogger("varsel").disabled = False
+    assert store.writes == [] and varsel._card_baseline == {}
+
+
+def test_following_a_store_that_raises_leaves_the_caches_as_they_were():
+    """R5: a follower tick, the lifespan and an acquisition call this, and none of them may fail on
+    a store that cannot be read -- the pod serves what it already holds."""
+    _reset_state()
+
+    class _Raising:
+        def seed_card_entries(self, *, beat=None):
+            raise RuntimeError("firestore down")
+
+    varsel.configure_card_store(_Raising())
+    with varsel._state_lock:
+        varsel._messages[("k",)] = "kept"
+    logging.getLogger("varsel").disabled = True
+    try:
+        varsel.follow_card_caches()
+    finally:
+        logging.getLogger("varsel").disabled = False
+    assert varsel._messages == {("k",): "kept"} and varsel._card_watermark is None
+
+
+def test_a_stored_entry_that_does_not_parse_is_skipped_not_applied():
+    """A key whose shape no longer matches `wording_key` (an older or newer leader) would be stored
+    under a tuple nothing derives; it is skipped and the rest of the page applies."""
+    _reset_state()
+    CardEntry = _CardStore.CardEntry
+    good = varsel._card_key_json((("A", "B"), "S1", ""))
+    logging.getLogger("varsel").disabled = True
+    try:
+        applied = varsel.apply_card_entries([
+            CardEntry(varsel._CARD_MESSAGE, '["too", "short"]', '{"text": "x", "meta": null}'),
+            CardEntry(varsel._CARD_ALTERNATIVE, good, varsel._card_alternative_value(_some_alternative())),
+        ])
+    finally:
+        logging.getLogger("varsel").disabled = False
+    assert applied == 1 and not varsel._messages
+    assert varsel._alternatives == {(("A", "B"), "S1", ""): _some_alternative()}
 
 
 if __name__ == "__main__":
