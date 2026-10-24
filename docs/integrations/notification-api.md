@@ -963,8 +963,8 @@ keep a bus favourite's alerts to buses and a train favourite's to trains: the st
 not say, and the service scores Vy and Go-Ahead rail beside the bus, T-bane, tram and boat routes of
 other operators. We ask the Journey Planner for every line once a day, so a Ruter T-bane is
 `metro` and never `bus`. Because it is the line's mode, a replacement bus on a rail line is `rail`.
-It is `null` when the Journey Planner has not answered for the line, which for a non-rail line is
-the case for about a minute after we restart, and it is absent from an event minted before the field existed. The journey-alerts read carries the same value
+It is never `null` for a rail line. For any other line it is `null` only when the Journey Planner
+could not be reached as we started, until it answers (normally within a minute), and it is absent from an event minted before the field existed. The journey-alerts read carries the same value
 as `train.mode`, and `journey-status` as each train's `mode`.
 
 **`summary`, `summary_en` and `summary_nn`** (since 2026-10-05, KIX-26; nynorsk since 2026-10-19)

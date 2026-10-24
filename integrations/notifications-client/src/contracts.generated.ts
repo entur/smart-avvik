@@ -253,9 +253,9 @@ export interface NotificationEvent {
     /**
      * The line's transport mode in the Journey Planner's own `TransportMode` vocabulary: `rail`,
      * `bus`, `metro`, `tram`, `water`, `coach`, ... It is the LINE's mode, so a replacement bus on
-     * a rail line is `rail`. Null when the Journey Planner has not answered for the line, which
-     * for a non-rail line is the case for about a minute after we restart. Absent from an event
-     * minted before the field existed.
+     * a rail line is `rail`. Never null for a rail line. For any other line it is null only when
+     * the Journey Planner could not be reached as we started, until it answers, normally within a
+     * minute. Absent from an event minted before the field existed.
      */
     mode?: string | null;
     /**
