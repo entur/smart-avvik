@@ -324,6 +324,18 @@ exemptions (KTD6). `firestore.indexes.json`: the matching `fieldOverrides` entry
 
 After U3 has deployed and its sync has run a day without issue, so U2's store pattern is proven.
 
+**As built (2026-10-24), two departures from the text below.**
+- KTD11's write queue is a DIFF instead: `flush_card_writes` compares the caches with what was last
+  written or applied and writes the difference plus tombstones. It covers every mutation site by
+  construction, so the structural "every site enqueues" test became a differential one (a follower
+  fed from the store holds exactly the leader's three caches). A failed write marks its entries
+  unknown and the next flush rewrites them, rather than dropping them.
+- The wording key carries the prediction snapshot (`notification_wording.wording_key`), and
+  acquisition forces a rebuild, so a new leader's first cycle re-words every alerting train; the
+  stored wordings serve the card until then, and the stored alternatives save the Journey Planner
+  lookups. The success criterion's "no wording call for a (pair, train) the store holds" does not
+  hold for wordings, and R10's `ok_cached` applies only within one snapshot.
+
 `notification_store.py`:
 - `VARSEL_CARD_CACHE`;
 - `write_card_entries(entries)`, a batched `set` of up to 500 per commit;
@@ -409,7 +421,18 @@ machine-translated and missing texts.
 
 ## Measurements
 
-_U6 (after) still owed._
+**U6, prd, 2026-10-23 15:50 to 2026-10-24 17:33 UTC** (U2-U5 deployed, PR 353). Read from the pods'
+`situation_english_coverage` logs, because the U1 pairs had no situations on 2026-10-24 (80
+journey-alerts reads, zero situations):
+
+- Both pods held every needed translation at the end (en 28/28, nn 140/140 each, tick after tick).
+  No `store_error` or `follow_error` since the deploy.
+- 228 of 510 follower ticks read short of `needing`, and in every window checked the leader was
+  short by the same amount at the same minute: Gemini still translating a new text, never a
+  follower missing a stored one. The longest such window, ~2 h, was the first deploy into an empty
+  store (the leader started at 0 and caught up in about an hour).
+- Both handoffs (07:47, 11:10) started from the store: 42/42 nynorsk at once, and 87/93 complete two
+  minutes later, against ~30 minutes of retranslation before.
 
 **U1, prd, 2026-10-22 ~09:20 UTC** (two pods since step B at 09:00, `a2e3fd7`). 40 journey-alerts
 reads at `wait=0` over four Oslo S / Lillestrøm / Drammen pairs, then 16 reads of one pair:

@@ -1173,8 +1173,9 @@ def follow_last_build() -> dict[str, str]:
     per-load isolation and the one `event="follow_last_build"` record are
     `poller_follow.follow_last_build`'s. The registries are read at call time (the suites swap them).
 
-    Then the leader's machine translations from the store (`situation_english.follow`, which never
-    raises either): a seed the first time, a watermark sync on every tick after.
+    Then the leader's machine translations and `/varsel` card caches from the store
+    (`situation_english.follow`, `varsel.follow_card_caches`, neither of which raises): a seed the
+    first time, a watermark sync on every tick after.
     """
     outcomes = poller_follow.follow_last_build(
         _FOLLOWED_CACHES,
@@ -1185,6 +1186,7 @@ def follow_last_build() -> dict[str, str]:
         refresh_line_modes=refresh_line_modes,
     )
     situation_english.follow()
+    varsel.follow_card_caches()
     return outcomes
 
 
@@ -2055,6 +2057,12 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             outcome = varsel.check_and_notify(_varsel_snapshot(), should_continue=_still_leading)
     except Exception:
         logger.exception("Avviksvarsel notify failed")
+    # What the pass changed in the card caches, to the store for every other pod (translation store
+    # U7). Its own phase so its cost is visible; never raises; skipped by a leader demoted mid-pass,
+    # whose successor writes from what it loaded.
+    if _still_leading():
+        with _phase("varsel_card_cache", timings):
+            varsel.flush_card_writes()
     # The client (webhook) channel's two WRITING steps, in their own phase and deliberately after
     # the one above (KTD6, plus the orchestrator's resolution of where the phase reading goes).
     #
@@ -2556,6 +2564,9 @@ async def lifespan(app: FastAPI):
     # Machine translations on the same gate (the shared translation store, KTD8): every pod reads
     # the leader's from Firestore, so two pods serve one English and one nynorsk. None in tst.
     situation_english.configure(store=notification_store if _varsel_store is not None else None)
+    # The /varsel card caches on the same gate (U7, D2): the leader's wording and alternative reach
+    # every pod, and a new leader starts from them. None in tst.
+    varsel.configure_card_store(notification_store if _varsel_store is not None else None)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
     rushhistorikk.configure(bq_client=bq_client)
@@ -3155,6 +3166,9 @@ def _on_lease_acquired() -> None:
     # asks Gemini only for what nobody has (AE2). Outside the try: it never raises, and a store that
     # cannot be read must not cost the acquisition (R5) -- unlike the mirror seed above.
     situation_english.follow(beat=_beat)
+    # The card caches likewise (U7, R10): the first cycle of this tenure starts from the wordings and
+    # alternatives the last leader held, and its reconcile drops what is stale.
+    varsel.follow_card_caches(beat=_beat)
     _force_rebuild = True
     metrics.POLLER_LEADER.set(1)
 

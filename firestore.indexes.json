@@ -203,6 +203,11 @@
       "collectionGroup": "situation_translations",
       "fieldPath": "translations",
       "indexes": []
+    },
+    {
+      "collectionGroup": "varsel_card_cache",
+      "fieldPath": "value",
+      "indexes": []
     }
   ]
 }

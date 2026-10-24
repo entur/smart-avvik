@@ -71,9 +71,18 @@ hours old. Three things stay leader-only on purpose:
   acquisition, reset on loss, never seeded on a follower. Request paths read the store on every pod,
   the leader included (`stored_journey` for the delete route's ownership check, the lists), so a
   journey registered on another pod deletes cleanly on the leader.
-- **Wording and alternatives** (`varsel._messages`, `_alternatives`) are per pod and not shared
-  (KTD11): a follower's `/varsel` card shows the SX summary and no alternative; journey-alerts on a
-  follower words through that pod's own PULL ledger.
+- **Wording and alternatives** (`varsel._messages`, `_message_meta`, `_alternatives`) are written by
+  the leader's pass alone, and since the translation store's U7 every pod serves them: after each
+  pass the leader writes what changed to Firestore's `varsel_card_cache` (phase `varsel_card_cache`;
+  a dropped entry is a tombstone, `expires_at` 24 h after the write), and every pod seeds the
+  collection in the lifespan and syncs it on each follower tick and on acquisition
+  (`varsel.follow_card_caches`). So a follower's `/varsel` card shows the leader's wording and
+  alternative within a tick, and a new leader starts from them; its first reconcile drops what is
+  stale. Not shared: the failure budgets and the decision ledger, which a new leader starts afresh.
+  Journey-alerts on a follower serves those cached wordings for registered definitions and words
+  the rest through that pod's own PULL ledger. A store failure logs
+  `event="varsel_card_cache"` with `result` `store_error` (the next pass writes again) or
+  `follow_error` (the pod serves what it holds).
 
 **The leader's pre-send check** (`varsel_state.StoreRegistrations.may_send`): one store read per
 push, outside `_state_lock`. It refuses a journey that is gone and a push whose situations are all
@@ -238,7 +247,9 @@ three pods are three times each.
 
 Gemini translation of operator text is leader-only, so followers do not translate the same
 situations; they read the leader's from `situation_translations` instead (the shared translation
-store, 2026-10-22), seeded on startup and on taking the lease, synced on every follower tick. An ingress-wide budget would need the platform; nothing here provides one.
+store, 2026-10-22), seeded on startup and on taking the lease, synced on every follower tick. The
+`/varsel` card's wording and alternatives likewise come from the leader's `varsel_card_cache`
+(2026-10-24), so no follower calls Gemini or the Journey Planner for a card. An ingress-wide budget would need the platform; nothing here provides one.
 
 **`/rushvarsel-api/outlook` now reads the device's journeys from the store on every call** (it read
 process memory before), so a public outlook read is one store query and can trigger the weekly

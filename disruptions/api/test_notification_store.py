@@ -208,15 +208,26 @@ class _Batch:
     def __init__(self, client: Any) -> None:
         self.client = client
         self._deletes: list[str] = []
+        self._sets: list[tuple[str, dict[str, Any]]] = []
 
     def delete(self, ref: _Ref) -> None:
         self._deletes.append(ref.path)
 
-    def commit(self) -> None:
+    def set(self, ref: _Ref, data: dict[str, Any]) -> None:
+        """A card cache write (translation store U7), server stamps resolved as `create` does."""
+        self._sets.append((ref.path, data))
+
+    def commit(self, timeout: float | None = None) -> None:
+        if self._sets:
+            assert timeout == notification_store._CALL_DEADLINE_S, "a batch commit without a deadline"
+            self.client.batch_commits.append([path for path, _ in self._sets])
+        for path, data in self._sets:
+            self.client.docs[path] = dict(_resolve_server_timestamps(data, self.client.server_now) or {})
         for path in self._deletes:
             self.client.docs.pop(path, None)
         self.client.batch_deletes.extend(self._deletes)
         self._deletes = []
+        self._sets = []
 
 
 class _AggregationResult:
@@ -304,6 +315,7 @@ class _FakeClient:
         #: migration marker's startup write has none to carry.
         self.set_timeouts: dict[str, float | None] = {}
         self.batch_deletes: list[str] = []
+        self.batch_commits: list[list[str]] = []
         self.fail_with: BaseException | None = None
         # The STORE's clock, which a server stamp resolves against. Deliberately ahead of `NOW` by
         # a visible margin: the bodies are handed `NOW` for `updated_at`, and a fake where the two
@@ -4122,6 +4134,83 @@ def _translation_row(digest: str, stamp: datetime, *, expires: datetime | None =
     )
 
 
+def _card_row(kind: str, key: str, stamp: datetime, *, value: str | None = "{}",
+              expires: datetime | None = None) -> tuple[str, dict]:
+    row = {
+        "kind": kind,
+        "key": key,
+        "tombstone": value is None,
+        notification_store.TRANSLATION_STAMP_FIELD: stamp,
+        notification_store.TTL_FIELD: expires or NOW + timedelta(hours=1),
+    }
+    if value is not None:
+        row["value"] = value
+    return f"{notification_store.VARSEL_CARD_CACHE}/{kind}-{key}", row
+
+
+def test_card_entries_are_written_in_bounded_batches_with_a_server_stamp_and_a_day_of_ttl():
+    """U7, KTD10/KTD11: one document per (kind, key), a tombstone where the entry was dropped, the
+    server's stamp for the sync's watermark, `expires_at` a day after the write, and no batch above
+    Firestore's 500 writes -- shrunk to 2 here so the split is visible."""
+    client = _FakeClient()
+    _install(client)
+    batch = notification_store.CARD_WRITE_BATCH
+    notification_store.CARD_WRITE_BATCH = 2
+    try:
+        CardEntry = notification_store.CardEntry
+        notification_store.write_card_entries(
+            [CardEntry("message", "k1", '{"text": "a"}'), CardEntry("alternative", "k2", "{}"),
+             CardEntry("message", "k3", None)],
+            now=NOW,
+        )
+        assert [len(paths) for paths in client.batch_commits] == [2, 1]
+        docs = {doc["key"]: doc for path, doc in client.docs.items()
+                if path.startswith(notification_store.VARSEL_CARD_CACHE + "/")}
+        assert docs["k1"]["value"] == '{"text": "a"}' and docs["k1"]["tombstone"] is False
+        assert docs["k2"]["kind"] == "alternative"
+        assert docs["k3"]["tombstone"] is True and "value" not in docs["k3"]
+        for doc in docs.values():
+            assert doc[notification_store.TRANSLATION_STAMP_FIELD] == client.server_now
+            assert doc[notification_store.TTL_FIELD] == NOW + timedelta(hours=24)
+        # One document per (kind, key): a rewrite replaces it, a tombstone included.
+        notification_store.write_card_entries([CardEntry("message", "k1", None)], now=NOW)
+        assert len(docs) == len({path for path in client.docs
+                                 if path.startswith(notification_store.VARSEL_CARD_CACHE + "/")})
+        assert any(doc.get("key") == "k1" and doc["tombstone"] for doc in client.docs.values())
+    finally:
+        notification_store.CARD_WRITE_BATCH = batch
+        _uninstall()
+
+
+def test_card_entries_seed_and_sync_return_tombstones_and_skip_expired_documents():
+    """A follower pops on a tombstone, so the reads return them; an expired document (TTL deletes up
+    to ~24 h late) is skipped while its stamp still moves the watermark; the sync reads past the
+    watermark less the mirror's overlap."""
+    client = _FakeClient()
+    _install(client)
+    try:
+        t1, t2, t3 = (NOW - timedelta(minutes=m) for m in (30, 20, 10))
+        client.pages["varsel_card_cache_seed"] = [
+            _card_row("message", "k3", t3, value=None),
+            _card_row("message", "k2", t2, expires=NOW - timedelta(minutes=1)),
+            _card_row("alternative", "k1", t1, value='{"a": 1}'),
+        ]
+        entries, watermark = notification_store.seed_card_entries(now=NOW)
+        CardEntry = notification_store.CardEntry
+        assert entries == [CardEntry("message", "k3", None), CardEntry("alternative", "k1", '{"a": 1}')]
+        assert watermark == t3
+
+        client.pages["varsel_card_cache_sync"] = [_card_row("message", "k4", NOW, value='"x"')]
+        entries, watermark = notification_store.sync_card_entries(since=t3, now=NOW)
+        assert entries == [CardEntry("message", "k4", '"x"')] and watermark == NOW
+        name, _eq, inequality, _limit = client.query_calls[-1]
+        overlap = timedelta(seconds=notification_store.MIRROR_SYNC_OVERLAP_S)
+        assert name == "varsel_card_cache_sync"
+        assert inequality == {notification_store.TRANSLATION_STAMP_FIELD: t3 - overlap}
+    finally:
+        _uninstall()
+
+
 def test_a_situation_translation_is_created_once_and_a_later_writer_adopts_the_stored_one():
     """Translation store KTD4: first writer wins and every writer converges on the stored text. A
     second writer -- two leaders across a handoff -- gets the FIRST translation back, so it serves
@@ -4769,6 +4858,29 @@ def emulator_test_a_situation_translation_is_created_once_and_seeded_and_synced_
     assert renewed[notification_store.TTL_FIELD] == NOW + notification_store.TRANSLATION_TTL
     readable = notification_store.read_situation_translations(["d1"], now=NOW)
     assert [e.translations for e in readable] == [_translations(en="Renewed")]
+
+
+def emulator_test_card_entries_are_batch_written_and_seeded_and_synced_by_their_stamp():
+    """U7 against a real client: the batched `set` lands with a real server stamp, a rewrite to a
+    tombstone replaces the same document, and the seed's and sync's stamp queries return it."""
+    _emulator_setup()
+    CardEntry = notification_store.CardEntry
+    notification_store.write_card_entries(
+        [CardEntry("message", '["k1"]', '{"text":"a"}'), CardEntry("alternative", '["k2"]', "{}")],
+        now=NOW,
+    )
+    entries, watermark = notification_store.seed_card_entries(now=NOW)
+    assert sorted(entries, key=lambda e: e.key) == [
+        CardEntry("message", '["k1"]', '{"text":"a"}'), CardEntry("alternative", '["k2"]', "{}"),
+    ], entries
+    assert watermark is not None
+
+    notification_store.write_card_entries([CardEntry("message", '["k1"]', None)], now=NOW)
+    synced, later = notification_store.sync_card_entries(since=watermark, now=NOW)
+    assert CardEntry("message", '["k1"]', None) in synced, synced
+    assert later is not None and later >= watermark
+    reseeded, _ = notification_store.seed_card_entries(now=NOW)
+    assert len(reseeded) == 2, "one document per (kind, key): the tombstone replaced the entry"
 
 
 def emulator_test_a_feedback_context_is_claimed_once_and_erased_with_its_device():

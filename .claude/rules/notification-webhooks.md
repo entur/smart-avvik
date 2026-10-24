@@ -61,7 +61,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   leader-only memory and never fails a tick or an acquisition; tst has no store. Each update and
   follow logs `situation_english_coverage` (per language, texts needing a machine translation and
   how many the pod holds, with its role) -- a follower reading short of the leader for long is a
-  stalled sync. The summary's `_NN` vocabulary keeps bokmål's mode nouns and title shape (nynorsk
+  stalled sync; a follower short only while the leader is short too is Gemini still translating.
+  The `/varsel` card caches follow the same pattern through `varsel_card_cache` since 2026-10-24
+  (U7, see `.claude/rules/varsel.md`), which is how a follower's journey-alerts read serves the
+  leader's cached wording for a registered definition. The summary's `_NN` vocabulary keeps bokmål's mode nouns and title shape (nynorsk
   names a vehicle the same way); the hand-written and machine nynorsk were reviewed by a nynorsk
   reader on 2026-10-22. Not in `message_input`.
 - **Each `payload.situations[]` entry carries `report_type`** (2026-10-05, KIX-29): SIRI-SX
