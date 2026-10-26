@@ -148,10 +148,22 @@ _GEMINI_MODEL = os.environ.get("VERTEX_GEMINI_MODEL", "gemini-3.8-flash")
 # 97 `ok`, 3 `ungrounded` (refused, as they should be), p90 1.3 s. But on the 33 predicted
 # cancellations it quoted `innstilling_prosent` in none of 32 wordings and wrote 3 as certain («er
 # innstilt»), where 3.8 quoted it in 26 of 26 -- a miss `_is_grounded` cannot see, since it checks
-# that quoted figures exist and not that required ones were quoted. `_attempt_models` therefore keeps
-# a predicted cancellation on `_GEMINI_MODEL` for both attempts. Empty turns the fallback off.
+# that quoted figures exist and not that required ones were quoted. `_attempt_models` therefore never
+# sends a predicted cancellation here. Empty turns the fallback off.
 # Served at eu in dev and prd (checked 2026-10-23); tst serves no Vertex model at all.
 _GEMINI_FALLBACK_MODEL = os.environ.get("VERTEX_GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite").strip()
+# The second attempt for a predicted cancellation, since 2026-10-26. That afternoon 3.8 was down at
+# eu again (dev: 13 of ~170 calls served in 30 min), and every wording that still failed was a
+# predicted cancellation, sent back to 3.8 by the rule above. Probed then on that day's inputs with
+# the real prompt: 3.5 Flash served 64 of 64 across dev and prd and quoted the percentage in 52 of
+# 52. Replayed over the same 100 prd inputs as Flash-Lite: 99 `ok`, 1 `ungrounded`, p90 1.9 s, the
+# percentage quoted in 33 of 33 predicted cancellations and none written as certain.
+# It is not the fallback for everything because on 2026-10-23 it was down with 3.8 (0 of 15 above)
+# while Flash-Lite answered: each population gets the model measured safe for it, and an outage of
+# both leaves a predicted cancellation on the template, as before. Empty sends it back to 3.8.
+_GEMINI_CANCELLATION_FALLBACK_MODEL = os.environ.get(
+    "VERTEX_GEMINI_CANCELLATION_FALLBACK_MODEL", "gemini-3.5-flash"
+).strip()
 # Thinking level per model, "low" for any model not named. Flash-Lite at "low" spent anywhere from
 # ~120 to ~1 500 thinking tokens on one wording and hit `_MAX_TOKENS` on 35 of the 100 replayed
 # inputs; at "minimal" none did. It cannot be one value for all: 3.7 Flash refuses "minimal".
@@ -887,18 +899,18 @@ def _gemini_write(input_json: str) -> str:
 
 
 def _attempt_models(input_json: str) -> tuple[str, ...]:
-    """The model for each of `_gemini_write`'s attempts: `_GEMINI_MODEL` first, the fallback after.
+    """The model for each of `_gemini_write`'s attempts: `_GEMINI_MODEL` first, a fallback after.
 
-    A predicted cancellation stays on `_GEMINI_MODEL` throughout, and so does an input this cannot
-    read: the fallback measured unsafe on exactly that population (see `_GEMINI_FALLBACK_MODEL`).
-    `innstilling_prosent` is the marker because `build_message_input` writes it only there.
+    A predicted cancellation falls back to `_GEMINI_CANCELLATION_FALLBACK_MODEL`, never to
+    `_GEMINI_FALLBACK_MODEL`, which measured unsafe on exactly that population. An input this cannot
+    read stays on `_GEMINI_MODEL` throughout rather than guess which it is. `innstilling_prosent` is
+    the marker because `build_message_input` writes it only there.
     """
-    later = _GEMINI_FALLBACK_MODEL or _GEMINI_MODEL
     try:
-        if json.loads(input_json).get("innstilling_prosent") is not None:
-            later = _GEMINI_MODEL
+        cancellation = json.loads(input_json).get("innstilling_prosent") is not None
     except (ValueError, AttributeError):
-        later = _GEMINI_MODEL
+        return (_GEMINI_MODEL,) * _RETRY_OPTIONS["attempts"]
+    later = (_GEMINI_CANCELLATION_FALLBACK_MODEL if cancellation else _GEMINI_FALLBACK_MODEL) or _GEMINI_MODEL
     return (_GEMINI_MODEL,) + (later,) * (_RETRY_OPTIONS["attempts"] - 1)
 
 
