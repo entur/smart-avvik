@@ -1653,7 +1653,7 @@ def _vertex_error(code):
 
 
 @contextlib.contextmanager
-def _scripted_gemini(*outcomes, fallback="gemini-3.1-flash-lite"):
+def _scripted_gemini(*outcomes, fallback="gemini-3.1-flash-lite", cancellation_fallback="gemini-3.5-flash"):
     """The REAL `_gemini_write` against a client that answers from a script, one outcome per
     `generate_content` call: an exception to raise or a reply to return. Yields the calls made as
     (model, thinking level) and the waits slept between them."""
@@ -1666,17 +1666,20 @@ def _scripted_gemini(*outcomes, fallback="gemini-3.1-flash-lite"):
             raise outcome
         return SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")], text=outcome)
 
-    saved = (llm_message._gemini_client, llm_message.sleep, llm_message._GEMINI_FALLBACK_MODEL)
+    names = ("_gemini_client", "sleep", "_GEMINI_FALLBACK_MODEL", "_GEMINI_CANCELLATION_FALLBACK_MODEL")
+    saved = [getattr(llm_message, name) for name in names]
     llm_message._gemini_client = lambda **_: SimpleNamespace(
         models=SimpleNamespace(generate_content=generate_content)
     )
     llm_message.sleep = slept.append
     llm_message._GEMINI_FALLBACK_MODEL = fallback
+    llm_message._GEMINI_CANCELLATION_FALLBACK_MODEL = cancellation_fallback
     _reset(provider="gemini")
     try:
         yield calls, slept
     finally:
-        llm_message._gemini_client, llm_message.sleep, llm_message._GEMINI_FALLBACK_MODEL = saved
+        for name, value in zip(names, saved):
+            setattr(llm_message, name, value)
 
 
 def test_a_transient_failure_is_retried_on_the_fallback_model():
@@ -1698,15 +1701,22 @@ def test_a_transient_failure_is_retried_on_the_fallback_model():
         assert llm_message.write_message_detailed(_DELAY_INPUT).model == primary
 
 
-def test_a_predicted_cancellation_never_reaches_the_fallback():
+def test_a_predicted_cancellation_falls_back_to_its_own_model():
     """Replayed over 100 prd inputs, Flash-Lite quoted the cancellation percentage in none of 32
-    predicted cancellations and wrote 3 of them as certain; 3.8 quoted it in 26 of 26. A wrong
-    certainty is worse than the template, so this population keeps both attempts on 3.8."""
+    predicted cancellations and wrote 3 of them as certain; 3.5 Flash quoted it in 33 of 33. A wrong
+    certainty is worse than the template, so this population's second attempt goes to 3.5 Flash and
+    never to Flash-Lite (2026-10-26: these were every wording 3.8's outage still cost)."""
     primary = llm_message._GEMINI_MODEL
-    with _scripted_gemini(_vertex_error(504), _vertex_error(504)) as (calls, _):
+    reply = '{"melding": "Det er 73 % sjanse for at tog L1 08:12 blir innstilt."}'
+    with _scripted_gemini(_vertex_error(504), reply) as (calls, _):
+        result = llm_message.write_message_detailed(_CANCEL_INPUT)
+    assert result.status == "ok" and result.model == "gemini-3.5-flash", result
+    assert calls == [(primary, "low"), ("gemini-3.5-flash", "low")], calls
+    # Empty is its off switch, and off means back to 3.8 -- not into Flash-Lite.
+    with _scripted_gemini(_vertex_error(504), _vertex_error(504), cancellation_fallback="") as (calls, _):
         assert llm_message.write_message_detailed(_CANCEL_INPUT).status == "error"
     assert [model for model, _ in calls] == [primary, primary], calls
-    # An input this cannot read stays there too, rather than defaulting into the fallback.
+    # An input this cannot read stays on 3.8, rather than defaulting into either fallback.
     assert llm_message._attempt_models("not json") == (primary, primary)
 
 

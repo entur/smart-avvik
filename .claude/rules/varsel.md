@@ -645,7 +645,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     control. Note the `/varsel-api` tests pin `KIX_ENVIRONMENT=prd` at import, or a developer with
     `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported fails the push-title assertions.
   - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
-    `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` / `VERTEX_GEMINI_FALLBACK_MODEL` — the push text is written by an LLM on Vertex AI
+    `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` / `VERTEX_GEMINI_FALLBACK_MODEL` /
+    `VERTEX_GEMINI_CANCELLATION_FALLBACK_MODEL` — the push text is written by an LLM on Vertex AI
     (`disruptions/api/llm_message.py`) from the enriched `/impact` payload. No API keys: both
     backends use the runtime SA's ADC (`roles/aiplatform.user`, already granted for `AI.CLASSIFY`).
     Every Helm environment pins `VARSEL_LLM_PROVIDER=gemini`; `auto` remains supported by the code
@@ -698,14 +699,19 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `sdk_retry=False`; `situation_english` keeps the SDK's), so the count, the 1 s wait and
     `_WORST_CASE_CALL_S` did not move -- and note the count is TWO attempts at 9.5 s since
     2026-09-21, not the three at 6 s described above. Three things are easy to get backwards. **A
-    predicted cancellation never reaches the fallback** (`_attempt_models`, keyed on
+    predicted cancellation never reaches Flash-Lite** (`_attempt_models`, keyed on
     `innstilling_prosent`): replayed over 100 prd inputs, Flash-Lite quoted that percentage in none
-    of 32 and wrote 3 as certain, a miss `_is_grounded` cannot see. **Flash-Lite needs
+    of 32 and wrote 3 as certain, a miss `_is_grounded` cannot see. Its second attempt goes to
+    `VERTEX_GEMINI_CANCELLATION_FALLBACK_MODEL` instead (default `gemini-3.5-flash`, since
+    2026-10-26; empty sends it back to 3.8): when 3.8 went down again that day, every wording still
+    failing was a predicted cancellation, and 3.5 Flash served all 64 probes and quoted the
+    percentage in 33 of 33 replayed. It is not the fallback for everything because it was down
+    with 3.8 on 2026-10-23, when Flash-Lite alone answered. **Flash-Lite needs
     `thinking_level: "minimal"`** (`_THINKING_LEVELS`): at "low" it hit `_MAX_TOKENS` on 35 of the
     100. **Only a 404/403 on `_GEMINI_MODEL` latches the backend**; the fallback's own is one failed
     attempt. `llm_model` on the decision row and `model` on the `ok` record name the model that
     wrote the text (`_model_of` reads `_replied_by`), and a retry logs `event="llm_message_retry"`
-    with `model`, `next_model` and `error`. A prompt change now has to be replayed on both models.
+    with `model`, `next_model` and `error`. A prompt change now has to be replayed on all three models.
     Every failure path (unset,
     unavailable model, timeout, empty or over-long reply) falls back to the previous deterministic
     wording, so a push is never lost to an LLM problem.
