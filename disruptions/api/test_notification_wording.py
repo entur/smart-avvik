@@ -1250,16 +1250,25 @@ def test_situations_text_drops_vys_superseded_forecast_and_says_the_cause_once()
     assert nw.situations_text([forecast])[0].startswith("Vi forventer")
 
 
-def test_situations_text_puts_advice_last_and_keeps_messages_that_differ_in_a_place():
-    advice = _msg("S1", "Ta neste tog", "Ta neste tog mellom Høn og Sandvika.")
-    other = _msg("S2", "Ta neste tog", "Ta neste tog mellom Blommenholm og Lysaker.")
+def test_situations_text_drops_advice_beside_a_fact_and_keeps_messages_that_differ_in_a_place():
+    advice = _msg("S1", "Ta neste tog", "Ta neste tog mellom Høn og Sandvika.",
+                  "Take the next train", "Take the next train between Høn and Sandvika.")
+    other = _msg("S2", "Ta andre tog", "Ta andre tog fra Asker, Sandvika og Lysaker.")
     fact = _msg("S3", "Ny kjørerute mellom Asker og Lysaker",
-                "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket.")
+                "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket.",
+                "New route", "The train does not stop at Høn and Stabekk.")
     ours = _msg("KIX:NoSituation:t1", "Mulig avvik", "Skrevet av oss.", has_situation=False)
-    assert nw.situations_text([advice, ours, other, fact])[0] == (
-        "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket. "
-        "Ta neste tog mellom Høn og Sandvika. Ta neste tog mellom Blommenholm og Lysaker."
+    # The untranslated advice is gone, so it no longer blanks the English line.
+    assert nw.situations_text([advice, ours, other, fact])[:2] == (
+        "Toget stopper ikke på Høn og Stabekk. Det skyldes at toget er forsinket.",
+        "The train does not stop at Høn and Stabekk.",
     )
+    # Another mode is not a train the alternative departure can name, so it stays.
+    bus = _msg("S4", "Ta Ruters buss", "Ta Ruters buss mellom Asker og Sandvika.")
+    assert nw.situations_text([advice, fact, bus])[0].endswith("Ta Ruters buss mellom Asker og Sandvika.")
+    # Advice alone is all the operator said, so it stays.
+    assert nw.situations_text([advice, ours, other])[:2] == (
+        "Ta neste tog mellom Høn og Sandvika. Ta andre tog fra Asker, Sandvika og Lysaker.", None)
     # «11. oktober» and «kl. 14:00» are not sentence breaks, so a different date is not cut down to
     # «Ny oppdatering kommer 12.» by the shared «oktober kl. 14:00.».
     a = _msg("S1", "Stengt: Lysaker–Stabekk", "Lysaker–Stabekk er stengt. Ny oppdatering kommer 11. oktober kl. 14:00.")

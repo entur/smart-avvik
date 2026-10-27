@@ -920,10 +920,12 @@ only left out or reordered:
   for the same train;
 - a sentence an earlier message already said is left out, which is usually the cause («Dette
   skyldes …»);
-- advice («Ta neste tog …») comes after the facts.
+- «Ta neste tog …» and «Ta andre tog fra …» are left out whenever the train has another
+  message (since 2026-10-27), and kept when they are all the operator said. They are still in
+  `situations`.
 
-Only exact repeats go: «Ta neste tog mellom Høn og Sandvika» and «Ta neste tog mellom Blommenholm
-og Lysaker» are both kept. It is built from the situations whose `has_situation` is true, so it is
+Only exact repeats go: «Lysaker–Stabekk er stengt» and «Lysaker–Oslo S er stengt» are both
+kept. It is built from the situations whose `has_situation` is true, so it is
 `null` when there are none, as on the test event. **`situations_text_en`** is the same text in
 English, from the same messages. It is `null` until every one of them has its English, so the
 line never mixes languages. Present it as a translation when any of those situations has

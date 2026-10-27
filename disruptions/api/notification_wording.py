@@ -707,6 +707,10 @@ def alerts_summary(trains: list[tuple[dict, list[dict]]]) -> tuple[str | None, s
 #: prd over the 14 days to 2026-10-18 named the same origin. Keyed on the summary pair Vy uses, so a
 #: forecast under any other wording is never dropped.
 _SUPERSEDED_BY = {"forsinkelse forventes": "forsinket"}
+#: Vy's advice to wait or switch train, each its own situation (691 of the 717 «Ta …» summaries over
+#: the 30 days to 2026-10-27). «Ta Ruters buss» is not here: it names a mode the alternative
+#: departure beside the text cannot.
+_TAKE_ANOTHER_TRAIN = ("ta neste tog", "ta andre tog")
 #: A sentence ends at terminal punctuation followed by a capital, so «11. oktober» and «kl. 14:00»
 #: stay whole. A missed boundary only costs a deduplication; a false one could drop half a sentence.
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-ZÆØÅ])")
@@ -739,10 +743,11 @@ def situations_text(situations: list[dict]) -> tuple[str | None, str | None, str
 
     Every word is the operator's: messages are only left out or reordered, never rewritten. A
     superseded forecast goes (:data:`_SUPERSEDED_BY`), a sentence an earlier message already said
-    goes (the shared cause, «Dette skyldes …»), and advice («Ta neste tog …») comes after the facts
-    -- otherwise the payload's order, which is severity. Exact sentences only: two messages that
-    differ only in a place name («Ta neste tog mellom Høn og Sandvika» / «… Blommenholm og
-    Lysaker») differ in exactly what matters.
+    goes (the shared cause, «Dette skyldes …»), and advice («Ta neste tog …», «Ta andre tog fra …»)
+    goes whenever a fact is left to say (2026-10-27: the app's card ran to a list of 25 stations,
+    and the alternative departure under it already says which train to take) -- otherwise the
+    payload's order, which is severity. Exact sentences only: two messages that differ only in a
+    place name («Stengt: Lysaker–Stabekk» / «… Lysaker–Oslo S») differ in exactly what matters.
 
     Only `has_situation` messages contribute, since anything else is text this codebase wrote. The
     situations to keep are chosen once, on the Norwegian, and each language is deduplicated on its
@@ -753,7 +758,8 @@ def situations_text(situations: list[dict]) -> tuple[str | None, str | None, str
     kept = [s for s in situations if s.get("has_situation") and (s.get("description") or s.get("summary"))]
     summaries = {_summary_key(s.get("summary")) for s in kept}
     kept = [s for s in kept if _SUPERSEDED_BY.get(_summary_key(s.get("summary"))) not in summaries]
-    kept.sort(key=lambda s: _summary_key(s.get("summary")).startswith("ta "))
+    facts = [s for s in kept if not _summary_key(s.get("summary")).startswith(_TAKE_ANOTHER_TRAIN)]
+    kept = facts or kept
     fields = ["description" if s.get("description") else "summary" for s in kept]
     translations = [
         [s.get(f"{field}_{language}") for s, field in zip(kept, fields, strict=True)] for language in ("en", "nn")
