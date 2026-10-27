@@ -6259,9 +6259,9 @@ class Journey(BaseModel):
     )
     today: journey_status.JourneyStatus | None = Field(
         default=None,
-        description="Every Vy train in today's window, graded -- the «I dag» strip (plan "
-        "2026-09-22-001). NULL while the day's timetable is not loaded, or when grading this journey "
-        "failed; the card then renders exactly as it did before the strip existed.",
+        description="Every Vy and SJ Norge train in today's window, graded -- the «I dag» strip "
+        "(plan 2026-09-22-001). NULL while the day's timetable is not loaded, or when grading this "
+        "journey failed; the card then renders exactly as it did before the strip existed.",
     )
 
 

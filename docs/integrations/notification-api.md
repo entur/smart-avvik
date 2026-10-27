@@ -334,8 +334,8 @@ are [The journey-keyed read](#the-journey-keyed-read) below.
 
 ### `GET /journey-status` — every train today, graded
 
-No credential. Every Vy train in today's window on a definition, graded as a fact or a forecast. See
-[The journey-status read](#the-journey-status-read) below.
+No credential. Every Vy and SJ Norge train in today's window on a definition, graded as a fact or
+a forecast. See [The journey-status read](#the-journey-status-read) below.
 
 ### Errors
 
@@ -629,10 +629,11 @@ same object, so it is not restated here. What the envelope around it means:
 
 ### `coverage`, and what an empty list means
 
-`coverage.operators` is the set of operator codespaces the service scores at all — Vy rail and the
-trained bus operators. The two `*_in_timetable_today` flags say whether each canonical stop appears in
-today's planned timetable, checked over every ref of the physical place; they **fail open** (an
-unloaded timetable reads `true`), because "we do not know" must never render as "not served".
+`coverage.operators` is the set of operator codespaces the service scores at all — Vy and SJ Norge
+rail and the trained bus operators. The two `*_in_timetable_today` flags say whether each canonical
+stop appears in today's planned timetable, checked over every ref of the physical place; they **fail
+open** (an unloaded timetable reads `true`), because "we do not know" must never render as "not
+served".
 
 There is deliberately **no servability caveat** on this read: the question costs a BigQuery query per
 anonymous pair and writes both refs into a log line, neither of which belongs on a public
@@ -760,8 +761,8 @@ definition is registered**.
 ## The journey-status read
 
 `GET /notification-api/v1/journey-status` answers "how does today look on this trip, all of it?":
-every Vy train in today's window that boards at the origin and lets the traveller off at the
-destination, in departure order, the ones that already ran included. It is the body behind the
+every Vy and SJ Norge train in today's window that boards at the origin and lets the traveller off
+at the destination, in departure order, the ones that already ran included. It is the body behind the
 «I dag» strip on `/varsel`, and it takes the same five parameters as `journey-alerts` without `wait`
 and `limit`, and the same `ET-Client-Name` header. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
 Only today is answered: a today not in `days` is an empty `trains` with `reason: not_a_travel_day`.
@@ -817,9 +818,11 @@ timetable is more than an hour old) the read answers `503 plan_not_loaded` with 
 the first poller cycle, never an empty list. A grading failure
 is `503 status_failed`, also retryable.
 
-**Coverage.** `operators` and `coverage.operators` are `["VYG"]`: the timetable behind this read is
-Vy rail only. Render a GO-Ahead or bus trip as outside the answer, never as calm. Nothing here is
-scored on `/historikk`, and nothing here notifies anybody.
+**Coverage.** `operators` and `coverage.operators` are `["VYG", "SJN"]`: the timetable behind this
+read is Vy and SJ Norge rail only. Render a Go-Ahead or bus trip as outside the answer, never as
+calm. An SJ Norge train's recorded calls come from the hourly timetable rather than the 15-minute
+actuals, so for up to about an hour after it has arrived it can still read `predicted` or
+`unknown`. Nothing here is scored on `/historikk`, and nothing here notifies anybody.
 
 ---
 
