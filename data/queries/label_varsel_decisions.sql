@@ -255,6 +255,7 @@ removed_subjects AS (
 -- as replacement buses only reads as absent, and its removed trains stay NULL rather than hits.
 removed_et AS (
   SELECT
+    e.operator,
     e.operatingDate AS od,
     n AS trainno,
     REGEXP_EXTRACT(e.lineRef, r'([^:]+)$') AS line,
@@ -265,23 +266,25 @@ removed_et AS (
     e.call_cancelled, e.aimed_dep, e.actual_dep
   FROM et AS e,
     UNNEST([REGEXP_EXTRACT(e.jkey, r'ServiceJourney:(\d+)[-_]'),
-            REGEXP_EXTRACT(e.jkey, r'ServiceJourney:\d+-(\d+)_')]) AS n
+            REGEXP_EXTRACT(e.jkey, r'ServiceJourney:\d+-(\d+)_'),
+            -- SJ Norge (KIX-43): Bane NOR's '<number>:<date>'
+            REGEXP_EXTRACT(e.jkey, r'^(\d+):')]) AS n
   LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
     ON q.id = e.stopPointRef
-  WHERE e.operator = 'VYG' AND e.vehicleMode = 'rail' AND n IS NOT NULL
+  WHERE e.operator IN ('VYG', 'SJN') AND e.vehicleMode = 'rail' AND n IS NOT NULL
 ),
 -- The two presence lookups are one row per key, so their LEFT JOINs cannot duplicate a subject;
 -- `removed_boarding` can, and `labelled_removed`'s QUALIFY takes it back to one. That matters
 -- because the INSERT's NOT EXISTS sees only the table, never the rows the same statement is writing.
 removed_lines_ran AS (
-  SELECT DISTINCT od, line FROM removed_et
+  SELECT DISTINCT operator, od, line FROM removed_et
 ),
 -- Keyed without the line, on purpose. A number that also ran on ANOTHER line that day finds no
 -- boarding call and is not absent either, so the subject is NULL and retried: the conservative
 -- direction. Keying on the line would make a train re-added under a different line code read as
 -- absent, i.e. a false hit. ET's line code matched GTFS's for every shared number over 2026-09-19..22.
 removed_trains_ran AS (
-  SELECT DISTINCT od, trainno FROM removed_et
+  SELECT DISTINCT operator, od, trainno FROM removed_et
 ),
 -- The boarding call, on the same realized rule as `realized` above: cancelled, or actually departed.
 -- EVERY candidate is kept. One number can carry two journeys in a day (Vy files a partial re-run as
@@ -291,7 +294,7 @@ removed_trains_ran AS (
 -- NOT EXISTS guard then froze that verdict.
 removed_boarding AS (
   SELECT
-    od, trainno, line, stop_place, call_cancelled, aimed_dep,
+    operator, od, trainno, line, stop_place, call_cancelled, aimed_dep,
     TIMESTAMP_DIFF(actual_dep, aimed_dep, MINUTE) AS dep_delay_min
   FROM removed_et
   WHERE call_cancelled OR actual_dep IS NOT NULL
@@ -324,10 +327,12 @@ labelled_removed AS (
     CAST(NULL AS BOOL) AS actual_destination_cancelled
   FROM removed_subjects AS g
   LEFT JOIN removed_boarding AS b
-    ON  b.od = g.r_od AND b.trainno = g.r_trainno AND b.line = g.r_line
+    ON  b.operator = g.operator AND b.od = g.r_od AND b.trainno = g.r_trainno AND b.line = g.r_line
     AND b.stop_place = g.stop_place
-  LEFT JOIN removed_lines_ran AS lr ON lr.od = g.r_od AND lr.line = g.r_line
-  LEFT JOIN removed_trains_ran AS tr ON tr.od = g.r_od AND tr.trainno = g.r_trainno
+  LEFT JOIN removed_lines_ran AS lr
+    ON lr.operator = g.operator AND lr.od = g.r_od AND lr.line = g.r_line
+  LEFT JOIN removed_trains_ran AS tr
+    ON tr.operator = g.operator AND tr.od = g.r_od AND tr.trainno = g.r_trainno
   -- One row per subject (the view's grain), keeping the boarding candidate whose aimed departure is
   -- nearest the one the subject was decided on: `departure_time` is the aimed departure from the
   -- boarding stop, and a partial re-run of the same number leaves at a different time. A subject

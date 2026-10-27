@@ -188,7 +188,32 @@ End to end on scratch tables (2026-10-24): today's one SJN situation, a capacity
 Oslo – Trondheim, reached trains 43 and 48 as 30 flagged rows (max `p_impact_dep` 0.57, under the
 bar). All 8 136 Vy prediction rows came out byte-identical to `main`'s.
 
+## KIX-43: SJ trains taken out of the timetable (2026-10-24)
+
+SJ, like Vy, sometimes drops a train from the day's timetable rather than cancelling it, and such a
+train never enters SIRI-ET. The case is a train in the GTFS plan on at least 3 of the 4 previous
+same weekdays, but in neither today's plan nor ET. Over 2026-09-25..10-21 that was 137 of 2 224
+standing SJN train-days (6.2 %), on 13 days, all on planned closures: Dovrebanen F6 including the
+night trains 405/406 (09-26..29), then Raumabanen R65 and some F7 (09-30..10-07). Only 20 more were
+in the plan but absent from ET; this rule does not cover those.
+
+ET's date and GTFS's operating date agree for SJN, night trains included: 1 226 of 1 246 planned
+trains over 2026-10-08..21 carried the same date in both, all F6 night trains among them. The rest
+were trains missing from ET that day, which the rule never touches, because they are in the plan.
+
+By line: R65 60, F6 38, R70 14, F7 12, R71 8, R60 5. **F6 and F7 are excluded**: they close boarding
+or alighting mid-journey (7 of 12 F6 trains and 1 of 8 F7 on 2026-10-24, at Oslo lufthavn,
+Lillestrøm, Heimdal and the Trøndelag airport), and GTFS cannot say which calls a removed train's
+passengers may use. That is the 2026-09-01 F4 incident the Vy relay was built to avoid. It leaves
+87 of the 137 train-days covered.
+
+Replayed over 2026-09-25..10-07 against `last_recorded` (`replay_removed_trains.sh`, which now
+replays SJN too): **87 SJN train-days, 847 calls**, all with a stop place and name, none
+`bus_for_train`. All 30 051 Vy rows over the 13 days were identical to `main`'s, with nothing extra
+on either side.
+
 ## Follow-ups
+
 
 1. **R60's false «innstilt»**: pool SJN into `training_calls` once the `p_cancel` serving fix has
    landed and been measured. `create_training_calls_sjn.sql` is already the pool's shape.
@@ -198,3 +223,6 @@ bar). All 8 136 Vy prediction rows came out byte-identical to `main`'s.
    recorded calls from the planned table, up to 60 min old. Widening it touches Rushvarsel and the
    labeller, so it is a change of its own.
 5. **SJV and TM** (also under `BNR`) would take the same path if wanted.
+6. **F6 and F7 removed trains** (KIX-49; 36 % of SJN's removed train-days): keep each train's
+   per-stop boarding and alighting rules from the ET days it ran, in a small table, and use them
+   instead of excluding the line. That would also let Vy's F4 and RX11 back in.

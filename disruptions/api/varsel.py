@@ -6389,7 +6389,7 @@ def _card_alerts(alerts: list[Alert]) -> list[Alert]:
     (those rows are the lead-time series, and a match that stayed under the gate is exactly what a
     `miss` is made of) and the push gate is unchanged -- a sub-threshold alert was never pushed.
 
-    A train Vy took out of the plan (`KIX:PlanRemoved:`) is never on the card: the «I dag» strip
+    A train taken out of the plan (`KIX:PlanRemoved:`, Vy's and SJ Norge's) is never on the card: the «I dag» strip
     already shows it as «tatt ut av rutetabellen», and on a cut day a box per removed train buried
     the real disruptions under dozens of identical ones.
     """

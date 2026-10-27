@@ -1,5 +1,16 @@
--- Vy trains REMOVED from the day's plan, one row per call, in the shape of
+-- Vy and SJ Norge trains REMOVED from the day's plan, one row per call, in the shape of
 -- rail_calls_planned_today (plan docs/plans/2026-09-23-001-feat-removed-trains-plan.md).
+--
+-- SJ NORGE since KIX-43 (2026-10-24). SJ does the same thing on its planned closures: 137 of 2 224
+-- standing SJN train-days of 2026-09-25..10-21 were taken out of the plan, all on the Dovrebanen
+-- (F6, 09-26..29) and Raumabanen (R65, 09-30..10-07) closures and their neighbours. Every rule
+-- below runs PER OPERATOR, so one operator's timetable change cannot silence the other's
+-- removals and one operator's half-written plan cannot refuse the other's (`guard`). Two things
+-- differ: SJN's ET jkey is Bane NOR's '<number>:<date>', and SJN's GTFS has no bus trips at all,
+-- so `bus_for_train` is Vy's alone -- only SJ's own SX can say «buss for tog». F6 and F7 close
+-- boarding or alighting mid-journey (7 of 12 F6 and 1 of 8 F7 trains on 2026-10-24) and are left
+-- out like F4, which leaves 87 of the 137 train-days; covering them needs each call's activities,
+-- which GTFS does not carry.
 --
 -- From Saturday 2026-09-19 Vy has been taking trains out of the day's timetable instead of
 -- cancelling them: 147 trains an ordinary Wednesday runs were missing on 2026-09-23, against 5
@@ -73,6 +84,7 @@ WITH
 gtfs AS (
   SELECT
     operating_date AS od,
+    IF(agency_id = 'SJN:Authority:SJN', 'SJN', 'VYG') AS operator,
     route_short_name AS line,
     direction_id,
     trip_id,
@@ -89,50 +101,57 @@ gtfs AS (
   WHERE operating_date IN (@d,
                            DATE_SUB(@d, INTERVAL 7 DAY), DATE_SUB(@d, INTERVAL 14 DAY),
                            DATE_SUB(@d, INTERVAL 21 DAY), DATE_SUB(@d, INTERVAL 28 DAY))
-    AND agency_id LIKE 'VYG%'
+    AND (agency_id LIKE 'VYG%' OR agency_id = 'SJN:Authority:SJN')
     AND route_type = 'Train'
 ),
 trips AS (
-  SELECT DISTINCT od, line, trainno, trainno2 FROM gtfs WHERE trainno IS NOT NULL
+  SELECT DISTINCT od, operator, line, trainno, trainno2 FROM gtfs WHERE trainno IS NOT NULL
 ),
 -- Every number @d's plan knows a train by (see the header on through trains).
 today AS (
-  SELECT DISTINCT n AS trainno
+  SELECT DISTINCT operator, n AS trainno
   FROM trips, UNNEST([trainno, trainno2]) AS n
   WHERE od = @d AND n IS NOT NULL
 ),
 standing AS (
-  SELECT line, trainno, ANY_VALUE(trainno2) AS trainno2, MAX(od) AS last_od
+  SELECT operator, line, trainno, ANY_VALUE(trainno2) AS trainno2, MAX(od) AS last_od
   FROM trips
   WHERE od < @d
-  GROUP BY line, trainno
+  GROUP BY operator, line, trainno
   HAVING COUNT(DISTINCT od) >= 3
 ),
 -- The trains ET carries for @d, by the operating date in the jkey rather than by call date: a
 -- night train of @d-1 has calls on @d under the same number a removed @d train would have.
 -- data/queries/replay_removed_trains.sh swaps this CTE for last_recorded, which has past dates.
 et_trains AS (
-  SELECT DISTINCT n AS trainno
+  SELECT DISTINCT 'VYG' AS operator, n AS trainno
   FROM `disruptions.rail_calls_planned_today`,
     UNNEST([REGEXP_EXTRACT(jkey, r'ServiceJourney:(\d+)[-_]'),
             REGEXP_EXTRACT(jkey, r'ServiceJourney:\d+-(\d+)_')]) AS n
   WHERE SAFE.PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(jkey, r'_(\d{2}-\d{2}-\d{2})$')) = @d
     AND n IS NOT NULL
+  UNION DISTINCT
+  -- SJN: '<number>:<yyyy-mm-dd>', the date being the operating day, as for Vy above
+  SELECT DISTINCT 'SJN', REGEXP_EXTRACT(jkey, r'^(\d+):')
+  FROM `disruptions.rail_calls_planned_today`
+  WHERE lineRef LIKE 'SJN:%'
+    AND SAFE.PARSE_DATE('%Y-%m-%d', REGEXP_EXTRACT(jkey, r':(\d{4}-\d{2}-\d{2})$')) = @d
+    AND REGEXP_CONTAINS(jkey, r'^\d+:')
 ),
 present AS (
-  SELECT trainno FROM today
+  SELECT operator, trainno FROM today
   UNION DISTINCT
-  SELECT trainno FROM et_trains
+  SELECT operator, trainno FROM et_trains
 ),
 -- The train numbers a Vy bus-for-train trip stands in for on @d (see the header).
 -- Vy's bus-for-train trips are `route_type = 'Train'` in GTFS (all 3 480 of them, 2026-08-24..09-27),
 -- so they are in `gtfs` already.
 bus_numbers AS (
-  SELECT DISTINCT REGEXP_EXTRACT(trip_id, r'ServiceJourney:BUS-(\d+)_') AS trainno
+  SELECT DISTINCT 'VYG' AS operator, REGEXP_EXTRACT(trip_id, r'ServiceJourney:BUS-(\d+)_') AS trainno
   FROM gtfs
-  WHERE od = @d AND REGEXP_CONTAINS(trip_id, r'ServiceJourney:BUS-\d+_')
+  WHERE od = @d AND operator = 'VYG' AND REGEXP_CONTAINS(trip_id, r'ServiceJourney:BUS-\d+_')
   UNION DISTINCT
-  SELECT DISTINCT REGEXP_EXTRACT(jkey, r'ServiceJourney:BUS-(\d+)_')
+  SELECT DISTINCT 'VYG', REGEXP_EXTRACT(jkey, r'ServiceJourney:BUS-(\d+)_')
   FROM `disruptions.rail_calls_planned_today`
   WHERE SAFE.PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(jkey, r'_(\d{2}-\d{2}-\d{2})$')) = @d
     AND REGEXP_CONTAINS(jkey, r'ServiceJourney:BUS-\d+_')
@@ -140,22 +159,23 @@ bus_numbers AS (
 missing AS (
   SELECT s.*
   FROM standing AS s
-  LEFT JOIN present AS p1 ON p1.trainno = s.trainno
-  LEFT JOIN present AS p2 ON p2.trainno = s.trainno2
+  LEFT JOIN present AS p1 ON p1.operator = s.operator AND p1.trainno = s.trainno
+  LEFT JOIN present AS p2 ON p2.operator = s.operator AND p2.trainno = s.trainno2
   WHERE p1.trainno IS NULL AND p2.trainno IS NULL
   -- A number is one train per operating day; if it stood on two lines, the latest wins.
-  QUALIFY ROW_NUMBER() OVER (PARTITION BY s.trainno ORDER BY s.last_od DESC, s.line) = 1
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY s.operator, s.trainno ORDER BY s.last_od DESC, s.line) = 1
 ),
 -- One trip per train on the date it last ran (a number can carry two trip variants).
 last_trip AS (
-  SELECT m.line, m.trainno, m.last_od, MIN(g.trip_id) AS trip_id
+  SELECT m.operator, m.line, m.trainno, m.last_od, MIN(g.trip_id) AS trip_id
   FROM missing AS m
-  JOIN gtfs AS g ON g.od = m.last_od AND g.trainno = m.trainno AND g.line = m.line
-  GROUP BY m.line, m.trainno, m.last_od
+  JOIN gtfs AS g
+    ON g.od = m.last_od AND g.operator = m.operator AND g.trainno = m.trainno AND g.line = m.line
+  GROUP BY m.operator, m.line, m.trainno, m.last_od
 ),
 calls AS (
   SELECT
-    lt.line, lt.trainno, g.direction_id, g.quay, g.parent_station, g.stop_name, g.stop_sequence,
+    lt.operator, lt.line, lt.trainno, g.direction_id, g.quay, g.parent_station, g.stop_name, g.stop_sequence,
     TIMESTAMP(DATETIME_ADD(DATETIME(g.departure_time, 'Europe/Oslo'),
                            INTERVAL DATE_DIFF(@d, lt.last_od, DAY) DAY), 'Europe/Oslo') AS dep,
     TIMESTAMP(DATETIME_ADD(DATETIME(g.arrival_time, 'Europe/Oslo'),
@@ -164,22 +184,24 @@ calls AS (
     g.stop_sequence = MAX(g.stop_sequence) OVER trip AS is_last
   FROM last_trip AS lt
   JOIN gtfs AS g ON g.od = lt.last_od AND g.trip_id = lt.trip_id
-  WINDOW trip AS (PARTITION BY lt.trainno)
+  WINDOW trip AS (PARTITION BY lt.operator, lt.trainno)
 ),
 -- Trains in @d's plan that are not standing: the retimed and renumbered stand-ins. TRAINS: a
 -- bus-for-train trip has no train number (`BUS-2281_...`) and must not net the train it replaces
 -- out of the table -- that train is removed, and `bus_for_train` is how the digest says so.
 new_calls AS (
-  SELECT g.line, g.direction_id, g.parent_station, g.departure_time
+  SELECT g.operator, g.line, g.direction_id, g.parent_station, g.departure_time
   FROM gtfs AS g
-  LEFT JOIN (SELECT DISTINCT trainno FROM standing) AS s ON s.trainno = g.trainno
+  LEFT JOIN (SELECT DISTINCT operator, trainno FROM standing) AS s
+    ON s.operator = g.operator AND s.trainno = g.trainno
   WHERE g.od = @d AND g.trainno IS NOT NULL AND s.trainno IS NULL
 ),
 stood_in AS (
-  SELECT DISTINCT c.trainno
+  SELECT DISTINCT c.operator, c.trainno
   FROM calls AS c
   JOIN new_calls AS n
-    ON n.line = c.line AND n.direction_id = c.direction_id AND n.parent_station = c.parent_station
+    ON n.operator = c.operator
+   AND n.line = c.line AND n.direction_id = c.direction_id AND n.parent_station = c.parent_station
    AND ABS(TIMESTAMP_DIFF(n.departure_time, c.dep, MINUTE)) <= 15
   WHERE c.is_first
 ),
@@ -193,36 +215,44 @@ stood_in AS (
 -- PLUS THE LINES SEEN RESTRICTED BEFORE, because today's ET can only speak for a line that runs
 -- today: close F4 for the whole day and no F4 train is in ET, so the detection finds nothing and
 -- every removed F4 train comes out bookable at every call -- the 2026-09-01 incident exactly.
--- ponytail: a fixed list (both lines the detection found on 2026-09-23); a line newly selling
+-- ponytail: a fixed list (Vy's two lines the detection found on 2026-09-23, SJN's two on
+-- 2026-10-24, KIX-43; KIX-49 would replace it with per-stop rules); a line newly selling
 -- boarding-only stretches is caught only on days it runs. Persist the detected set with a
 -- last-seen date before the morning digest (plan U4) ships to prd.
 restricted AS (
-  SELECT DISTINCT REGEXP_EXTRACT(lineRef, r'([^:]+)$') AS line
+  SELECT DISTINCT REGEXP_EXTRACT(lineRef, r'^([^:]+):') AS operator,
+                  REGEXP_EXTRACT(lineRef, r'([^:]+)$') AS line
   FROM `disruptions.rail_calls_planned_today`
-  WHERE REGEXP_CONTAINS(jkey, r'ServiceJourney:\d+[-_]')
+  -- trains: Vy's numbered DatedServiceJourneys, SJN's '<number>:<date>'
+  WHERE REGEXP_CONTAINS(jkey, r'ServiceJourney:\d+[-_]') OR REGEXP_CONTAINS(jkey, r'^\d+:')
   QUALIFY stop_order > MIN(stop_order) OVER (PARTITION BY jkey)
       AND stop_order < MAX(stop_order) OVER (PARTITION BY jkey)
       AND (NOT boarding_allowed OR NOT alighting_allowed)
   UNION DISTINCT
-  SELECT line FROM UNNEST(['F4', 'RX11']) AS line
+  SELECT operator, line FROM UNNEST([
+    STRUCT('VYG' AS operator, 'F4' AS line), ('VYG', 'RX11'), ('SJN', 'F6'), ('SJN', 'F7')])
 ),
+-- One row per operator: every count below is that operator's alone.
 guard AS (
   SELECT
-    (SELECT COUNT(*) FROM today) AS n_today,
-    (SELECT COUNT(*) FROM standing) AS n_standing,
-    (SELECT COUNT(*) FROM missing) AS n_missing,
-    (SELECT MAX(gtfs_version) FROM gtfs WHERE od = @d) AS gtfs_version,
+    op AS operator,
+    (SELECT COUNT(*) FROM today WHERE operator = op) AS n_today,
+    (SELECT COUNT(*) FROM standing WHERE operator = op) AS n_standing,
+    (SELECT COUNT(*) FROM missing WHERE operator = op) AS n_missing,
+    (SELECT MAX(gtfs_version) FROM gtfs WHERE od = @d AND operator = op) AS gtfs_version,
     -- NULL, not FALSE, when the calendar has no row for @d: an unmaintained calendar fails closed.
     (SELECT LOGICAL_OR(holiday) FROM `disruptions.togvarsel_calendar` WHERE d = @d) AS holiday,
-    (SELECT COUNT(DISTINCT trainno) FROM trips WHERE od = @d) AS n_today_trains,
+    (SELECT COUNT(DISTINCT trainno) FROM trips WHERE od = @d AND operator = op) AS n_today_trains,
     (SELECT COUNT(DISTINCT t.trainno)
      FROM trips AS t
-     LEFT JOIN (SELECT DISTINCT trainno FROM standing) AS s ON s.trainno = t.trainno
-     WHERE t.od = @d AND s.trainno IS NULL) AS n_new
+     LEFT JOIN (SELECT DISTINCT operator, trainno FROM standing) AS s
+       ON s.operator = t.operator AND s.trainno = t.trainno
+     WHERE t.od = @d AND t.operator = op AND s.trainno IS NULL) AS n_new
+  FROM UNNEST(['VYG', 'SJN']) AS op
 )
 SELECT
   CONCAT('RemovedJourney:', c.trainno, '_', FORMAT_DATE('%Y-%m-%d', @d)) AS jkey,
-  CONCAT('VYG:Line:', c.line) AS lineRef,
+  CONCAT(c.operator, ':Line:', c.line) AS lineRef,
   c.quay,
   c.parent_station AS stop_place,
   c.stop_name,
@@ -239,10 +269,10 @@ SELECT
   bn.trainno IS NOT NULL AS bus_for_train,
   g.gtfs_version
 FROM calls AS c
-CROSS JOIN guard AS g
-LEFT JOIN bus_numbers AS bn ON bn.trainno = c.trainno
-LEFT JOIN stood_in AS si ON si.trainno = c.trainno
-LEFT JOIN restricted AS r ON r.line = c.line
+JOIN guard AS g ON g.operator = c.operator
+LEFT JOIN bus_numbers AS bn ON bn.operator = c.operator AND bn.trainno = c.trainno
+LEFT JOIN stood_in AS si ON si.operator = c.operator AND si.trainno = c.trainno
+LEFT JOIN restricted AS r ON r.operator = c.operator AND r.line = c.line
 WHERE si.trainno IS NULL
   AND r.line IS NULL
   -- CASE, not AND: BigQuery does not promise to short-circuit AND, and ERROR() must be reached
@@ -251,8 +281,11 @@ WHERE si.trainno IS NULL
     WHEN NOT @enabled OR g.n_today = 0 THEN FALSE
     WHEN g.holiday IS NOT FALSE THEN FALSE
     WHEN g.n_new > 0.25 * g.n_today_trains THEN FALSE
-    WHEN g.n_missing > 0.5 * g.n_standing THEN ERROR(FORMAT(
+    -- Vy's refusal keeps the previous table (the poller logs the ERROR). SJN's is quiet: its
+    -- ~80 trains a day must not be able to take Vy's rows down with it.
+    WHEN g.n_missing > 0.5 * g.n_standing AND c.operator = 'VYG' THEN ERROR(FORMAT(
       'rail_calls_removed_today refused: %d of %d standing trains missing from the %t plan',
       g.n_missing, g.n_standing, @d))
+    WHEN g.n_missing > 0.5 * g.n_standing THEN FALSE
     ELSE TRUE
   END;

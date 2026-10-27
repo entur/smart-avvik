@@ -32,11 +32,18 @@ import sys
 sql, day = open(sys.argv[1]).read(), sys.argv[2]
 live_et = sql[sql.index("et_trains AS (") : sql.index("\n),", sql.index("et_trains AS (")) + 1]
 replay_et = """et_trains AS (
-  SELECT DISTINCT n AS trainno
+  SELECT DISTINCT 'VYG' AS operator, n AS trainno
   FROM `ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded`,
     UNNEST([REGEXP_EXTRACT(datedServiceJourneyId, r'ServiceJourney:(\\d+)[-_]'),
             REGEXP_EXTRACT(datedServiceJourneyId, r'ServiceJourney:\\d+-(\\d+)_')]) AS n
   WHERE operatingDate = @d AND dataSource = 'VYG' AND n IS NOT NULL
+  UNION DISTINCT
+  -- SJ Norge through Bane NOR: '<number>:<departure date>' in serviceJourneyId (KIX-43)
+  SELECT DISTINCT 'SJN', REGEXP_EXTRACT(serviceJourneyId, r'^(\\d+):')
+  FROM `ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded`
+  WHERE operatingDate BETWEEN DATE_SUB(@d, INTERVAL 1 DAY) AND DATE_ADD(@d, INTERVAL 1 DAY)
+    AND dataSource = 'BNR' AND lineRef LIKE 'SJN:%' AND vehicleMode = 'rail'
+    AND SAFE.PARSE_DATE('%Y-%m-%d', REGEXP_EXTRACT(serviceJourneyId, r':(\\d{4}-\\d{2}-\\d{2})$')) = @d
 """
 header = "CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today`"
 assert sql.count(header) == 1 and sql.count(live_et) == 1
