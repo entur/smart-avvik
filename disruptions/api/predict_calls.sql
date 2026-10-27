@@ -83,7 +83,12 @@ sit AS (
       ELSE 'other'
     END AS status,
     d.planned,
-    ARRAY_LENGTH(d.affected_journeys) AS num_journeys,
+    -- SJ names one train under two refs, '..._STK-LMO_26-10-13' and '..._STK-LMO_M_26-10-13'; counted
+    -- raw, num_journeys would double for exactly the trains it describes (KIX-42).
+    IF(d.participantRef = 'SJN',
+       (SELECT COUNT(DISTINCT REGEXP_REPLACE(j, r'_M_(\d{2}-\d{2}-\d{2})$', r'_\1'))
+        FROM UNNEST(d.affected_journeys) AS j),
+       ARRAY_LENGTH(d.affected_journeys)) AS num_journeys,
     ARRAY_LENGTH(d.affected_stops)    AS num_stops,
     ARRAY_LENGTH(d.affected_lines)    AS num_lines,
     d.affected_journeys,
@@ -101,10 +106,19 @@ sit AS (
     AND NOT IFNULL(d.all_clear, FALSE)
 ),
 aff AS (
-  SELECT
+  -- DISTINCT because SJ's two refs for one train bridge to one jkey; a no-op for NSB, whose
+  -- stripped refs were distinct in all 54 780 situations of 2025-10..2026-10.
+  SELECT DISTINCT
     s.situationNumber, s.onset_ts, s.summary, s.status, s.planned,
     s.num_journeys, s.num_stops, s.num_lines, s.category, s.stated_min,
-    REGEXP_REPLACE(j, r'^[A-Za-z]+:', '') AS jkey
+    -- SJ Norge's ET comes through Bane NOR as '<train number>:<date>', so its own refs
+    -- ('SJN:DatedServiceJourney:<nr>_<from>-<to>[_M]_<yy-mm-dd>') bridge on number + date, as
+    -- alternatives.cache_key does for JP. A replacement-bus ref ('...:B425-...') has no leading
+    -- digits, comes out NULL and joins nothing.
+    IF(STARTS_WITH(j, 'SJN:'),
+       CONCAT(REGEXP_EXTRACT(j, r'^SJN:DatedServiceJourney:(\d+)_'), ':',
+              FORMAT_DATE('%Y-%m-%d', SAFE.PARSE_DATE('%y-%m-%d', REGEXP_EXTRACT(j, r'_(\d{2}-\d{2}-\d{2})$')))),
+       REGEXP_REPLACE(j, r'^[A-Za-z]+:', '')) AS jkey
   FROM sit AS s, UNNEST(s.affected_journeys) AS j
 ),
 base AS (

@@ -1,5 +1,9 @@
--- Build disruptions.disruptions_initial_today: TODAY's NSB situations in the INITIAL-version
+-- Build disruptions.disruptions_initial_today: TODAY's NSB and SJN situations in the INITIAL-version
 -- per-situation feature/label shape, so predict.sql can score the live incidents.
+--
+-- SJN (SJ Norge's own messages) since KIX-42, 2026-10-24, for predict_calls.sql's flagged branch
+-- only: predict.sql (the duration model and the /disruptions feed) keeps to NSB, and the impact
+-- label below reads Vy's rail_calls_today, so it is 0 for SJN and nothing reads it for them.
 --
 -- create_disruptions_initial.sql does the full 2-year build of disruptions.disruptions_initial
 -- (the training population). This script applies the SAME first-version feature snapshot and
@@ -33,7 +37,7 @@ WITH all_versions AS (
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
   -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
   WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
-    AND participantRef = 'NSB'
+    AND participantRef IN ('NSB', 'SJN')
 ),
 -- First version = feature snapshot AND clock start (onset).
 first_version AS (
@@ -119,6 +123,8 @@ base AS (
     -- «Toget kjører igjen»). Measured 2026-09-20..10-06: 377 of 383 such NSB situations say exactly
     -- that, and the other 6 («Planlegger buss for tog» and the like) were CLOSED by Vy. Serving drops
     -- these (predict_calls.sql); bus operators use GENERAL for live problems, so this is NSB-only.
+    -- It is inert for SJN, which never republishes as GENERAL and never closes (267 situations
+    -- 2025-10..2026-10): each SJN message only reaches its own train's 12 h window anyway.
     (fv.reportType = 'INCIDENT' AND lv.latest_report_type = 'GENERAL') AS all_clear,
     (
       SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
@@ -177,6 +183,14 @@ base AS (
   LEFT JOIN end_times AS et USING (participantRef, situationNumber)
   LEFT JOIN latest_version AS lv USING (participantRef, situationNumber)
   WHERE (fv.severity IS NULL OR fv.severity != 'NO_IMPACT')
+    -- SJ publishes unfilled template fields («{START1} at du bruker annen transport», «Bruk andre
+    -- tog til {STASJON}»): 6 of 267 SJN situations in a year, 0 of 119 807 NSB messages. Such a
+    -- text would reach the card and the wording model as is, so the situation is dropped and its
+    -- train falls through to the no-SX and ET-relay branches like any train nobody wrote about.
+    AND NOT EXISTS (SELECT 1 FROM UNNEST(ARRAY_CONCAT(fv.summaries, fv.descriptions)) AS x
+                    WHERE REGEXP_CONTAINS(x.value, r'\{[^}]+\}'))
+    AND NOT REGEXP_CONTAINS(CONCAT(IFNULL(lv.latest_summary, ''), ' ', IFNULL(lv.latest_description, '')),
+                            r'\{[^}]+\}')
 ),
 -- Impacted calls (cancel or big delay) at affected stops, within the look window.
 -- rail_calls_today (today's ET), NOT rail_calls (2-year) — today's incidents' calls live in
