@@ -160,9 +160,9 @@ export interface Journey {
   // Something about the registration itself, not about today's traffic: currently only "no planned
   // trip connects these stops today", which means this journey cannot produce an alert.
   warning: string | null;
-  // Every Vy train in today's window, graded -- the «I dag» strip (plan 2026-09-22-001). Null while
-  // the server has no timetable loaded; absent from a server that predates the field. The card
-  // renders exactly as before in both cases.
+  // Every Vy and SJ Norge train in today's window, graded -- the «I dag» strip (plan
+  // 2026-09-22-001). Null while the server has no timetable loaded; absent from a server that
+  // predates the field. The card renders exactly as before in both cases.
   today?: JourneyStatus | null;
 }
 

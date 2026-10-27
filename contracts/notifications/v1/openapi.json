@@ -557,7 +557,7 @@
         ],
         "summary": "Every train in a journey definition's window today, graded",
         "security": [],
-        "description": "Every Vy train in today's window on a definition nobody registered, in departure order, each graded: `confirmed` where the outcome is known (ran on time, ran late, cancelled), `predicted` where the model behind `journey-alerts` has a figure, `unknown` where nothing can be said. Built for a glanceable overview of today's commute: one circle per train, filled for a fact and a ring for a forecast.\n\n**No credential**, and the same limiter as `GET /journey-alerts` -- the SAME buckets, global and per canonical stop pair, so reading both routes for one favourite spends the thirty per pair per minute twice as fast.\n\n**The definition** is validated and canonicalized exactly as `journey-alerts` does it, and echoed in `journey`. Only today is answered.\n\n**How old each fact can be** is in `as_of`: the day's timetable (which trains exist, and a cancellation) is rebuilt hourly, the recorded calls every fifteen minutes, the forecasts every prediction cycle. `red` for a forecast is the same bar a notification fires at, applied to the same pairing of a train's two calls. The two reads agree on which forecast trains are bad, with one stated exception: a trip is `cancelled` here when EITHER end is, while notifications fire on the boarding call, so a train cancelled only at your destination is red here and can be absent from `journey-alerts`.\n\n**After a deploy** the timetable is not in memory for the first cycle and the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.",
+        "description": "Every Vy and SJ Norge train in today's window on a definition nobody registered, in departure order, each graded: `confirmed` where the outcome is known (ran on time, ran late, cancelled), `predicted` where the model behind `journey-alerts` has a figure, `unknown` where nothing can be said. Built for a glanceable overview of today's commute: one circle per train, filled for a fact and a ring for a forecast.\n\n**No credential**, and the same limiter as `GET /journey-alerts` -- the SAME buckets, global and per canonical stop pair, so reading both routes for one favourite spends the thirty per pair per minute twice as fast.\n\n**The definition** is validated and canonicalized exactly as `journey-alerts` does it, and echoed in `journey`. Only today is answered.\n\n**How old each fact can be** is in `as_of`: the day's timetable (which trains exist, and a cancellation) is rebuilt hourly, the recorded calls every fifteen minutes, the forecasts every prediction cycle. `red` for a forecast is the same bar a notification fires at, applied to the same pairing of a train's two calls. The two reads agree on which forecast trains are bad, with one stated exception: a trip is `cancelled` here when EITHER end is, while notifications fire on the boarding call, so a train cancelled only at your destination is red here and can be absent from `journey-alerts`.\n\n**After a deploy** the timetable is not in memory for the first cycle and the read answers `503 plan_not_loaded` with `Retry-After`, never an empty list.",
         "parameters": [
           {
             "name": "from_stop",
@@ -1174,7 +1174,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "The operator codespaces the service scores at all -- Vy rail and the trained bus operators. A train by any other operator is never listed, however disrupted."
+                "description": "The operator codespaces the service scores at all -- Vy and SJ Norge rail and the trained bus operators. A train by any other operator is never listed, however disrupted."
               },
               "from_stop_in_timetable_today": {
                 "type": "boolean",
@@ -1439,7 +1439,7 @@
         "title": "Journey status",
         "type": "object",
         "additionalProperties": false,
-        "description": "Every Vy train in today's window on the definition, in departure order, each graded. Built per request from memory the service already holds; nothing in it identifies a registration.",
+        "description": "Every Vy and SJ Norge train in today's window on the definition, in departure order, each graded. Built per request from memory the service already holds; nothing in it identifies a registration.",
         "required": [
           "now",
           "date",
@@ -1503,7 +1503,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Operators whose trains are listed: `[\"VYG\"]`. A trip by any other operator is never listed."
+            "description": "Operators whose trains are listed: `[\"VYG\", \"SJN\"]`. A trip by any other operator is never listed."
           },
           "as_of": {
             "type": "object",
@@ -1594,7 +1594,7 @@
                 "items": {
                   "type": "string"
                 },
-                "description": "The operators this answer covers -- `[\"VYG\"]`, the same as the top-level `operators`."
+                "description": "The operators this answer covers -- `[\"VYG\", \"SJN\"]`, the same as the top-level `operators`."
               },
               "from_stop_in_timetable_today": {
                 "type": "boolean",
@@ -1670,7 +1670,7 @@
           },
           "operator": {
             "type": "string",
-            "description": "Operator codespace (`VYG`)."
+            "description": "Operator codespace (`VYG` or `SJN`)."
           },
           "line": {
             "type": [

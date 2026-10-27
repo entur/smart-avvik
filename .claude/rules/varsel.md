@@ -331,10 +331,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   no tombstone and read as "never turned on" in the report, so the split is meaningful only from
   2026-09-04.
   **Each journey card carries an «I dag» strip since 2026-09-22** (plan
-  `docs/plans/2026-09-22-001-feat-journey-status-strip-plan.md`): one circle per Vy train in today's
-  window, filled for a fact (the alighting call recorded, or a declared cancellation whose time has
-  passed), a ring for a forecast and grey where nothing can be said. It is `Journey.today` on
-  `GET /varsel-api/journeys` and the same body on the public `GET /notification-api/v1/journey-status`,
+  `docs/plans/2026-09-22-001-feat-journey-status-strip-plan.md`): one circle per Vy or SJ Norge
+  train in today's window, filled for a fact (the alighting call recorded, or a declared
+  cancellation whose time has passed), a ring for a forecast and grey where nothing can be said.
+  It is `Journey.today` on `GET /varsel-api/journeys` and the same body on the public
+  `GET /notification-api/v1/journey-status`,
   both from the leaf module `disruptions/api/journey_status.py`, which imports `impact` and
   `alert_policy` only, and gets `varsel.place_refs` by injection. **Three in-memory sources, one
   precedence**: the day's planned timetable (`rail_calls_planned_today`, loaded by
@@ -358,10 +359,12 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   call (a terminus by the last recorded call before it): an arrival-delay column was measured at
   +11 % on the planned rebuild and +58 % on the 15-min actuals scan and left out. Nothing is cached
   and nothing touches BigQuery on a request. The public read spends `journey-alerts`' limiter
-  buckets and logs `notification_status`. Vy rail only, today only. **A green forecast reads «ventet
-  i rute»** (2026-10-23, `dagensReiseModel.stateText`): the words follow the circle's colour, so a
-  typical delay under 5 min is never quoted — a DISPLAY rule only, the served p50 stays the honest
-  number. Its price is in the comment beside it (SX trains called on time: 20 % arrive ≥ 5 late).
+  buckets and logs `notification_status`. Vy and SJ Norge rail only (Go-Ahead is not in the
+  feed until shortly before each train runs, so it needs a GTFS timetable), today only. **A green
+  forecast reads «ventet i rute»** (2026-10-23, `dagensReiseModel.stateText`): the words follow the
+  circle's colour, so a typical delay under 5 min is never quoted — a DISPLAY rule only, the served
+  p50 stays the honest number. Its price is in the comment beside it (SX trains called on time: 20 %
+  arrive ≥ 5 late).
   **Trains Vy took OUT of the plan are cancellations too** (2026-09-23, plan
   `docs/plans/2026-09-23-001-feat-removed-trains-plan.md`). From 2026-09-19 Vy has been removing
   trains from the day's timetable instead of cancelling them — 188 standing trains on 2026-09-23

@@ -429,7 +429,7 @@ class JourneyStatusResponse(journey_status.JourneyStatus):
     """Every train in the definition's window today, graded (plan 2026-09-22-001) -- the body
     `/varsel`'s «I dag» strip renders, plus the echoed definition and the coverage block.
     `coverage.operators` is `journey_status.OPERATORS`, not this read's `SERVED_OPERATORS`: the
-    timetable behind the strip is Vy rail only."""
+    timetable behind the strip is Vy and SJ Norge rail only."""
 
     model_config = ConfigDict(extra="forbid")
     journey: JourneyOut
@@ -1898,8 +1898,8 @@ async def journey_status_read(
         "optional, and never changes the answer.",
     ),
 ) -> JourneyStatusResponse:
-    """Every Vy train in today's window on this definition, each graded: `confirmed` where the
-    outcome is known, `predicted` where the model has a figure, `unknown` otherwise.
+    """Every Vy and SJ Norge train in today's window on this definition, each graded: `confirmed`
+    where the outcome is known, `predicted` where the model has a figure, `unknown` otherwise.
 
     Built per request from memory: the day's planned timetable (rebuilt hourly), the prediction
     cache (every poller cycle) and today's recorded calls. `as_of` says how old each is. A day not
