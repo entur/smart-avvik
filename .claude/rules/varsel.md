@@ -989,6 +989,13 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   SJN trains once rather than twice. Flagged SJN calls alert at `_OPERATOR_ALERT_THRESHOLD["SJN"]`
   = 0.75, not 0.65 (`data/queries/eval_sjn_flagged.sql`): at 0.65 «innstilt» was right 77 % of the
   time, mostly on part-cancelled trains.
+  **SJ trains taken out of the timetable ride the removed-trains relay since KIX-43**:
+  `rail_calls_removed_today.sql` carries an `operator` through every CTE, and its guards are one row
+  per operator, so a Vy timetable change cannot silence SJN and an SJN refusal is quiet instead of
+  an `ERROR()` that would keep Vy's previous table too. SJN's F6 and F7 close boarding mid-journey
+  and are excluded like Vy's F4 and RX11; SJN's GTFS has no bus trips, so `bus_for_train` is
+  Vy-only. The labeller's removed branch reads SJN's train number from `<nr>:<date>` and joins on
+  operator; re-register `varsel-label-daily` in both environments after merging.
   Four places keep it from leaking or missing, each easy to undo by accident:
   `predict_calls.sql`'s `netpre` stays Vy-only (training's network is Vy; without the filter 1 110
   of 8 694 Vy rows moved on one snapshot, pinned in `test_impact.py`); Rushvarsel's provisional

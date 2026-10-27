@@ -1312,6 +1312,20 @@ def test_the_removed_sql_takes_the_parameters_the_poller_passes():
     assert sql.count("CREATE OR REPLACE TABLE `disruptions.rail_calls_removed_today`") == 1
 
 
+def test_sjn_removals_are_guarded_apart_from_vy():
+    # KIX-43: SJ Norge rides the same relay, but its guards are its own. A half-written SJN plan
+    # must not ERROR the build (that keeps Vy's previous table too), and F6/F7 close boarding
+    # mid-journey, which GTFS cannot say, so they are left out as F4 and RX11 are.
+    import re
+
+    sql = re.sub(r"--.*$", "", main._RAIL_CALLS_REMOVED_QUERY, flags=re.MULTILINE)
+    assert "FROM UNNEST(['VYG', 'SJN']) AS op" in sql, "one guard row per operator"
+    assert "JOIN guard AS g ON g.operator = c.operator" in sql
+    assert "AND c.operator = 'VYG' THEN ERROR(" in sql, "only Vy's refusal errors"
+    assert "('SJN', 'F6'), ('SJN', 'F7')" in sql
+    assert "CONCAT(c.operator, ':Line:', c.line) AS lineRef" in sql
+
+
 class _Ticks:
     """Duck-types the stop_event: poll_for_changes runs exactly `n` loop iterations."""
 
