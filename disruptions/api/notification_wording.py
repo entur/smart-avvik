@@ -133,10 +133,15 @@ def removed_digest(trains: list[tuple[str, bool]], *, weekday: int) -> tuple[str
 # ---- The template wording -----------------------------------------------------------------------
 def delay_phrase(message_input: dict) -> str | None:
     """"typisk 15–27 min forsinket" from the exceedance-stack interval (p50–p90, /demo's delay
-    column); collapsed to one number when they coincide, None when neither is known."""
+    column); collapsed to one number when they coincide, None when neither is known.
+
+    Also None when the median is on time (p50 == 0). The stack's p90 is then at most 3 min
+    (predict_calls.sql, arr_delay_p50_stack_min), and the fall-through below would quote it as
+    «Typisk 3 min forsinket» -- the opposite of the median it stands in for. Unreachable before
+    2026-10-23, when the median could not go below 3."""
     delay = message_input.get("forsinkelse_min") or {}
     p50, p90 = delay.get("typisk"), delay.get("verstefall")
-    if not p50 and not p90:
+    if p50 == 0 or (not p50 and not p90):
         return None
     if p50 and p90 and p90 > p50:
         return f"Typisk {p50}–{p90} min forsinket"

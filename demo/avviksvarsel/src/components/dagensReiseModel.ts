@@ -51,8 +51,14 @@ function stateText(train: TrainStatus): string {
     return train.delay_min <= 0 ? 'kom fram i rute' : `kom fram ${train.delay_min} min forsinket`;
   }
   if (train.level === 'red') return 'fare for over 10 min forsinkelse eller innstilling';
+  // A green forecast reads as practically on time (2026-10-23): the server grades a typical delay
+  // under 5 min green (journey_status.YELLOW_DELAY_MIN), so the words follow the circle's colour
+  // and «ventet 2 min forsinket» is never said. The price, measured on the lead-time holdout: of
+  // the trains a disruption message names that this calls on time, 20 % arrive >= 5 min late and
+  // 9 % >= 10 (without a message 8 % and 2.4 %). The number itself stays honest for every other
+  // use (expected departure, alternatives), which is why this lives here and not in the SQL.
   const typ = train.delay_p50_min ?? 0;
-  return typ > 0 ? `ventet ${typ} min forsinket` : 'ventet i rute';
+  return train.level === 'yellow' && typ > 0 ? `ventet ${typ} min forsinket` : 'ventet i rute';
 }
 
 /** How many trains are left of «nå»: every train whose aimed departure is at or before `now`. */

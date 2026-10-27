@@ -55,11 +55,11 @@ CREATE TEMP FUNCTION platt_w(p FLOAT64, a FLOAT64, b FLOAT64, w FLOAT64) AS (
 );
 
 -- Delay quantile (minutes) read off the monotone survival curve s5..s40 = P(delay >= 5..40):
--- q = 0.5 gives the median, q = 0.1 the p90 (10 % exceedance). Same piecewise-linear
--- interpolation + sqrt tail cap as predict_calls.sql.
+-- q = 0.5 gives the median, q = 0.1 the p90 (10 % exceedance). Same curve as predict_calls.sql:
+-- log-linear and floored below 5 min, piecewise-linear above, sqrt tail cap.
 CREATE TEMP FUNCTION stack_q(s5 FLOAT64, s10 FLOAT64, s20 FLOAT64, s40 FLOAT64, q FLOAT64) AS (
   CAST(ROUND(CASE
-    WHEN s5  <= q THEN (1 - q) / GREATEST(1 - s5, 0.001) * 5
+    WHEN s5  <= q THEN FLOOR(5 * LN(q) / LN(GREATEST(s5, 1e-6)))
     WHEN s10 <= q THEN 5  + (s5  - q) / GREATEST(s5  - s10, 0.001) * 5
     WHEN s20 <= q THEN 10 + (s10 - q) / GREATEST(s10 - s20, 0.001) * 10
     WHEN s40 <= q THEN 20 + (s20 - q) / GREATEST(s20 - s40, 0.001) * 20

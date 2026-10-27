@@ -80,6 +80,8 @@ test('the label names the line, the time and what is known', () => {
   );
   assert.equal(circleLabel(train('08:18', { level: 'yellow', delay_p50_min: 4 })), 'L1 08:18, ventet 4 min forsinket');
   assert.equal(circleLabel(train('08:33')), 'L1 08:33, ventet i rute');
+  // Green is practically on time: a typical delay under 5 min is not quoted.
+  assert.equal(circleLabel(train('08:40', { level: 'green', delay_p50_min: 3 })), 'L1 08:40, ventet i rute');
   assert.equal(circleLabel(train('07:33', { state: 'confirmed', level: 'yellow', delay_min: 5 })), 'L1 07:33, kom fram 5 min forsinket');
   assert.equal(circleLabel(train('07:03', { state: 'confirmed', delay_min: 0 })), 'L1 07:03, kom fram i rute');
   assert.equal(
@@ -107,7 +109,7 @@ test('an unrecorded train well past its expected arrival reads as not registered
   assert.equal(circleLabel(late, oslo('11:26')), 'L1 09:54, ankomst ikke registrert');
   assert.equal(circleLabel(late, oslo('21:52')), 'L1 09:54, ankomst ikke registrert');
   // No arrival time known: never claims the arrival is missing.
-  assert.equal(circleLabel(train('07:03', { delay_p50_min: 2, level: 'green' }), oslo('21:52')), 'L1 07:03, underveis, ventet 2 min forsinket');
+  assert.equal(circleLabel(train('07:03', { delay_p50_min: 2, level: 'green' }), oslo('21:52')), 'L1 07:03, underveis, ventet i rute');
   // Only forecasts: a confirmed or unknown train keeps its own wording.
   assert.equal(circleLabel(train('07:03', { state: 'unknown', level: 'grey', arrival_time: oslo('07:40') }), oslo('21:52')), 'L1 07:03, ikke vurdert');
 });

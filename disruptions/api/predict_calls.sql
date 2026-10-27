@@ -17,7 +17,8 @@
 --     the last observed 60 min).
 --   * exceedance stacks arr_ge{5,10,20,40}_clf + dep_ge{5,10,20,40}_clf with their *_platt
 --     layers -> calibrated P(delay >= t) per side, monotonicity-enforced survival curves ->
---     arr_delay_p50/p90_stack_min + dep_delay_p50/p90_stack_min intervals and the alerts
+--     arr_delay_p50/p90_stack_min + dep_delay_p50/p90_stack_min intervals (log-linear and
+--     floored below 5 min since 2026-10-23, see arr_delay_p50_stack_min) and the alerts
 --     p_impact (arrival) / p_impact_dep (departure) = p_cancel + (1-p_cancel) * P(>=10).
 --   * 2026-07-03 ALL CALIBRATION IS ASK-HORIZON-AWARE: every platt layer is fit at the
 --     training anchoring (~30 min before the call), so earlier asks are mis-calibrated
@@ -825,14 +826,27 @@ SELECT
   IF(s.is_origin, NULL, ROUND(s.s10, 4)) AS p_arr_ge10,
   IF(s.is_origin, NULL, ROUND(s.s20, 4)) AS p_arr_ge20,
   IF(s.is_origin, NULL, ROUND(s.s40, 4)) AS p_arr_ge40,
+  -- The quantiles read off the survival curve. Below 5 min the stack has no rung, so the curve runs
+  -- LOG-linearly from S(0) = 1 to S(5) = s5 -- S(t) = s5^(t/5) -- and the crossing is FLOORED, not
+  -- rounded: labels are truncated minutes, so the integer quantile of the curve is the floor of
+  -- where it crosses. Until 2026-10-23 that stretch was linear and rounded, which can never go
+  -- below 2.5 -> 3 (the p90 below 4.5 -> 5): 95 % of no-SX calls read 3 min where the realized
+  -- median is 0, and «I dag» said «ventet 3 min forsinket» about nearly every train. Measured on
+  -- the leadtime holdout, rail and bus, both sides: the median now sits on the realized one in
+  -- every s5 band but 0.3-0.5, where it reads ~3 against a realized 4-5 (SX rail, bus); the p90
+  -- covers 88-92 % (was 89-95 %, over-covering at the bottom). Carrying the 5->10 segment's slope
+  -- back below 5 gained ~0.1 min there and was left out. p50 = 0 only when s5 < 0.5^5 (~0.031),
+  -- and the p90 is then at most 3, which is why the wordings quote nothing for it
+  -- (notification_wording.delay_phrase). The rungs from 5 min up are unchanged. The dep twin
+  -- below, predict_calls_bus.sql and data/queries' copies use the same formula.
   IF(s.is_origin, NULL, CAST(ROUND(CASE
-    WHEN s.s5  <= 0.5 THEN (1 - 0.5) / GREATEST(1 - s.s5, 0.001) * 5
+    WHEN s.s5  <= 0.5 THEN FLOOR(5 * LN(0.5) / LN(GREATEST(s.s5, 1e-6)))
     WHEN s.s10 <= 0.5 THEN 5  + (s.s5  - 0.5) / GREATEST(s.s5  - s.s10, 0.001) * 5
     WHEN s.s20 <= 0.5 THEN 10 + (s.s10 - 0.5) / GREATEST(s.s10 - s.s20, 0.001) * 10
     WHEN s.s40 <= 0.5 THEN 20 + (s.s20 - 0.5) / GREATEST(s.s20 - s.s40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.s40 / 0.5), 90) END) AS INT64)) AS arr_delay_p50_stack_min,
   IF(s.is_origin, NULL, CAST(ROUND(CASE
-    WHEN s.s5  <= 0.1 THEN (1 - 0.1) / GREATEST(1 - s.s5, 0.001) * 5
+    WHEN s.s5  <= 0.1 THEN FLOOR(5 * LN(0.1) / LN(GREATEST(s.s5, 1e-6)))
     WHEN s.s10 <= 0.1 THEN 5  + (s.s5  - 0.1) / GREATEST(s.s5  - s.s10, 0.001) * 5
     WHEN s.s20 <= 0.1 THEN 10 + (s.s10 - 0.1) / GREATEST(s.s10 - s.s20, 0.001) * 10
     WHEN s.s40 <= 0.1 THEN 20 + (s.s20 - 0.1) / GREATEST(s.s20 - s.s40, 0.001) * 20
@@ -853,13 +867,13 @@ SELECT
   IF(s.is_terminal, NULL, ROUND(s.d20, 4)) AS p_dep_ge20,
   IF(s.is_terminal, NULL, ROUND(s.d40, 4)) AS p_dep_ge40,
   IF(s.is_terminal, NULL, CAST(ROUND(CASE
-    WHEN s.d5  <= 0.5 THEN (1 - 0.5) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d5  <= 0.5 THEN FLOOR(5 * LN(0.5) / LN(GREATEST(s.d5, 1e-6)))
     WHEN s.d10 <= 0.5 THEN 5  + (s.d5  - 0.5) / GREATEST(s.d5  - s.d10, 0.001) * 5
     WHEN s.d20 <= 0.5 THEN 10 + (s.d10 - 0.5) / GREATEST(s.d10 - s.d20, 0.001) * 10
     WHEN s.d40 <= 0.5 THEN 20 + (s.d20 - 0.5) / GREATEST(s.d20 - s.d40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.d40 / 0.5), 90) END) AS INT64)) AS dep_delay_p50_stack_min,
   IF(s.is_terminal, NULL, CAST(ROUND(CASE
-    WHEN s.d5  <= 0.1 THEN (1 - 0.1) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d5  <= 0.1 THEN FLOOR(5 * LN(0.1) / LN(GREATEST(s.d5, 1e-6)))
     WHEN s.d10 <= 0.1 THEN 5  + (s.d5  - 0.1) / GREATEST(s.d5  - s.d10, 0.001) * 5
     WHEN s.d20 <= 0.1 THEN 10 + (s.d10 - 0.1) / GREATEST(s.d10 - s.d20, 0.001) * 10
     WHEN s.d40 <= 0.1 THEN 20 + (s.d20 - 0.1) / GREATEST(s.d20 - s.d40, 0.001) * 20

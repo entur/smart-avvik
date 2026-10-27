@@ -113,9 +113,10 @@ export const CANCEL_LIKELY = 0.5;
 
 /** Which figure the /varsel push text would have quoted for this snapshot, or null if it would not
  *  have quoted one. Mirrors varsel.py's `_deterministic_body`: the cancellation probability above
- *  CANCEL_LIKELY, otherwise the delay interval — and neither when no delay figure is known (the
- *  falsy check, not a null check, matches `_delay_phrase`, which also treats 0 as absent). Returns
- *  null unless the snapshot actually crosses the alert threshold: with no push there is no text. */
+ *  CANCEL_LIKELY, otherwise the delay interval — and neither when no delay figure is known or the
+ *  median is on time (the falsy check, not a null check, plus p50 === 0: `_delay_phrase` quotes
+ *  nothing for either). Returns null unless the snapshot actually crosses the alert threshold: with
+ *  no push there is no text. */
 export function varselDriver(snap: {
   cancel_probability: number;
   delay_p50_min: number | null;
@@ -124,6 +125,7 @@ export function varselDriver(snap: {
 }): 'cancel' | 'delay' | null {
   if (!snap.would_alert) return null;
   if (snap.cancel_probability >= CANCEL_LIKELY) return 'cancel';
+  if (snap.delay_p50_min === 0) return null;
   return snap.delay_p50_min || snap.delay_p90_min ? 'delay' : null;
 }
 
