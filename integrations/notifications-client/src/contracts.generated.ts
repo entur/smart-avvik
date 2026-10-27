@@ -279,8 +279,9 @@ export interface NotificationEvent {
      * The `situations` as ONE Norwegian text, for showing in place of every `description` stacked:
      * the operator's own sentences, never rewritten, only left out or reordered. A forecast Vy has
      * superseded is left out («Forsinkelse forventes» once «Forsinket» is published), as is a
-     * sentence an earlier message already said (the shared cause), and advice («Ta neste tog ...»)
-     * comes after the facts. Exact repeats only: two messages that differ in a place name are both
+     * sentence an earlier message already said (the shared cause), and advice («Ta neste tog ...»,
+     * «Ta andre tog fra ...») is left out whenever the train has another message, kept when it is
+     * all the operator said. Exact repeats only: two messages that differ in a place name are both
      * kept. Built from the `has_situation` situations only, so null when there is none (a `KIX:`
      * situation alone); absent from an event minted before the field existed.
      */
