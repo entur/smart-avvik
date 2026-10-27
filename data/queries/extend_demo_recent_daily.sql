@@ -42,9 +42,10 @@ CREATE TEMP FUNCTION platt_w(p FLOAT64, a FLOAT64, b FLOAT64, w FLOAT64) AS (
                             / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) + IFNULL(w, 0))))
 );
 
+-- Same curve as create_demo_predictions.sql's stack_q (log-linear and floored below 5 min).
 CREATE TEMP FUNCTION stack_q(s5 FLOAT64, s10 FLOAT64, s20 FLOAT64, s40 FLOAT64, q FLOAT64) AS (
   CAST(ROUND(CASE
-    WHEN s5  <= q THEN (1 - q) / GREATEST(1 - s5, 0.001) * 5
+    WHEN s5  <= q THEN FLOOR(5 * LN(q) / LN(GREATEST(s5, 1e-6)))
     WHEN s10 <= q THEN 5  + (s5  - q) / GREATEST(s5  - s10, 0.001) * 5
     WHEN s20 <= q THEN 10 + (s10 - q) / GREATEST(s10 - s20, 0.001) * 10
     WHEN s40 <= q THEN 20 + (s20 - q) / GREATEST(s20 - s40, 0.001) * 20

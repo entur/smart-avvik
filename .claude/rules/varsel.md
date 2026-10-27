@@ -358,7 +358,10 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   call (a terminus by the last recorded call before it): an arrival-delay column was measured at
   +11 % on the planned rebuild and +58 % on the 15-min actuals scan and left out. Nothing is cached
   and nothing touches BigQuery on a request. The public read spends `journey-alerts`' limiter
-  buckets and logs `notification_status`. Vy rail only, today only.
+  buckets and logs `notification_status`. Vy rail only, today only. **A green forecast reads «ventet
+  i rute»** (2026-10-23, `dagensReiseModel.stateText`): the words follow the circle's colour, so a
+  typical delay under 5 min is never quoted — a DISPLAY rule only, the served p50 stays the honest
+  number. Its price is in the comment beside it (SX trains called on time: 20 % arrive ≥ 5 late).
   **Trains Vy took OUT of the plan are cancellations too** (2026-09-23, plan
   `docs/plans/2026-09-23-001-feat-removed-trains-plan.md`). From 2026-09-19 Vy has been removing
   trains from the day's timetable instead of cancelling them — 188 standing trains on 2026-09-23
@@ -796,7 +799,11 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     one), so no lower bar. Every scored train is ranked on `predicted_arrival_time` (aimed + our
     p50, never earlier than JP's) like the original already was; `risky` only publishes `at_risk`.
     Every alerted Vy train in that period had either `p_cancel` over the gate or a p50 of ≥ 3 min,
-    so an alerted original never ranks as on time.
+    so an alerted original never ranked as on time — but ≥ 3 was the p50's FLOOR, not a finding,
+    and the floor went on 2026-10-23 (`predict_calls.sql`, `arr_delay_p50_stack_min`). In prd's
+    cache that day the lowest p50 of an alerted train under the cancel gate was 1 min. 0 is
+    possible when `p_cancel` sits just under the gate, and that train then ranks on its delay
+    alone, which is the reading the gate already gives a `p_cancel` below it.
     The **hard** exclusion (`affected_refs`) is the subject train
     plus cells that are cancelled or over the alert gate — never every cell on the trip: since nosx
     scoring every running train has a cell, and until 2026-10-07 that excluded every in-window

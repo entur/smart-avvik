@@ -588,14 +588,16 @@ SELECT
   IF(s.is_origin, NULL, ROUND(s.s10, 4)) AS p_arr_ge10,
   IF(s.is_origin, NULL, ROUND(s.s20, 4)) AS p_arr_ge20,
   IF(s.is_origin, NULL, ROUND(s.s40, 4)) AS p_arr_ge40,
+  -- Log-linear and floored below 5 min, linear above: disruptions/api/predict_calls.sql
+  -- (arr_delay_p50_stack_min) says why and what it measured.
   IF(s.is_origin, NULL, CAST(ROUND(CASE
-    WHEN s.s5  <= 0.5 THEN (1 - 0.5) / GREATEST(1 - s.s5, 0.001) * 5
+    WHEN s.s5  <= 0.5 THEN FLOOR(5 * LN(0.5) / LN(GREATEST(s.s5, 1e-6)))
     WHEN s.s10 <= 0.5 THEN 5  + (s.s5  - 0.5) / GREATEST(s.s5  - s.s10, 0.001) * 5
     WHEN s.s20 <= 0.5 THEN 10 + (s.s10 - 0.5) / GREATEST(s.s10 - s.s20, 0.001) * 10
     WHEN s.s40 <= 0.5 THEN 20 + (s.s20 - 0.5) / GREATEST(s.s20 - s.s40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.s40 / 0.5), 90) END) AS INT64)) AS arr_delay_p50_stack_min,
   IF(s.is_origin, NULL, CAST(ROUND(CASE
-    WHEN s.s5  <= 0.1 THEN (1 - 0.1) / GREATEST(1 - s.s5, 0.001) * 5
+    WHEN s.s5  <= 0.1 THEN FLOOR(5 * LN(0.1) / LN(GREATEST(s.s5, 1e-6)))
     WHEN s.s10 <= 0.1 THEN 5  + (s.s5  - 0.1) / GREATEST(s.s5  - s.s10, 0.001) * 5
     WHEN s.s20 <= 0.1 THEN 10 + (s.s10 - 0.1) / GREATEST(s.s10 - s.s20, 0.001) * 10
     WHEN s.s40 <= 0.1 THEN 20 + (s.s20 - 0.1) / GREATEST(s.s20 - s.s40, 0.001) * 20
@@ -616,13 +618,13 @@ SELECT
   IF(s.is_terminal, NULL, ROUND(s.d20, 4)) AS p_dep_ge20,
   IF(s.is_terminal, NULL, ROUND(s.d40, 4)) AS p_dep_ge40,
   IF(s.is_terminal, NULL, CAST(ROUND(CASE
-    WHEN s.d5  <= 0.5 THEN (1 - 0.5) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d5  <= 0.5 THEN FLOOR(5 * LN(0.5) / LN(GREATEST(s.d5, 1e-6)))
     WHEN s.d10 <= 0.5 THEN 5  + (s.d5  - 0.5) / GREATEST(s.d5  - s.d10, 0.001) * 5
     WHEN s.d20 <= 0.5 THEN 10 + (s.d10 - 0.5) / GREATEST(s.d10 - s.d20, 0.001) * 10
     WHEN s.d40 <= 0.5 THEN 20 + (s.d20 - 0.5) / GREATEST(s.d20 - s.d40, 0.001) * 20
     ELSE LEAST(40 * SQRT(s.d40 / 0.5), 90) END) AS INT64)) AS dep_delay_p50_stack_min,
   IF(s.is_terminal, NULL, CAST(ROUND(CASE
-    WHEN s.d5  <= 0.1 THEN (1 - 0.1) / GREATEST(1 - s.d5, 0.001) * 5
+    WHEN s.d5  <= 0.1 THEN FLOOR(5 * LN(0.1) / LN(GREATEST(s.d5, 1e-6)))
     WHEN s.d10 <= 0.1 THEN 5  + (s.d5  - 0.1) / GREATEST(s.d5  - s.d10, 0.001) * 5
     WHEN s.d20 <= 0.1 THEN 10 + (s.d10 - 0.1) / GREATEST(s.d10 - s.d20, 0.001) * 10
     WHEN s.d40 <= 0.1 THEN 20 + (s.d20 - 0.1) / GREATEST(s.d20 - s.d40, 0.001) * 20

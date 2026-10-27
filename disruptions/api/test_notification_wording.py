@@ -117,6 +117,19 @@ def test_the_template_bytes_are_the_ones_varsel_was_sending():
         assert nw.deterministic_body(message_input) == expected, message_input
 
 
+def test_an_on_time_median_quotes_no_delay():
+    """The stack's median can be 0 since 2026-10-23, and its p90 is then at most 3 min. Falling
+    through to «Typisk 3 min forsinket» would quote the p90 as the typical delay of a train whose
+    median is on time; demo/avviksvarsel/test/format.test.mjs pins the card's twin."""
+    def phrase(p50, p90):
+        return nw.delay_phrase({"forsinkelse_min": {"typisk": p50, "verstefall": p90}})
+
+    assert phrase(0, 3) is None
+    assert phrase(0, 0) is None
+    assert phrase(1, 3) == "Typisk 1–3 min forsinket"
+    assert phrase(None, 12) == "Typisk 12 min forsinket"  # unchanged: only a p90 is known
+
+
 def test_the_alternative_clause_is_the_one_varsel_was_sending():
     """Its caveats are the load-bearing part: prd shipped this template, so a caveat that reaches
     only the prompt reaches nobody."""

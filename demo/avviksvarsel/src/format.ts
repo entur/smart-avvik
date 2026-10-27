@@ -115,10 +115,11 @@ export const LEG_MODE_NOUN: Record<string, string> = {
 export const CANCEL_LIKELY = 0.5;
 
 /** Delay phrasing from the exceedance-stack interval: "Typisk 15–27 min forsinket" (collapsed when
- *  p50 and p90 coincide, omitted when neither is known). Word-for-word varsel.py's `_delay_phrase`,
- *  capital T included, so the card and the push it describes cannot read differently. */
+ *  p50 and p90 coincide, omitted when neither is known or the median is on time). Word-for-word
+ *  varsel.py's `_delay_phrase`, capital T included, so the card and the push it describes cannot
+ *  read differently. */
 export function fmtDelay(p50: number | null, p90: number | null): string | null {
-  if (!p50 && !p90) return null;
+  if (p50 === 0 || (!p50 && !p90)) return null;
   if (p50 && p90 && p90 > p50) return `Typisk ${p50}–${p90} min forsinket`;
   return `Typisk ${p90 ?? p50} min forsinket`;
 }

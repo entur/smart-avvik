@@ -76,7 +76,7 @@ def calibrate(df, w, prefix):
     p50 = np.select(
         [s5 <= 0.5, s10 <= 0.5, s20 <= 0.5, s40 <= 0.5],
         [
-            0.5 / np.maximum(1 - s5, 0.001) * 5,
+            np.floor(5 * np.log(0.5) / np.log(np.maximum(s5, 1e-6))),  # log-linear, floored
             5 + (s5 - 0.5) / np.maximum(s5 - s10, 0.001) * 5,
             10 + (s10 - 0.5) / np.maximum(s10 - s20, 0.001) * 10,
             20 + (s20 - 0.5) / np.maximum(s20 - s40, 0.001) * 20,
