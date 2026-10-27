@@ -980,7 +980,15 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `docs/sjn/LEARNINGS.md`). SJN's ET arrives through Bane NOR (`dataSource = 'BNR'`) with lineRef
   `SJN:Line:*` and the legacy ref `<train number>:<date>`, so an SJN jkey is `49:2026-10-15` and its
   operator, read from the lineRef, is `SJN`. `rail_calls_planned_today.sql` takes those lineRefs, and
-  the no-SX path, the ET relay and the «I dag» strip serve them unchanged; no SJN SX is ingested.
+  the no-SX path, the ET relay and the «I dag» strip serve them unchanged.
+  **SJ's own SX are served since KIX-42 (2026-10-24)**: `disruptions_today.sql` reads
+  `participantRef IN ('NSB', 'SJN')` and drops a situation whose text carries an unfilled `{…}`
+  template field; `predict.sql` (duration model, `/disruptions`) stays NSB; `predict_calls.sql`'s
+  `aff` bridges `SJN:DatedServiceJourney:<nr>_…[_M]_<yy-mm-dd>` to `<nr>:<date>` and is DISTINCT,
+  because SJ names one train under two refs (the `_M` variant), which also made `num_journeys` count
+  SJN trains once rather than twice. Flagged SJN calls alert at `_OPERATOR_ALERT_THRESHOLD["SJN"]`
+  = 0.75, not 0.65 (`data/queries/eval_sjn_flagged.sql`): at 0.65 «innstilt» was right 77 % of the
+  time, mostly on part-cancelled trains.
   Four places keep it from leaking or missing, each easy to undo by accident:
   `predict_calls.sql`'s `netpre` stays Vy-only (training's network is Vy; without the filter 1 110
   of 8 694 Vy rows moved on one snapshot, pinned in `test_impact.py`); Rushvarsel's provisional

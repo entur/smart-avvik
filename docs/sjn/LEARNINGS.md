@@ -152,13 +152,47 @@ match its regexes); `varsel_connectivity.sql` (SJN-only stop pairs correctly bec
   `predict_calls.sql` and `rail_calls_planned_today.sql`, in different hunks, so whichever lands
   second rebases cleanly.
 
+## KIX-42: SJ's own SX (2026-10-24)
+
+SJN situations through the **flagged** path: `data/queries/eval_sjn_flagged.sql` builds them in
+`training_calls`' `base` shape (situation × call, 0–720 min from onset) for all of 2024-06 to
+2026-10. SJN was in no training row and no Platt fit, so all of it is out of sample. Network state
+comes from Vy (as serving's `netpre` does), and category from the same AI.CLASSIFY call serving
+makes. 240 situations, 341 trains, 4 518 calls, 48 % impacted. Vy's flagged holdout sits beside it.
+
+Composite `p_impact_dep` at the default 0.65 bar, with «innstilt» wording (`p_cancel` ≥ the same bar):
+
+| Lead | SJN AUC | Vy AUC | SJN prec / recall | Vy prec / recall | SJN «innstilt» | Vy «innstilt» |
+|---|---|---|---|---|---|---|
+| 30 | 0.912 | 0.930 | 0.870 / 0.731 | 0.903 / 0.619 | 0.774 | 0.902 |
+| 60 | 0.878 | 0.877 | 0.929 / 0.521 | 0.937 / 0.355 | 0.835 | 0.961 |
+| 120 | 0.801 | 0.830 | 0.908 / 0.290 | 0.960 / 0.143 | 0.812 | 0.978 |
+| 240 | 0.743 | 0.804 | 0.875 / 0.141 | 0.977 / 0.075 | 0.788 | 0.980 |
+| plan | 0.662 | 0.799 | 0.867 / 0.207 | 0.939 / 0.242 | 0.759 | 0.962 |
+
+Recall is far above SJN's no-SX path (0.73 vs 0.36 at 30 min, 0.52 vs 0.24 at 60): a message
+makes SJ trains visible. The weak spot is «innstilt»: many SJN messages describe a part-cancelled
+train («buss for tog fra Mørkved»), so whole-train certainty is wrong for the calls that ran.
+**SJN's flagged bar is 0.75** (`alert_policy._OPERATOR_ALERT_THRESHOLD`): precision 0.922 / 0.931 /
+0.944 at 30 / 60 / 120 min, «innstilt» 0.819 / 0.890 / 0.908, recall 0.70 / 0.46 / 0.22. Even the
+wrong «innstilt» were 90 %+ trains that ran ≥ 10 min late.
+
+Two data quirks the serving change handles:
+- SJ names one train under two refs (`…_STK-LMO_26-10-13` and `…_STK-LMO_M_26-10-13`). Both bridge to
+  one jkey, so the join is DISTINCT and `num_journeys` counts trains, not refs. Uncorrected, the
+  rows tripled in the eval (7 149 rows, 4 518 distinct).
+- 6 of 267 SJN situations (2.2 %) carry unfilled template fields (`{START1}`, `{STASJON}`); they are
+  dropped. 0 of 119 807 NSB messages do.
+
+End to end on scratch tables (2026-10-24): today's one SJN situation, a capacity notice for train 43
+Oslo – Trondheim, reached trains 43 and 48 as 30 flagged rows (max `p_impact_dep` 0.57, under the
+bar). All 8 136 Vy prediction rows came out byte-identical to `main`'s.
+
 ## Follow-ups
 
 1. **R60's false «innstilt»**: pool SJN into `training_calls` once the `p_cancel` serving fix has
    landed and been measured. `create_training_calls_sjn.sql` is already the pool's shape.
-2. **SJN's own SX as explanation text.** Ingest `participantRef = 'SJN'` and bridge
-   `SJN:DatedServiceJourney:<nr>_…_<yy-mm-dd>` → `<nr>:<yyyy-mm-dd>`, the same rewrite as
-   `alternatives.cache_key`.
+2. ~~**SJN's own SX as explanation text.**~~ Done in KIX-42, above.
 3. **Vy infrastructure messages as a stop-keyed feature for SJN** (the 2.4× lift above).
 4. **Fresh actuals for SJN**: `rail_calls_today` is still Vy-only, so the «I dag» strip reads SJN's
    recorded calls from the planned table, up to 60 min old. Widening it touches Rushvarsel and the

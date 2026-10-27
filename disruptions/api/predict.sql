@@ -59,6 +59,9 @@ src AS (
       WHERE REGEXP_CONTAINS(j, r':\d+_([A-Za-z]+-[A-Za-z]+)')
     ) AS od_corridors
   FROM `disruptions.disruptions_initial_today` AS d
+  -- The intake also carries SJ Norge's own messages since KIX-42; the duration models were fit on
+  -- NSB and this table feeds /disruptions, so they stay NSB.
+  WHERE d.participantRef = 'NSB'
 ),
 feat AS (
   SELECT

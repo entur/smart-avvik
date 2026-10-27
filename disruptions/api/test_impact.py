@@ -2743,6 +2743,26 @@ def test_sjn_trains_are_served_without_moving_vy_network_state():
     assert "WHERE r.lineRef LIKE 'VYG:%'" in netpre
 
 
+def test_sjn_messages_reach_their_trains_and_nothing_else():
+    # KIX-42: SJ's own SX name 'SJN:DatedServiceJourney:43_OSL-TND_26-10-24', its ET says
+    # '43:2026-10-24'. The codespace strip that bridges Vy cannot bridge that, and the two refs SJ
+    # gives one train ('..._M_...') must collapse to one row. No CI job runs SQL, so the text is held.
+    import re
+    from pathlib import Path
+
+    def code(name):
+        return re.sub(r"--.*$", "", (Path(__file__).parent / name).read_text(), flags=re.MULTILINE)
+
+    intake, calls = code("disruptions_today.sql"), code("predict_calls.sql")
+    assert "participantRef IN ('NSB', 'SJN')" in intake
+    assert intake.count(r"r'\{[^}]+\}'") == 2, "first and latest text both screened for placeholders"
+    assert "WHERE d.participantRef = 'NSB'" in code("predict.sql"), "duration model stays NSB"
+    aff = calls.split("aff AS (", 1)[1].split("FROM sit AS s", 1)[0]
+    assert "SELECT DISTINCT" in aff
+    assert r"r'^SJN:DatedServiceJourney:(\d+)_'" in aff
+    assert "REGEXP_REPLACE(j, r'^[A-Za-z]+:', '')" in aff, "Vy's bridge is unchanged"
+
+
 def _run():
     tests = sorted(
         (name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn)

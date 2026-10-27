@@ -51,6 +51,11 @@ TROUBLE_DELAY_MIN = 10
 # SOF/SKY stay on the default (already at/near the bar); OST and GCO have too little holdout
 # evidence to override (OST: ~6 alerts at any >=90 % cut). NSB is the rail family (0.65
 # validated at ~91 % in eval/impact_eval.py) and is deliberately absent.
+# SJN is SJ Norge's OWN messages through the rail heads (KIX-42, data/queries/eval_sjn_flagged.sql,
+# 2026-10-24): at 0.65 precision was 0.87 at 30 min, and «innstilt» wording (the same cut, through
+# impact._likely_cancelled) was right 77 % of the time, mostly on part-cancelled trains; 0.75 gives
+# 0.92-0.94 at 30-120 min and «innstilt» 0.82-0.91, for recall 0.73 -> 0.70 at 30 min. It does not
+# touch SJN's no-SX calls, which take _NOSX_ALERT_THRESHOLD like every operator's.
 _OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
     "ATB": 0.55,
     "FIN": 0.75,
@@ -59,6 +64,7 @@ _OPERATOR_ALERT_THRESHOLD: dict[str, float] = {
     "MOR": 0.90,
     "NOR": 0.80,
     "RUT": 0.75,
+    "SJN": 0.75,
     "TRO": 0.55,
 }
 
