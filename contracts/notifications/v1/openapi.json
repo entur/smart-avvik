@@ -54,7 +54,7 @@
           "notification-subscriptions"
         ],
         "summary": "Create or replace a watch by your own reference",
-        "description": "Idempotent on (reference, definition): an identical retry returns the stored record and changes nothing but the inactivity horizon, so an unacknowledged POST is safe to repeat. A different definition under the same reference amends it and bumps `version`. A reference that has been deleted is **not** resurrected -- the id is spent and its record is the audit trail -- which is a 409.\n\nThe window, the weekday set and the stop pair are validated exactly as Entur's own Smarte reisevarsler validates them, including a window over midnight: `begin` and `end` must differ, and an `end` before `begin` is one window from `begin` until `end` the next morning, belonging to the weekday it begins on (`days: [4]` is Friday night into Saturday). A watch registered as two halves before this keeps working unchanged.\n\nA stop pair that no direct trip serves is **stored, never refused** -- weekend-only and seasonal routes are why a refusal would be wrong -- and carries the caveat on `servable` with `servable_checked_at` beside it.\n\n`servable` is **null on this response**, always: the question is a BigQuery job and this API exists to onboard an existing commuter base, so a background sweep establishes it within the hour instead of asking on the registration path. Null means \"not established\" and must never be rendered to a traveller as an all-clear.\n\n`alerts` is **null** on this response: a create or replace does not read the alert state. Null therefore means \"not included here\", never \"no standing alerts\" -- that is `n_active: 0` with `truncated: false`, from either GET route.",
+        "description": "Idempotent on (reference, definition): an identical retry returns the stored record and changes nothing but the inactivity horizon, so an unacknowledged POST is safe to repeat. A different definition under the same reference amends it and bumps `version`. A reference that has been deleted is **not** resurrected -- the id is spent and its record is the audit trail -- which is a 409.\n\nThe window, the weekday set and the stop pair are validated exactly as Entur's own Smarte reisevarsler validates them, including a window over midnight: `begin` and `end` must differ, and an `end` before `begin` is one window from `begin` until `end` the next morning, belonging to the weekday it begins on (`days: [4]` is Friday night into Saturday). A watch registered as two halves before this keeps working unchanged.\n\nA stop pair the service cannot alert on -- no direct trip, nor, where this deployment evaluates trips with a change, any such trip it watches -- is **stored, never refused** -- weekend-only and seasonal routes are why a refusal would be wrong -- and carries the caveat on `servable` with `servable_checked_at` beside it.\n\n`servable` is **null on this response**, always: the question is a BigQuery job and this API exists to onboard an existing commuter base, so a background sweep establishes it within the hour instead of asking on the registration path. Null means \"not established\" and must never be rendered to a traveller as an all-clear.\n\n`alerts` is **null** on this response: a create or replace does not read the alert state. Null therefore means \"not included here\", never \"no standing alerts\" -- that is `n_active: 0` with `truncated: false`, from either GET route.",
         "parameters": [
           {
             "name": "If-Match",
@@ -395,7 +395,7 @@
         ],
         "summary": "The alert-worthy trains ahead on a journey definition, right now",
         "security": [],
-        "description": "What Entur's own Smarte reisevarsler would be warning about on this route, for a definition nobody registered: one entry per alert-worthy train ahead, soonest first, each carrying the webhook event's own `payload` -- the ready-to-display Norwegian notification, the figures, the contributing situations and the alternative journey. Built for a favourites panel: the app's BFF asks once per saved route when a user opens the app.\n\n**No credential.** This is the one public operation in this document: `security: []` here overrides the global `clientKey`. A stop pair holds nothing personal, and the read has its own limiter -- a global ceiling of 300 reads a minute across every anonymous caller and 30 a minute per canonical stop pair -- which is `429 rate_limited` with `Retry-After: 60` when it binds. The ceiling and the read's wording and Journey Planner allowances are **shared by every anonymous caller**, the app's BFF included, with no reserved slice: treat a 429, and a `rate_limited` status on an entry, as ordinary states and serve your cached answer.\n\n**The definition.** `from_stop` and `to_stop` are `NSR:StopPlace:<digits>` and are canonicalized as `/varsel` canonicalizes a submitted ref (a collapsed ref names the same place; two refs that collapse to one place are a 422). `begin`/`end` is an optional Oslo `HH:MM` period, both or neither, `begin` before `end`; `days` an optional repeated weekday parameter (`days=0&days=1`, 0 = Monday). No period means the whole day; no days means today's and tomorrow's weekday, which is every window the prediction cache can carry. The canonical definition and the windows asked about are echoed, so key your cache on `journey` plus `refreshed_at` and never on the query string you sent.\n\n**Selection is the notification pass's, unchanged.** Which trains alert, which alerts clear the per-operator bar, the collapse of several situations about one train into one entry: all `/varsel`'s and the webhook channel's. So an empty `alerts` means *no alert-worthy train among the trains the service scores* -- direct trips by the operators in `coverage.operators` -- and never all-clear. A trip with a transfer never alerts, and nothing here is a claim about any other operator. One difference from the webhook channel: a Vy train missing from today's timetable altogether (usually on this weekday, not in today's plan, no cancellation published; situation `KIX:PlanRemoved:<journey_ref>`) is listed here as `confirmed`, and no webhook event is ever minted for one.\n\n**Two halves, and a wait budget between them.** The figures -- which trains, which numbers -- are served at once from the service's in-process cache. The model's wording and the alternative journey are fetched on request, in the background, under the read's own allowances; the request waits up to `wait` seconds for them and then answers with whatever is ready. An entry that is not ready carries the template wording and no alternative, and its `wording.status` / `alternative.status` say why. `complete` is true only when every listed entry's two statuses are terminal, and it decides the caching header: `Cache-Control: public, max-age=60` when complete, `no-store` otherwise. The work continues after the request returns, so a `wait=0` read followed by a second read a few seconds later is the cheap way to a complete answer; a warm read within one prediction cycle runs no matcher, no model call and no Journey Planner call. At most four trains per read are worded, soonest first; the rest carry the template under `not_worded` -- past the four-per-read wording cap in this read's soonest-first order, re-evaluated on every read as the trains ahead depart, never cached.\n\n**Byte-identity with the event, and its exact boundary.** When the five fields you pass are verbatim a registration's (a browser's or a webhook subscription's) and the notification pass has already worded that train, the entry serves the pass's own wording and `payload.notification` is byte-identical to the event's. The figures are live where the event's were its mint-time snapshot, and the alternative can differ in one case the operating contract publishes. For any other definition the wording is the read's own draw from a non-deterministic model, or the template. The entry says whether its text is the model's; it never says whether the definition is registered.\n\n**What the read does not do.** No servability caveat (the `coverage` block is what you render an unknown favourite from), no daily cap (nothing is delivered), no decision row -- a definition nobody registered is unscored, deliberately, so nothing here is evidence about alert quality. **Three accepted exposures, published rather than closed**: the completeness and latency of a FIRST read reveal whether a registration with exactly those five fields exists and is alert-worthy now (no status ever says so); the ceiling and allowances above are shared, so one anonymous source at the ceiling holds every caller at 429 and one at the daily wording allowance holds them template-only for the trailing day; and the definition rides in the query string, which the service redacts from its own access log but which any log outside the process may keep.\n\n**After a deploy** the prediction cache is empty for about a minute and the read answers `503 predictions_not_loaded` with `Retry-After`, never an empty list -- an empty list off an empty cache would report an empty process as a calm day. Nothing about the webhook channel's own configuration gates this route: it answers in every environment, store or no store.",
+        "description": "What Entur's own Smarte reisevarsler would be warning about on this route, for a definition nobody registered: one entry per alert-worthy train ahead, soonest first, each carrying the webhook event's own `payload` -- the ready-to-display Norwegian notification, the figures, the contributing situations and the alternative journey. Built for a favourites panel: the app's BFF asks once per saved route when a user opens the app.\n\n**No credential.** This is the one public operation in this document: `security: []` here overrides the global `clientKey`. A stop pair holds nothing personal, and the read has its own limiter -- a global ceiling of 300 reads a minute across every anonymous caller and 30 a minute per canonical stop pair -- which is `429 rate_limited` with `Retry-After: 60` when it binds. The ceiling and the read's wording and Journey Planner allowances are **shared by every anonymous caller**, the app's BFF included, with no reserved slice: treat a 429, and a `rate_limited` status on an entry, as ordinary states and serve your cached answer.\n\n**The definition.** `from_stop` and `to_stop` are `NSR:StopPlace:<digits>` and are canonicalized as `/varsel` canonicalizes a submitted ref (a collapsed ref names the same place; two refs that collapse to one place are a 422). `begin`/`end` is an optional Oslo `HH:MM` period, both or neither, `begin` before `end`; `days` an optional repeated weekday parameter (`days=0&days=1`, 0 = Monday). No period means the whole day; no days means today's and tomorrow's weekday, which is every window the prediction cache can carry. The canonical definition and the windows asked about are echoed, so key your cache on `journey` plus `refreshed_at` and never on the query string you sent.\n\n**Selection is the notification pass's, unchanged.** Which trains alert, which alerts clear the per-operator bar, the collapse of several situations about one train into one entry: all `/varsel`'s and the webhook channel's. So an empty `alerts` means *no alert-worthy train among the trains the service scores* -- direct trips by the operators in `coverage.operators`, and trips with a change only where `coverage.transfers` says `evaluated` -- and never all-clear. A departure with a change is listed under its first leg's boarding call, with the whole trip in `payload.trip`. Nothing here is a claim about any other operator. One difference from the webhook channel: a Vy train missing from today's timetable altogether (usually on this weekday, not in today's plan, no cancellation published; situation `KIX:PlanRemoved:<journey_ref>`) is listed here as `confirmed`, and no webhook event is ever minted for one.\n\n**Two halves, and a wait budget between them.** The figures -- which trains, which numbers -- are served at once from the service's in-process cache. The model's wording and the alternative journey are fetched on request, in the background, under the read's own allowances; the request waits up to `wait` seconds for them and then answers with whatever is ready. An entry that is not ready carries the template wording and no alternative, and its `wording.status` / `alternative.status` say why. `complete` is true only when every listed entry's two statuses are terminal, and it decides the caching header: `Cache-Control: public, max-age=60` when complete, `no-store` otherwise. The work continues after the request returns, so a `wait=0` read followed by a second read a few seconds later is the cheap way to a complete answer; a warm read within one prediction cycle runs no matcher, no model call and no Journey Planner call. At most four trains per read are worded, soonest first; the rest carry the template under `not_worded` -- past the four-per-read wording cap in this read's soonest-first order, re-evaluated on every read as the trains ahead depart, never cached.\n\n**Byte-identity with the event, and its exact boundary.** When the five fields you pass are verbatim a registration's (a browser's or a webhook subscription's) and the notification pass has already worded that train, the entry serves the pass's own wording and `payload.notification` is byte-identical to the event's. The figures are live where the event's were its mint-time snapshot, and the alternative can differ in one case the operating contract publishes. For any other definition the wording is the read's own draw from a non-deterministic model, or the template. The entry says whether its text is the model's; it never says whether the definition is registered.\n\n**What the read does not do.** No servability caveat (the `coverage` block is what you render an unknown favourite from), no daily cap (nothing is delivered), no decision row -- a definition nobody registered is unscored, deliberately, so nothing here is evidence about alert quality. **Three accepted exposures, published rather than closed**: the completeness and latency of a FIRST read reveal whether a registration with exactly those five fields exists and is alert-worthy now (no status ever says so); the ceiling and allowances above are shared, so one anonymous source at the ceiling holds every caller at 429 and one at the daily wording allowance holds them template-only for the trailing day; and the definition rides in the query string, which the service redacts from its own access log but which any log outside the process may keep.\n\n**After a deploy** the prediction cache is empty for about a minute and the read answers `503 predictions_not_loaded` with `Retry-After`, never an empty list -- an empty list off an empty cache would report an empty process as a calm day. Nothing about the webhook channel's own configuration gates this route: it answers in every environment, store or no store.",
         "parameters": [
           {
             "name": "from_stop",
@@ -1095,12 +1095,12 @@
           },
           "complete": {
             "type": "boolean",
-            "description": "Whether every listed entry's `wording.status` and `alternative.status` reached a terminal value. `false` while any is pending or transiently refused; the answer is then `Cache-Control: no-store` and a later read of the same definition completes it."
+            "description": "Whether every listed entry's `wording.status` and `alternative.status` reached a terminal value. `false` while any is pending or transiently refused, and while the timetable for the trips with a change in the next three hours is still being fetched (`coverage.transfers`); the answer is then `Cache-Control: no-store` and a later read of the same definition completes it."
           },
           "n_alerts": {
             "type": "integer",
             "minimum": 0,
-            "description": "Alert-worthy trains ahead on this definition, before `limit` was applied. Zero means no alert-worthy train AMONG THE TRAINS THE SERVICE SCORES -- direct trips by the operators in `coverage.operators` -- and never all-clear: a trip with a transfer never alerts, and nothing is said about any other operator."
+            "description": "Alert-worthy trains ahead on this definition, before `limit` was applied. Zero means no alert-worthy train AMONG THE TRAINS THE SERVICE SCORES -- direct trips by the operators in `coverage.operators`, and trips with a change where `coverage.transfers` is `evaluated` -- and never all-clear: nothing is said about any other operator."
           },
           "truncated": {
             "type": "boolean",
@@ -1166,7 +1166,8 @@
             "required": [
               "operators",
               "from_stop_in_timetable_today",
-              "to_stop_in_timetable_today"
+              "to_stop_in_timetable_today",
+              "transfers"
             ],
             "properties": {
               "operators": {
@@ -1183,6 +1184,15 @@
               "to_stop_in_timetable_today": {
                 "type": "boolean",
                 "description": "The same, for the destination."
+              },
+              "transfers": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "not_evaluated",
+                  "evaluated"
+                ],
+                "description": "Whether this answer judged the departures with a change on this definition -- trips where the traveller changes vehicles on the way, which the service watches when one of their legs is a Vy or SJ Norge train. `evaluated`: the service holds the timetable's trips with a change for the period ahead, and those it watches are judged like the direct trains. `none`: that timetable has no trip with a change in the period, so the direct trains are the whole answer. `not_evaluated`: no trip with a change was judged -- the timetable for the period is not held yet (the answer is then `complete: false` until it lands), its trips with a change ride no train the service scores, this deployment does not evaluate trips with a change at all, or the period reaches more than three hours ahead and the timetable for the later part is not held. A read fetches a missing timetable for the next three hours only, so that last case does not hold `complete` false: it lifts as those hours come within reach, or sooner when a registered journey on the same stops covers them. Like an empty list, `not_evaluated` is never all-clear: a pair served only with a change may be disrupted with nothing listed."
               }
             }
           },
@@ -1244,7 +1254,7 @@
               "predicted",
               "confirmed"
             ],
-            "description": "`confirmed` when the real-time feed has declared the train cancelled, or when a Vy train that runs on this weekday is missing from today's timetable altogether (situation `KIX:PlanRemoved:<journey_ref>`) -- a fact, with probabilities of 1.0 and null delay figures in the payload -- else `predicted`. There is no `withdrawn` entry: a train no longer over the gate is simply absent."
+            "description": "`confirmed` when the real-time feed has declared the train cancelled, when a departure with a change cannot get there for a declared cancellation of one of its legs (`payload.trip`), or when a Vy train that runs on this weekday is missing from today's timetable altogether (situation `KIX:PlanRemoved:<journey_ref>`) -- a fact, with probabilities of 1.0 and null delay figures in the payload -- else `predicted`. There is no `withdrawn` entry: a train no longer over the gate is simply absent."
           },
           "train": {
             "title": "Train",
@@ -1439,7 +1449,7 @@
         "title": "Journey status",
         "type": "object",
         "additionalProperties": false,
-        "description": "Every Vy and SJ Norge train in today's window on the definition, in departure order, each graded. Built per request from memory the service already holds; nothing in it identifies a registration.",
+        "description": "Every Vy and SJ Norge train in today's window on the definition and, beside them, every departure with a change the service judges, in departure order, each graded. Built per request from memory the service already holds; nothing in it identifies a registration.",
         "required": [
           "now",
           "date",
@@ -1503,7 +1513,7 @@
             "items": {
               "type": "string"
             },
-            "description": "Operators whose trains are listed: `[\"VYG\", \"SJN\"]`. A trip by any other operator is never listed."
+            "description": "Operators whose timetable this read lists: `[\"VYG\", \"SJN\"]`. Every direct train listed is theirs, and a departure with a change is listed when one of its legs is -- so its row's own `operator`, its first leg's, can be another's. Any other departure is never listed."
           },
           "as_of": {
             "type": "object",
@@ -1586,7 +1596,8 @@
             "required": [
               "operators",
               "from_stop_in_timetable_today",
-              "to_stop_in_timetable_today"
+              "to_stop_in_timetable_today",
+              "transfers"
             ],
             "properties": {
               "operators": {
@@ -1603,6 +1614,15 @@
               "to_stop_in_timetable_today": {
                 "type": "boolean",
                 "description": "The same, for the destination."
+              },
+              "transfers": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "not_evaluated",
+                  "evaluated"
+                ],
+                "description": "Whether this answer judged the departures with a change on this definition -- trips where the traveller changes vehicles on the way, which the service watches when one of their legs is a Vy or SJ Norge train. `evaluated`: the service holds the timetable's trips with a change for the period ahead, and those it watches are judged like the direct trains. `none`: that timetable has no trip with a change in the period, so the direct trains are the whole answer. `not_evaluated`: no trip with a change was judged -- the timetable for the period is not held yet (the answer is then `complete: false` until it lands), its trips with a change ride no train the service scores, this deployment does not evaluate trips with a change at all, or the period reaches more than three hours ahead and the timetable for the later part is not held. A read fetches a missing timetable for the next three hours only, so that last case does not hold `complete` false: it lifts as those hours come within reach, or sooner when a registered journey on the same stops covers them. Like an empty list, `not_evaluated` is never all-clear: a pair served only with a change may be disrupted with nothing listed."
               }
             }
           },
@@ -1633,7 +1653,7 @@
         "title": "Train status",
         "type": "object",
         "additionalProperties": false,
-        "description": "One Vy train in today's window that boards at the origin and lets you off at the destination.",
+        "description": "One Vy or SJ Norge train in today's window that boards at the origin and lets you off at the destination -- or, with `trip` set, one departure with a change, in its first leg's identity and graded end to end.",
         "required": [
           "departure_time",
           "arrival_time",
@@ -1652,7 +1672,8 @@
           "alert_worthy",
           "observed_at",
           "removed_from_plan",
-          "bus_for_train"
+          "bus_for_train",
+          "trip"
         ],
         "properties": {
           "departure_time": {
@@ -1666,11 +1687,11 @@
               "null"
             ],
             "format": "date-time",
-            "description": "Aimed arrival at the alighting stop, UTC."
+            "description": "Aimed arrival at the alighting stop, UTC; at the destination for a departure with a change."
           },
           "operator": {
             "type": "string",
-            "description": "Operator codespace (`VYG` or `SJN`)."
+            "description": "Operator codespace (`VYG` or `SJN`); a departure with a change carries its first leg's, which can be a bus operator's."
           },
           "line": {
             "type": [
@@ -1691,7 +1712,7 @@
               "string",
               "null"
             ],
-            "description": "The line's transport mode in the Journey Planner's `TransportMode` vocabulary, as on journey-alerts: `rail` for every train listed today."
+            "description": "The line's transport mode in the Journey Planner's `TransportMode` vocabulary, as on journey-alerts: `rail` for every train listed today. A departure with a change carries its first leg's mode."
           },
           "jkey": {
             "type": "string",
@@ -1704,7 +1725,7 @@
               "predicted",
               "unknown"
             ],
-            "description": "`confirmed` when the alighting call is recorded, or the train is cancelled and its aimed departure has passed; a recorded call outranks an earlier cancellation, so a reinstated train that ran reads as run -- draw it filled. `predicted` when the model has a figure (or the cancellation is announced but not yet due) -- draw a ring. `unknown` when nothing can be said, including a train with no operator message more than two hours out, whose score is not better than the base rate."
+            "description": "`confirmed` when the alighting call is recorded, or the train is cancelled and its aimed departure has passed; a recorded call outranks an earlier cancellation, so a reinstated train that ran reads as run -- draw it filled. `predicted` when the model has a figure (or the cancellation is announced but not yet due) -- draw a ring. `unknown` when nothing can be said, including a train with no operator message more than two hours out, whose score is not better than the base rate. A departure with a change follows these rules on its last leg, and a change observed missed is `confirmed` at once."
           },
           "level": {
             "type": "string",
@@ -1714,7 +1735,7 @@
               "green",
               "grey"
             ],
-            "description": "`red` cancelled, 10 min or more late, or (predicted) over the same alert bar a notification fires at; `yellow` 5-9 min; `green` less; `grey` exactly when `state` is `unknown` or a confirmed train has no delay figure."
+            "description": "`red` cancelled, 10 min or more late, or (predicted) over the same alert bar a notification fires at; `yellow` 5-9 min; `green` less; `grey` exactly when `state` is `unknown` or a confirmed train has no delay figure. A departure with a change is `red` when it alerts, is cancelled or a change was observed missed, and is otherwise graded on its expected arrival at the destination -- after a broken change, on the continuation that still holds -- and never `green` while a leg has no data."
           },
           "cancelled": {
             "type": "boolean",
@@ -1747,7 +1768,7 @@
               "number",
               "null"
             ],
-            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a cancellation. Null on a confirmed or unknown train, and on a forecast scored at only one end of the trip -- notifications cannot fire on one, so neither is it red."
+            "description": "P(cancelled OR 10 min or more late) at the boarding stop, the figure notifications are gated on. 1.0 for a cancellation. Null on a confirmed or unknown train, and on a forecast scored at only one end of the trip -- notifications cannot fire on one, so neither is it red. For a departure with a change, the figure its verdict was taken on, which `trip.problem` names when it alerts."
           },
           "alert_worthy": {
             "type": "boolean",
@@ -1763,11 +1784,247 @@
           },
           "removed_from_plan": {
             "type": "boolean",
-            "description": "The train is missing from today's timetable altogether: Vy runs it on this weekday, today's plan does not have it, and no cancellation has been published. Always `cancelled` and `red` too, drawn by the same ring-then-fill rule -- but say «tatt ut av rutetabellen» rather than «innstilt», since a traveller who checks the operator's own channels will find no cancellation."
+            "description": "The train is missing from today's timetable altogether: Vy runs it on this weekday, today's plan does not have it, and no cancellation has been published. Always `cancelled` and `red` too, drawn by the same ring-then-fill rule -- but say «tatt ut av rutetabellen» rather than «innstilt», since a traveller who checks the operator's own channels will find no cancellation. Always false on a departure with a change: a ridden leg out of the timetable is `trip.problem.kind` `leg_removed`."
           },
           "bus_for_train": {
             "type": "boolean",
             "description": "A removed train the operator has set up a replacement bus for; false on every other train."
+          },
+          "trip": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "description": "The departure with a change this row is -- the traveller changes vehicles on the way -- described as a webhook event's `payload.trip` describes one; null on a direct train, and on every row where this deployment does not evaluate trips with a change. The row's own fields are then the first leg's boarding call (`departure_time`, `operator`, `line`, `jkey`, `mode`), and grade the departure end to end: `arrival_time` is the planned arrival at the destination, `delay_min` and `delay_p50_min` are at the destination. `legs` are the ridden legs in travel order and `transfers` the changes, both from 0, transfer `i` between legs `i` and `i + 1`. `expected_arrival` is when the traveller is expected at the destination: on the planned route, or after a broken change on the earliest planned continuation of the same first train that still holds -- the arrival a `yellow` or `green` row is graded on; `arrives_via` then names where that continuation leaves the planned route («fram 08:06 via Asker»), and is null on the planned route, however late. Each leg's `data_source` says what it was judged from: `none` is a leg with no live data, which keeps the row off `green`. `problem` names what breaks the planned ride when the departure alerts (a `red` forecast or a cancellation), or when a change was observed missed (`missed_connection` with `state` `confirmed`); null otherwise. A ridden leg taken out of today's timetable is `problem.kind` `leg_removed`.",
+            "required": [
+              "legs",
+              "transfers",
+              "expected_arrival",
+              "arrives_via",
+              "problem"
+            ],
+            "properties": {
+              "legs": {
+                "type": "array",
+                "description": "The ridden legs, in travel order, from 0.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "mode",
+                    "line",
+                    "public_code",
+                    "from_name",
+                    "to_name",
+                    "destination",
+                    "start_time",
+                    "end_time",
+                    "board_stop_place",
+                    "alight_stop_place",
+                    "aimed_departure",
+                    "aimed_arrival",
+                    "cancelled",
+                    "data_source"
+                  ],
+                  "properties": {
+                    "mode": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "The Journey Planner's transport mode: `rail`, `bus`, ..."
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Line ref, e.g. `VYG:Line:R12`."
+                    },
+                    "public_code": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "The line as shown to passengers, e.g. `R12`."
+                    },
+                    "from_name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Where the leg is boarded, when the service knows the name."
+                    },
+                    "to_name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Where the leg is left, when the service knows the name."
+                    },
+                    "destination": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Where the vehicle terminates, when known."
+                    },
+                    "start_time": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "The Journey Planner's expected departure, when it has a live one for this leg."
+                    },
+                    "end_time": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "The Journey Planner's expected arrival, when it has a live one for this leg."
+                    },
+                    "board_stop_place": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "NSR StopPlace ref where the leg is boarded."
+                    },
+                    "alight_stop_place": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "NSR StopPlace ref where the leg is left."
+                    },
+                    "aimed_departure": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "Aimed (timetabled) departure from the boarding stop."
+                    },
+                    "aimed_arrival": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "date-time",
+                      "description": "Aimed (timetabled) arrival at the alighting stop."
+                    },
+                    "cancelled": {
+                      "type": "boolean",
+                      "description": "The boarding or alighting call of this leg is declared cancelled."
+                    },
+                    "data_source": {
+                      "enum": [
+                        "prediction",
+                        "jp_realtime",
+                        "none",
+                        null
+                      ],
+                      "description": "What the leg was judged from: `prediction`, the service's own figures for both its ends (or its train is taken out of today's timetable); `jp_realtime`, the Journey Planner's real-time data; `none`, nothing -- no live data for this leg, so the departure cannot be judged on it. Null where the leg was not judged."
+                    }
+                  }
+                }
+              },
+              "transfers": {
+                "type": "array",
+                "description": "The changes, from 0: transfer `i` sits between legs `i` and `i + 1`.",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "stop_place",
+                    "stop_name",
+                    "walk_min",
+                    "slack_min"
+                  ],
+                  "properties": {
+                    "stop_place": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "NSR StopPlace ref where the arriving leg is left."
+                    },
+                    "stop_name": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Its name, when the service knows it."
+                    },
+                    "walk_min": {
+                      "type": "integer",
+                      "description": "Minutes on foot to the next leg's boarding stop."
+                    },
+                    "slack_min": {
+                      "type": "integer",
+                      "description": "Planned slack in minutes: the next leg's aimed departure, minus the arriving leg's aimed arrival, minus the walk. Negative when the plan is already too tight."
+                    }
+                  }
+                }
+              },
+              "expected_arrival": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "date-time",
+                "description": "When the traveller is expected at the destination; null when nothing in the plan gets them there."
+              },
+              "arrives_via": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Where the continuation `expected_arrival` belongs to leaves the planned route -- its stop name, or its NSR StopPlace ref when the service has no name for it. Set only when a change on the planned route breaks and another continuation of the same first train, arriving less than 10 minutes after the planned arrival, still holds -- the traveller then gets there via this stop. Null on the planned route, however late."
+              },
+              "problem": {
+                "type": [
+                  "object",
+                  "null"
+                ],
+                "additionalProperties": false,
+                "description": "What breaks the planned ride, and the figure the alert was decided on. `kind` and `index` name the reason on the route the traveller planned; `probability` and `threshold` are the figure and bar the decision was taken on, which can come from another continuation of the same first train when that one decided it. `index` is the leg for a leg reason and the transfer for `missed_connection`.",
+                "required": [
+                  "kind",
+                  "index",
+                  "probability",
+                  "threshold"
+                ],
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "departure",
+                      "leg_cancelled",
+                      "leg_departure",
+                      "missed_connection",
+                      "leg_removed"
+                    ],
+                    "description": "`departure`: the first leg's own departure. `leg_cancelled`: a ridden leg's boarding or alighting call declared cancelled. `leg_departure`: a later leg's departure. `missed_connection`: the change is likely missed. `leg_removed`: a ridden leg's train is taken out of today's timetable."
+                  },
+                  "index": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "The leg index, or the transfer index for `missed_connection`, from 0."
+                  },
+                  "probability": {
+                    "type": "number",
+                    "description": "The deciding figure, 0-1; 1.0 for a certainty."
+                  },
+                  "threshold": {
+                    "type": "number",
+                    "description": "The bar the alert gate applied to `probability`."
+                  }
+                }
+              }
+            }
           }
         }
       }

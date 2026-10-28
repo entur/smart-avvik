@@ -334,8 +334,9 @@ are [The journey-keyed read](#the-journey-keyed-read) below.
 
 ### `GET /journey-status` — every train today, graded
 
-No credential. Every Vy and SJ Norge train in today's window on a definition, graded as a fact or
-a forecast. See [The journey-status read](#the-journey-status-read) below.
+No credential. Every Vy and SJ Norge train in today's window on a definition, and each departure
+with a change where those are evaluated, graded as a fact or a forecast. See
+[The journey-status read](#the-journey-status-read) below.
 
 ### Errors
 
@@ -382,8 +383,12 @@ not one uniform shape bought at that price.
 
 ## Servability
 
-`servable` and `servable_checked_at` answer "does any planned direct trip run between these two
-places today?", from `/varsel`'s own connectivity check.
+`servable` and `servable_checked_at` answer "can the service alert on any planned trip between these
+two places today?", from `/varsel`'s own connectivity check. Where the deployment evaluates trips
+with a change (`TRIP_PLANS_ENABLED`, on in dev since 2026-10-28 and off in tst and prd), that is a
+direct trip **or** a trip with a change that rides a Vy or SJ Norge train, read off the timetable of
+trips with a change the service holds for the pair, today's and tomorrow's. Elsewhere it is a direct
+trip only, as before.
 
 - **A pair no direct trip serves is stored, never refused.** Weekend-only and seasonal routes are why
   a refusal would be wrong.
@@ -405,7 +410,7 @@ roughly 50 cycles — about four hours — and anything smaller settles on the n
 **It is then re-asked, and the cadence is `/varsel`'s own: every six hours per record.** A
 weekend-only ferry registered on a Friday evening, a seasonal route registered out of season and a
 pair whose timetable had not been published yet all answer "no direct service" and start running
-later, so the caveat clears by itself. Three properties of that sweep are worth knowing:
+later, so the caveat clears by itself. Four properties of that sweep are worth knowing:
 
 - **Only `false` and `null` are re-asked.** A `true` is never re-checked, deliberately: the harm is
   one-directional — a stale `false` shows you a caveat about a watch that is working, while a stale
@@ -415,6 +420,10 @@ later, so the caveat clears by itself. Three properties of that sweep are worth 
   `servable_checked_at` is the age of the last *answer*, not of the last *change*.
 - **A check that could not be established writes nothing at all** — neither the value nor the stamp.
   One BigQuery blip must not become a freshly-stamped non-answer.
+- **Where trips with a change are evaluated, a pair no direct trip serves is not answered until its
+  timetable of trips with a change is held.** Until then the check is not established, so the
+  record keeps `null` (or its last answer) and is asked again on every sweep rather than six hours
+  later: a route served only with a change does not carry a `false` for hours after you register it.
 
 **One window where it does not run**, and it is worth knowing during onboarding: the sweep is gated
 on the same flag as delivery, so until the webhook channel is enabled in that environment nothing
@@ -523,8 +532,9 @@ and for a subscription's `from_stop`/`to_stop`.
               "begin": "06:30", "end": "09:00", "days": [2, 3]},
   "windows": [{"start": "2026-09-10T04:30:00+00:00", "end": "2026-09-10T07:00:00+00:00"},
               {"start": "2026-09-11T04:30:00+00:00", "end": "2026-09-11T07:00:00+00:00"}],
-  "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "TRO", "VYG"],
-               "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true},
+  "coverage": {"operators": ["ATB", "FIN", "GOA", "KOL", "MOR", "NOR", "RUT", "SJN", "TRO", "VYG"],
+               "from_stop_in_timetable_today": true, "to_stop_in_timetable_today": true,
+               "transfers": "none"},
   "summary": "Tog L1 Lillestrøm 07:45 er innstilt",
   "summary_en": "Train L1 Lillestrøm 07:45 is cancelled",
   "summary_nn": "Tog L1 Lillestrøm 07:45 er innstilt",
@@ -619,6 +629,11 @@ same object, so it is not restated here. What the envelope around it means:
   `expected_departure_time` is the aimed time plus the typical delay
   predicted for it — the figure that decides whether the train can still be caught, and the one the
   list is ordered on; equal to the aimed time for a declared cancellation.
+- **A departure with a change is one entry, under its first leg** (where the deployment evaluates
+  them). `train`, `aimed_departure_time` and `expected_departure_time` are the first leg's boarding
+  call, so its `operator` and `mode` can be a bus's when a later leg is the Vy or SJ Norge train. `payload.trip` carries the whole trip — the legs, the changes, the expected arrival and what
+  breaks it — and `payload.arrival` is null, since no one vehicle reaches the destination. See
+  [the payload](#payload).
 - **`journey` and `windows` are what the answer is about** — the canonical refs, the defaults filled
   in, and the boarding windows as UTC instants (today's remaining one and tomorrow's, on the
   definition's weekdays). **Key your cache on `journey` plus `refreshed_at`**, never on the query
@@ -635,16 +650,40 @@ stop appears in today's planned timetable, checked over every ref of the physica
 open** (an unloaded timetable reads `true`), because "we do not know" must never render as "not
 served".
 
+`coverage.transfers` (since 2026-10-28) says whether the answer judged the departures with a change
+— trips where the traveller changes vehicles on the way, watched when one of their legs is a Vy or
+SJ Norge train. It is always present:
+
+| value | means |
+|---|---|
+| `evaluated` | the service holds the timetable's trips with a change for the period ahead, and the watched ones were judged like the direct trains |
+| `none` | that timetable has no trip with a change in the period: the direct trains are the whole answer |
+| `not_evaluated` | none was judged: the timetable for the period is not held yet, its trips with a change ride no train the service scores, the period reaches past what a read fetches (below), or the deployment does not evaluate trips with a change at all — `TRIP_PLANS_ENABLED` off, as in tst and prd today, where every answer says this |
+
+**A read fetches the timetable it lacks, for the next three hours only** — and an hour past them,
+so the reads in the hour after it are served from the same fetch. The service holds the timetable
+for every registered definition's windows. For a definition nobody registered, the first read that
+misses starts a background fetch on a Journey Planner allowance of its own, into an
+in-process cache that is never stored or refreshed — per replica, so a read served by another one
+can miss once more. Until the fetch lands the answer is `not_evaluated` with `complete: false`
+(`no-store`); the read after it lists the trips with a change. A period reaching more than three
+hours ahead, such as the whole-day default, reads `not_evaluated` for as long as its later hours are
+not held, and `complete` stays `true`: no later read fetches those hours either, so `false` would
+promise an answer that is not coming. It lifts as the hours come within reach, or sooner when a
+registered journey on the same stops covers them.
+
 There is deliberately **no servability caveat** on this read: the question costs a BigQuery query per
 anonymous pair and writes both refs into a log line, neither of which belongs on a public
 unauthenticated path. The `coverage` block is what you render an unknown favourite from — **render a
 favourite whose stop reads `false` as unverified, not as calm.**
 
 And read an empty `alerts` for what it is: **no alert-worthy train among the trains the service
-scores** — direct trips by the operators in `coverage.operators` — and never all-clear. A trip with a
-transfer never alerts; nothing here says anything about any other operator; and nothing here is
-evidence about alert quality, because a definition nobody registered produces no decision row and is
-**unscored, deliberately** (the fifth KTD12 limitation in the operations document).
+scores** — direct trips by the operators in `coverage.operators`, and trips with a change only where
+`coverage.transfers` says `evaluated` — and never all-clear. Render `not_evaluated` as unverified,
+like a stop that reads `false`: a pair served only with a change may be disrupted with nothing
+listed. Nothing here says anything about any other operator; and nothing here is evidence about
+alert quality, because a definition nobody registered produces no decision row and is **unscored,
+deliberately** (the fifth KTD12 limitation in the operations document).
 
 ### The statuses, and which are final
 
@@ -679,8 +718,9 @@ answers with whatever is ready. What is not ready is served as the template and 
 the statuses above saying why. **The work continues after the request returns**, so the next read of
 the same definition finds it.
 
-`complete` is `true` only when every *listed* entry's two statuses are terminal, and it decides the
-caching header:
+`complete` is `true` only when every *listed* entry's two statuses are terminal and no timetable of
+trips with a change for the next three hours is still being fetched (see
+[`coverage`](#coverage-and-what-an-empty-list-means)), and it decides the caching header:
 
 | `complete` | `Cache-Control` |
 |---|---|
@@ -727,6 +767,16 @@ definition is registered**.
    canonical pair and the train, so the signal no longer requires a favourite matching a
    registration minute for minute, only one on the same corridor. The mitigation is unchanged and
    still holds at this grain: no status ever says so, and a pair with a period is not a person.
+   Where trips with a change are evaluated (since 2026-10-28), a first read's `coverage.transfers`
+   and `complete` carry a sharper form of the signal, and they are statuses, so the mitigation above
+   does not cover them: a registered pair's plan is already held for the hours its registrations
+   cover, so the read answers `evaluated` (or `none`) and complete at once, while an unregistered
+   pair, or hours no registration covers, read `not_evaluated` with `complete: false` until the
+   read's own fetch lands. A caller probing narrow windows can therefore learn which hours of a
+   pair someone registered. Accepted by the owner on 2026-10-28 while trips with a change are
+   evaluated in dev only; revisit before they are turned on in production. The fix, if wanted, is to
+   judge a public read only from plans fetched for public reads, at one extra plan fetch per pair,
+   date and pod.
 2. **The global ceiling and the allowances are shared by every anonymous caller**, the app's BFF
    included, with no reserved slice — one source at the ceiling holds every caller at 429; one at
    the daily wording allowance holds every caller template-only for the trailing day. Treat both as
@@ -762,7 +812,9 @@ definition is registered**.
 
 `GET /notification-api/v1/journey-status` answers "how does today look on this trip, all of it?":
 every Vy and SJ Norge train in today's window that boards at the origin and lets the traveller off
-at the destination, in departure order, the ones that already ran included. It is the body behind the
+at the destination, in departure order, the ones that already ran included — and, where the
+deployment evaluates trips with a change, every departure with a change the service judges, under
+its first leg (below). It is the body behind the
 «I dag» strip on `/varsel`, and it takes the same five parameters as `journey-alerts` without `wait`
 and `limit`, and the same `ET-Client-Name` header. Validation, canonicalization, the 422 shapes and the echoed `journey` are that read's.
 Only today is answered: a today not in `days` is an empty `trains` with `reason: not_a_travel_day`.
@@ -793,7 +845,21 @@ from today's timetable, with no cancellation published, carries `removed_from_pl
 `cancelled` and `red` like any cancellation, ring before its time and filled after. Say «tatt ut av
 rutetabellen» for it rather than «innstilt»: the operator's own channels show no cancellation.
 `bus_for_train` is true when Vy has set up a replacement bus for it. Each train's `mode` is its
-line's transport mode, as on journey-alerts: `rail` for every train this read lists today.
+line's transport mode, as on journey-alerts: `rail` for every direct train this read lists today.
+
+**A departure with a change** (since 2026-10-28) is one row with `trip` set, under its first leg:
+`departure_time`, `operator`, `line`, `jkey` and `mode` are the first leg's boarding call — a bus's,
+when a later leg is the Vy or SJ Norge train — while `arrival_time` is the planned arrival at the
+destination, and `delay_min` and `delay_p50_min` are at the destination. `trip` is the webhook
+event's `payload.trip` (see [the payload](#payload)), so the two render alike. The row is graded end
+to end on the verdict a notification fires on: `red` for a forecast exactly where an alert would go,
+a broken change that another continuation of the same first train covers within 10 minutes graded
+on that continuation's arrival, and `grey` while a leg nothing can judge could change the answer.
+`state` follows the table above on the last leg, and a change observed missed is `confirmed` at
+once. A bus leg has no recorded calls, so a change missed after one stays `predicted` or `unknown`.
+The rows are the departures a notification may be about: one no faster than waiting for the next
+direct train is not listed. Every other row carries `trip: null`, and so does every row where trips
+with a change are not evaluated.
 
 **Each train's `destination`** is where it terminates (`"Drammen"`), the same value a notification
 title and the journey-alerts read name the train with; name it `R14 Drammen 14:59`. It is `null`
@@ -809,7 +875,8 @@ not loaded or the matcher failed: those cost the sentence, never the strip, whic
 **How old each fact can be** is in `as_of`. The day's timetable (which trains exist, and a
 cancellation) is rebuilt hourly. The recorded calls are rebuilt every fifteen minutes; until they
 are loaded, the timetable's own recorded calls stand in. The forecasts are rebuilt every prediction
-cycle. The answer is always `Cache-Control: public, max-age=60`.
+cycle. The answer is `Cache-Control: public, max-age=60`, except while a timetable of trips with a
+change is being fetched for it (`coverage.transfers`, below), when it is `no-store`.
 
 **Limits.** The read spends the same global and per-pair buckets as `journey-alerts`, not buckets
 of its own. A BFF reading both routes for one favourite therefore spends the per-pair thirty a
@@ -819,10 +886,16 @@ the first poller cycle, never an empty list. A grading failure
 is `503 status_failed`, also retryable.
 
 **Coverage.** `operators` and `coverage.operators` are `["VYG", "SJN"]`: the timetable behind this
-read is Vy and SJ Norge rail only. Render a Go-Ahead or bus trip as outside the answer, never as
-calm. An SJ Norge train's recorded calls come from the hourly timetable rather than the 15-minute
-actuals, so for up to about an hour after it has arrived it can still read `predicted` or
-`unknown`. Nothing here is scored on `/historikk`, and nothing here notifies anybody.
+read is Vy and SJ Norge rail only, so every direct row is theirs, and a departure with a change is
+listed when one of its legs is. A row's own `operator` can therefore be a bus's, or Go-Ahead's, when
+it is a trip's first leg. Any other Go-Ahead or bus departure — direct, or with a change that rides
+no Vy or SJ Norge train — is outside the answer: render it as that, never as calm.
+`coverage.transfers` is journey-alerts' field, said over this read's one window by the same rule
+and fetched the same way (see [`coverage`](#coverage-and-what-an-empty-list-means)): until it is
+`evaluated` or `none`, the trips with a change are missing from `trains` rather than calm. An SJ
+Norge train's recorded calls come from the hourly timetable rather than the 15-minute actuals, so
+for up to about an hour after it has arrived it can still read `predicted` or `unknown`. Nothing
+here is scored on `/historikk`, and nothing here notifies anybody.
 
 ---
 
@@ -866,6 +939,12 @@ the envelope**; the nested objects under `payload` are deliberately open.
 | `situations` | array of string | no | contributing SIRI-SX situation numbers |
 | `payload` | object | yes | facts plus the Norwegian prose |
 
+**On a departure with a change the train fields are the first leg's** (since 2026-10-28):
+`operator`, `line`, `journey_ref`, `stop_place` and `stop_order` name its boarding call, so the
+grain below is `(subscription, first train)`. `stop_place` is as the Journey Planner names it, which
+can be a child of the parent stop your subscription names, and `stop_order` is the Journey Planner's
+position in the pattern plus one, which is the real-time feed's for Vy.
+
 **`alert_id`'s grain is `(subscription, train)` and not the train alone**, and this matters to your
 suppression: a per-train key would make "drop a revision not strictly newer" suppress the *second*
 commuter's notification about the same cancelled train. The train's own fields ride along for display
@@ -888,9 +967,11 @@ all-clear, so it is stated rather than left out.
 
 A `situations` entry with a `KIX:` prefix means **no operator message is behind this alert**:
 `KIX:ETCancellation:` is a cancellation the real-time feed declared with no SIRI-SX message naming it,
-`KIX:NoSituation:` is a disruption scored from real-time data alone. There is nothing to fetch for
-either. (`KIX:PlanRemoved:`, a Vy train missing from today's timetable, is never the subject of an
-event; the journey-alerts read lists it.)
+`KIX:NoSituation:` is a disruption scored from real-time data alone, and
+`KIX:Trip:<operator>:<journey>:<date>` (since 2026-10-28) is a leg of a departure with a change that
+the Journey Planner's real-time data shows cancelled or missed, on a leg the service does not score.
+There is nothing to fetch for any of them. (`KIX:PlanRemoved:`, a Vy train missing from today's
+timetable, is never the subject of an event; the journey-alerts read lists it.)
 
 ### Payload
 
@@ -912,7 +993,8 @@ off the event; do not assume the published per-operator cut. A `situations` entr
 `situation_number`, `summary`, `description`, `summary_en`, `description_en`,
 `en_machine_translated`, `summary_nn`, `description_nn`, `nn_machine_translated`, `has_situation`,
 `report_type`), `situations_text`, `situations_text_en` and `situations_text_nn` (`string|null`),
-`alternative_journey` (`object|null`), and `summary`, `summary_en` and `summary_nn`.
+`alternative_journey` (`object|null`), `arrival`, `summary`, `summary_en` and `summary_nn`, and on a
+departure with a change `trip`.
 
 **`situations_text`** (since 2026-10-18) is the `situations` as one Norwegian text, for showing
 in place of every `description` stacked. Half of all alerted Vy trains carry two or more operator
@@ -950,6 +1032,33 @@ itself looked fine. `call` and `arrival` tell the two cases apart: `arrival.canc
 the boarding call running means the vehicle leaves but never gets there. Only a declared
 cancellation does this; `arrival.cancellation` as a forecast moves nothing. `null` when the
 destination call could not be resolved, and absent from an event minted before the field existed.
+
+**`trip`** (since 2026-10-28, where the deployment evaluates trips with a change) is present only on
+a departure with a change — the traveller changes vehicles on the way — and **absent** on a direct
+train, so a receiver that never reads it is unaffected. The event is still about the first leg's
+boarding call: `call`, `probabilities` and `delay` are that call's, can be calm while a later leg is
+not, and are null under `predicted` when the service does not score the first leg. `arrival` is
+null, because no one vehicle reaches your destination. `trip` carries:
+
+- `legs`, the ridden legs in travel order, each with its line, stops, aimed times, the Journey
+  Planner's live times when it has them, `cancelled`, and `data_source` — what the leg was judged
+  from: `prediction` (the service's own figures), `jp_realtime` (the Journey Planner's real-time
+  data), `none` (nothing, so the departure cannot be judged on that leg), or null where the leg was
+  not judged;
+- `transfers`, the changes, each with its stop, the walk and the planned slack. Both lists count
+  from 0, and transfer `i` sits between legs `i` and `i + 1`;
+- `expected_arrival` at your destination, null when nothing in the plan gets the traveller there,
+  and `arrives_via`: set only when a change on the planned route breaks and another continuation of
+  the same first train, arriving less than 10 minutes after the planned arrival, still holds — the
+  stop where that continuation leaves the planned route;
+- `problem`, what breaks the planned ride: `kind` (`departure`, `leg_cancelled`, `leg_departure`,
+  `missed_connection` or `leg_removed`), `index` (the leg, or the transfer for
+  `missed_connection`), and `probability` and `threshold`, the figure the alert was decided on and
+  its bar. **Show that figure for a departure with a change, not `probabilities`.** It can come from
+  another continuation of the same first train when that one decided the alert.
+
+`phase` `confirmed` on a departure with a change is a declared cancellation of a leg that no other
+continuation of the same first train can replace.
 
 **`situations[].report_type`** (since 2026-10-05) is SIRI-SX's `reportType` as the
 operator published it: `INCIDENT` for a disruption, `GENERAL` for general information such as
@@ -1017,12 +1126,17 @@ stretch — so a call you receive is already one the traveller may board and ali
 the flags would publish a rule instead of its result. Putting either on the wire would be a schema
 **addition**, not a description change.
 
-**`effect`'s vocabulary is `"cancelled"`, `"delayed"` or `null`** — the schema declares the field and
-enumerates no values, so this list is the code's and is stated here rather than left to be discovered.
-`cancelled` means the feed declared the trip impossible on this departure: the boarding call
-cancelled, or (since 2026-10-19) the destination call cancelled while the vehicle still leaves --
-`arrival.cancelled` says which. `delayed` means a departure delay figure was established; `null`
-means neither was.
+**`effect` is `"cancelled"`, `"delayed"`, `"missed_connection"` or `null`**, and since 2026-10-28
+the schema enumerates them; before that it declared the field with no values. `cancelled` means the
+trip is impossible on this departure: the boarding call cancelled, or (since 2026-10-19) the
+destination call cancelled while the vehicle still leaves -- `arrival.cancelled` says which -- or,
+on a departure with a change, no continuation gets there. `missed_connection` (since 2026-10-28) is
+a departure with a change whose planned ride breaks at a change -- a likely missed connection, or a
+later leg cancelled while the other continuations are only predicted to fail -- whatever the first
+leg's own delay. `delayed` means a departure delay figure was established; `null` means none of
+these. A receiver with a closed list of its own must add `missed_connection`; the typed client's
+union has it. More values may be added: treat a value you do not know as other, never as an error or
+as one of these.
 
 `alternative_journey` is the **best remaining way there**, not necessarily a faster one. Read
 `arrives_before_original` rather than assuming a saving; `minutes_saved` is signed.
@@ -1238,6 +1352,31 @@ between them — that isolation is what the project boundary enforces, not an ap
 
 ---
 
+## Changes to the contract
+
+Listed here from 2026-10-28; earlier additions are dated where they are described ("since …").
+
+**2026-10-28 — departures with a change**
+(`docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`), where the deployment evaluates them
+(`TRIP_PLANS_ENABLED`: dev on, tst and prd off):
+
+- **Two strict-schema additions**, present in every environment including those where the flag is
+  off. `coverage.transfers` on journey-alerts and journey-status (`not_evaluated` with the flag
+  off), and `TrainStatus.trip` on journey-status (`null` on every train with the flag off). Both
+  response models forbid unknown fields and list every property as required, so a client that
+  validates against the previous `openapi.json` with `additionalProperties: false` rejects these
+  answers until it takes the new contract.
+- **Additive on the event:** `payload.trip`, absent on a direct train and everywhere with the flag
+  off; `payload.arrival` is null on an event that carries it. The envelope's fields keep their
+  meaning and name the first leg's train.
+- **A new `effect` value**, `missed_connection`, and the schema now enumerates `effect`. Additive on
+  the wire, but a receiver with a closed list of values must add it. The list may grow again: treat
+  a value you do not know as other, never as an error.
+- **`servable`** also counts a trip with a change on a Vy or SJ Norge train, where the flag is on.
+- A new synthetic situation, `KIX:Trip:<operator>:<journey>:<date>`.
+
+---
+
 ## Not in scope
 
 Deferred, and named so nobody plans around a promise that was not made: exact dated itinerary
@@ -1254,7 +1393,7 @@ self-service onboarding; new model or operator coverage.
 
 And for the public read specifically: a favourite **departure** (a line at a stop) and a favourite
 **stop place** carry no destination and are not served — the read is keyed on a pair and serves
-favourite **routes** only; a trip with a **transfer** never alerts, so a definition across one reads
-as calm however bad the day is; the per-subscription pull with an unguessable token, for a client
-that wants the full event envelope rather than the payload; and a pull helper in the vendored
-package.
+favourite **routes** only; a trip with a change that rides no Vy or SJ Norge train, which is never
+judged (`coverage.transfers` says so rather than reading calm); the per-subscription pull with an
+unguessable token, for a client that wants the full event envelope rather than the payload; and a
+pull helper in the vendored package.

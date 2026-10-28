@@ -1,21 +1,13 @@
+import { useState } from 'react';
 import { IconButton, SecondaryButton } from '@entur/button';
 import { DeleteIcon, UndoIcon } from '@entur/icons';
 import { SmallAlertBox } from '@entur/alert';
 import { Paragraph, SmallText } from '@entur/typography';
-import type { Alert, AlternativeJourney, AlternativeLeg, Journey } from '../api';
-import {
-  CANCEL_LIKELY,
-  fmtDelay,
-  fmtPct,
-  fmtTime,
-  formatDays,
-  LEG_MODE_NOUN,
-  lineCode,
-  withDestination,
-  trainLabel,
-} from '../format';
+import type { Alert, AlternativeJourney, Journey } from '../api';
+import { fmtTime, formatDays, trainLabel } from '../format';
 import AlertFeedback from './AlertFeedback';
 import DagensReise from './DagensReise';
+import { alertDriver, arrivalLine, legLabel, legRows, notEvaluatedNote, verdict } from './tripModel';
 
 // "Sist observert: Asker, 18 min forsinket (kl 07:42)" — what has actually happened on the line, as
 // opposed to what is predicted. Shown with its time because the observation can be up to an hour
@@ -38,16 +30,6 @@ function observationText(obs: NonNullable<Alert['latest_observation']>): string 
 // on the card, not the operator's message.
 function decidedText(alert: Alert): string | null {
   return alert.decided_at ? `Vurdert kl ${fmtTime(alert.decided_at)}` : null;
-}
-
-// «tog RE11» — a transit leg as a departure board names it, mirroring varsel.py's
-// `_first_leg_label`: lower-case noun mid-clause, and no noun at all for a mode this codebase has
-// no word for (a guessed vehicle is worse than a missing one).
-function legLabel(leg: AlternativeLeg): string | null {
-  const noun = leg.mode ? LEG_MODE_NOUN[leg.mode] : undefined;
-  const code = withDestination(leg.public_code ?? lineCode(leg.line), leg.destination);
-  if (noun && code) return `${noun} ${code}`;
-  return code ?? noun ?? null;
 }
 
 // The escape route as its own box (design review 2026-09-01, finding 1). The API has carried
@@ -105,26 +87,32 @@ function AlternativeBox({ alt, toName }: { alt: AlternativeJourney; toName: stri
 // `impact_probability` is still what the gate gets compared against, which is why the
 // below-threshold note is phrased as a threshold rather than restated as a probability.
 function AlertLine({ alert, toName }: { alert: Alert; toName: string }) {
+  const [legsOpen, setLegsOpen] = useState(false);
   const parts: string[] = [];
   if (alert.departure_time) parts.push(trainLabel(alert.mode, alert.line, alert.departure_time, alert.destination));
   // A departure ET has already declared cancelled is stated, never scored: "91 % sjanse for
   // innstilling" for a train the journey planner no longer offers sends the traveller looking for
-  // it (2026-08-05). Word for word varsel.py's `_deterministic_body`, like the two below it.
-  // A departure that leaves but never reaches the traveller's stop is as certain, and said
-  // verbatim as notification_wording.DESTINATION_CANCELLED.
-  const driver = alert.cancelled
-    ? 'Innstilt'
-    : alert.destination_cancelled
-      ? 'Kjører ikke helt fram'
-      : alert.cancel_probability >= CANCEL_LIKELY
-      ? `${fmtPct(alert.cancel_probability)} sjanse for innstilling`
-      : fmtDelay(alert.delay_p50_min, alert.delay_p90_min);
+  // it (2026-08-05). A departure that leaves but never reaches the traveller's stop is as certain.
+  // A departure with a change names the leg or change at fault instead of the first train's
+  // figures. Word for word varsel.py's `_deterministic_body` (tripModel.alertDriver).
+  const driver = alertDriver(alert);
   if (driver) parts.push(driver);
   const observation = alert.latest_observation ? observationText(alert.latest_observation) : null;
   const stamp = observation ?? decidedText(alert);
+  // A departure with a change (multi-leg U10), in the plan's order: the verdict as the push title
+  // says it, the leg or change at fault and the expected arrival (the body's two lines), the legs,
+  // and the alternative apart under its own heading, so the trip and the alternative never read as
+  // one. Without `trip` every one of these is null and the card is what it was.
+  const trip = alert.trip ?? null;
+  const heading = verdict(alert);
+  const arrival = arrivalLine(alert);
+  // AlternativeBox's own rule for rendering nothing, so a heading is never left over an empty box.
+  const alt = alert.alternative_journey;
+  const alternative = alt && (alt.departure_time || alt.arrival_time) ? <AlternativeBox alt={alt} toName={toName} /> : null;
   return (
     <div className="av-alert">
       <SmallAlertBox variant={alert.alertworthy ? 'negative' : 'warning'} width="fluid">
+        {heading && <span className="av-alert-verdict">{heading}</span>}
         {alert.message ? (
           /* The wording is written as several lines (see varsel._deterministic_body's "\n".join, and
              the model is asked for the same shape), and the card quotes the text the push carries.
@@ -142,8 +130,34 @@ function AlertLine({ alert, toName }: { alert: Alert; toName: string }) {
         {!alert.message && parts.length > 0 && (
           <span className="av-alert-detail">{parts.join(' · ')}</span>
         )}
-        {alert.alternative_journey && (
-          <AlternativeBox alt={alert.alternative_journey} toName={toName} />
+        {!alert.message && arrival && <span className="av-alert-detail">{arrival}</span>}
+        {trip && (
+          <ol className="av-trip-legs" aria-label="Reisen, etappe for etappe">
+            {legRows(trip, legsOpen).map((row, i) =>
+              'more' in row ? (
+                <li key={i}>
+                  <button
+                    type="button"
+                    className="av-trip-more"
+                    aria-expanded={false}
+                    onClick={() => setLegsOpen(true)}
+                  >
+                    {row.label}
+                  </button>
+                </li>
+              ) : (
+                <li key={i}>{row.text}</li>
+              ),
+            )}
+          </ol>
+        )}
+        {alternative && trip ? (
+          <div className="av-trip-alternative">
+            <span className="av-trip-alternative-heading">Alternativ reise</span>
+            {alternative}
+          </div>
+        ) : (
+          alternative
         )}
         {stamp && <span className="av-alert-observed">{stamp}</span>}
       </SmallAlertBox>
@@ -195,6 +209,7 @@ export default function JourneyCard({
   const fromPush =
     notificationSituation !== null &&
     journey.alerts.some((alert) => alert.situation_number === notificationSituation);
+  const transfersNote = notEvaluatedNote(journey);
 
   return (
     <li
@@ -223,8 +238,9 @@ export default function JourneyCard({
       </div>
 
       {/* The «I dag» strip, between the chips and the alerts. Absent (null, or a server that
-          predates the field) the card is exactly what it was before the strip existed. */}
-      {journey.today && <DagensReise today={journey.today} />}
+          predates the field) the card is exactly what it was before the strip existed. Trips with a
+          change the server could not judge say so under it (multi-leg U10). */}
+      {journey.today && <DagensReise today={journey.today} note={transfersNote} />}
 
       {/* The warning replaces "ingen aktive avvik" rather than joining it: it is the reason there are
           none, and the reassuring line on its own is what let a journey watching the wrong stop look
@@ -259,6 +275,8 @@ export default function JourneyCard({
           ))}
         </div>
       )}
+      {/* No strip to sit under: the line is the card's footnote instead. */}
+      {transfersNote && !journey.today && <SmallText className="av-muted">{transfersNote}</SmallText>}
     </li>
   );
 }

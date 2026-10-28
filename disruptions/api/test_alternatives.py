@@ -1816,5 +1816,26 @@ def test_a_late_replacement_carries_how_late_against_the_plan():
     assert in_time.minutes_after_original is None
 
 
+def test_a_candidate_keeps_each_ridden_leg_for_the_connection_check():
+    """Multi-leg U6 (KTD10): the check on a candidate's change reads each ridden leg's refs, the
+    stops and aimed times at both ends, and the walk to the next leg, which the flat `transit_refs`
+    and the wire-shaped `legs` cannot carry. The walk after the last leg is no change."""
+    first = parse_candidates(_recorded_patterns())[0]
+    rail, bus = first.transit_legs
+    assert rail.refs == (
+        ("VYG", "DatedServiceJourney:113_OSL-HLD_26-08-06"), ("VYG", "ServiceJourney:113_552907-R"),
+    )
+    assert (rail.board_stop_place, rail.alight_stop_place) == ("NSR:StopPlace:337", "NSR:StopPlace:127")
+    assert (rail.aimed_departure.isoformat(), rail.aimed_arrival.isoformat()) == (
+        "2026-08-06T11:14:00+02:00", "2026-08-06T11:25:00+02:00",
+    )
+    assert rail.walk_after_s == 281, "Ski to the bus stop, 11:25:26-11:30:07"
+    assert bus.refs[1] == ("RUT", "ServiceJourney:fe362750909c4c05aec47f2891ee3a5d")
+    assert (bus.board_stop_place, bus.alight_stop_place) == ("NSR:StopPlace:4992", "NSR:StopPlace:5553")
+    assert bus.aimed_departure.isoformat() == "2026-08-06T11:32:00+02:00"
+    assert bus.walk_after_s == 0, "the walk to Drøbak torg is the egress, not a change"
+    assert "transit_legs" not in alternatives.AlternativeJourney.model_fields
+
+
 if __name__ == "__main__":
     _run()

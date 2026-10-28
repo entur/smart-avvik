@@ -95,7 +95,7 @@
         "boolean",
         "null"
       ],
-      "description": "Whether any planned direct trip runs between the two places. `null` means the answer could not be established -- an outage, a timeout -- and must never render as an all-clear. A subscription no direct trip can serve carries the caveat and is NEVER refused: weekend-only and seasonal routes are why a refusal would be wrong."
+      "description": "Whether the service can alert on any planned trip between the two places: a direct trip, or -- where this deployment evaluates trips with a change -- a trip with a change on a Vy or SJ Norge train. `null` means the answer could not be established -- an outage, a timeout -- and must never render as an all-clear. A subscription the service cannot serve carries the caveat and is NEVER refused: weekend-only and seasonal routes are why a refusal would be wrong."
     },
     "servable_checked_at": {
       "type": [

@@ -7,6 +7,7 @@
 
 import type { JourneyStatus, TrainStatus } from '../api';
 import { fmtTime, lineCode, withDestination } from '../format.ts';
+import { tripLevel, tripStateText } from './tripModel.ts';
 
 /** The server grades no-SX figures only this far ahead (journey_status.NOSX_HORIZON_MIN). */
 const NOSX_HORIZON_MS = 120 * 60 * 1000;
@@ -19,7 +20,7 @@ const ARRIVAL_GRACE_MS = 30 * 60 * 1000;
 /** `dr-fact` is a filled circle, `dr-ring` a coloured ring; the level picks the colour. */
 export function circleClass(train: TrainStatus): string {
   const fill = train.state === 'confirmed' ? 'dr-fact' : 'dr-ring';
-  return `dr-circle ${fill} dr-${train.level}${train.cancelled ? ' dr-cancelled' : ''}`;
+  return `dr-circle ${fill} dr-${tripLevel(train)}${train.cancelled ? ' dr-cancelled' : ''}`;
 }
 
 /** What the train is and how it looks, in one line: «L1 07:48, fare for over 10 min forsinkelse
@@ -40,6 +41,9 @@ export function circleLabel(train: TrainStatus, now?: string): string {
 }
 
 function stateText(train: TrainStatus): string {
+  // A departure with a change reads by the trip's own state table (multi-leg U10).
+  const trip = tripStateText(train);
+  if (trip !== null) return trip;
   // Not «innstilt»: Vy has not cancelled it, and entur.no shows no cancellation (plan 2026-09-23-001).
   if (train.removed_from_plan) {
     return train.bus_for_train ? 'tatt ut av rutetabellen, buss for tog' : 'tatt ut av rutetabellen';

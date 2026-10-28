@@ -23,9 +23,20 @@ so the strip and the morning digest can say what happened rather than «innstilt
 Precedence (KTD3): a declared cancellation, then a recorded alighting call, then a prediction, then
 unknown. Nothing here queries BigQuery; every read is a dict lookup on a swapped-whole snapshot.
 
+**Departures with a change** (multi-leg U9, KTD14), with TRIP_PLANS_ENABLED on and the pair's day
+plan held: one more row per first-leg departure, `trip` set, from `trips.judge` -- the matcher's
+own enumeration and verdict, so the strip lists what the matcher judges, the ones that already ran
+included (no `catchable_after`). Red is therefore the gate's (KTD6, KTD19), and a broken change whose
+KTD19 cushion holds is graded on the cushion's arrival: the strip is never red where the alert stays
+silent. On top of it the spine's facts for the rail legs: a cancellation the cache has let go of, a
+change observed missed (AE8), the arrival recorded at the destination. A leg nothing can judge
+(KTD8) keeps the trip off green. A request still never touches the network: no plan, no trip rows,
+and the public read says `not_evaluated` and starts the fetch (`notification_pull`).
+
 A leaf module: it imports `impact` and `alert_policy` and never `varsel` or `notification_pull`, so
 both surfaces can call it without breaking the rule that `varsel` never imports `notification_pull`.
-What it needs from `varsel` (`place_refs`) is injected through :func:`configure`.
+What it needs from `varsel` (`place_refs`) and from `trip_plans` (the plan reader) is injected
+through :func:`configure`; the trip logic it reaches through `impact`, which imports `trips`.
 """
 
 from __future__ import annotations
@@ -41,7 +52,7 @@ from zoneinfo import ZoneInfo
 import alert_policy
 import impact
 import line_modes
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 _OSLO = ZoneInfo("Europe/Oslo")
 
@@ -112,15 +123,32 @@ class CallTable:
         return sum(len(v) for v in self.by_key.values())
 
 
+@dataclass(frozen=True, slots=True)
+class RemovedTrain:
+    """A train out of today's plan as the morning digest names and marks it (KTD6): `jkey` the
+    relay's key, whose `KIX:PlanRemoved:` situation, dated by the day, is the digest's mark; `line`,
+    `departure_time` (aimed, at its boarding stop) and `destination` its label. A direct row's own
+    train, or a trip's removed ridden leg -- the connecting train, never the first leg that runs."""
+
+    jkey: str
+    line: str | None
+    departure_time: datetime
+    destination: str | None
+    bus_for_train: bool
+
+
 # ---- Wire shape --------------------------------------------------------------------------------
 
 
 class TrainStatus(BaseModel):
-    """One train in the window: what it is, what we know, and how bad."""
+    """One train in the window: what it is, what we know, and how bad. Or, with `trip` set, one
+    departure with a change, in its first leg's identity (multi-leg KTD5) and graded end to end."""
 
     model_config = ConfigDict(extra="forbid")
     departure_time: datetime = Field(description="Aimed departure from the boarding stop, UTC.")
-    arrival_time: datetime | None = Field(description="Aimed arrival at the alighting stop, UTC.")
+    arrival_time: datetime | None = Field(
+        description="Aimed arrival at the alighting stop, UTC; at the destination for a trip."
+    )
     operator: str
     line: str | None = Field(description="SIRI lineRef, e.g. `VYG:Line:L1`.")
     jkey: str = Field(description="Dated journey ref with its codespace stripped.")
@@ -142,7 +170,8 @@ class TrainStatus(BaseModel):
     impact_probability: float | None = Field(
         description="P(cancelled OR >= 10 min late) at the boarding stop — what the push gates on. "
         "1.0 when cancelled; null on a confirmed or unknown train, and on a forecast the cache "
-        "scored at one end only (the push cannot fire on one)."
+        "scored at one end only (the push cannot fire on one). For a trip, the figure its verdict "
+        "was taken on (multi-leg KTD6)."
     )
     alert_worthy: bool
     observed_at: datetime | None = Field(
@@ -150,7 +179,8 @@ class TrainStatus(BaseModel):
     )
     removed_from_plan: bool = Field(
         description="Missing from today's timetable: it runs on this weekday, today's plan lacks "
-        "it, and no cancellation was published. Always `cancelled` too."
+        "it, and no cancellation was published. Always `cancelled` too. False on a trip, whose "
+        "ridden leg out of the plan is `trip.problem.kind` `leg_removed`."
     )
     bus_for_train: bool = Field(description="A removed train Vy has set up a replacement bus for.")
     destination: str | None = Field(
@@ -160,6 +190,16 @@ class TrainStatus(BaseModel):
         default=None,
         description="The line's Journey Planner transport mode: `rail` for every train listed today.",
     )
+    # Required and nullable (multi-leg KTD13): the strict schema lists every property, so it is
+    # present with TRIP_PLANS_ENABLED off too, as null (R16).
+    trip: impact.TripFacts | None = Field(
+        description="The departure with a change this row is, as `payload.trip` describes one: its "
+        "legs, changes, expected arrival and, when it alerts or broke, the problem. Null on a direct "
+        "train."
+    )
+    # A trip's ridden leg out of today's plan, for the morning digest (`removed_train`). Never on the
+    # wire: the relay's key is ours, and `removed_from_plan` would name this row's first train.
+    _removed: RemovedTrain | None = PrivateAttr(default=None)
 
 
 class WindowSpan(BaseModel):
@@ -204,23 +244,36 @@ _spine: CallTable | None = None
 _actuals: CallTable | None = None
 _predictions_refreshed_at: Callable[[], datetime | None] = lambda: None
 _place_refs: Callable[[str], tuple[str, ...]] = lambda ref: (ref,)
+#: The pair's day plan, `(from_stop, to_stop, Oslo date) -> trips.DayPlan | None` (multi-leg U9):
+#: `trip_plans.read_plan`, memory only. None: no departure with a change is listed.
+_trip_plans: Callable[[str, str, dt.date], impact.trips.DayPlan | None] | None = None
+#: Every plan the leader holds (`trip_plans.held`), for :func:`removed_today`'s trips. None: none.
+_held_plans: Callable[[], Iterable[impact.trips.DayPlan]] | None = None
 
 
 def configure(
     *,
     predictions_refreshed_at: Callable[[], datetime | None],
     place_refs: Callable[[str], tuple[str, ...]],
+    trip_plans: Callable[[str, str, dt.date], impact.trips.DayPlan | None] | None = None,
+    held_plans: Callable[[], Iterable[impact.trips.DayPlan]] | None = None,
 ) -> None:
-    """Wire the prediction-cache stamp and `varsel.place_refs`, once, at startup.
+    """Wire the prediction-cache stamp, `varsel.place_refs` and the plan reader, once, at startup.
 
     `place_refs` is not optional in production: a definition carries the CANONICAL ref, which for a
     station like Asker is its busiest (bus) side, while every rail call in the spine sits on the rail
     ref. Walked on the canonical ref alone the strip would be empty for exactly the stations the
     2026-08-03 collapse was about. It is injected because this module may not import `varsel`.
+
+    `trip_plans` is `trip_plans.read_plan`, the reader `varsel` matches with (KTD4), and
+    `held_plans` `trip_plans.held`, every plan the leader holds: injected, so this module never
+    imports `trip_plans`, and read only with TRIP_PLANS_ENABLED on.
     """
-    global _predictions_refreshed_at, _place_refs
+    global _predictions_refreshed_at, _place_refs, _trip_plans, _held_plans
     _predictions_refreshed_at = predictions_refreshed_at
     _place_refs = place_refs
+    _trip_plans = trip_plans
+    _held_plans = held_plans
 
 
 def set_spine(table: CallTable | None) -> None:
@@ -270,30 +323,60 @@ def destination(operator: str | None, jkey: str | None) -> str | None:
 
 def removed_today() -> frozenset[str]:
     """The stop places the spine's trains Vy took out of today's plan call at; empty while unloaded.
+    With TRIP_PLANS_ENABLED on, also the boarding place of every held trip with a change whose
+    ridden leg is such a train (AE13): the train calls at the change, never at the trip's from-place.
 
     `varsel`'s morning digest reads them to walk only registrations whose from-place a removed
     train calls at, so a day without a cut costs one scan of the spine and nothing per registration.
+    A superset of the strip's own set (a trip whose KTD19 cushion holds is asked and names nothing),
+    which is all a pre-filter must be.
     """
     with _lock:
         spine = _spine
     if spine is None:
         return frozenset()
-    return frozenset(
+    stops = {
         c.stop_place
         for calls in spine.by_key.values()
         for c in calls
         if c.call_source == "removed" and c.stop_place is not None
-    )
+    }
+    if _held_plans is not None and impact.trips.enabled():
+
+        def removed(leg: impact.trips.PlanLeg) -> bool:
+            key = impact.trips.removed_ref(leg)
+            return key is not None and bool(spine.by_key.get(key) or impact._lookup_journey_calls(*key))
+
+        stops.update(
+            trip.legs[0].board_stop_place
+            for plan in _held_plans() for trip in plan.trips
+            if any(removed(leg) for leg in trip.legs)
+        )
+    return frozenset(stops)
+
+
+def removed_train(train: TrainStatus) -> RemovedTrain | None:
+    """The train out of today's plan a strip row stands for, as the morning digest names it: a
+    direct row's own train when it is `removed_from_plan`, or an alerting trip's ridden leg whose
+    train is out of the plan (its `problem` `leg_removed`, confirmed or on a forecast). None for any
+    other row."""
+    if train.trip is not None:
+        return train._removed
+    if not train.removed_from_plan:
+        return None
+    return RemovedTrain(train.jkey, train.line, train.departure_time, train.destination, train.bus_for_train)
 
 
 def reset_state() -> None:
     """Test-only: forget both tables and the wiring."""
-    global _spine, _actuals, _predictions_refreshed_at, _place_refs
+    global _spine, _actuals, _predictions_refreshed_at, _place_refs, _trip_plans, _held_plans
     with _lock:
         _spine = None
         _actuals = None
     _predictions_refreshed_at = lambda: None
     _place_refs = lambda ref: (ref,)
+    _trip_plans = None
+    _held_plans = None
 
 
 # ---- The answer --------------------------------------------------------------------------------
@@ -386,6 +469,12 @@ def _confirmed_delay(calls: tuple[PlannedCall, ...], a: PlannedCall) -> tuple[in
     return None
 
 
+def _arrival_read(recorded: dict[int, PlannedCall], at: PlannedCall) -> tuple[int, PlannedCall] | None:
+    """`_confirmed_delay` of the recorded call `at`, over its train's recorded calls (`_recorded`)
+    in stop order."""
+    return _confirmed_delay(tuple(recorded[o] for o in sorted(recorded)), at)
+
+
 def _level_for_delay(delay: int | None) -> Level:
     if delay is None:
         return "grey"
@@ -445,6 +534,51 @@ def _end_cancelled(planned: PlannedCall, recorded: PlannedCall | None, preds: li
     )
 
 
+def _recorded(key: tuple[str, str], spine: CallTable, actuals: CallTable | None) -> dict[int, PlannedCall]:
+    """A train's recorded calls by stop order: the spine's own, overlaid per stop by the actuals
+    index, which is fresher (15 min against 60). An overlay and not a replacement:
+    `rail_calls_today` keeps only calls with an aimed DEPARTURE, so it never holds a terminus
+    arrival, and letting it stand alone for a train it knows would hide the spine's recorded
+    terminus call."""
+    by_order = {c.stop_order: c for c in spine.by_key.get(key, ()) if c.call_source == "recorded"}
+    if actuals is not None:
+        by_order.update({c.stop_order: c for c in actuals.by_key.get(key, ())})
+    return by_order
+
+
+def _blank_row(
+    *,
+    departure_time: datetime,
+    arrival_time: datetime | None,
+    operator: str,
+    line: str | None,
+    jkey: str,
+    destination: str | None,
+    mode: str | None,
+    trip: impact.TripFacts | None,
+) -> dict:
+    """A row's identity with every figure blank: what each grade of `_status` and `_trip_status`
+    fills in."""
+    return {
+        "departure_time": departure_time,
+        "arrival_time": arrival_time,
+        "operator": operator,
+        "line": line,
+        "jkey": jkey,
+        "destination": destination,
+        "mode": mode,
+        "impact_probability": None,
+        "alert_worthy": False,
+        "expected_departure_time": None,
+        "delay_min": None,
+        "delay_p50_min": None,
+        "observed_at": None,
+        "removed_from_plan": False,
+        "bus_for_train": False,
+        "trip": trip,
+    }
+
+
 def _status(
     b: PlannedCall,
     a: PlannedCall,
@@ -455,34 +589,20 @@ def _status(
     key = (b.operator, b.jkey)
     preds = impact._lookup_journey_calls(b.operator, b.jkey)
 
-    # Recorded calls: the spine's own, overlaid per stop by the actuals index, which is fresher
-    # (15 min against 60). An overlay and not a replacement: `rail_calls_today` keeps only calls
-    # with an aimed DEPARTURE, so it never holds a terminus arrival, and letting it stand alone for
-    # a train it knows would hide the spine's recorded terminus call.
-    by_order = {c.stop_order: c for c in spine.by_key[key] if c.call_source == "recorded"}
-    if actuals is not None:
-        by_order.update({c.stop_order: c for c in actuals.by_key.get(key, ())})
-    recorded_calls = tuple(by_order[o] for o in sorted(by_order))
+    by_order = _recorded(key, spine, actuals)
     recorded_a = by_order.get(a.stop_order)
     recorded_b = by_order.get(b.stop_order)
 
-    common = {
-        "departure_time": b.aimed_dep,
-        "arrival_time": a.aimed_arr,
-        "operator": b.operator,
-        "line": b.line,
-        "jkey": b.jkey,
-        "destination": _destination(spine.by_key[key]),
-        "mode": line_modes.transport_mode(b.operator, b.line),
-        "impact_probability": None,
-        "alert_worthy": False,
-        "expected_departure_time": None,
-        "delay_min": None,
-        "delay_p50_min": None,
-        "observed_at": None,
-        "removed_from_plan": False,
-        "bus_for_train": False,
-    }
+    common = _blank_row(
+        departure_time=b.aimed_dep,
+        arrival_time=a.aimed_arr,
+        operator=b.operator,
+        line=b.line,
+        jkey=b.jkey,
+        destination=_destination(spine.by_key[key]),
+        mode=line_modes.transport_mode(b.operator, b.line),
+        trip=None,
+    )
 
     # R3: a trip is cancelled when EITHER end is. Vy cancels partial legs.
     if _end_cancelled(b, recorded_b, preds) or _end_cancelled(a, recorded_a, preds):
@@ -501,7 +621,7 @@ def _status(
         )
 
     if recorded_a is not None:
-        read = _confirmed_delay(recorded_calls, recorded_a)
+        read = _arrival_read(by_order, recorded_a)
         delay, source = read if read is not None else (None, recorded_a)
         return TrainStatus(
             **{**common, "delay_min": delay, "observed_at": source.aimed_arr or source.aimed_dep},
@@ -564,6 +684,268 @@ def _unknown(common: dict) -> TrainStatus:
     return TrainStatus(**common, state="unknown", level="grey", cancelled=False)
 
 
+# ---- Departures with a change (multi-leg U9, KTD14) ---------------------------------------------
+
+# A rail leg as the spine holds it: its boarding and alighting calls, and its train's recorded calls
+# by stop order (`_recorded`).
+_SpineLeg = tuple[PlannedCall, PlannedCall, dict[int, PlannedCall]]
+
+
+def _trip_rows(
+    definition: dict,
+    start: datetime,
+    end: datetime,
+    spine: CallTable,
+    actuals: CallTable | None,
+    now: datetime,
+    direct: set[tuple[str, str, datetime]],
+) -> list[TrainStatus]:
+    """One row per first-leg departure with a change in today's window, the ones that already ran
+    included, or none while TRIP_PLANS_ENABLED is off or no plan is held (a request never fetches).
+
+    The set is the request-path matcher's (`varsel.match_journey` without a standing alert):
+    `trips.judge`'s departures, the figure-less ones too, KTD20's admitted ones only -- a trip that
+    waiting for the next direct train beats is an alternative, and listed it could show red where no
+    alert would go -- and never one whose first-leg departure is a direct row here (AE7), as a
+    direct alert wins `varsel`'s merge. `direct_for_pair` cannot always see that: it reads the
+    cache, an hour back at most, and the plan's direct patterns, which JP thins by dominance.
+
+    `ponytail:` KTD20 reads the prediction cache, so a trip admitted only because the direct train
+    after it was cancelled drops off the strip once that train's calls age out of the cache, an hour
+    after it. Upgrade path: the cancellation from the spine, if the strip ever needs it all day.
+    """
+    reader = _trip_plans
+    if reader is None or not impact.trips.enabled():
+        return []
+    plan = reader(definition["from_stop"], definition["to_stop"], start.astimezone(_OSLO).date())
+    if plan is None:
+        return []
+    verdicts = impact.trips.judge(
+        plan, to_stop=definition["to_stop"], window_start=start, window_end=end, unjudged=True
+    )
+    return [
+        _trip_status(verdict, spine, actuals, now)
+        for verdict in verdicts
+        if verdict.admitted and verdict.key not in direct
+    ]
+
+
+def _spine_leg(leg: impact.trips.PlanLeg, spine: CallTable, actuals: CallTable | None) -> _SpineLeg | None:
+    """A rail leg's two calls in the spine, matched as the verdict matches the cache's, on stop
+    place and aimed time; a train out of the plan under the relay's key, as the spine holds it. None
+    for a leg the spine does not hold: every bus, and a train it lacks."""
+    for key in (impact.trips.leg_ref(leg), impact.trips.removed_ref(leg)):
+        calls = spine.by_key.get(key) if key is not None else None
+        if not calls:
+            continue
+        b = next((c for c in calls if c.stop_place == leg.board_stop_place
+                  and c.aimed_dep == leg.aimed_departure), None)
+        a = next((c for c in calls if c.stop_place == leg.alight_stop_place
+                  and c.aimed_arr == leg.aimed_arrival), None)
+        if b is not None and a is not None:
+            return b, a, _recorded(key, spine, actuals)
+    return None
+
+
+def _removed_leg(leg: impact.trips.PlanLeg, spine: CallTable) -> RemovedTrain | None:
+    """A trip's ridden leg out of the plan as the digest names it (AE13): the relay's key -- the
+    same `trips.removed_ref` the verdict found its rows under, dated by the leg's service day, so
+    the digest's `KIX:PlanRemoved:` mark ends in the Oslo day the blob prune keeps -- and the leg's
+    own line and aimed departure at its boarding stop, with the train's terminus and replacement
+    bus off the spine's rows for it."""
+    key = impact.trips.removed_ref(leg)
+    if key is None:
+        return None
+    calls = spine.by_key.get(key, ())
+    return RemovedTrain(
+        key[1], leg.line, leg.aimed_departure, _destination(calls), any(c.bus_for_train for c in calls)
+    )
+
+
+def _with_removed(row: TrainStatus, legs: tuple[impact.trips.PlanLeg, ...], spine: CallTable) -> TrainStatus:
+    """An alerting trip row, carrying its ridden leg out of the plan for the digest (AE13) when
+    that is its problem: the per-train push and the event drop a `KIX:PlanRemoved:` situation,
+    confirmed or predicted, so the digest must name it either way."""
+    problem = row.trip.problem if row.trip is not None else None
+    if problem is not None and problem.kind == "leg_removed":
+        row._removed = _removed_leg(legs[problem.index], spine)
+    return row
+
+
+def _problem(kind: str, index: int, leg: impact.trips.PlanLeg) -> impact.alternatives.TripProblem:
+    """A certainty the spine observed, as KTD6 gates one: 1.0 at the leg's operator's no-SX bar,
+    since no operator message stands behind an observation of ours."""
+    threshold, _ = alert_policy.gate(1.0, leg.operator, has_situation=False)
+    return impact.alternatives.TripProblem(kind=kind, index=index, probability=1.0, threshold=threshold)
+
+
+def _cancelled_leg(
+    states: list[impact.trips.LegState], rail: list[_SpineLeg | None]
+) -> tuple[int, str] | None:
+    """The first ridden rail leg the spine says is cancelled at either end while the cache no
+    longer scores it, and the reason kind: an hour after its calls the spine is what still knows,
+    as it is for a direct train. While the cache scores the leg the verdict decides, cushion and
+    all (KTD19).
+
+    `ponytail:` once the cache has let go, a cancelled change whose KTD19 cushion held reads red.
+    Upgrade path: compose the spine's cancellations across the continuations, as the verdict does.
+    """
+    for i, (state, found) in enumerate(zip(states, rail, strict=True)):
+        if found is None or state.board or state.alight or state.removed:
+            continue
+        b, a, recorded = found
+        if _end_cancelled(b, recorded.get(b.stop_order), []) or _end_cancelled(a, recorded.get(a.stop_order), []):
+            return i, "leg_removed" if b.call_source == "removed" else "leg_cancelled"
+    return None
+
+
+def _missed_change(
+    legs: tuple[impact.trips.PlanLeg, ...],
+    states: list[impact.trips.LegState],
+    rail: list[_SpineLeg | None],
+    now: datetime,
+) -> tuple[int, PlannedCall] | None:
+    """A change observed missed (AE8): the arriving train's recorded call at the change, plus the
+    walk, after the connecting departure -- recorded when the spine has it, else JP's expected --
+    and that departure has passed. The transfer index and the call it was read off. Never against
+    the aimed departure alone: a connecting vehicle not yet recorded may be held or late too.
+
+    The arrival is the recorded call's delay figure (`_confirmed_delay`: the departure delay at a
+    through station, as the strip reads every arrival today). A bus arriving has no recorded call of
+    ours, so its change is never observed here and stays predicted or grey (KTD8).
+
+    `ponytail:` a real miss onto a train JP has no expected time for stays predicted until the
+    actuals record that train's departure, up to 15 min later."""
+    for i in range(len(legs) - 1):
+        if rail[i] is None:
+            continue
+        _b, a, recorded = rail[i]
+        at = recorded.get(a.stop_order)
+        read = None if at is None else _arrival_read(recorded, at)
+        if read is None:
+            continue
+        arrived = legs[i].aimed_arrival + timedelta(minutes=read[0], seconds=legs[i].walk_after_s)
+        leaves = None
+        if rail[i + 1] is not None:
+            b, _a, onward = rail[i + 1]
+            left = onward.get(b.stop_order)
+            if left is not None:
+                leaves = legs[i + 1].aimed_departure + timedelta(minutes=left.dep_delay_min or 0)
+        realtime = states[i + 1].realtime
+        if leaves is None and realtime is not None:
+            leaves = realtime.expected_departure
+        if leaves is not None and now >= leaves and arrived > leaves:
+            return i, at
+    return None
+
+
+def _trip_status(
+    verdict: impact.trips.Verdict, spine: CallTable, actuals: CallTable | None, now: datetime
+) -> TrainStatus:
+    """One departure with a change, graded (KTD14), in the direct row's precedence: a confirmed
+    reason (KTD6, composed per KTD19), then a change observed missed (AE8), then the arrival
+    recorded at the destination, then the verdict's forecast, then unknown.
+
+    Red for a forecast is the verdict's gate, so a broken planned change whose cushion holds is
+    graded on the cushion's arrival (KTD9's expected arrival) and never red where the alert stays
+    silent. A leg nothing can judge greys the trip (KTD8), and so does a no-SX figure past the
+    horizon, as on a direct train. The ring-then-fill rule is today's, on the trip's last leg; a
+    change observed missed is a fact at once, and filled.
+    """
+    legs = verdict.trip.legs
+    first, last = legs[0], legs[-1]
+    operator, jkey = impact.trips.leg_ref(first)
+    # The states the verdict was taken on, so the row and the verdict read one cache snapshot.
+    states = list(verdict.leg_states)
+    rail = [_spine_leg(leg, spine, actuals) for leg in legs]
+    facts = verdict.facts
+    common = _blank_row(
+        departure_time=first.aimed_departure,
+        arrival_time=last.aimed_arrival,
+        operator=operator or "",
+        line=first.line,
+        jkey=jkey,
+        destination=_destination(spine.by_key.get((operator, jkey), ())),
+        mode=first.mode,
+        trip=facts,
+    )
+
+    gone = None if verdict.confirmed else _cancelled_leg(states, rail)
+    if verdict.confirmed or gone is not None:
+        if gone is not None:
+            index, kind = gone
+            facts = facts.model_copy(update={
+                "problem": _problem(kind, index, legs[index]), "expected_arrival": None,
+            })
+        passed = now >= last.aimed_departure
+        return _with_removed(TrainStatus(
+            **{**common, "trip": facts, "impact_probability": 1.0, "alert_worthy": True,
+               "observed_at": last.aimed_departure if passed else None},
+            state="confirmed" if passed else "predicted",
+            level="red",
+            cancelled=True,
+        ), legs, spine)
+
+    missed = _missed_change(legs, states, rail, now)
+    if missed is not None:
+        index, call = missed
+        facts = facts.model_copy(update={
+            "problem": _problem("missed_connection", index, legs[index]), "expected_arrival": None,
+        })
+        return TrainStatus(
+            **{**common, "trip": facts, "observed_at": call.aimed_arr or call.aimed_dep},
+            state="confirmed",
+            level="red",
+            cancelled=False,
+        )
+
+    if rail[-1] is not None:
+        _b, a, recorded = rail[-1]
+        at = recorded.get(a.stop_order)
+        if at is not None:
+            read = _arrival_read(recorded, at)
+            delay, source = read if read is not None else (None, at)
+            return TrainStatus(
+                **{**common, "delay_min": delay, "observed_at": source.aimed_arr or source.aimed_dep},
+                state="confirmed",
+                level=_level_for_delay(delay),
+                cancelled=False,
+            )
+
+    deciding = verdict.deciding
+    if deciding is None or (
+        not deciding.has_situation and first.aimed_departure - now > timedelta(minutes=NOSX_HORIZON_MIN)
+    ):
+        return _unknown(common)
+    expected_departure = None
+    if verdict.board:
+        expected_departure = impact._expected_departure(impact._worst_call(verdict.board))
+    elif states[0].realtime is not None:
+        expected_departure = states[0].realtime.expected_departure
+    delay = None
+    if facts.expected_arrival is not None:
+        delay = max(round((facts.expected_arrival - last.aimed_arrival).total_seconds() / 60), 0)
+    forecast = {**common, "impact_probability": deciding.probability, "delay_p50_min": delay,
+                "expected_departure_time": expected_departure}
+    if verdict.alertworthy:
+        # Red on a forecast can still be a ridden train out of the plan: a KTD19 cushion only
+        # predicted to fail leaves the verdict unconfirmed, and the digest is its only channel.
+        return _with_removed(
+            TrainStatus(**{**forecast, "alert_worthy": True}, state="predicted", level="red", cancelled=False),
+            legs, spine,
+        )
+    unknown_leg = any(
+        state.unknown and not (found is not None and {found[0].stop_order, found[1].stop_order} <= found[2].keys())
+        for state, found in zip(states, rail, strict=True)
+    )
+    if unknown_leg or delay is None:
+        return _unknown(common)
+    # Not over the gate, so not red whatever the delay: the gate is the one statement of red for a
+    # forecast, as on a direct train.
+    level = _level_for_delay(delay)
+    return TrainStatus(**forecast, state="predicted", level="yellow" if level == "red" else level, cancelled=False)
+
+
 def status_for(definition: dict, now: datetime) -> JourneyStatus | None:
     """The strip for `definition` (`from_stop`, `to_stop`, `begin`, `end`, `days`) at `now`, or None
     while the spine is not loaded — which a caller must never render as «alt i rute»."""
@@ -586,9 +968,14 @@ def status_for(definition: dict, now: datetime) -> JourneyStatus | None:
     start, end = window
     from_refs = _place_refs(definition["from_stop"])
     to_refs = set(_place_refs(definition["to_stop"]))
-    trains = [
-        _status(b, a, spine, actuals, now) for b, a in _trains(spine, from_refs, to_refs, start, end)
-    ]
+    pairs = _trains(spine, from_refs, to_refs, start, end)
+    trains = [_status(b, a, spine, actuals, now) for b, a in pairs]
+    trains += _trip_rows(
+        definition, start, end, spine, actuals, now,
+        direct={(b.operator, b.jkey, b.aimed_dep) for b, _a in pairs},
+    )
+    # Stable, so the direct trains keep `_trains`' order and a trip follows one at the same minute.
+    trains.sort(key=lambda t: t.departure_time)
     return JourneyStatus(
         now=now, date=start.astimezone(_OSLO).date(), window=WindowSpan(start=start, end=end), reason=None,
         operators=list(OPERATORS), as_of=as_of, trains=trains,

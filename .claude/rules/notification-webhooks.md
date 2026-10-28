@@ -129,6 +129,53 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   Otherwise `_destination_call` takes the train's first arrival at `to_stop` after boarding, from
   any situation, and `_Generation._pair` keys its alighting set on `(operator, jkey)` to match.
   `journey_status._paired_prediction` restates the same rule.
+- **A departure with a change carries `payload.trip`** (2026-10-28, behind `TRIP_PLANS_ENABLED`; how
+  a trip is judged is in `.claude/rules/varsel.md`). It is KTD13's one model, `alternatives.TripFacts`,
+  serialised unchanged in the payload, journey-status's `TrainStatus.trip` and `/varsel-api`: legs in
+  travel order (`TripLeg`, `data_source` one of `prediction`/`jp_realtime`/`none`/null), transfers
+  (transfer `i` between legs `i` and `i + 1`), `expected_arrival`, `arrives_via` (set only when a KTD19
+  sibling continuation cushions a broken change) and `problem` (kind, 0-based index, the deciding
+  figure and its bar). **ABSENT, not null, on a direct train and everywhere with the flag off**, so an
+  existing receiver sees nothing. Three readings that are easy to get backwards: `payload.arrival` is
+  null on a trip (no one vehicle reaches the destination); `call`, `probabilities` and `delay` stay the
+  FIRST leg's, may be calm, and are null under `predicted` when we do not score that leg, while the
+  figure the alert was decided on is `trip.problem.probability`; and `effect` is an ENUM now, with
+  `missed_connection` for a predicted break at a change whatever the first leg's delay — additive on
+  the wire, a changed literal union in the typed client. A confirmed trip is `cancelled`, as today.
+  The wording key gains `"<kind>:<index>"` and the trip brief's version: categorical, so a rescoring
+  does not re-word and a reason change does.
+  **Two strict-schema additions are present with the flag OFF** (R16): `coverage.transfers` (`none` /
+  `not_evaluated` / `evaluated`; `not_evaluated` when off) on journey-alerts and journey-status, and
+  `TrainStatus.trip` (required, null on a direct train). Both models are `extra="forbid"` with
+  `required == properties`, which is why the contract changelog names them as such. journey-status's
+  `coverage.operators` is still `journey_status.OPERATORS` (VYG, SJN), the trains it grades, although
+  a bus leg can now sit inside a listed trip.
+  **A public read fetches its own plan, and only three hours of it.** A pair no registration covers
+  starts `trip_plans.fetch_for_read` through the injected trigger (`notification_pull` never imports
+  `trip_plans`): a background flight per (pair, Oslo date) on the `plans_pull` path
+  (`alternatives._PLANS_PULL_FETCH_MAX_PER_MIN`, 20 pages a minute, apart from the leader's `plans`),
+  at most `PUBLIC_FLIGHTS_MAX` (4) at once, keeping only a `complete` fetch in a per-pod LRU of
+  `PUBLIC_PLANS_MAX` (1 000) that is never stored and never refreshed by the leader.
+  `trip_plans.read_plan` is the UNION of the leader's plan and that cache, while the leader's due gate
+  reads `day_plan` alone — a public fetch must never make a registered range look covered. A read
+  needs now..now + `notification_pull.PLAN_HORIZON_H` (3 h), because a whole-day favourite would be
+  up to 50 pages a date against 20 a minute, and its fetch reaches `PLAN_FETCH_MARGIN_H` (1 h)
+  further: the needed range moves with the clock, and fetched to the horizon exactly it left the
+  fetched one a second later, so every following read missed, refetched and answered `no-store`
+  (pinned by `test_a_fetch_reaches_past_the_horizon_so_the_next_reads_are_served_from_it`).
+  **Coverage, though, is said over the whole period
+  ahead** (2026-10-28): a later part no plan covers is `not_evaluated` with `complete` left TRUE,
+  since a re-read fetches nothing more until the clock brings those hours inside the horizon; only a
+  missing plan inside the horizon holds `complete: false` / `no-store` and starts a fetch. Said over
+  the horizon, as it first was, a whole-day read on an unregistered pair answered `evaluated`,
+  `complete: true` for hours nobody fetched, and `none` beside a trip the plan held past the horizon
+  and the read listed. journey-status inherits the rule through the shared `_plan_windows` and sends
+  `no-store` while its fetch is pending (it has no `complete`). Pinned by
+  `test_a_whole_day_read_never_reads_hours_nobody_fetched_as_evaluated`. The figures cache keys on the
+  plans' covered ranges (`_plans_seen`), so the read after a fetch lands lists the trip.
+  **`servable` widens with the flag** (KTD15): a direct trip OR a watched trip with a change, as the
+  reworded description in `subscription.schema.json` and the openapi says; with no plan held the
+  transfer half is unestablished, and the sweep leaves the record due rather than writing `false`.
 - **A deploy no longer means a minute and a half of `predictions_not_loaded`** (2026-09-25): the
   lifespan loads the prediction caches and the «I dag» timetable from the tables the leader last
   built (`main.follow_last_build`, since 2026-10-13; it replaced the 2026-09-25 warm start and
@@ -1069,7 +1116,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `NOTIFICATION_WEBHOOK_LLM_ENABLED`, so `false` **plus a restart** is their revert (`disabled` on
   every entry, template served, correct and complete); `VARSEL_LLM_PROVIDER=off` stops every
   surface. Three accepted exposures are published in both documents rather than closed: a first
-  read's completeness reveals that a matching registration exists, the ceiling and allowances are
+  read's completeness reveals that a matching registration exists (and, with `TRIP_PLANS_ENABLED`
+  on, `coverage.transfers`/`complete` reveal WHICH HOURS of the pair are registered, a status, not
+  just latency: accepted 2026-10-28 for dev only, decide before prd), the ceiling and allowances are
   shared with every anonymous caller, and the definition rides in the query string outside the
   process's own redaction.
   **A window over midnight (`end < begin`) belongs to the weekday it BEGINS on** (2026-09-29,

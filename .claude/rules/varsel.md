@@ -2,8 +2,8 @@
 paths:
   - "disruptions/api/varsel*"
   - "disruptions/api/test_varsel*"
-  - "disruptions/api/{impact,alternatives,llm_message,journey_status,alert_policy,notification_wording,gen_vapid}.py"
-  - "disruptions/api/test_{impact,alternatives,llm_message,journey_status,alert_policy,personvern_texts}.py"
+  - "disruptions/api/{impact,alternatives,llm_message,journey_status,alert_policy,notification_wording,gen_vapid,trips,trip_plans}.py"
+  - "disruptions/api/test_{impact,alternatives,llm_message,journey_status,alert_policy,personvern_texts,trips,trip_plans}.py"
   - "disruptions/api/{predict_calls,predict_calls_bus,rail_calls_planned_today,bus_calls_planned_today,rail_calls_today,rail_calls_removed_today}.sql"
   - "data/queries/replay_removed_trains.sh"
   - "demo/avviksvarsel/**"
@@ -838,6 +838,18 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     response copy its alert carries — but the Alert is still the field the wording is built from.
     Expect `alt_status = 'not_worth_lookup'` to grow against `offered` at long lead times: that is
     the horizon finally reaching the trains that used to inherit a nearer train's answer.
+    **A departure with a change gets its own lookup** (2026-10-28, behind `TRIP_PLANS_ENABLED`,
+    `impact._best_trip_journey`; the trip path itself is the last bullet of this file). The trip
+    competes as the original against its LAST leg's aimed arrival, and its own arrival is the
+    end-to-end expected one — null when nothing in the plan gets there, which is unrankable, so «stay
+    put» is never claimed for it. The hard exclusion is the BROKEN legs (`_broken_legs`) plus the
+    disrupted direct trains, never the first leg as such, so the same first train with a later
+    connection competes. It spends the same `_MAX_ALTERNATIVE_LOOKUPS`, soonest first, and its
+    outcome rides on the subject, never in `by_train`: a direct train's answer is a claim against
+    another deadline. With the flag on, every candidate's own change is checked too (KTD7,
+    `_missed_change`): one expected missed is `risky`, and its arrival becomes the earliest later
+    candidate's on the same first leg, or null. That check is behind the flag because it moves what
+    DIRECT alerts are offered as well, and the alternative is in the wording key.
   **The matcher scans a PRUNED scope, not the whole cache** (2026-09-12, U2 of the 100k plan).
   `for_trip` used to hand `impact._trip_cells` the entire prediction snapshot — ~1 100 situations
   over ~20 000 scored calls at the midnight peak — and `_trip_cells` rebuilt its two per-situation
@@ -1007,3 +1019,67 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   offered as its own alternative; and `label_varsel_decisions.sql` reads SJN from `BNR`
   (re-register the scheduled query after changing it). `rail_calls_today` stays Vy-only, so SJN's
   «I dag» facts come from the planned table's recorded calls, up to the planned TTL old.
+- **Departures with a change, behind `TRIP_PLANS_ENABLED`** (2026-10-28, plan
+  `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`). A departure that reaches the
+  destination only with a change is judged END TO END: the Journey Planner supplies the planned
+  structure (`trip_plans.py`), our predictions and ET decide whether a leg is in trouble
+  (`trips.judge`), and JP real-time stands in only for a leg we do not score. The flag is read per
+  call (`trips.enabled()`, unset = off), `"true"` in dev's values and `"false"` in tst and prd, where
+  it waits on the plan's dev review. Off is today's behaviour on every surface apart from two
+  strict-schema fields (see the webhook rules): no fetch, no `trip` key, the same `message_input`,
+  servability text and alternatives. What a later change is most likely to get backwards:
+  **Two leader phases, both ABOVE `varsel_stops`**, for that step's orphan-window reason: `trip_plans`
+  (registered pairs on both channels, due ranges soonest first, stopped at `_PHASE_DEADLINE_S`, 20 s)
+  and `trip_realtime` right after it, NOT just before `varsel_notify` as KTD8 put it — its up to three
+  3 s requests would widen the window by ~9 s, and the pass reads an answer one cycle old, well inside
+  `REALTIME_MAX_AGE_S`. With the flag off both keys are absent from `poller_cycle.phases`. Real-time is
+  per POD: a follower fetches on its own tick after `follow_last_build`, and the leader also on a tick
+  that did not rebuild once its last refresh is `main._TRIP_REALTIME_TICK_S` (60 s) old, or its answers
+  would age out while every follower's stayed fresh.
+  **The plan is ONE string.** One Firestore document per (canonical pair, Oslo date) in `trip_plans`,
+  the `trips.DayPlan` as canonical JSON in the field `plan` (a leg's `refs` is an array of arrays,
+  which Firestore refuses), merged in a transaction and never replaced, synced by the server stamp
+  `stored_at`, expiring two days after its date. Every pod seeds and syncs it (`trip_plans.follow`:
+  lifespan, follower tick, acquisition) and requests read memory only; tst, on the blob, keeps the
+  leader's memory alone. `varsel.journey_windows` offers tomorrow from Oslo MIDNIGHT, so a window is
+  first fetched about a day ahead and refreshed every `PLAN_REFRESH_S` (3 h) until it ends — that is
+  the volume knob. Another pod's new registration is fetched one cycle late (the phase reads last
+  cycle's mirror) and reads as a miss until then.
+  **A JP-only reason attaches to `KIX:Trip:<operator>:<jkey>:<service_date>`**, dated for every
+  operator because a bus jkey repeats daily: a synthetic no-SX situation (so the 0.85 bar and «Mulig
+  avvik») with fixed texts in three languages (`notification_wording.TRIP_SITUATION_TEXTS`). A reason a
+  scored call drove keeps that call's situation. `main._varsel_live` adds the held plans' `KIX:Trip:`
+  situations to the live set, or the pass would drop and re-write such an alert's wording every
+  cycle, and under the blob its push mark too.
+  **KTD20 and the standing alert.** A trip that waiting for the next direct train beats is not
+  admitted, but one a registration already holds an alert on is kept, so that alert can still be
+  withdrawn. "Holds" is read from state that survives a leader change and nothing new is written for
+  it: the push ledger's `pushed_trains` and the webhook `SubjectMirror` (`_holds_alert_on`).
+  **`_trip_reasons` is per pod** — what each subject last alerted on. KTD8 holds a withdrawal only
+  while the reason a subject stood on sits on a leg now unknown, and a restart or a new leader forgets
+  the memo, which holds every such withdrawal: the safe side (`Alert._hold_withdrawal`).
+  **P(miss) carries a FITTED correction, and it is a snapshot** (`trips._MISS_*`, 2026-10-28). The
+  read-off of the arriving call's survival points was overconfident about twofold where it alerts,
+  measured on six months of historical Vy changes; four constants fit by
+  `data/queries/transfer_miss_backtest.py` correct it (0.84 / 0.87 precision at 30 min out of time,
+  with and without a message). Like `nosx_platt_weights`, a retrain of the arrival heads leaves them
+  stale without a sound: rebuild `exp_etcmp6_fair_scored` (et_expected_eval.sql statements 1-2 over
+  the window), rerun the script and copy the constants it prints. The suites pin the corrected
+  figures to four decimals, so CI goes red until those pins are moved too: the refit's tripwire.
+  **On `/varsel-api`**: `TripLeg` SUBCLASSES `AlternativeLeg` instead of widening it, so every existing
+  alternative leg on `/impact`, `/varsel-api` and the webhook keeps its shape. The Alert gains `trip`,
+  `deciding_probability`/`deciding_threshold` (the gate's figure, possibly another leg's;
+  `impact_probability` stays the boarding call's) and `trip_confirmed`, and `cancel_probability` is
+  nullable (a first leg we do not score); `Journey` gains `transfers`. With the flag on the caveat
+  stops saying a direct departure is required (`_NO_DIRECT_TRANSFERS_NOT_EVALUATED` while no plan is
+  held, `_NOTHING_TO_ALERT_ON` after), and `_with_transfers` answers None until the pair's plan lands,
+  so the record stays due rather than carrying a `false` for six hours.
+  **The «I dag» strip lists KTD20-admitted trips only.** A standing-kept trip is invisible there, and
+  one admitted only because the next direct train was cancelled drops off once that train's calls age
+  out of the prediction cache, about an hour on. A change the spine observes missed is `confirmed` at
+  once; a bus leg has no recorded call, so a change missed after a bus stays predicted or grey. A
+  connecting train Vy removed goes into the morning digest under its own dated
+  `KIX:PlanRemoved:RemovedJourney:<nr>_<date>` mark, named by its own line and departure at the
+  change, never by the first leg, which runs. Stop order is JP's position + 1 verified for VYG only,
+  so legs resolve on stop place, aimed time and service date. The log events are `trip_*` and label a
+  pair by `pair_digest` only (R17); the operations document's table is the authority.

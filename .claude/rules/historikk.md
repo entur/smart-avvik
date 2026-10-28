@@ -320,6 +320,34 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     and a train that entered the prediction cache after the digest went out can show
     `pushed_any = false` («ikke levert») although the digest covered it. That is a known limitation
     of the digest's bookkeeping, not of the segment.
+  - **A fifth segment, «Med bytte» (`transfer`), since 2026-10-28** (KTD16 of
+    `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`; rows exist only where
+    `TRIP_PLANS_ENABLED` is on, see `.claude/rules/varsel.md`). The grain does not move: a departure with
+    a change is one row per definition × situation × FIRST-LEG departure, and `varsel_decisions` gains
+    four columns, appended last: `trip_legs` (JSON of EVERY continuation of the first train the verdict
+    was taken over, the planned one first; it names the route, so like `message_input` it never enters
+    an API SELECT), `trip_reason_kind`, `trip_reason_index` (0-based) and `trip_p_miss` (NULL where we
+    score none of the changes; a JP-expected miss is a verdict, not a figure). `impact_probability` and
+    `alert_threshold` on such a row are the DECIDING reason's, possibly another leg's, and a change of
+    reason kind or index writes a row however thinned the subject is. The groups function picks the
+    four as ONE struct from the cycle the verdict judges and never groups on them. The outcomes table
+    gains `trip_legs`, `connection_held` and `arrival_delay_min`, and on a trip `actual_trouble` is the
+    trip's own: arrival delay ≥ 10 or every continuation broken, so a cushioned trip that stayed silent
+    is no miss. The two columns have different scopes and are easy to swap: «connection held» reads the
+    PLANNED continuation only (FALSE beats NULL; an unrecorded leg is NULL, never TRUE), the arrival
+    delay EVERY continuation, a broken one supplying none. The provenance CASE tests `trip_legs IS NOT
+    NULL` FIRST, ahead of the removed prefix and the NULL arm, in all six copies (twice each in
+    `historikk_summary.sql`, `meldinger_summary.sql` and `message_wording_comparison.sql`), because a
+    trip's first leg can be any of the other four; `test_a_departure_with_a_change_is_its_own_segment`
+    in both page suites and `test_the_labeller_judges_a_departure_with_a_change_end_to_end` pin it. A
+    trip row's `prompt_version` is the trip brief's (`llm_message.prompt_version_for`), so the wording
+    comparison treats «med bytte» as its own writing task. Known limits: a trip subject attached to a
+    `KIX:PlanRemoved:` situation goes to the removed branch, whose train-number keys its first leg
+    lacks, and stays NULL; and the labeller's added ET columns have no measured cost yet, so re-measure
+    before quoting the ~$0.015 above. **Operator step, owed**: deploy first (the startup `ADD COLUMN IF
+    NOT EXISTS`), then `bq update --transfer_config` in dev and prd in one sitting. The segment's
+    precision (≥ 0.8 over 30 labelled alerts) and recall (no lower than the direct segments' over 30
+    labelled trouble trips) are two of the marks the owner turns the flag on in prd against.
   - **The from/to filters are a deliberate narrowing of the privacy claim** (2026-08-21). The page
     has five dropdowns now — Utfall, Operatør, **Linje, Fra, Til** — populated by
     `GET /historikk-api/filters` (`historikk_filters.sql`) over the whole window, never from the

@@ -89,9 +89,10 @@ const rowTotal = (s: Segment | undefined) =>
  *  about. The fourth (2026-09-23) is trains Vy took out of the day's timetable without publishing a
  *  cancellation: served at 1.0 like the relayed row, with nothing published to relay. */
 function SegmentSplit({ summary }: { summary: Summary }) {
-  const { predicted, relayed, no_sx: noSx, removed } = summary;
+  const { predicted, relayed, no_sx: noSx, removed, transfer } = summary;
   const segmented =
-    rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx) + rowTotal(removed);
+    rowTotal(predicted) + rowTotal(relayed) + rowTotal(noSx) + rowTotal(removed) +
+    rowTotal(transfer);
 
   return (
     // Collapsed by default, and native <details> rather than a useState + aria-expanded button: the
@@ -143,6 +144,16 @@ function SegmentSplit({ summary }: { summary: Summary }) {
               label="Tatt ut av rutetabellen"
               help="Toget manglet i dagens rutetabell, og ingen innstilling var publisert. Vi meldte det som sikkert — ingen prøve på modellene."
               segment={removed}
+            />
+          ) : null}
+          {/* The fifth row (multi-leg U11), on the same condition: a departure with a change,
+              judged on whether it got the traveller to the destination, whatever its first leg
+              would have read as above. */}
+          {transfer && rowTotal(transfer) > 0 ? (
+            <SplitRow
+              label="Med bytte"
+              help="Reisen har ett eller flere bytter og ble vurdert helt fram: om du rakk byttet, og hvor sent du var framme."
+              segment={transfer}
             />
           ) : null}
         </>

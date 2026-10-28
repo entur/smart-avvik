@@ -75,6 +75,42 @@ export interface AlternativeJourney {
   at_risk?: boolean;
 }
 
+// A departure with a change (alternatives.TripFacts, multi-leg KTD13): the one trip shape the alert,
+// the strip's row and the webhook payload all carry. Legs and transfers count from 0, and transfer
+// `i` sits between legs `i` and `i + 1`.
+export interface TripLeg extends AlternativeLeg {
+  board_stop_place: string | null;
+  alight_stop_place: string | null;
+  aimed_departure: string | null;
+  aimed_arrival: string | null;
+  cancelled: boolean;
+  /** What the leg was judged from this cycle; 'none' is «mangler sanntid». */
+  data_source?: 'prediction' | 'jp_realtime' | 'none' | null;
+}
+
+export interface TripTransfer {
+  stop_place: string | null;
+  stop_name: string | null;
+  walk_min: number;
+  slack_min: number; // negative when the plan is already too tight
+}
+
+export interface TripProblem {
+  kind: 'departure' | 'leg_cancelled' | 'leg_departure' | 'missed_connection' | 'leg_removed';
+  index: number; // the leg's for a leg reason, the transfer's for missed_connection
+  probability: number;
+  threshold: number;
+}
+
+export interface TripFacts {
+  legs: TripLeg[];
+  transfers: TripTransfer[];
+  expected_arrival: string | null; // null: nothing in the plan gets them there («ankomst ukjent»)
+  /** Where a continuation that still holds leaves the planned route (KTD19). */
+  arrives_via?: string | null;
+  problem: TripProblem | null;
+}
+
 // Every field added after `alertworthy` is optional, so a PWA build can be newer or older than the
 // API it talks to without breaking during a rollout.
 export interface Alert {
@@ -92,7 +128,8 @@ export interface Alert {
   // ET has declared the call at the journey's destination cancelled while this departure runs: it
   // leaves and never gets there. The card says "Kjører ikke helt fram" and no percentage.
   destination_cancelled?: boolean;
-  cancel_probability: number;
+  // Null only on a departure with a change whose first leg we do not score.
+  cancel_probability: number | null;
   delay_p50_min: number | null; // median delay from the exceedance stack (as /demo shows)
   delay_p90_min: number | null;
   ge10_probability: number | null;
@@ -113,6 +150,13 @@ export interface Alert {
   message?: string | null;
   feedback_context_id?: string | null;
   feedback_enabled?: boolean;
+  // A departure with a change (multi-leg U5): its legs, changes, expected arrival and the problem.
+  // Absent or null on a direct train, whose card is unchanged.
+  trip?: TripFacts | null;
+  deciding_probability?: number | null;
+  deciding_threshold?: number | null;
+  // The trip cannot get the traveller there, as a fact (KTD19).
+  trip_confirmed?: boolean;
 }
 
 export type FeedbackRating = 'up' | 'down';
@@ -164,6 +208,9 @@ export interface Journey {
   // 2026-09-22-001). Null while the server has no timetable loaded; absent from a server that
   // predates the field. The card renders exactly as before in both cases.
   today?: JourneyStatus | null;
+  // Whether today's trips with a change were judged (trips.transfer_coverage). Null with
+  // TRIP_PLANS_ENABLED off and on a day the journey is not travelled; absent from an older server.
+  transfers?: 'evaluated' | 'none' | 'not_evaluated' | null;
 }
 
 /** One train on the strip (journey_status.TrainStatus). */
@@ -190,6 +237,9 @@ export interface TrainStatus {
   removed_from_plan: boolean;
   /** A removed train Vy has set up a replacement bus for. */
   bus_for_train: boolean;
+  /** A departure with a change, in its first leg's identity and graded end to end; null on a
+   *  direct train, absent from a server that predates it. */
+  trip?: TripFacts | null;
 }
 
 /** journey_status.JourneyStatus. `now` is the server's instant; the «nå» marker is drawn on it. */

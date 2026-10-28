@@ -36,8 +36,10 @@
 -- either, for the same reason /historikk does not accept it here.
 --
 -- Provenance resolution order matters where the buckets overlap, and it is the same order as
--- /historikk's: `removed` first, then NULL (its own bucket), then `relayed`, then `no_sx`, else
--- `predicted`. A removed train (`KIX:PlanRemoved:`, since 2026-09-23) carries et_cancelled = TRUE
+-- /historikk's: `transfer` (a departure with a change, «med bytte», multi-leg U11) first, then
+-- `removed`, then NULL (its own bucket), then `relayed`, then `no_sx`, else `predicted`. A trip is
+-- discriminated on the outcome's legs snapshot (`trip_legs`), whatever its first leg would read as.
+-- A removed train (`KIX:PlanRemoved:`, since 2026-09-23) carries et_cancelled = TRUE
 -- although ET declared nothing, so it is tested before the flag is read; historikk_summary.sql's
 -- header has the argument, and why testing it ahead of NULL changes no existing row. A no-SX
 -- call can be declared cancelled by ET between the cycle that scored it and the cycle the verdict
@@ -88,7 +90,8 @@ joined AS (
     -- A matched row implies o.call_date = s.call_date, and s.call_date is non-NULL for any row that
     -- could match, so this is a reliable "did the join find a verdict row" flag.
     o.call_date IS NOT NULL AS is_labelled,
-    o.verdict, o.actual_trouble, o.et_cancelled, o.destination_cancelled, o.alert_lead_min
+    o.verdict, o.actual_trouble, o.et_cancelled, o.destination_cancelled, o.alert_lead_min,
+    o.trip_legs
   FROM subjects AS s
   LEFT JOIN `disruptions.varsel_decision_outcomes` AS o
     ON  o.call_date BETWEEN DATE_SUB(@day, INTERVAL 1 DAY) AND DATE_ADD(@day, INTERVAL 1 DAY)
@@ -101,13 +104,14 @@ joined AS (
 ),
 labelled AS (
   SELECT
-    verdict, alert_lead_min, actual_trouble, et_cancelled, destination_cancelled,
-    -- Derived once so the many COUNTIFs below cannot each spell the rule slightly differently. The
-    -- removed prefix goes first (see the header). After it, NULL et_cancelled still means
+    verdict, alert_lead_min, actual_trouble, et_cancelled, destination_cancelled, trip_legs,
+    -- Derived once so the many COUNTIFs below cannot each spell the rule slightly differently. A
+    -- trip goes first, then the removed prefix (see the header). After them, NULL et_cancelled means
     -- "unsegmented" -- a row written before the flag existed (2026-08-05) belongs to no segment, and
     -- defaulting it to 'predicted' would be right for most and would bury exactly the rows worth
     -- finding.
     CASE
+      WHEN trip_legs IS NOT NULL                             THEN 'transfer'
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
       WHEN et_cancelled IS NULL                              THEN NULL
       WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
@@ -150,6 +154,7 @@ hits_per_train AS (
       j.alert_lead_min, j.operator, j.jkey, j.call_date, j.stop_place, j.stop_order,
       j.line, j.departure_time, j.situation_number,
       CASE
+        WHEN j.trip_legs IS NOT NULL                             THEN 'transfer'
         WHEN STARTS_WITH(j.situation_number, 'KIX:PlanRemoved:') THEN 'removed'
         WHEN j.et_cancelled IS NULL                              THEN NULL
         WHEN j.et_cancelled IS TRUE OR j.destination_cancelled IS TRUE THEN 'relayed'
@@ -209,7 +214,7 @@ SELECT
   (SELECT COUNT(*) FROM hits_per_train) AS n_hit_trains,
 
   -- ---- the same rows, segmented ----------------------------------------------------------------
-  -- Nothing is dropped: every labelled verdict above lands in exactly one of the four buckets below
+  -- Nothing is dropped: every labelled verdict above lands in exactly one of the five buckets below
   -- or in n_unsegmented.
   --
   -- MODEL SKILL: the trouble we actually forecast. What a threshold should be tuned on.
@@ -299,6 +304,27 @@ SELECT
   (SELECT COUNTIF(first_alert.provenance = 'removed' AND first_alert.alert_lead_min >= 30)
    FROM hits_per_train) AS n_hit_with_30min_notice_removed,
   (SELECT COUNTIF(first_alert.provenance = 'removed') FROM hits_per_train) AS n_hit_trains_removed,
+
+  -- WITH A CHANGE («med bytte», multi-leg U11): judged end to end on the arrival at the
+  -- destination. See historikk_summary.sql's note on the same block.
+  COUNTIF(provenance = 'transfer' AND verdict = 'hit')            AS n_hit_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'false_alarm')    AS n_false_alarm_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'miss')           AS n_miss_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'correct_reject') AS n_correct_reject_transfer,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'transfer' AND verdict = 'hit'),
+    COUNTIF(provenance = 'transfer' AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_transfer,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'transfer' AND verdict = 'hit'),
+    COUNTIF(provenance = 'transfer' AND verdict IN ('hit', 'miss'))
+  ) AS recall_transfer,
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.provenance = 'transfer', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_transfer,
+  (SELECT COUNTIF(first_alert.provenance = 'transfer' AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_transfer,
+  (SELECT COUNTIF(first_alert.provenance = 'transfer') FROM hits_per_train) AS n_hit_trains_transfer,
 
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
   -- Reported, not assigned. The CASE's NULL rather than the flag's, so a removed row -- resolved

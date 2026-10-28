@@ -31,6 +31,7 @@ succeeds there. Therefore:
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import os
@@ -40,8 +41,9 @@ import textwrap
 import threading
 import urllib.error
 import urllib.request
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Self
+from zoneinfo import ZoneInfo
 
 import notification_store
 
@@ -582,6 +584,11 @@ def test_every_transaction_body_reads_before_it_writes():
         ),
         lambda t: notification_store._release_feedback_body(
             t, refs, context_id=_CONTEXT, response_id="r-held"
+        ),
+        # The trip-plan merge (multi-leg U2): read the stored plan, write the merged one.
+        lambda t: notification_store._trip_plan_body(
+            t, refs, plan_id="p1", from_stop="NSR:StopPlace:426", to_stop="NSR:StopPlace:337",
+            oslo_date=PLAN_DAY, apply=lambda stored: "{}", stamp="stamp", now=NOW,
         ),
     ]
     client.put(notification_store.POLLER_LEASE, notification_store.POLLER_LEASE_DOC, _held_lease())
@@ -4211,6 +4218,135 @@ def test_card_entries_seed_and_sync_return_tombstones_and_skip_expired_documents
         _uninstall()
 
 
+PLAN_DAY = date(2026, 9, 8)
+PLAN_FROM, PLAN_TO = "NSR:StopPlace:426", "NSR:StopPlace:337"
+
+
+def _plan_id(from_stop: str = PLAN_FROM, to_stop: str = PLAN_TO, day: date = PLAN_DAY) -> str:
+    return hashlib.sha256(f"{from_stop}|{to_stop}|{day.isoformat()}".encode()).hexdigest()
+
+
+def _plan_row(plan: str, stamp: datetime, *, day: date = PLAN_DAY,
+              expires: datetime | None = None) -> tuple[str, dict]:
+    return (
+        f"{notification_store.TRIP_PLANS}/{_plan_id(day=day)}",
+        {
+            "plan": plan,
+            "from_stop": PLAN_FROM,
+            "to_stop": PLAN_TO,
+            "oslo_date": day.isoformat(),
+            notification_store.TRANSLATION_STAMP_FIELD: stamp,
+            notification_store.TTL_FIELD: expires or NOW + timedelta(days=1),
+        },
+    )
+
+
+def test_a_trip_plan_write_merges_into_the_stored_document_in_one_transaction():
+    """Multi-leg U2, KTD2: one document per (from, to, Oslo date), its id the unsalted SHA-256 of
+    `from|to|date`; a write reads the stored plan, hands it to the caller's merge and writes the
+    result back in the SAME transaction, so it never replaces what another write stored. The body
+    holds the plan, the pair, the date, the server's stamp and the TTL -- and no registration,
+    client or device field (R17)."""
+    client = _FakeClient()
+    _install(client)
+    seen: list[str | None] = []
+
+    def apply(stored: str | None) -> str:
+        seen.append(stored)
+        return (stored or "") + "+fetch"
+
+    try:
+        first = notification_store.merge_trip_plan(PLAN_FROM, PLAN_TO, PLAN_DAY, apply, now=NOW)
+        second = notification_store.merge_trip_plan(PLAN_FROM, PLAN_TO, PLAN_DAY, apply, now=NOW)
+        assert (first, second) == ("+fetch", "+fetch+fetch") and seen == [None, "+fetch"]
+        assert len(client.transactions) == 2
+        stored = client.doc(notification_store.TRIP_PLANS, _plan_id())
+        assert stored is not None, "the document id is the digest of from|to|date"
+        assert set(stored) == {
+            "plan", "from_stop", "to_stop", "oslo_date",
+            notification_store.TRANSLATION_STAMP_FIELD, notification_store.TTL_FIELD,
+        }, sorted(stored)
+        assert stored["plan"] == "+fetch+fetch"
+        assert (stored["from_stop"], stored["to_stop"], stored["oslo_date"]) == (
+            PLAN_FROM, PLAN_TO, "2026-09-08")
+        # The server's clock, never the body's: the sync's watermark is compared against it.
+        assert stored[notification_store.TRANSLATION_STAMP_FIELD] == client.server_now
+        # TTL two days after the Oslo date begins: past every window that date's plan serves.
+        assert stored[notification_store.TTL_FIELD] == datetime(
+            2026, 9, 10, tzinfo=ZoneInfo("Europe/Oslo"))
+        # Another date is another document, and the first is untouched.
+        notification_store.merge_trip_plan(PLAN_FROM, PLAN_TO, date(2026, 9, 9), apply, now=NOW)
+        assert client.doc(notification_store.TRIP_PLANS, _plan_id())["plan"] == "+fetch+fetch"
+        assert client.doc(notification_store.TRIP_PLANS, _plan_id(day=date(2026, 9, 9))) is not None
+    finally:
+        _uninstall()
+
+
+def test_an_expired_trip_plan_is_merged_as_absent():
+    """TTL deletes up to ~24 h late, and an expired document is gone for every reader: the merge
+    starts from nothing rather than from a plan no follower can load."""
+    client = _FakeClient()
+    path, row = _plan_row("old", NOW - timedelta(days=3), expires=NOW - timedelta(minutes=1))
+    client.docs[path] = row
+    _install(client)
+    seen: list[str | None] = []
+    try:
+        notification_store.merge_trip_plan(
+            PLAN_FROM, PLAN_TO, PLAN_DAY, lambda stored: seen.append(stored) or "new", now=NOW)
+        assert seen == [None]
+        assert client.doc(notification_store.TRIP_PLANS, _plan_id())["plan"] == "new"
+    finally:
+        _uninstall()
+
+
+def test_a_trip_plan_body_may_run_twice_and_writes_the_same_thing():
+    client = _FakeClient()
+    path, row = _plan_row("stored", NOW)
+    client.docs[path] = row
+    refs = notification_store._Refs(client)
+    with _NoClockNoLog():
+        first, second = _Txn(), _Txn()
+        runs = [
+            notification_store._trip_plan_body(
+                txn, refs, plan_id=_plan_id(), from_stop=PLAN_FROM, to_stop=PLAN_TO,
+                oslo_date=PLAN_DAY, apply=lambda stored: f"{stored}+fetch", stamp="stamp", now=NOW,
+            )
+            for txn in (first, second)
+        ]
+    assert runs == ["stored+fetch", "stored+fetch"]
+    assert first.writes == second.writes and first.writes
+
+
+def test_trip_plans_seed_and_sync_by_the_server_stamp_and_skip_expired_or_unreadable():
+    client = _FakeClient()
+    _install(client)
+    try:
+        t1, t2, t3 = (NOW - timedelta(minutes=m) for m in (30, 20, 10))
+        _, broken = _plan_row("x", t1, day=date(2026, 9, 7))
+        broken["oslo_date"] = "not a date"
+        client.pages["trip_plans_seed"] = [
+            _plan_row("p3", t3),
+            _plan_row("p2", t2, day=date(2026, 9, 7), expires=NOW - timedelta(minutes=1)),
+            (f"{notification_store.TRIP_PLANS}/broken", broken),
+        ]
+        entries, watermark = notification_store.seed_trip_plans(now=NOW)
+        Stored = notification_store.StoredTripPlan
+        assert entries == [Stored(PLAN_FROM, PLAN_TO, PLAN_DAY, "p3")], entries
+        assert watermark == t3, "the newest stamp read, expired and unreadable ones included"
+        name, _eq, inequality, _limit = client.query_calls[-1]
+        assert name == "trip_plans_seed" and inequality == {}
+
+        client.pages["trip_plans_sync"] = [_plan_row("p4", NOW)]
+        entries, watermark = notification_store.sync_trip_plans(since=t3, now=NOW)
+        assert entries == [Stored(PLAN_FROM, PLAN_TO, PLAN_DAY, "p4")] and watermark == NOW
+        name, _eq, inequality, _limit = client.query_calls[-1]
+        overlap = timedelta(seconds=notification_store.MIRROR_SYNC_OVERLAP_S)
+        assert name == "trip_plans_sync"
+        assert inequality == {notification_store.TRANSLATION_STAMP_FIELD: t3 - overlap}
+    finally:
+        _uninstall()
+
+
 def test_a_situation_translation_is_created_once_and_a_later_writer_adopts_the_stored_one():
     """Translation store KTD4: first writer wins and every writer converges on the stored text. A
     second writer -- two leaders across a handoff -- gets the FIRST translation back, so it serves
@@ -4881,6 +5017,68 @@ def emulator_test_card_entries_are_batch_written_and_seeded_and_synced_by_their_
     assert later is not None and later >= watermark
     reseeded, _ = notification_store.seed_card_entries(now=NOW)
     assert len(reseeded) == 2, "one document per (kind, key): the tombstone replaced the entry"
+
+
+def emulator_test_a_trip_plan_is_created_merged_synced_and_read_as_expired_through_the_real_client():
+    """Multi-leg U2 against a real client: the transactional merge reads what the first write stored
+    (a second fetch's range and trips join the first's, never replace them), the plan's canonical
+    JSON survives the round trip as ONE string (Firestore refuses the arrays-in-arrays a dumped
+    `PlanLeg.refs` would be), and the seed's and sync's stamp queries return it. Expiry is the
+    READ's test here: the emulator does not run TTL deletion, so `expires_at` in the past must make
+    the seed skip the document while it still exists."""
+    import trip_plans
+    import trips
+
+    client = _emulator_setup()
+    tz = ZoneInfo("Europe/Oslo")
+
+    def trip(hhmm: str, journey: str) -> trips.PlanTrip:
+        hour, minute = map(int, hhmm.split(":"))
+        departure = datetime(2026, 9, 8, hour, minute, tzinfo=tz)
+        legs = tuple(
+            trips.PlanLeg(
+                operator="VYG", refs=(("VYG", f"DatedServiceJourney:{journey}-{n}"),),
+                line="VYG:Line:R13", public_code="R13", mode="rail",
+                board_stop_place=board, alight_stop_place=alight, board_quay=None,
+                alight_quay=None, board_position=None, alight_position=None,
+                aimed_departure=departure + timedelta(minutes=20 * n),
+                aimed_arrival=departure + timedelta(minutes=20 * n + 15),
+                service_date=PLAN_DAY,
+            )
+            for n, (board, alight) in enumerate(((PLAN_FROM, "NSR:StopPlace:11"),
+                                                 ("NSR:StopPlace:11", PLAN_TO)))
+        )
+        return trips.PlanTrip(legs=legs)
+
+    def write(found: trips.PlanTrip, start: str, end: str) -> trips.DayPlan:
+        span = [datetime(2026, 9, 8, *map(int, hhmm.split(":")), tzinfo=tz) for hhmm in (start, end)]
+        fetched = trip_plans.FetchResult("complete", (found,), (), 1)
+
+        def apply(stored: str | None) -> str:
+            base = trips.DayPlan.model_validate_json(stored) if stored else None
+            return trip_plans.merge(base, fetched, *span, NOW).model_dump_json()
+
+        return trips.DayPlan.model_validate_json(
+            notification_store.merge_trip_plan(PLAN_FROM, PLAN_TO, PLAN_DAY, apply, now=NOW))
+
+    write(trip("07:17", "1606"), "07:00", "08:00")
+    merged = write(trip("16:17", "1650"), "16:00", "17:00")
+    assert len(merged.trips) == 2 and len(merged.covered) == 2, merged
+    stored = client.collection(notification_store.TRIP_PLANS).document(_plan_id()).get().to_dict()
+    assert isinstance(stored["plan"], str)
+    assert trips.DayPlan.model_validate_json(stored["plan"]) == merged
+
+    entries, watermark = notification_store.seed_trip_plans(now=NOW)
+    assert [(e.from_stop, e.to_stop, e.oslo_date) for e in entries] == [(PLAN_FROM, PLAN_TO, PLAN_DAY)]
+    assert trips.DayPlan.model_validate_json(entries[0].plan) == merged
+    assert watermark is not None
+    synced, later = notification_store.sync_trip_plans(since=watermark, now=NOW)
+    assert [e.plan for e in synced] == [entries[0].plan] and later == watermark
+
+    client.collection(notification_store.TRIP_PLANS).document(_plan_id()).update(
+        {notification_store.TTL_FIELD: NOW - timedelta(minutes=1)})
+    expired, _ = notification_store.seed_trip_plans(now=NOW)
+    assert expired == [], "an expired plan TTL has not deleted yet is gone for readers"
 
 
 def emulator_test_a_feedback_context_is_claimed_once_and_erased_with_its_device():

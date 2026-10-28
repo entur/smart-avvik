@@ -396,7 +396,7 @@ def test_every_recorded_field_is_a_column_of_the_decision_table():
         latest_observation = FakeObservation()
         alternative_journey = FakeAlternative()
 
-    recorded = set(_row(Alert())) | set(_row())
+    recorded = set(_row(Alert())) | set(_row()) | set(_row(FakeTripAlert()))
     assert {"alt_operator", "alt_jkey", "alt_stop_order"} <= recorded, (
         "the fixture alert must still exercise the branch that writes the recommendation's join "
         "key, or this guard silently stops covering those columns"
@@ -422,6 +422,12 @@ def test_a_new_column_reaches_the_environments_that_already_have_the_table():
     # else. "message_deterministic IS NOT NULL dates a post-change row" rests on this too.
     assert {"message_llm", "message_deterministic"} <= added
     assert added <= created, f"added but never created: {sorted(added - created)}"
+    # Multi-leg U11, both tables: the trip columns reach dev and prd only through these ALTERs, and
+    # on the outcomes side a missing one fails the re-registered nightly job outright.
+    assert _TRIP_COLUMNS <= added
+    outcomes = {"trip_legs", "connection_held", "arrival_delay_min"}
+    assert outcomes <= _added_columns("disruptions.varsel_decision_outcomes")
+    assert outcomes <= _created_columns("disruptions.varsel_decision_outcomes")
 
 
 def test_a_certainty_is_marked_as_one():
@@ -436,6 +442,77 @@ def test_a_certainty_is_marked_as_one():
         cancel_probability = 1.0
 
     assert _row(Alert())["et_cancelled"] is True
+
+
+def test_a_trip_rows_figure_and_bar_are_the_deciding_pair_not_the_boarding_calls():
+    """Multi-leg KTD6: a departure with a change is gated on its deciding reason, and recording one
+    number while the gate applied another is the failure `alert_policy.gate` forbids -- so the row's
+    `impact_probability` and `alert_threshold` are the deciding pair, on the first row and on a
+    restated one alike. A direct train, which has no deciding pair, records its own figures."""
+
+    class Trip(FakeAlert):
+        impact_probability = 0.3  # the boarding call's: a calm first train
+        alert_threshold = 0.65
+        deciding_probability = 0.8  # a missed change at the next stop
+        deciding_threshold = 0.85
+
+    row = _row(Trip())
+    assert (row["impact_probability"], row["alert_threshold"]) == (0.8, 0.85)
+    again = decisions.rescored(row, Trip())
+    assert (again["impact_probability"], again["alert_threshold"]) == (0.8, 0.85)
+    assert (_row()["impact_probability"], _row()["alert_threshold"]) == (0.91, 0.65)
+
+
+_SNAPSHOT = {"continuations": [
+    {"planned": True, "legs": [{"jkey": "DatedServiceJourney:1"}, {"jkey": "DatedServiceJourney:2"}]},
+    {"planned": False, "legs": [{"jkey": "DatedServiceJourney:1"}, {"jkey": "DatedServiceJourney:3"}]},
+]}
+
+
+class FakeTripAlert(FakeAlert):
+    """A departure with a change as `varsel._trip_alert` builds it: the planned route's problem on
+    `trip` (read by attribute, like the Alert field it stands for), and the excluded carrier with
+    every continuation and the planned route's P(miss)."""
+
+    class trip:
+        class problem:
+            kind = "missed_connection"
+            index = 0
+
+    trip_legs_snapshot = _SNAPSHOT
+    trip_p_miss = 0.72
+
+
+_TRIP_COLUMNS = {"trip_legs", "trip_reason_kind", "trip_reason_index", "trip_p_miss"}
+
+
+def test_a_trip_row_carries_its_legs_reason_and_p_miss_and_a_direct_row_none_of_the_keys():
+    """Multi-leg U11 (KTD16): the snapshot as JSON, the problem's kind and 0-based index, and the
+    planned route's P(miss); a direct train writes none of the four keys (NULL in the table) and is
+    otherwise the row it always was, byte for byte -- so it is never one the streaming insert
+    rejects for naming a column added minutes before. A restated row (the thinning rule's closing
+    row) carries the last look's, and none once that look is a direct train's."""
+    import json
+
+    trip, direct = _row(FakeTripAlert()), _row()
+    assert json.loads(trip["trip_legs"]) == _SNAPSHOT
+    assert (trip["trip_reason_kind"], trip["trip_reason_index"], trip["trip_p_miss"]) == (
+        "missed_connection", 0, 0.72,
+    )
+    assert _TRIP_COLUMNS.isdisjoint(direct)
+    assert set(trip) - set(direct) == _TRIP_COLUMNS
+    assert {k for k in direct if trip[k] != direct[k]} == set(), "nothing else moves"
+    assert _TRIP_COLUMNS.isdisjoint(decisions.rescored(trip, FakeAlert())), "a direct last look"
+
+    class Below(FakeTripAlert):
+        class trip:
+            problem = None
+
+        trip_p_miss = 0.4
+
+    again = decisions.rescored(trip, Below())
+    assert (again["trip_reason_kind"], again["trip_reason_index"]) == (None, None), "below the bar"
+    assert again["trip_p_miss"] == 0.4 and again["trip_legs"] == trip["trip_legs"]
 
 
 def test_an_ordinary_prediction_is_not_marked_a_certainty():
@@ -748,6 +825,28 @@ def test_the_quoted_wording_is_the_one_that_was_pushed():
         assert "STRUCT(" in agg and "message_source" in agg, (
             "message and message_source must be chosen as one struct, not aggregated separately"
         )
+
+
+def test_the_groups_view_takes_the_trip_columns_from_one_row_and_never_groups_on_them():
+    """Multi-leg U11 (KTD16). The subject's legs, reason and P(miss) are AGGREGATED -- the grain
+    stays one first-leg departure -- and from one cycle: the first alerting row, else the last
+    one, the cycle the verdict judges, as `et_cancelled` is resolved. One STRUCT per pick, because
+    the reason's index points into that cycle's legs. Projected after every existing column, so
+    the registered labelling copy's `SELECT *` still lines its two UNION ALL branches up."""
+    view = _decision_groups_view()
+    aggs = re.findall(r"ARRAY_AGG\((.*?)\)\s*\[SAFE_OFFSET\(0\)\]", view, re.DOTALL)
+    picks = [a for a in aggs if "trip_legs" in a]
+    assert len(picks) == 2, f"expected a first-alerting pick and a fallback, found {len(picks)}"
+    assert sum("alertworthy" in a for a in picks) == 1
+    for agg in picks:
+        assert "STRUCT(" in agg and all(
+            name in agg for name in ("trip_reason_kind", "trip_reason_index", "trip_p_miss")
+        ), "the four must be one struct, not four aggregates that may pick different rows"
+    group_by = view[view.index("GROUP BY") :]
+    assert "trip" not in group_by.split(")")[0], "a trip column in the GROUP BY splits the subject"
+    outer = view[: view.index("FROM (")]
+    projected = re.findall(r"\bAS (\w+)", outer)
+    assert projected[-4:] == ["trip_legs", "trip_reason_kind", "trip_reason_index", "trip_p_miss"]
 
 
 def test_a_failed_description_refresh_does_not_stop_the_log():

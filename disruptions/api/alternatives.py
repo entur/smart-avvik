@@ -82,7 +82,7 @@ import urllib.request
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from time import perf_counter
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from entur_api import ET_CLIENT_NAME
 from llm_message import key_digest
@@ -152,6 +152,14 @@ _POLLER_FETCH_MAX_PER_MIN = 90
 # `unanswered`, which is exactly the outcome the split exists to keep rare. The public number, on
 # the public reasoning: the read is reachable without credentials and a caller can invent keys.
 _PULL_FETCH_MAX_PER_MIN = 30
+# ...and the trip plans (multi-leg journeys, KTD18) get three more, so plan traffic can never eat
+# the alternative lookups' share. Each counts PAGES, one request each: `plans` for the leader's
+# phase, which pages through a registered pair's range a few times a day; `plans_pull` for a pod
+# fetching a plan for a public read that missed; `realtime` for the batched per-leg JP real-time
+# reads (U4).
+_PLANS_FETCH_MAX_PER_MIN = 60
+_PLANS_PULL_FETCH_MAX_PER_MIN = 20
+_REALTIME_FETCH_MAX_PER_MIN = 20
 _RATE_WINDOW = timedelta(minutes=1)
 # How long past `_HTTP_TIMEOUT_S` a caller waiting on somebody else's in-flight fetch keeps waiting.
 # Covers the gap between claiming the key and actually issuing the request; past it the waiter gives
@@ -344,6 +352,112 @@ class AlternativeLeg(BaseModel):
     end_time: datetime | None = Field(default=None, description="Expected end of the leg.")
 
 
+# ---- The one trip shape (multi-leg KTD13) ------------------------------------------------------
+# A departure with a change, as `payload.trip`, journey-status's `TrainStatus.trip` and the
+# `/varsel-api` models all serialise it. Plain objects only: the contract's schema generator
+# handles no `oneOf` and no `$defs`.
+
+#: Why a trip with a change is in trouble, one vocabulary for the verdict, the wording, the payload
+#: and the decision log. `departure`: the first leg's boarding figure. `leg_cancelled`: a ridden
+#: leg's boarding or alighting call declared cancelled (ET or Journey Planner). `leg_departure`: a
+#: later leg's boarding figure. `missed_connection`: a change our figures (or JP's expected times)
+#: say is missed. `leg_removed`: a ridden leg on a train taken out of today's plan.
+TripReasonKind = Literal[
+    "departure", "leg_cancelled", "leg_departure", "missed_connection", "leg_removed"
+]
+#: What a leg was judged from this cycle (multi-leg KTD8's three states): our own figures
+#: (`prediction`, the prediction cache scores both its ends, or its train is out of the plan),
+#: Journey Planner real-time (`jp_realtime`), or nothing (`none`: «mangler sanntid»).
+TripLegSource = Literal["prediction", "jp_realtime", "none"]
+
+
+class TripLeg(AlternativeLeg):
+    """One ridden leg of a trip with a change: :class:`AlternativeLeg` widened, additively.
+
+    KTD13 says to widen `AlternativeLeg` itself. It is a subclass instead, deliberately:
+    `AlternativeLeg` is serialised in today's `/impact`, `/varsel-api` and webhook payloads, and with
+    the flag off nothing on those wires may change beyond R16's two fields (AE6). The trip shape
+    gets the widened leg; every existing payload keeps the leg it has.
+    """
+
+    board_stop_place: str | None = Field(
+        default=None, description="NSR StopPlace ref where this leg is boarded."
+    )
+    alight_stop_place: str | None = Field(
+        default=None, description="NSR StopPlace ref where this leg is left."
+    )
+    aimed_departure: datetime | None = Field(
+        default=None, description="Aimed (timetabled) departure from the boarding stop."
+    )
+    aimed_arrival: datetime | None = Field(
+        default=None, description="Aimed (timetabled) arrival at the alighting stop."
+    )
+    cancelled: bool = Field(
+        default=False,
+        description="The boarding or alighting call of this leg is declared cancelled (ET or the "
+        "Journey Planner's real-time data).",
+    )
+    data_source: TripLegSource | None = Field(
+        default=None,
+        description="What the leg was judged from: `prediction` (our own figures), `jp_realtime` "
+        "(the Journey Planner's real-time data) or `none` (nothing: no live data for this leg). "
+        "Null where the leg was not judged.",
+    )
+
+
+class TripTransfer(BaseModel):
+    """A change between two legs: transfer `i` sits between legs `i` and `i + 1`."""
+
+    stop_place: str | None = Field(description="NSR StopPlace ref where the arriving leg is left.")
+    stop_name: str | None = Field(default=None, description="Its name (null if unresolved).")
+    walk_min: int = Field(description="Minutes on foot to the next leg's boarding stop.")
+    slack_min: int = Field(
+        description="Planned slack in minutes: the next leg's aimed departure, minus the arriving "
+        "leg's aimed arrival, minus the walk. Negative when the plan is already too tight.",
+    )
+
+
+class TripProblem(BaseModel):
+    """What breaks the planned ride, and the figure the alert gate decided on (KTD6)."""
+
+    kind: TripReasonKind = Field(description="The reason, from the published vocabulary.")
+    index: int = Field(
+        description="The leg index (0-based) for a leg reason, the transfer index for "
+        "`missed_connection`."
+    )
+    probability: float = Field(
+        description="The deciding figure, 0-1; 1.0 for a certainty. It may come from another "
+        "continuation of the same first train, the one that bound the verdict (KTD19).",
+    )
+    threshold: float = Field(description="The bar the alert gate applied to `probability`.")
+
+
+class TripFacts(BaseModel):
+    """A departure with a change, judged end to end: its legs, its changes, when it gets there,
+    and what breaks it."""
+
+    legs: list[TripLeg] = Field(description="The ridden legs, in travel order, from 0.")
+    transfers: list[TripTransfer] = Field(
+        description="The changes, from 0: transfer `i` sits between legs `i` and `i + 1`."
+    )
+    expected_arrival: datetime | None = Field(
+        default=None,
+        description="When the traveller is expected at the destination: on the planned route, or "
+        "after a broken change on the earliest planned continuation of the same first train that "
+        "still holds. Null when nothing in the plan gets them there.",
+    )
+    arrives_via: str | None = Field(
+        default=None,
+        description="Where the continuation `expected_arrival` belongs to leaves the planned route "
+        "-- its stop name, or its NSR StopPlace ref when the service has no name for it -- set only "
+        "when a planned change breaks and another continuation of the same first train arriving "
+        "less than 10 minutes later holds (KTD19). Null on the planned route.",
+    )
+    problem: TripProblem | None = Field(
+        default=None, description="Why the departure alerts; null when it does not."
+    )
+
+
 class AlternativePrediction(BaseModel):
     """What we know and what we forecast about the alternative's own boarding call.
 
@@ -514,6 +628,20 @@ class AlternativeJourney(BaseModel):
     )
 
 
+class CandidateLeg(NamedTuple):
+    """One ridden leg of a candidate, as the check on its change reads it (multi-leg U6, KTD10):
+    the leg's refs in the cache's key form (both, as `transit_refs` collects them), its two stops
+    and aimed times, and the seconds walked to the next leg (0 after the last: an egress walk is no
+    change). Internal only: `AlternativeLeg` is the wire shape and stays as it is."""
+
+    refs: tuple[tuple[str | None, str], ...]
+    board_stop_place: str | None
+    alight_stop_place: str | None
+    aimed_departure: datetime | None
+    aimed_arrival: datetime | None
+    walk_after_s: int = 0
+
+
 class AlternativeCandidate(BaseModel):
     """One parsed `tripPattern` from a Journey Planner reply, before any selection has happened.
 
@@ -560,6 +688,11 @@ class AlternativeCandidate(BaseModel):
     )
     lines: list[str] = Field(
         default_factory=list, description="Ordered line refs of the transit legs, e.g. 'VYG:Line:R11'."
+    )
+    transit_legs: list[CandidateLeg] = Field(
+        default_factory=list,
+        description="The transit legs one by one, what `impact`'s check on a change reads (KTD7). "
+        "Empty for a candidate built by hand, which then has no change to check.",
     )
     board_stop_place: str | None = Field(
         default=None,
@@ -807,11 +940,14 @@ _cache = _KeyedTTLCache(_TTL, _FAILURE_COOLDOWN)
 _REQUEST_PATH = "request"
 _POLLER_PATH = "poller"
 _PULL_PATH = "pull"
-FetchPath = Literal["request", "poller", "pull"]
+FetchPath = Literal["request", "poller", "pull", "plans", "plans_pull", "realtime"]
 _FETCH_CEILINGS: dict[str, int] = {
     _REQUEST_PATH: _FETCH_MAX_PER_MIN,
     _POLLER_PATH: _POLLER_FETCH_MAX_PER_MIN,
     _PULL_PATH: _PULL_FETCH_MAX_PER_MIN,
+    "plans": _PLANS_FETCH_MAX_PER_MIN,
+    "plans_pull": _PLANS_PULL_FETCH_MAX_PER_MIN,
+    "realtime": _REALTIME_FETCH_MAX_PER_MIN,
 }
 # The paths whose caller blocks on somebody else's in-flight fetch for the same key — see
 # `wait_for_refresh` in `_KeyedTTLCache.get`. Not the request path, and the reason is stated there.
@@ -826,7 +962,7 @@ _fetch_calls: dict[str, list[datetime]] = {path: [] for path in _FETCH_CEILINGS}
 #: interesting moment is when the bound starts binding; the rest are counted and carried into one
 #: summary per `_REFUSAL_SUMMARY_WINDOW`.
 #:
-#: It needs no stale sweep, unlike every budget in `varsel`: it holds one counter per path (three of
+#: It needs no stale sweep, unlike every budget in `varsel`: it holds one counter per path (six of
 #: them, for the life of the process) and a leaked one costs a log line's accuracy rather than an
 #: alert. The suites reset it for determinism, not for correctness.
 _REFUSAL_SUMMARY_WINDOW = timedelta(minutes=1)
@@ -1144,6 +1280,8 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
     alight_stop_place: str | None = None
     cancelled = False
     seen_refs: set[tuple[str | None, str]] = set()
+    # Each ridden leg's fields for `CandidateLeg`, the walk last so a foot leg can add to it.
+    ridden: list[list[Any]] = []
     for leg in legs:
         # A foot leg has no service journey and no estimated calls; it is part of the itinerary a
         # traveller walks, never something the prediction cache can score or a situation can hit.
@@ -1156,10 +1294,19 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
         ]
         refs = [ref for ref in refs if isinstance(ref, str) and ref]
         if not refs:
+            # A walk after a ridden leg is that change's walk, `trip_plans._parse_pattern`'s rule;
+            # an unreadable time costs the walk, never the pattern.
+            start, end = _parse_ts(leg.get("aimedStartTime")), _parse_ts(leg.get("aimedEndTime"))
+            if ridden and leg.get("mode") == "foot" and start is not None and end is not None:
+                ridden[-1][-1] += round((end - start).total_seconds())
             continue
-        for ref in refs:
-            split = cache_key(ref)
-            if split is not None and split not in seen_refs:
+        leg_refs = tuple(dict.fromkeys(filter(None, map(cache_key, refs))))
+        ridden.append([
+            leg_refs, _stop_place_ref(leg.get("fromPlace")), _stop_place_ref(leg.get("toPlace")),
+            _parse_ts(leg.get("aimedStartTime")), _parse_ts(leg.get("aimedEndTime")), 0,
+        ])
+        for split in leg_refs:
+            if split not in seen_refs:
                 seen_refs.add(split)
                 transit_refs.append(split)
         line_id = _as_dict(leg.get("line")).get("id")
@@ -1171,6 +1318,8 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
         if alight is not None:
             alight_stop_place = alight
         cancelled = cancelled or _leg_is_cancelled(leg)
+    if ridden:
+        ridden[-1][-1] = 0  # the walk after the last leg is the egress, not a change
 
     return AlternativeCandidate(
         departure_time=_parse_ts(pattern.get("expectedStartTime")),
@@ -1196,6 +1345,7 @@ def _to_candidate(pattern: dict, ordinal: int) -> AlternativeCandidate | None:
         cancelled=cancelled,
         transit_refs=transit_refs,
         lines=lines,
+        transit_legs=[CandidateLeg(*fields) for fields in ridden],
         board_stop_place=board_stop_place,
         alight_stop_place=alight_stop_place,
         ordinal=ordinal,

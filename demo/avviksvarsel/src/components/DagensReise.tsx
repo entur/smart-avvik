@@ -2,10 +2,13 @@ import { Fragment, useLayoutEffect, useRef, useState } from 'react';
 import type { JourneyStatus } from '../api';
 import { fmtTime } from '../format';
 import { caption, circleClass, circleLabel, splitAtNow, stripTitle, updatedAt } from './dagensReiseModel';
+import { tripNote } from './tripModel';
 
 /** «I dag»: one circle per train in today's window, left to right, filled for a fact and a ring for
- *  a forecast (plan 2026-09-22-001). Renders nothing on a day the journey is not travelled. */
-export default function DagensReise({ today }: { today: JourneyStatus }) {
+ *  a forecast (plan 2026-09-22-001). Renders nothing on a day the journey is not travelled. A
+ *  departure with a change is one circle on its first train, its changes named under its label
+ *  (multi-leg U10); `note` is the line under the strip when those were not judged. */
+export default function DagensReise({ today, note }: { today: JourneyStatus; note?: string | null }) {
   const [selected, setSelected] = useState<string | null>(null);
   const rowRef = useRef<HTMLDivElement>(null);
   const nowRef = useRef<HTMLLIElement>(null);
@@ -24,6 +27,7 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
 
   const updated = updatedAt(today);
   const chosen = today.trains.find((t) => t.jkey === selected) ?? null;
+  const chosenNote = chosen ? tripNote(chosen) : null;
   const marker = (
     <li className="dr-now" ref={nowRef} aria-hidden="true">
       <span>nå</span>
@@ -46,7 +50,7 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
                   <button
                     type="button"
                     className={circleClass(train)}
-                    aria-label={circleLabel(train, today.now)}
+                    aria-label={[circleLabel(train, today.now), tripNote(train)].filter(Boolean).join('. ')}
                     aria-pressed={selected === train.jkey}
                     onClick={() => setSelected(selected === train.jkey ? null : train.jkey)}
                   >
@@ -66,8 +70,10 @@ export default function DagensReise({ today }: { today: JourneyStatus }) {
       {chosen && (
         <p className="dr-detail" aria-live="polite">
           {circleLabel(chosen, today.now)}
+          {chosenNote && <span className="dr-detail-note">{chosenNote}</span>}
         </p>
       )}
+      {note && <p className="dr-legend">{note}</p>}
     </section>
   );
 }

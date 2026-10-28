@@ -48,13 +48,18 @@ import threading
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from time import monotonic
 from typing import Any, NamedTuple
 
 from line_modes import transport_mode
 
 logger = logging.getLogger(__name__)
+
+#: The message-input key that carries a departure with a change, present only on one (multi-leg
+#: KTD12). Defined here because the template reads it without `llm_message`; that module imports it,
+#: and its presence is what selects the trip prompt there (`llm_message.prompt_version_for`).
+TRIP_KEY = "reise_med_bytte"
 
 def mode_label(operator: str | None, line: str | None = None) -> str:
     """User-facing vehicle noun for a departure: its line's Journey Planner mode where known, so a
@@ -86,6 +91,39 @@ def is_plan_removed(situation_number: str | None) -> bool:
 def plan_removed_situation(jkey: str) -> str:
     """The situation `predict_calls.sql` relays a removed train's `RemovedJourney:` jkey under."""
     return PLAN_REMOVED_PREFIX + jkey
+
+
+# ---- Trips with a change judged from Journey Planner real-time data (multi-leg U3) ---------------
+#: The synthetic situation a trip reason attaches to when no scored call drove it: the Journey
+#: Planner's real-time data said a leg is cancelled or a change is missed, and no operator message
+#: or row of ours is behind it. One per leg and service date, `KIX:Trip:<operator>:<jkey>:<date>`.
+#: DATED for every operator, as `KIX:ETCancellation:` is on the bus side: a bus `ServiceJourney`
+#: jkey repeats every operating day, and `/varsel`'s push marks are per situation (seven days in the
+#: store), so an undated number would mark today's reason and swallow tomorrow's push about the
+#: same bus. It carries no SX message (`has_situation` false, so the no-SX bar and the «Mulig
+#: avvik» head) and no report type.
+TRIP_PREFIX = "KIX:Trip:"
+#: Its fixed texts, (summary, description) per language, in the order `situation_english.update`
+#: takes them: bokmål, then English, then nynorsk. Nobody publishes them, so they are written here,
+#: as the `KIX:` rows' are written in `predict_calls.sql`.
+TRIP_SITUATION_TEXTS = (
+    "Avvik på en del av reisen",
+    "Sanntidsdata fra operatøren viser at en del av reisen er innstilt eller forsinket.",
+    "Disruption on part of the journey",
+    "The operator's real-time data shows that part of the journey is cancelled or delayed.",
+    "Avvik på ein del av reisa",
+    "Sanntidsdata frå operatøren viser at ein del av reisa er innstilt eller forseinka.",
+)
+
+
+def is_trip_situation(situation_number: str | None) -> bool:
+    """Is this the synthetic situation of a trip reason with no scored call behind it?"""
+    return bool(situation_number) and situation_number.startswith(TRIP_PREFIX)
+
+
+def trip_situation(operator: str | None, jkey: str, service_date: date) -> str:
+    """The `KIX:Trip:` situation of one leg's journey on the day it runs (`PlanLeg.service_date`)."""
+    return f"{TRIP_PREFIX}{operator}:{jkey}:{service_date.isoformat()}"
 
 
 #: How many trains the digest names before it counts the rest («og 32 til»).
@@ -352,6 +390,10 @@ def deterministic_body(message_input: dict) -> str:
         # The vehicle leaves, and ET has cancelled the call where the traveller gets off. As certain
         # as «Innstilt» and as figure-free, and the body's first line already names the stop.
         detail = DESTINATION_CANCELLED
+    elif (transfer := _trip_detail(message_input)) is not None:
+        # A departure with a change broken at a change or on a later leg (multi-leg KTD12): the
+        # input carries no first-train figures in this case, so the trip's own line takes their place.
+        detail = transfer
     elif cancel_pct is not None:
         detail = f"{cancel_pct} % sjanse for innstilling"
     else:
@@ -361,8 +403,11 @@ def deterministic_body(message_input: dict) -> str:
         detail = f"{train}: {detail}" if detail else train
     # The alternative comes LAST, after the cancellation or the delay: what has happened to the
     # traveller's own train is the news, and the replacement is the advice that follows from it.
+    # A trip's expected arrival sits between them: it is the news's last word, not advice.
     return "\n".join(
-        part for part in (summary, detail, alternative_phrase(message_input)) if part
+        part
+        for part in (summary, detail, _arrival_line(message_input), alternative_phrase(message_input))
+        if part
     )
 
 
@@ -387,7 +432,11 @@ def notification_title(
     title = _train_title(message_input)
     if title is None:
         return f"{from_name} → {to_name}"
-    certain = message_input.get("innstilt") or message_input.get("kommer_ikke_fram")
+    certain = (
+        message_input.get("innstilt")
+        or message_input.get("kommer_ikke_fram")
+        or (message_input.get(TRIP_KEY) or {}).get("bekreftet")
+    )
     return f"Bekreftet: {title}" if confirmed and certain else title
 
 
@@ -404,6 +453,15 @@ def outcome_verb(message_input: dict) -> str:
         return "er innstilt"
     if message_input.get("kommer_ikke_fram"):
         return "kjører ikke helt fram"
+    # A departure with a change whose planned ride breaks at a change (multi-leg KTD12/KTD13): the
+    # connection is lost, as a fact when nothing in the plan cushions it (`bekreftet`), else as a
+    # forecast. Ahead of the figures, which are the first train's and may be calm; a later leg's own
+    # delay and the first leg's departure fall through to them (none ride for the former).
+    trip = message_input.get(TRIP_KEY) or {}
+    if trip.get("bekreftet"):
+        return "mister overgangen"
+    if trip.get("problem") in TRANSFER_PROBLEMS:
+        return "kan miste overgangen"
     if message_input.get("innstilling_prosent") is not None:
         return "kan bli innstilt"
     delay = message_input.get("forsinkelse_min") or {}
@@ -418,7 +476,72 @@ def _train_title(message_input: dict) -> str | None:
     if train is None:
         return None
     verb = outcome_verb(message_input)
-    return f"{train}: {verb}" if verb == "mulig avvik" else f"{train} {verb}"
+    title = f"{train}: {verb}" if verb == "mulig avvik" else f"{train} {verb}"
+    return title + _trip_tail(message_input, verb, _NB)
+
+
+def _trip_tail(message_input: dict, verb: str, v: _Vocabulary) -> str:
+    """What a departure with a change adds to its title (R7): where a lost connection is, and whether
+    and when the traveller gets there -- «i Drammen, framme kl 08:20», «…, ankomst ukjent». Nothing
+    for a direct train, and nothing beside «er innstilt»: a train that does not run has no arrival."""
+    trip = message_input.get(TRIP_KEY)
+    if not trip or message_input.get("innstilt"):
+        return ""
+    tail = ""
+    if verb in ("mister overgangen", "kan miste overgangen") and trip.get("byttested"):
+        tail = f" {v.in_place} {trip['byttested']}"
+    arrival = trip.get("ventet_framme_kl")
+    return f"{tail}, {v.arrives} {arrival}" if arrival else f"{tail}, {v.arrival_unknown}"
+
+
+#: The trip reasons that break the planned ride AT a change: a missed connection, and a ridden later
+#: leg that is cancelled or taken out of the plan (KTD13's `missed_connection` effect).
+TRANSFER_PROBLEMS = ("missed_connection", "leg_cancelled", "leg_removed")
+#: How the template names the trouble on a later leg, after that leg's own label.
+_LEG_PROBLEM = {
+    "leg_cancelled": "er innstilt",
+    "leg_removed": "er tatt ut av rutetabellen",
+    "leg_departure": "kan bli forsinket eller innstilt",
+}
+
+
+def _trip_detail(message_input: dict) -> str | None:
+    """The template's transfer detail line for a departure with a change, the trip's counterpart of
+    :data:`DESTINATION_CANCELLED`: «kan miste overgangen i Drammen (4 min planlagt byttetid)», «tog
+    R12 07:30 fra Drammen er innstilt». None for a direct train and for the first train's own
+    departure, whose figures the line already words."""
+    trip = message_input.get(TRIP_KEY) or {}
+    kind = trip.get("problem")
+    if kind == "missed_connection":
+        line = "mister overgangen" if trip.get("bekreftet") else "kan miste overgangen"
+        if trip.get("byttested"):
+            line += f" i {trip['byttested']}"
+        if trip.get("planlagt_byttetid_min") is not None:
+            line += f" ({trip['planlagt_byttetid_min']} min planlagt byttetid)"
+        return line
+    if kind not in _LEG_PROBLEM:
+        return None
+    legs, index = trip.get("etapper") or [], trip.get("indeks")
+    leg = legs[index] if isinstance(index, int) and 0 <= index < len(legs) else {}
+    # Lower case: it lands mid-clause after the first train's label, like the alternative's leg.
+    label = (
+        train_label(_LEG_MODE_NOUN.get(leg.get("transportmiddel")), leg.get("linje"), leg["avgang_kl"],
+                    leg.get("destinasjon"))
+        if leg.get("avgang_kl")
+        else "en del av reisen"
+    )
+    if leg.get("fra"):
+        label += f" fra {leg['fra']}"
+    return f"{label} {_LEG_PROBLEM[kind]}"
+
+
+def _arrival_line(message_input: dict) -> str | None:
+    """«Ventet framme kl 08:20» / «Ankomst ukjent» for a departure with a change that runs."""
+    trip = message_input.get(TRIP_KEY)
+    if not trip or message_input.get("innstilt"):
+        return None
+    arrival = trip.get("ventet_framme_kl")
+    return f"Ventet framme kl {arrival}" if arrival else "Ankomst ukjent"
 
 
 # ---- The one-sentence summary of several alerts (the favourites row, 2026-09-25) ----------------
@@ -450,7 +573,12 @@ _VERB_ORDER = (
     # Certain like the one above and just as much a reason to look for another way (2026-10-19), so
     # it ranks next to it and ahead of every forecast.
     "kjører ikke helt fram",
+    # A departure with a change whose planned connection is gone (multi-leg KTD12): certain, after
+    # the two that say the traveller's own train does not get there; then its forecast, after a
+    # likely cancellation and ahead of a delay, since a missed change costs more than a late train.
+    "mister overgangen",
     "kan bli innstilt",
+    "kan miste overgangen",
     "kan bli forsinket",
     "mulig avvik",
 )
@@ -477,6 +605,9 @@ class _Vocabulary:
     tomorrow: str
     and_word: str
     at: str  # the line-less label's «kl»
+    in_place: str  # where a connection is lost: «i Drammen»
+    arrives: str  # «framme kl 08:20»
+    arrival_unknown: str  # a departure with a change whose arrival nothing in the plan gives
     #: the payload situation field a cause is quoted from in this language; None for the Norwegian,
     #: whose cause is the operator's own `summary`
     cause_field: str | None
@@ -499,13 +630,18 @@ _NB = _Vocabulary(
     tomorrow="i morgen",
     and_word="og",
     at="kl",
+    in_place="i",
+    arrives="framme kl",
+    arrival_unknown="ankomst ukjent",
     cause_field=None,
 )
 _EN = _Vocabulary(
     verbs={
         "er innstilt": ("is cancelled", "are cancelled"),
         "kjører ikke helt fram": ("does not run all the way", "do not run all the way"),
+        "mister overgangen": ("misses the connection", "miss the connection"),
         "kan bli innstilt": ("may be cancelled", "may be cancelled"),
+        "kan miste overgangen": ("may miss the connection", "may miss the connection"),
         "kan bli forsinket": ("may be delayed", "may be delayed"),
         "mulig avvik": ("possible disruption", "possible disruption"),
     },
@@ -524,6 +660,9 @@ _EN = _Vocabulary(
     tomorrow="tomorrow",
     and_word="and",
     at="at",
+    in_place="at",
+    arrives="arrives",
+    arrival_unknown="arrival unknown",
     cause_field="summary_en",
 )
 #: Nynorsk names a vehicle as bokmål does, so only the verbs and «i morgon» move. A weak participle
@@ -532,7 +671,11 @@ _NN = _Vocabulary(
     verbs={
         "er innstilt": ("er innstilt", "er innstilte"),
         "kjører ikke helt fram": ("køyrer ikkje heilt fram", "køyrer ikkje heilt fram"),
+        # The two connection verbs and «ankomst ukjend» are UNREVIEWED nynorsk (multi-leg Q4): the
+        # owner reviews them before TRIP_PLANS_ENABLED goes on in prd, as for the 2026-10-22 texts.
+        "mister overgangen": ("mistar overgangen", "mistar overgangen"),
         "kan bli innstilt": ("kan bli innstilt", "kan bli innstilte"),
+        "kan miste overgangen": ("kan miste overgangen", "kan miste overgangen"),
         "kan bli forsinket": ("kan bli forseinka", "kan bli forseinka"),
         "mulig avvik": ("mogleg avvik", "mogleg avvik"),
     },
@@ -551,12 +694,15 @@ _NN = _Vocabulary(
     tomorrow="i morgon",
     and_word="og",
     at="kl",
+    in_place="i",
+    arrives="framme kl",
+    arrival_unknown="ankomst ukjend",
     cause_field="summary_nn",
 )
 
 
 def _joined(parts: list[str], and_word: str) -> str:
-    """«a, b og c» / "a, b and c". At most five parts reach it (four verbs and tomorrow)."""
+    """«a, b og c» / "a, b and c". At most eight parts reach it (seven verbs and tomorrow)."""
     return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} {and_word} {parts[-1]}"
 
 
@@ -577,7 +723,8 @@ def _summary_title(message_input: dict, v: _Vocabulary) -> str | None:
     if message_input.get("i_morgen"):
         label = f"{label} {v.tomorrow}"
     verb = outcome_verb(message_input)
-    return f"{label}: {v.verbs[verb][0]}" if verb == "mulig avvik" else f"{label} {v.verbs[verb][0]}"
+    title = f"{label}: {v.verbs[verb][0]}" if verb == "mulig avvik" else f"{label} {v.verbs[verb][0]}"
+    return title + _trip_tail(message_input, verb, v)
 
 
 def _counted(
@@ -867,9 +1014,12 @@ def alternative_identity(alt: Any) -> tuple:
     )
 
 
-def prompt_version() -> str:
-    """`llm_message.PROMPT_VERSION`, or an empty marker on a deploy without the Vertex dependencies
-    — a wording is then never written anyway, so nothing is keyed wrongly.
+def prompt_version(trip: bool = False) -> str:
+    """The trip brief's version for a departure with a change (`trip`), the direct one otherwise
+    (KTD12) -- or an empty marker on a deploy without the Vertex dependencies: a wording is then
+    never written anyway, so nothing is keyed wrongly. Asked through
+    `llm_message.prompt_version_for` with the bare :data:`TRIP_KEY` marker it selects on, so that
+    selector stays the one reader of either version.
 
     A local import, like every other reach for that module from here: this runs on the poller
     thread and on the read's own pool, and an ImportError there must cost a cache key rather than
@@ -878,7 +1028,7 @@ def prompt_version() -> str:
     try:
         import llm_message
 
-        return llm_message.PROMPT_VERSION
+        return llm_message.prompt_version_for({TRIP_KEY: True} if trip else None)
     except ImportError:
         return ""
 
@@ -899,9 +1049,24 @@ def wording_key(
     `tomorrow` is passed rather than read off the message input, so a caller that has no input
     (the in-app card reads the cache with nothing but the alert) derives the same key as the pass
     that wrote it.
+
+    A departure with a change (`winner.trip`, multi-leg KTD12) adds one element before the prompt
+    version, `"<reason kind>:<0-based leg or transfer index>"`, with `:c` when the trip is confirmed:
+    categorical, never the deciding figure, so a rescoring does not re-word and a reason change --
+    or «kan miste» turning into «mister overgangen» on the same reason -- does. The version is then
+    the trip brief's, through the same selector the builder's document is worded under
+    (:func:`prompt_version` hands it the marker that document carries), since this caller holds the
+    alert and not the document. A direct key keeps its nine elements byte for byte, and the snapshot stays last
+    (`varsel._previous_wording`).
     """
     departure = getattr(winner, "departure_time", None)
     snapshot = getattr(getattr(winner, "impact", None), "refreshed_at", None)
+    trip = getattr(winner, "trip", None)
+    reason = ()
+    if trip is not None:
+        problem = getattr(trip, "problem", None)
+        confirmed = ":c" if getattr(winner, "trip_confirmed", False) else ""
+        reason = (f"{problem.kind}:{problem.index}{confirmed}" if problem is not None else "",)
     return (
         tuple(pair),
         getattr(winner, "situation_number", None),
@@ -910,7 +1075,8 @@ def wording_key(
         bool(getattr(winner, "destination_cancelled", False)),
         bool(tomorrow),
         alternative_identity(alternative) if alternative is not None else None,
-        prompt_version(),
+        *reason,
+        prompt_version(trip=trip is not None),
         snapshot.isoformat() if snapshot is not None else "",
     )
 
@@ -964,6 +1130,12 @@ class DepartureWordingFacts:
     has_situation: bool = True
     latest_observation: Any | None = None
     alternative_journey: Any | None = None
+    # A departure with a change (multi-leg U8): `alternatives.TripFacts` and whether it is confirmed,
+    # `Alert`'s names, so a wording built from these facts is the trip document the browser and the
+    # webhook pass word from (:data:`TRIP_KEY`) -- one match, one wording. Unset on a direct
+    # train, whose document is then byte-identical to before.
+    trip: Any | None = None
+    trip_confirmed: bool = False
 
     @property
     def mode(self) -> str:

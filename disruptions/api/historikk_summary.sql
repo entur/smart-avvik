@@ -74,13 +74,20 @@
 -- NULL costs nothing, because a removed row cannot predate the flag (the prefix is from 2026-09-23,
 -- the column from 2026-08-05), and n_unsegmented counts the CASE's NULL rather than the flag's, so
 -- the buckets partition the labelled rows by construction either way.
+--
+-- A FIFTH SINCE multi-leg U11 (KTD16): «med bytte», `transfer`, a departure that reaches the
+-- destination only with a change, judged end to end and labelled on its arrival there. Its first
+-- leg can be any of the four above -- a relayed cancellation, a no-SX train, a removed one -- so it
+-- is tested FIRST, discriminated on the legs snapshot (`trip_legs`), which a direct row never has.
+-- Its precision and recall are the marks the flag is turned on in prd against (U12).
 WITH labelled AS (
   SELECT
     call_date, verdict, alert_lead_min, actual_trouble, et_cancelled, destination_cancelled,
     -- Derived once here so the COUNTIFs below cannot each spell the rule slightly differently.
-    -- The removed prefix goes first (see the header); after it, NULL et_cancelled still means
-    -- "unsegmented".
+    -- A trip goes first, then the removed prefix (see the header); after them, NULL et_cancelled
+    -- still means "unsegmented".
     CASE
+      WHEN trip_legs IS NOT NULL                                    THEN 'transfer'
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:')        THEN 'removed'
       WHEN et_cancelled IS NULL                                     THEN NULL
       WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
@@ -157,6 +164,7 @@ hits_per_train AS (
     -- rather than a LOGICAL_OR across situations that could file a train under a segment no alert
     -- of it was ever in. NULL leads sort last under DESC, so one can only win if they all are.
     ARRAY_AGG(STRUCT(alert_lead_min, CASE
+      WHEN trip_legs IS NOT NULL                             THEN 'transfer'
       WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
       WHEN et_cancelled IS NULL                              THEN NULL
       WHEN et_cancelled IS TRUE OR destination_cancelled IS TRUE THEN 'relayed'
@@ -222,7 +230,7 @@ SELECT
   (SELECT COUNT(*) FROM hits_per_train) AS n_hit_trains,
 
   -- ---- the same rows, segmented ---------------------------------------------------------------
-  -- Nothing is dropped: every labelled verdict above lands in exactly one of the four buckets
+  -- Nothing is dropped: every labelled verdict above lands in exactly one of the five buckets
   -- below, or in n_unsegmented. `IS FALSE` / `IS TRUE` rather than `=` so the NULLs fall through
   -- to n_unsegmented instead of silently vanishing from both segments -- `et_cancelled = FALSE` is
   -- NULL, not TRUE, for a row that predates the column, and COUNTIF counts only TRUE.
@@ -325,6 +333,29 @@ SELECT
   (SELECT COUNTIF(first_alert.provenance = 'removed' AND first_alert.alert_lead_min >= 30)
    FROM hits_per_train) AS n_hit_with_30min_notice_removed,
   (SELECT COUNTIF(first_alert.provenance = 'removed') FROM hits_per_train) AS n_hit_trains_removed,
+
+  -- WITH A CHANGE («med bytte», multi-leg U11): judged end to end and labelled on the arrival at the
+  -- destination, so a hit is a departure that got there 10+ min late or not at all. The owner turns
+  -- the flag on in prd only when precision here reaches 0.8 and recall is no lower than the direct
+  -- segments', each over 30 labelled rows.
+  COUNTIF(provenance = 'transfer' AND verdict = 'hit')            AS n_hit_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'false_alarm')    AS n_false_alarm_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'miss')           AS n_miss_transfer,
+  COUNTIF(provenance = 'transfer' AND verdict = 'correct_reject') AS n_correct_reject_transfer,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'transfer' AND verdict = 'hit'),
+    COUNTIF(provenance = 'transfer' AND verdict IN ('hit', 'false_alarm'))
+  ) AS precision_transfer,
+  SAFE_DIVIDE(
+    COUNTIF(provenance = 'transfer' AND verdict = 'hit'),
+    COUNTIF(provenance = 'transfer' AND verdict IN ('hit', 'miss'))
+  ) AS recall_transfer,
+  (SELECT APPROX_QUANTILES(
+     IF(first_alert.provenance = 'transfer', first_alert.alert_lead_min, NULL), 2 IGNORE NULLS
+   )[SAFE_OFFSET(1)] FROM hits_per_train) AS median_lead_min_on_hits_transfer,
+  (SELECT COUNTIF(first_alert.provenance = 'transfer' AND first_alert.alert_lead_min >= 30)
+   FROM hits_per_train) AS n_hit_with_30min_notice_transfer,
+  (SELECT COUNTIF(first_alert.provenance = 'transfer') FROM hits_per_train) AS n_hit_trains_transfer,
 
   -- Decided before the flag existed (2026-08-05), so which segment they belong to is unrecoverable.
   -- Reported, not assigned: defaulting them to "predicted" would be right for most and would hide

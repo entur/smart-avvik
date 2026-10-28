@@ -78,6 +78,12 @@ class FakeCall:
     # case written before the F4 boarding-only bug is about a call anyone may use.
     boarding_allowed: bool = True
     alighting_allowed: bool = True
+    # The rest of the two stacks, which a trip's connection reads (multi-leg KTD7). None, like
+    # CallPred's defaults, so no case written before them moves.
+    p_arr_ge5: float | None = None
+    p_arr_ge20: float | None = None
+    p_dep_ge5: float | None = None
+    p_dep_ge20: float | None = None
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
@@ -140,9 +146,10 @@ def install(by_situation):
     _install_snapshot(by_situation)
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False, min_impact=0.0, path="poller"):
+                 with_alternative=False, min_impact=0.0, path="poller", plans=None):
         # Pass the flag THROUGH rather than hard-coding False: hard-coding it made the suite blind to
-        # a Journey Planner call reappearing on the request path (review 2026-07-29). `path` likewise.
+        # a Journey Planner call reappearing on the request path (review 2026-07-29). `path` likewise,
+        # and `plans` (multi-leg U5), as `main._varsel_impact` forwards it.
         return impact.for_trip(
             from_stop=from_stop,
             to_stop=to_stop,
@@ -153,6 +160,7 @@ def install(by_situation):
             with_alternative=with_alternative,
             min_impact=min_impact,
             path=path,
+            plans=plans,
         )
 
     varsel.configure(impact_provider=provider, stops_provider=list)
@@ -275,12 +283,12 @@ def test_the_journey_planner_is_asked_once_per_window_not_once_per_ref():
     asked = []
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False, min_impact=0.0, path="poller"):
+                 with_alternative=False, min_impact=0.0, path="poller", plans=None):
         asked.append((from_stop, with_alternative))
         return impact.for_trip(
             from_stop=from_stop, to_stop=to_stop, window_start=window_start,
             window_end=window_end, select="worst", catchable_after=catchable_after,
-            with_alternative=False, min_impact=min_impact,
+            with_alternative=False, min_impact=min_impact, plans=plans,
         )
 
     varsel.configure(impact_provider=provider, stops_provider=list)
@@ -1006,6 +1014,30 @@ def test_the_wording_falls_back_to_the_certainty_when_the_message_input_cannot_b
     )
     body = _deterministic_body(_message_input_from_alert(alert))
     assert body == "Signalfeil\nTog R10 08:00: Innstilt"
+
+
+def test_the_fallback_input_quotes_a_trips_first_train_figures_only_where_the_template_does():
+    """`llm_message.trip_quotes_figures` on the last-resort path too: a confirmed trip whose first
+    train we do not score carries the 1.0 certainty, and quoting it would say «100 % sjanse for
+    innstilling» about a first train that runs while a later leg is what is cancelled."""
+    def trip_alert(kind, index, **figures):
+        problem = TripProblem(kind=kind, index=index, probability=0.9, threshold=0.65)
+        return Alert(
+            situation_number="S9", summary="Signalfeil", line="VYG:Line:R12",
+            departure_time=MON_0800, alert_threshold=0.65, alertworthy=True,
+            trip=TripFacts(legs=[], transfers=[], problem=problem),
+            **{"delay_p50_min": None, "delay_p90_min": None, **figures},
+        )
+
+    confirmed = _message_input_from_alert(trip_alert(
+        "leg_cancelled", 1, trip_confirmed=True, cancel_probability=1.0, impact_probability=1.0,
+    ))
+    assert "innstilling_prosent" not in confirmed and "forsinkelse_min" not in confirmed, confirmed
+    assert "%" not in _deterministic_body(confirmed)
+    first = _message_input_from_alert(trip_alert(
+        "departure", 0, cancel_probability=0.6, impact_probability=0.9, delay_p50_min=4,
+    ))
+    assert first["innstilling_prosent"] == 60 and first["forsinkelse_min"]["typisk"] == 4
 
 
 def test_a_no_sx_alert_gets_its_own_headline_instead_of_quoting_one():
@@ -1801,7 +1833,7 @@ def test_match_journey_names_the_budget_its_lookups_spend():
     seen = []
 
     def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                 with_alternative=False, min_impact=0.0, path="poller"):
+                 with_alternative=False, min_impact=0.0, path="poller", plans=None):
         seen.append(path)  # falls off the end: _impact hands None back; the argument is the point
 
     varsel.configure(impact_provider=provider, stops_provider=list)
@@ -2070,6 +2102,716 @@ def test_arrival_is_the_boarded_journeys_own_never_another_lines():
     assert alert.impact.situations[0].arrival_prediction.cancel_probability == 0.60  # the other train's
     arrival = _payload(alert)["arrival"]
     assert arrival["cancelled"] is False and arrival["cancellation"] == 0.05
+
+
+# ---- Multi-leg U5: trips with a change, merged into the match ----------------------------------
+# `trips.judge` is test_trips' and `for_trip(plans=)` test_impact's. These pin what varsel does with
+# the subjects: the flag, which call carries the plan, KTD3's merge, KTD20's standing alerts, the
+# Alert's trip fields, and KTD8's withdrawal hold. Every scenario runs the REAL judge over this
+# suite's snapshot unless it says otherwise.
+
+import contextlib
+import logging
+import os
+
+import trips
+from alternatives import TripFacts, TripProblem
+
+
+def _snapshot_calls(operator, jkey):
+    """The trip verdict's call lookup: the rows of whatever snapshot the engine is reading, by
+    journey, as `main._impact_journey_calls` serves the poller's own (test_impact's helper)."""
+    snapshot, _stamp = impact._snapshot_provider()
+    found = [c for calls in snapshot.values() for c in calls if (c.operator, c.jkey) == (operator, jkey)]
+    return found or None
+
+
+trips.configure(call_lookup=_snapshot_calls, places=varsel.place_refs)
+
+MON_0717 = _oslo(2026, 7, 6, 7, 17)
+MONDAY = MON_0717.date()
+
+
+def _plan_leg(jkey, board, alight, dep, arr, *, operator="VYG", mode="rail", position=0):
+    return trips.PlanLeg(
+        operator=operator, refs=((operator, jkey),), line=f"{operator}:Line:R12",
+        public_code="R12", mode=mode, board_stop_place=board, alight_stop_place=alight,
+        board_quay=None, alight_quay=None, board_position=position, alight_position=position + 2,
+        aimed_departure=dep, aimed_arrival=arr, service_date=dep.astimezone(_OSLO).date(),
+    )
+
+
+def _change(dep=MON_0717, *, first="t17", second="t30"):
+    """A -> C on `first` (7 min), a 6-minute change at C, then C -> B on `second` (35 min)."""
+    return trips.PlanTrip(legs=(
+        _plan_leg(first, "A", "C", dep, dep + timedelta(minutes=7)),
+        _plan_leg(second, "C", "B", dep + timedelta(minutes=13), dep + timedelta(minutes=48)),
+    ))
+
+
+def _change_calls(dep=MON_0717, *, first="t17", second="t30", situation="S9", board=None,
+                  connecting=None, scored_first=True, scored_second=True):
+    """`_change`'s two trains as the cache scores them: the first train's boarding figure (0.9 by
+    default) and a small P(miss) at C, the connecting train's own low figure."""
+    calls = []
+    if scored_first:
+        calls += [
+            FakeCall(first, "A", 1, dep, situation_number=situation,
+                     **{"p_impact_dep": 0.9, **(board or {})}),
+            FakeCall(first, "C", 3, None, aimed_arr=dep + timedelta(minutes=7),
+                     situation_number=situation, p_arr_ge5=0.1, p_arr_ge10=0.05),
+        ]
+    if scored_second:
+        calls += [
+            FakeCall(second, "C", 1, dep + timedelta(minutes=13), situation_number=situation,
+                     **{"p_impact_dep": 0.1, "p_dep_ge10": 0.1, **(connecting or {})}),
+            FakeCall(second, "B", 4, None, aimed_arr=dep + timedelta(minutes=48),
+                     situation_number=situation),
+        ]
+    return calls
+
+
+@contextlib.contextmanager
+def _trips_on(plans, *, enabled=True):
+    """TRIP_PLANS_ENABLED and the injected plan reader, over `{(from, to, Oslo date): DayPlan}`.
+    Entered AFTER `install`, whose `varsel.configure` resets the reader."""
+    before_env = os.environ.get("TRIP_PLANS_ENABLED")
+    before = varsel._trip_plans
+    if enabled:
+        os.environ["TRIP_PLANS_ENABLED"] = "true"
+    else:
+        os.environ.pop("TRIP_PLANS_ENABLED", None)
+    varsel._trip_plans = lambda from_stop, to_stop, day: plans.get((from_stop, to_stop, day))
+    try:
+        yield
+    finally:
+        varsel._trip_plans = before
+        if before_env is None:
+            os.environ.pop("TRIP_PLANS_ENABLED", None)
+        else:
+            os.environ["TRIP_PLANS_ENABLED"] = before_env
+        with varsel._state_lock:
+            varsel._trip_reasons.clear()
+
+
+def _monday(plan):
+    return {("A", "B", MONDAY): plan}
+
+
+def test_a_trip_with_a_change_joins_the_match_beside_the_direct_trains():
+    """KTD3: the direct train is judged as today, and the departure with a change is added after the
+    per-situation selection with its trip facts, its pinned identity (KTD5) and its deciding pair."""
+    install({"S1": _train(MON_0800), "S9": _change_calls()})
+    with _trips_on(_monday(trips.DayPlan(trips=(_change(),)))):
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    by = {a.situation_number: a for a in alerts}
+    assert set(by) == {"S1", "S9"}, alerts
+    trip = by["S9"]
+    assert [leg.board_stop_place for leg in trip.trip.legs] == ["A", "C"]
+    assert (trip.operator, trip.jkey, trip.stop_place, trip.stop_order, trip.departure_time) == (
+        "VYG", "t17", "A", 1, MON_0717,
+    )
+    assert (trip.deciding_probability, trip.deciding_threshold) == (0.9, 0.65)
+    assert trip.alertworthy and not trip.trip_cancelled and not trip.trip_confirmed
+    assert (trip.trip.problem.kind, trip.trip.problem.index) == ("departure", 0)
+    direct = by["S1"]
+    assert direct.trip is None and direct.deciding_probability is None, "a direct train is today's"
+
+
+def test_with_the_flag_off_no_plan_is_read_and_the_match_is_todays():
+    """AE6: off means the plan reader is never asked, the provider is sent exactly today's keywords,
+    and the alerts are byte-identical to a match with no plan anywhere."""
+    install({"S1": _train(MON_0800), "S9": _change_calls()})
+    baseline = varsel.match_journey(_journey(), NOW)
+    asked, sent = [], []
+    real = varsel._impact_provider
+
+    def recording(**kw):
+        sent.append(set(kw))
+        return real(**kw)
+
+    varsel._impact_provider = recording
+    with _trips_on(_monday(trips.DayPlan(trips=(_change(),))), enabled=False):
+        reader = varsel._trip_plans
+        varsel._trip_plans = lambda *key: asked.append(key) or reader(*key)
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    assert asked == [], "no plan read with the flag off"
+    assert sent and all("plans" not in keywords for keywords in sent), sent
+    assert [a.model_dump_json() for a in alerts] == [a.model_dump_json() for a in baseline]
+
+
+def _subject(dep, jkey="t2", *, situation="S9", alertworthy=True, admitted=True, complete=True,
+             unknown=(), kind="departure", index=0, probability=0.9, confirmed=False):
+    """A hand-made `impact.TripSubject`, for the merge's own rules apart from the judge's."""
+    problem = (
+        TripProblem(kind=kind, index=index, probability=probability, threshold=0.65)
+        if alertworthy else None
+    )
+    return impact.TripSubject(
+        situation_number=situation, summary="Feil i Drammen", description=None, has_situation=True,
+        report_type=None, operator="VYG", line="VYG:Line:R12", jkey=jkey, stop_place="A",
+        stop_order=1, departure_time=dep, departure_prediction=None,
+        trip=TripFacts(legs=[], transfers=[], problem=problem), deciding_probability=probability,
+        deciding_threshold=0.65, alertworthy=alertworthy, confirmed=confirmed, admitted=admitted,
+        complete=complete, unknown_legs=unknown,
+    )
+
+
+def _install_subjects(by_situation, subjects, asked=None):
+    """The real provider, with `subjects` attached to every response the plan rides on."""
+    _install_snapshot(by_situation)
+
+    def provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
+                 with_alternative=False, min_impact=0.0, path="poller", plans=None):
+        if asked is not None:
+            asked.append((from_stop, to_stop, plans is not None))
+        response = impact.for_trip(
+            from_stop=from_stop, to_stop=to_stop, window_start=window_start,
+            window_end=window_end, select="worst", catchable_after=catchable_after,
+            with_alternative=with_alternative, min_impact=min_impact, path=path,
+        )
+        if plans is not None:
+            response._trip_subjects = [
+                s for s in subjects() if window_start <= s.departure_time <= window_end
+            ]
+        return response
+
+    varsel.configure(impact_provider=provider, stops_provider=list)
+
+
+def test_ae7_a_direct_alert_on_the_same_departure_wins_over_the_trip():
+    """KTD3's key is source-independent: (operator, journey, aimed departure at the from-stop). A
+    subject the judge returned for a departure the direct path already alerts on adds nothing."""
+    _install_subjects({"S1": _train(MON_0800)}, lambda: [_subject(MON_0800, jkey="t1")])
+    with _trips_on(_monday(trips.DayPlan())):
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    assert [(a.situation_number, a.trip) for a in alerts] == [("S1", None)]
+
+
+def test_a_trip_alert_carries_its_own_alternative_as_a_direct_alert_does():
+    """Multi-leg U6: `impact` looks a departure with a change up itself (KTD10), and its Alert
+    carries the answer where a direct Alert does -- on the Alert, and on the response copy it
+    carries, which the decision log, the caches and the wording key read."""
+    offer = alternatives.AlternativeJourney(
+        departure_time=MON_0717, arrival_time=MON_0717 + timedelta(minutes=70), minutes_saved=-12,
+    )
+    subject = _subject(MON_0717).model_copy(update={
+        "alternative_journey": offer, "alternative_subject": ("VYG", "t2"), "answered": False,
+    })
+    _install_subjects({"S1": _train(MON_0800)}, lambda: [subject])
+    with _trips_on(_monday(trips.DayPlan())):
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    [trip] = [alert for alert in alerts if alert.trip is not None]
+    assert trip.alternative_journey == offer
+    copy = trip.impact
+    assert (copy.alternative_journey, copy.original_is_best, copy.alternative_subject,
+            copy.answered) == (offer, False, ("VYG", "t2"), False)
+
+
+def test_a_trip_ktd20_no_longer_admits_stays_only_while_the_definition_holds_a_standing_alert():
+    """KTD20: a lifted cancellation must never leave a standing alert without a subject to
+    withdraw it. Standing is asked lazily, only about a subject KTD20 does not admit."""
+    subject = _subject(MON_0717, admitted=False)
+    _install_subjects({"S1": _train(MON_0800)}, lambda: [subject])
+    asked: list = []
+
+    def standing(answer):
+        def stands(alert):
+            asked.append(alert.jkey)
+            return answer
+        return stands
+
+    with _trips_on(_monday(trips.DayPlan())):
+        alone = varsel.match_journey(_journey(), NOW)
+        held = varsel.match_journey(_journey(), NOW, standing=standing(True))
+        gone = varsel.match_journey(_journey(), NOW, standing=standing(False))
+        subject = _subject(MON_0717, admitted=True)
+        admitted = varsel.match_journey(_journey(), NOW, standing=standing(False))
+    install({})
+    assert [a.situation_number for a in alone] == ["S1"], "no standing state: an alternative at most"
+    assert {a.situation_number for a in held} == {"S1", "S9"}
+    assert [a.situation_number for a in gone] == ["S1"]
+    assert {a.situation_number for a in admitted} == {"S1", "S9"}
+    assert asked == ["t2", "t2"], "asked once per non-admitted match, never about an admitted one"
+
+
+def test_the_plan_rides_on_the_journeys_own_pair_and_a_parent_destination_gets_its_own_call():
+    """A child ref expands only to its alias group, so the plan rides on the call whose `to_stop`
+    is the journey's own (KTD3's direct check reads every ref of it). With ordinary refs that is the
+    first pair, at no extra call; a parent to-ref is named by no pair, so with a plan in hand it gets
+    one call of its own -- whose direct half is empty, a parent carrying no calls."""
+    asked: list = []
+    _install_subjects({}, list, asked)
+    with _trips_on(_monday(trips.DayPlan())):
+        varsel.match_journey(_journey(), NOW)
+        assert asked[0] == ("A", "B", True) and len(asked) == 2, asked  # Monday's plan, Tuesday's none
+        asked.clear()
+        varsel.set_stop_aliases({}, parents={"P": ("B1", "B2")})
+        varsel._trip_plans = lambda f, t, d: trips.DayPlan() if (f, t, d) == ("A", "P", MONDAY) else None
+        try:
+            varsel.match_journey(_journey() | {"to_stop": "P"}, NOW)
+        finally:
+            varsel.set_stop_aliases({})
+    install({})
+    assert asked[:3] == [("A", "B1", False), ("A", "B2", False), ("A", "P", True)], asked
+    assert asked[3:] == [("A", "B1", False), ("A", "B2", False)], "no plan, no extra call"
+
+
+def test_the_trips_are_looked_up_on_the_call_their_plan_rides():
+    """Multi-leg U6: the lookup for a departure with a change runs inside the call that judges it.
+    The direct lookup stays on the first pair only; a parent destination's own call, which carries
+    the plan and no direct train, is asked with it too."""
+    _install_subjects({}, list)
+    real, sent = varsel._impact_provider, []
+    varsel._impact_provider = lambda **kw: sent.append((kw["to_stop"], kw["with_alternative"])) or (
+        real(**kw)
+    )
+    with _trips_on({}):
+        varsel.set_stop_aliases({}, parents={"P": ("B1", "B2")})
+        varsel._trip_plans = lambda f, t, d: trips.DayPlan() if (f, t, d) == ("A", "P", MONDAY) else None
+        try:
+            varsel.match_journey(_journey() | {"to_stop": "P"}, NOW, with_alternative=True)
+        finally:
+            varsel.set_stop_aliases({})
+    install({})
+    assert sent[:3] == [("B1", True), ("B2", False), ("P", True)], sent
+    assert sent[3:] == [("B1", True), ("B2", False)], "no plan, no call of its own"
+
+
+def test_a_confirmed_trip_is_trip_cancelled_and_carries_the_certainty_even_unscored():
+    """KTD19: a declared cancellation of the second leg's boarding call, with no continuation to
+    cushion it, is confirmed. `trip_cancelled` follows (so `phase` does), `cancelled` stays the
+    boarding call's, and the figures are the destination-cancelled overwrite -- also when we score
+    no call of the first leg, where there is no figure of ours to overwrite (KTD6)."""
+    for scored_first in (True, False):
+        install({"S9": _change_calls(board={"p_impact_dep": 0.1}, scored_first=scored_first,
+                                     connecting={"et_declared_cancelled": True})})
+        with _trips_on(_monday(trips.DayPlan(trips=(_change(),)))):
+            [trip] = varsel.match_journey(_journey(), NOW)
+        install({})
+        assert trip.trip_confirmed and trip.trip_cancelled and not trip.cancelled, scored_first
+        assert (trip.impact_probability, trip.cancel_probability) == (1.0, 1.0), scored_first
+        assert (trip.delay_p50_min, trip.delay_p90_min) == (None, None), scored_first
+        assert (trip.trip.problem.kind, trip.trip.problem.index) == ("leg_cancelled", 1)
+
+
+def test_a_first_train_that_never_leaves_is_worded_cancelled_never_a_missed_change():
+    """A confirmed shared reason on a first leg we do not score: Journey Planner's real-time has its
+    boarding call cancelled, or Vy took the train out of today's plan. The first vehicle never
+    leaves, so the alert is `cancelled` with the certainty, and the title, the body and the card's
+    detail say «er innstilt» as for a scored first train ET has cancelled -- never «mister
+    overgangen, ankomst ukjent»."""
+    import notification_wording
+
+    first = "DatedServiceJourney:1617_X"
+    removed_jkey = f"RemovedJourney:1617_{MONDAY.isoformat()}"
+    removed = notification_wording.plan_removed_situation(removed_jkey)
+    out_of_plan = {removed: [FakeCall(removed_jkey, "A", 1, MON_0717, situation_number=removed,
+                                      et_declared_cancelled=True, has_situation=False,
+                                      p_impact_dep=1.0)]}
+
+    def jp_cancelled(leg):
+        return trips.LegRealtime(board_cancelled=True) if leg.refs[0][1] == first else None
+
+    for realtime, extra, kind in ((jp_cancelled, {}, "leg_cancelled"), (None, out_of_plan, "leg_removed")):
+        install({"S9": _change_calls(first=first, scored_first=False, board=_calm_board()), **extra})
+        trips.configure(call_lookup=_snapshot_calls, places=varsel.place_refs, realtime=realtime)
+        try:
+            with _trips_on(_monday(trips.DayPlan(trips=(_change(first=first),)))):
+                [trip] = varsel.match_journey(_journey(), NOW)
+        finally:
+            trips.configure(call_lookup=_snapshot_calls, places=varsel.place_refs)
+            install({})
+        assert (trip.trip.problem.kind, trip.trip.problem.index) == (kind, 0), kind
+        assert trip.cancelled and trip.trip_confirmed, kind
+        assert (trip.impact_probability, trip.cancel_probability, trip.delay_p50_min) == (1.0, 1.0, None)
+        mi = _message_input(_journey(), trip)
+        title = notification_wording.notification_title(mi, "Oslo S", "Lillehammer", confirmed=True)
+        assert mi["innstilt"] is True and "er innstilt" in title and "overgangen" not in title, title
+        assert "ankomst ukjent" not in title and "Ankomst ukjent" not in _deterministic_body(mi)
+        assert varsel._feedback_detail(trip).endswith("Innstilt"), kind
+
+
+def test_an_unscored_first_leg_has_no_figures_and_ranks_on_the_deciding_pair():
+    """KTD6: no figure of ours for the boarding call, so none is made up -- and `_alert_severity`
+    ranks the subject on its deciding figure, so a broken change never sorts as a calm train."""
+    install({"S1": _train(MON_0800, p_impact_dep=0.7),
+             "S9": _change_calls(scored_first=False, connecting={"p_impact_dep": 0.95})})
+    with _trips_on(_monday(trips.DayPlan(trips=(_change(),)))):
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    assert [a.situation_number for a in alerts] == ["S9", "S1"], "worst first, on the deciding pair"
+    trip = alerts[0]
+    assert (trip.impact_probability, trip.cancel_probability, trip.ge10_probability) == (None,) * 3
+    assert varsel._alert_severity(trip) == (0.95, 0, 0.0)
+    assert (trip.trip.problem.kind, trip.trip.problem.index) == ("leg_departure", 1)
+    assert [a.situation_number for a in varsel.one_alert_per_train(alerts)] == ["S9", "S1"]
+
+
+def test_a_raise_while_merging_the_trips_costs_that_definition_its_trips_only():
+    """Decision 7: the direct alerts still come back, and the record names the error class only
+    (a message could quote a stop, R17)."""
+    install({"S1": _train(MON_0800), "S9": _change_calls()})
+    records: list[logging.LogRecord] = []
+
+    class _Sink(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    sink = _Sink()
+    varsel.logger.addHandler(sink)
+    real = varsel._trip_alert
+    varsel._trip_alert = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop NSR:StopPlace:A"))
+    try:
+        with _trips_on(_monday(trips.DayPlan(trips=(_change(),)))):
+            alerts = varsel.match_journey(_journey(), NOW)
+    finally:
+        varsel._trip_alert = real
+        varsel.logger.removeHandler(sink)
+        install({})
+    assert [a.situation_number for a in alerts] == ["S1"]
+    [record] = [r for r in records if getattr(r, "fields", {}).get("event") == "trip_merge_error"]
+    assert record.fields["error"] == "RuntimeError"
+    assert "NSR" not in record.getMessage() and not record.exc_info
+
+
+def test_the_trip_alert_hands_the_writer_its_own_situation_and_no_other():
+    """`build_message_input` falls back to EVERY situation of the response when the alert's own is
+    not in it, and a trip's situation is usually not in the direct, `to_stop`-narrowed response. The
+    trip alert's response copy carries only its own, so the direct train's text never reaches the
+    prompt as though it were the trip's."""
+    direct = _train(MON_0800, summary="Signalfeil ved Lysaker")
+    install({"S1": direct, "S9": _change_calls()})
+    with _trips_on(_monday(trips.DayPlan(trips=(_change(),)))):
+        trip = next(a for a in varsel.match_journey(_journey(), NOW) if a.trip is not None)
+    install({})
+    assert "Lysaker" not in str(_message_input(_journey(), trip))
+    assert trip.impact.alternative_subject is None and trip.impact.answered
+    assert not trip.impact.original_is_best and trip.impact.alternative_journey is None
+
+
+def test_an_unknown_leg_holds_the_withdrawal_only_of_a_subject_standing_on_it():
+    """KTD8. A subject standing on a reason that sits on a leg now unknown is not withdrawn however
+    many cycles stay unknown; one standing on the first train's figure withdraws by today's rules
+    when that figure falls; and a new leader, which knows nothing of what a subject stood on,
+    withdraws nothing an unknown leg could have changed."""
+    def cycle(subject):
+        _install_subjects({}, lambda: [subject])
+        with _trips_on(_monday(trips.DayPlan())):
+            varsel._trip_reasons.update(memory)
+            # As the pass asks: only it remembers a reason (`standing`, never asked of an admitted one).
+            [alert] = varsel.match_journey(_journey(), NOW, standing=lambda _alert: False)
+            memory.clear()
+            memory.update(varsel._trip_reasons)
+        return alert
+
+    calm = {"alertworthy": False, "complete": False, "unknown": (1,), "probability": 0.2}
+    memory: dict = {}
+    assert not cycle(_subject(MON_0717, kind="missed_connection", index=0))._hold_withdrawal
+    assert cycle(_subject(MON_0717, **calm))._hold_withdrawal
+    assert cycle(_subject(MON_0717, **calm))._hold_withdrawal, "two cycles of unknown, still held"
+
+    memory.clear()
+    cycle(_subject(MON_0717, kind="departure", index=0, complete=False, unknown=(1,)))
+    assert not cycle(_subject(MON_0717, **calm))._hold_withdrawal, "withdraws as today"
+
+    memory.clear()  # a new leader
+    assert cycle(_subject(MON_0717, **calm))._hold_withdrawal
+    assert not cycle(_subject(MON_0717, alertworthy=False, probability=0.2))._hold_withdrawal, (
+        "a complete verdict withdraws by today's rules whatever was remembered"
+    )
+    install({})
+
+
+def test_only_the_pass_remembers_what_a_trip_alerted_on():
+    """`_trip_reasons` is pruned by the leader's pass alone, so a request path (the card, a public
+    read: no `standing`) on any pod reads it and never writes it -- or a follower's would grow for
+    the life of the pod, one entry per alerting departure any caller asked about."""
+    _install_subjects({}, lambda: [_subject(MON_0717, kind="missed_connection", index=0)])
+    with _trips_on(_monday(trips.DayPlan())):
+        [alert] = varsel.match_journey(_journey(), NOW)
+        assert alert.trip is not None and varsel._trip_reasons == {}
+        varsel.match_journey(_journey(), NOW, standing=lambda _alert: False)
+        assert list(varsel._trip_reasons.values()) == [("missed_connection", 0)]
+    install({})
+
+
+def test_a_held_withdrawal_is_no_webhook_observation():
+    """What the hold MEANS downstream: no observation reaches the emit step, so nothing counts
+    toward the subject's withdrawal run, while the same reading unheld is an ordinary one."""
+    _install_subjects({}, lambda: [
+        _subject(MON_0717, alertworthy=False, complete=False, unknown=(1,), probability=0.2)
+    ])
+    with _trips_on(_monday(trips.DayPlan())):
+        [alert] = varsel.match_journey(_journey(), NOW)
+    install({})
+    key = "A|B|07:00|09:00|0,1,2,3,4"
+    recipient = varsel.WebhookRecipient("sub_1", _journey(), client_id="c1", destination_id="d1")
+
+    def observed():
+        out: list = []
+        varsel._observations_for_key(
+            out, key, [recipient], alerts_by_key={key: [alert]}, match_targets={key: _journey()},
+            message_inputs={}, webhook_llm=False,
+        )
+        return [observation.alertworthy for observation in out]
+
+    assert alert._hold_withdrawal and observed() == []
+    alert._hold_withdrawal = False
+    assert observed() == [False], "control: unheld, the reading is a withdrawal observation"
+
+
+def test_the_thinning_ledger_tracks_the_figure_the_row_records():
+    """The row records a trip's deciding figure as `impact_probability` (KTD6), and
+    `max_impact_probability` is a MAX over rows, so the thinning rule's `new_max` must be asked of
+    that same figure: a missed change climbing past the last peak is a row even while the calm
+    boarding call's own figure stays below it."""
+    trip = varsel.Alert(
+        situation_number="S9", summary=None, line=None, departure_time=MON_0717,
+        cancel_probability=0.05, delay_p50_min=None, delay_p90_min=None, impact_probability=0.3,
+        alert_threshold=0.65, alertworthy=True, deciding_probability=0.9, deciding_threshold=0.65,
+    )
+    entry = {"alertworthy": True, "max_impact": 0.5, "written_at": NOW}
+    assert varsel._thinning_reason(entry, trip, pushed=False, now=NOW) == "new_max"
+    direct = trip.model_copy(update={"deciding_probability": None, "deciding_threshold": None})
+    assert varsel._thinning_reason(entry, direct, pushed=False, now=NOW) is None, "control"
+
+
+def test_a_reason_change_on_a_thinned_cycle_writes_a_fresh_row():
+    """Multi-leg KTD11: the reason kind and the leg or transfer index are a thinning keep-reason, so
+    a standing trip subject whose problem moves -- the departure figure, then a missed change on the
+    same situation -- writes a row on the cycle it moves, with nothing else having changed. The
+    ledger keeps the reason it last WROTE, so a lost write fires again; an entry from before the
+    rule (no key) reads as no reason, which a direct train also has."""
+    def alert(kind, index):
+        return varsel.Alert(
+            situation_number="S9", summary=None, line=None, departure_time=MON_0717,
+            cancel_probability=0.05, delay_p50_min=None, delay_p90_min=None,
+            impact_probability=0.3, alert_threshold=0.65, alertworthy=True,
+            deciding_probability=0.9, deciding_threshold=0.65,
+            trip=TripFacts(legs=[], transfers=[], problem=TripProblem(
+                kind=kind, index=index, probability=0.9, threshold=0.65)),
+        )
+
+    entry = {"alertworthy": True, "max_impact": 0.9, "written_at": NOW,
+             "trip_reason": ("departure", 0)}
+    assert varsel._thinning_reason(entry, alert("departure", 0), pushed=False, now=NOW) is None
+    assert varsel._thinning_reason(
+        entry, alert("missed_connection", 0), pushed=False, now=NOW
+    ) == "trip_reason"
+    assert varsel._thinning_reason(
+        entry, alert("departure", 1), pushed=False, now=NOW
+    ) == "trip_reason", "the index alone moving is a reason change too"
+    direct = alert("departure", 0).model_copy(update={"trip": None})
+    assert varsel._thinning_reason(
+        {**entry, "trip_reason": None}, direct, pushed=False, now=NOW
+    ) is None, "control: a direct train has no reason to change"
+    assert varsel._thinning_reason(
+        {k: v for k, v in entry.items() if k != "trip_reason"}, direct, pushed=False, now=NOW
+    ) is None, "an entry written before the rule"
+
+
+def test_a_trip_alert_carries_every_continuation_to_its_decision_row():
+    """U11's carrier: the siblings a verdict was taken over reach the decision row, never a wire.
+    The Alert holds them excluded (as it holds its `impact`), so `/varsel-api` and every payload
+    built off the Alert are unchanged; the row gets the snapshot, the planned route's P(miss) and
+    the problem's kind and index -- the deciding pair stays in `impact_probability`."""
+    import json
+
+    import decisions
+
+    by_situation = _sibling_calls()
+    by_situation["S9"][1].p_arr_ge5 = by_situation["S9"][1].p_arr_ge10 = 0.9
+    trip, _ = _trip_alert(by_situation, _sibling_plan())
+    assert round(trip.trip_p_miss, 4) == 0.8226, "a read-off of 0.9 at a 6-minute change, corrected"
+    assert {"trip_legs_snapshot", "trip_p_miss"}.isdisjoint(trip.model_dump()), "never on a wire"
+    row = decisions.build_row({"from_stop": "A", "to_stop": "B"}, trip, journey_digest="d",
+                              n_devices=1, pushed=False, message=None, message_source="deterministic")
+    continuations = json.loads(row["trip_legs"])["continuations"]
+    assert [[leg["alight_stop_place"] for leg in c["legs"]] for c in continuations] == [
+        ["C", "B"], ["D", "B"],
+    ], "the planned route first, then the sibling via D"
+    assert (row["trip_reason_kind"], row["trip_reason_index"], round(row["trip_p_miss"], 4)) == (
+        "missed_connection", 0, 0.8226,
+    )
+    assert (row["impact_probability"], row["alert_threshold"]) == (0.7, 0.65), "the deciding pair"
+
+
+# ---- Multi-leg U8: the trip in the webhook payload ------------------------------------------------
+# `payload.trip` is the dump of the one trip model, beside today's boarding-call figures; `effect`
+# says `missed_connection` when the planned ride breaks at a change. The real judge, over this
+# suite's snapshot, so the facts are the verdict's own and not a hand-made dict.
+
+
+def _calm_board(**kw):
+    """The first train's boarding call: under the bar and, by default, no delay figure at all."""
+    return {"p_impact_dep": 0.1, "dep_delay_typ_min": 0, "dep_delay_p50_stack_min": 0,
+            "dep_delay_p90_min": 0, "dep_delay_p90_stack_min": 0, **kw}
+
+
+def _trip_alert(by_situation, plan):
+    install(by_situation)
+    with _trips_on(_monday(plan)):
+        alerts = varsel.match_journey(_journey(), NOW)
+    install({})
+    trip = next(a for a in alerts if a.trip is not None)
+    return trip, [a for a in alerts if a.trip is None]
+
+
+def test_a_trip_subjects_payload_carries_the_trip_model_and_no_same_vehicle_arrival():
+    """KTD13: `payload.trip` is `TripFacts` dumped -- legs, transfers, expected arrival, problem --
+    and nothing else; `arrival` is null, because no one vehicle reaches the destination. The
+    envelope's open sub-objects keep the direct train's exact key sets, and a direct train's
+    payload has no `trip` key at all."""
+    trip, [direct] = _trip_alert(
+        {"S1": _train(MON_0800), "S9": _change_calls()}, trips.DayPlan(trips=(_change(),))
+    )
+    payload, plain = _payload(trip), _payload(direct)
+    assert "trip" not in plain, "a direct train carries no trip key, not a null one"
+    assert payload["trip"] == trip.trip.model_dump(mode="json")
+    assert set(payload["trip"]) == {"legs", "transfers", "expected_arrival", "arrives_via", "problem"}
+    assert payload["trip"]["arrives_via"] is None, "the planned route"
+    assert [leg["board_stop_place"] for leg in payload["trip"]["legs"]] == ["A", "C"]
+    assert [leg["data_source"] for leg in payload["trip"]["legs"]] == ["prediction", "prediction"]
+    assert payload["trip"]["transfers"][0]["stop_place"] == "C"
+    assert payload["trip"]["problem"] == {
+        "kind": "departure", "index": 0, "probability": 0.9, "threshold": 0.65,
+    }
+    assert payload["arrival"] is None and trip.arrival_prediction is None
+    assert set(payload) == set(plain) | {"trip"}, set(payload) ^ set(plain)
+    for key in ("call", "probabilities", "notification"):
+        assert set(payload[key]) == set(plain[key]), key
+
+
+def test_a_predicted_missed_connection_keeps_the_boarding_figures_and_rides_its_own_in_the_problem():
+    """KTD6: `probabilities` are the first train's own, which may be calm; P(miss) and its bar ride in
+    `trip.problem`, with transfer 0 between legs 0 and 1. `effect` is `missed_connection` whatever
+    the boarding delay -- none, or one today's rule would call `delayed`."""
+    for board in (_calm_board(), _calm_board(dep_delay_p50_stack_min=4, dep_delay_p90_min=9)):
+        calls = _change_calls(board=board)
+        calls[1].p_arr_ge5 = calls[1].p_arr_ge10 = 0.9
+        trip, _ = _trip_alert({"S9": calls}, trips.DayPlan(trips=(_change(),)))
+        payload = _payload(trip)
+        assert trip.alertworthy and not trip.trip_cancelled
+        assert payload["probabilities"]["impact"] == 0.1, "the boarding call's own figure"
+        problem = {**payload["trip"]["problem"]}
+        assert round(problem.pop("probability"), 4) == 0.8226, "0.9 read off, corrected"
+        assert problem == {"kind": "missed_connection", "index": 0, "threshold": 0.65}
+        assert payload["effect"] == "missed_connection", board
+
+
+def test_a_cancelled_later_leg_reads_missed_connection_predicted_and_cancelled_confirmed():
+    """KTD13's effect rule both ways: a cancelled later leg with no cushion is a confirmed trip
+    (`cancelled`, the destination-cancelled overwrite of 1.0 and null delays); the same leg
+    beside a sibling only predicted to fail is `missed_connection`; and a later leg's own boarding
+    figure keeps today's rule, since the ride does not break at the change."""
+    gone = {"et_declared_cancelled": True}
+    trip, _ = _trip_alert(
+        {"S9": _change_calls(board=_calm_board(), connecting=gone)},
+        trips.DayPlan(trips=(_change(),)),
+    )
+    payload = _payload(trip)
+    assert trip.trip_confirmed and payload["effect"] == "cancelled"
+    assert (payload["probabilities"]["impact"], payload["probabilities"]["cancellation"]) == (1.0, 1.0)
+    assert payload["delay"] is None
+    assert (payload["trip"]["problem"]["kind"], payload["trip"]["problem"]["index"]) == ("leg_cancelled", 1)
+
+    trip, _ = _trip_alert(_sibling_calls(planned_connecting=gone), _sibling_plan())
+    payload = _payload(trip)
+    assert not trip.trip_cancelled and payload["effect"] == "missed_connection"
+    assert payload["trip"]["problem"]["kind"] == "leg_cancelled"
+
+    trip, _ = _trip_alert(
+        {"S9": _change_calls(board=_calm_board(), connecting={"p_impact_dep": 0.9})},
+        trips.DayPlan(trips=(_change(),)),
+    )
+    payload = _payload(trip)
+    assert payload["trip"]["problem"]["kind"] == "leg_departure"
+    assert payload["effect"] is None, "no boarding delay figure, so today's rule says nothing"
+
+
+def _sibling_plan():
+    """Two continuations of the 07:17 (KTD19): via C (planned, arrives 08:05) and via D (08:11,
+    inside `TROUBLE_DELAY_MIN` of it, so it cushions)."""
+    via_d = trips.PlanTrip(legs=(
+        _plan_leg("t17", "A", "D", MON_0717, MON_0717 + timedelta(minutes=12)),
+        _plan_leg("t40", "D", "B", MON_0717 + timedelta(minutes=20), MON_0717 + timedelta(minutes=54)),
+    ))
+    return trips.DayPlan(trips=(_change(), via_d))
+
+
+def _sibling_calls(*, planned_connecting=None, sibling_board=0.7):
+    calls = _change_calls(board=_calm_board(), connecting=planned_connecting)
+    calls += [
+        FakeCall("t17", "D", 4, None, aimed_arr=MON_0717 + timedelta(minutes=12),
+                 situation_number="S9", p_arr_ge5=0.1, p_arr_ge10=0.05),
+        FakeCall("t40", "D", 1, MON_0717 + timedelta(minutes=20), situation_number="S9",
+                 p_impact_dep=sibling_board, p_dep_ge10=0.1),
+        FakeCall("t40", "B", 5, None, aimed_arr=MON_0717 + timedelta(minutes=54),
+                 situation_number="S9"),
+    ]
+    return {"S9": calls}
+
+
+def test_a_figure_bound_by_a_sibling_names_the_planned_reason_beside_the_siblings_figure():
+    """KTD13 under KTD19: the problem says what breaks the ride the traveller PLANNED (the miss at
+    C, transfer 0), while the figure and bar beside it are the sibling's -- the later leg out of D at
+    0.7, which clears by the least and so binds the verdict. `probabilities` stays the boarding
+    call's."""
+    by_situation = _sibling_calls()
+    by_situation["S9"][1].p_arr_ge5 = by_situation["S9"][1].p_arr_ge10 = 0.9
+    trip, _ = _trip_alert(by_situation, _sibling_plan())
+    payload = _payload(trip)
+    assert trip.alertworthy and (trip.deciding_probability, trip.deciding_threshold) == (0.7, 0.65)
+    assert payload["trip"]["problem"] == {
+        "kind": "missed_connection", "index": 0, "probability": 0.7, "threshold": 0.65,
+    }
+    assert payload["probabilities"]["impact"] == 0.1 and payload["effect"] == "missed_connection"
+
+
+def test_an_unscored_first_leg_carries_null_figures_and_its_certainty_only_in_the_problem():
+    """KTD6 and KTD8: a first leg we do not score has no figure of ours, so the pinned keys carry
+    null; a miss by Journey Planner's own expected times is 1.0 and predicted, and that certainty
+    rides in `trip.problem`, never in `probabilities` -- the confirmed-cancellation coherence rule
+    the synthetic event and `wireContract.test.mjs` pin stays true of every predicted event."""
+    subject = _subject(MON_0717, kind="missed_connection", index=0, probability=1.0)
+    _install_subjects({}, lambda: [subject])
+    with _trips_on(_monday(trips.DayPlan())):
+        [trip] = varsel.match_journey(_journey(), NOW)
+    install({})
+    payload = _payload(trip)
+    assert set(payload["probabilities"]) == {"impact", "cancellation", "delay_ge10", "alert_threshold"}
+    assert payload["probabilities"]["impact"] is None
+    assert payload["probabilities"]["cancellation"] is None
+    assert payload["probabilities"]["delay_ge10"] is None
+    assert payload["trip"]["problem"]["probability"] == 1.0
+    assert payload["effect"] == "missed_connection" and not trip.trip_cancelled
+
+
+def test_main_counts_the_plans_trip_situations_as_live_only_with_the_flag_on():
+    """`main._varsel_live`: a trip reason judged from Journey Planner real-time attaches to a
+    `KIX:Trip:` situation no prediction row carries, and the pass sweeps every mark, wording and
+    decision subject whose situation is not live. With the flag off it is the snapshot itself."""
+    plan = trips.DayPlan(trips=(_change(),))
+    # A plan only a public read fetched: the pass matches through `read_plan`, which serves it too.
+    public = trips.DayPlan(trips=(_change(first="t40", second="t50"),))
+    real_held, real_public = main.trip_plans.held, main.trip_plans.public_plans
+    main.trip_plans.held = lambda: [plan]
+    main.trip_plans.public_plans = lambda: [public]
+    try:
+        with _trips_on({}, enabled=False):
+            assert main._varsel_live() is main._varsel_snapshot()
+        with _trips_on({}):
+            live = main._varsel_live()
+    finally:
+        main.trip_plans.held, main.trip_plans.public_plans = real_held, real_public
+    assert {"KIX:Trip:VYG:t17:2026-07-06", "KIX:Trip:VYG:t30:2026-07-06"} <= set(live)
+    assert {"KIX:Trip:VYG:t40:2026-07-06", "KIX:Trip:VYG:t50:2026-07-06"} <= set(live)
+    assert set(main._varsel_snapshot()) <= set(live)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ import notification_events
 import notification_pull
 import notification_store
 import notification_wording
+import trip_plans
 import webhook_delivery
 import webhook_sender
 import webhook_signing
@@ -96,7 +97,18 @@ MODULES_BY_NAME = {
     # Planner budget) without being channel modules themselves.
     "notification_wording": notification_wording,
     "alternatives": alternatives,
+    # The Journey Planner trip plans' numbers (multi-leg KTD18). `main`'s one row, the leader's
+    # off-cycle real-time tick, is read from its source by `_main_literal`: this suite never imports it.
+    "trip_plans": trip_plans,
 }
+
+
+def _main_literal(name: str) -> object:
+    """`main`'s module-level `NAME = <literal>`, read from the source (see the module docstring)."""
+    for node in _tree("main.py").body:
+        if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == name for t in node.targets):
+            return ast.literal_eval(node.value)
+    return None
 
 
 def _source(name: str) -> str:
@@ -138,15 +150,15 @@ def test_the_published_numbers_table_matches_the_constants():
     )
     for module_name, constant, printed in rows:
         module = MODULES_BY_NAME.get(module_name)
-        assert module is not None, (
+        assert module is not None or module_name == "main", (
             f"the constants table names module {module_name!r}, which this suite does not import. "
             "Add it to MODULES_BY_NAME, or the row is unchecked."
         )
-        assert hasattr(module, constant), (
+        actual = _main_literal(constant) if module is None else getattr(module, constant, None)
+        assert actual is not None, (
             f"{module_name}.{constant} is published in docs/operations/notification-webhooks.md and "
             "does not exist. A renamed constant leaves the published number describing nothing."
         )
-        actual = getattr(module, constant)
         expected = float(printed) if "." in printed else int(printed)
         assert actual == expected, (
             f"{module_name}.{constant} is {actual!r} and the operations document publishes "
@@ -177,6 +189,38 @@ def test_every_retention_constant_is_published():
         assert f"notification_store.{constant}" in published, (
             f"notification_store.{constant} bounds how long client data survives and is published "
             "nowhere. Add it to the constants table in docs/operations/notification-webhooks.md."
+        )
+
+
+def test_every_trip_plan_number_is_published():
+    """KTD18, the other direction: Journey Planner traffic on its own paths, with its numbers
+    published -- the three per-minute ceilings, the page bound's two terms, the refresh interval and
+    the phase deadline, the real-time look-ahead, age, batch and tick, the public-read cache and
+    flight bounds, and the read's fetch horizon and margin. A row deleted from the table is a JP volume nobody
+    can size from the document any more."""
+    published = {f"{module}.{name}" for module, name, _ in _published_numbers()}
+    for constant in (
+        "alternatives._PLANS_FETCH_MAX_PER_MIN",
+        "alternatives._PLANS_PULL_FETCH_MAX_PER_MIN",
+        "alternatives._REALTIME_FETCH_MAX_PER_MIN",
+        "trip_plans._PAGE_MINUTES",
+        "trip_plans._MAX_PAGES",
+        "trip_plans.PLAN_REFRESH_S",
+        "trip_plans._PHASE_DEADLINE_S",
+        "trip_plans.REALTIME_LOOKAHEAD_S",
+        "trip_plans.REALTIME_MAX_AGE_S",
+        "trip_plans._REALTIME_BATCH",
+        "trip_plans._REALTIME_MAX_REQUESTS",
+        "trip_plans.PUBLIC_PLANS_MAX",
+        "trip_plans.PUBLIC_FLIGHTS_MAX",
+        "main._TRIP_REALTIME_TICK_S",
+        "notification_pull.PLAN_HORIZON_H",
+        "notification_pull.PLAN_FETCH_MARGIN_H",
+    ):
+        assert constant in published, (
+            f"{constant} sizes the Journey Planner traffic of the trips with a change and is "
+            "published nowhere. Add it to the constants table in "
+            "docs/operations/notification-webhooks.md."
         )
 
 
@@ -324,35 +368,44 @@ def test_no_notification_module_logs_a_route_a_callback_a_credential_or_prose():
     )
 
 
+def _events(modules: tuple[str, ...]) -> set[str]:
+    """Every literal `"event": "<name>"` in the modules' dicts -- the structured log records."""
+    return {
+        value.value
+        for module in modules
+        for node in ast.walk(_tree(module)) if isinstance(node, ast.Dict)
+        for key, value in zip(node.keys, node.values)
+        if isinstance(key, ast.Constant) and key.value == "event"
+        and isinstance(value, ast.Constant) and isinstance(value.value, str)
+    }
+
+
 def test_the_operations_document_names_every_notification_log_event():
     """A log event nobody documented is one nobody will look for during an incident.
 
     The failure this closes is the one the `/meldinger` rename already cost once: an event name that
     exists in the code and in no query, dashboard or runbook returns nothing rather than erroring.
     """
-    emitted: set[str] = set()
-    for module in (*NOTIFICATION_MODULES, "varsel.py"):
-        for node in ast.walk(_tree(module)):
-            if not isinstance(node, ast.Dict):
-                continue
-            for key, value in zip(node.keys, node.values):
-                if (
-                    isinstance(key, ast.Constant)
-                    and key.value == "event"
-                    and isinstance(value, ast.Constant)
-                    and isinstance(value.value, str)
-                    and (
-                        value.value.startswith(("notification_", "webhook_"))
-                        or value.value == "varsel_webhook_load"
-                    )
-                ):
-                    emitted.add(value.value)
+    emitted = {
+        name for name in _events((*NOTIFICATION_MODULES, "varsel.py"))
+        if name.startswith(("notification_", "webhook_")) or name == "varsel_webhook_load"
+    }
     # A floor, not just non-emptiness: after the 2026-09-09 rename this filter still said
     # `partner_` and matched only `varsel_webhook_load`, so the test passed while checking one
     # event of nineteen. The number is the size of the log table this test exists to keep whole.
     assert len(emitted) >= 18, f"only {len(emitted)} client log events were found: {sorted(emitted)}"
+    # The trips with a change (multi-leg journeys): the plan fetch, store, follow and real-time
+    # records, and the three fail-open guards that cost a definition its trips, never its direct
+    # trains. Their own floor, so the filter above cannot quietly absorb them.
+    trip_events = {
+        name for name in _events(
+            ("trip_plans.py", "trips.py", "impact.py", "notification_pull.py", "varsel.py")
+        )
+        if name.startswith(("trip_", "trips_"))
+    }
+    assert len(trip_events) >= 9, f"only {len(trip_events)} trip log events were found: {sorted(trip_events)}"
     text = OPERATIONS_DOC.read_text(encoding="utf-8")
-    missing = sorted(name for name in emitted if f"`{name}`" not in text)
+    missing = sorted(name for name in emitted | trip_events if f"`{name}`" not in text)
     assert not missing, (
         f"these client log events are emitted and documented nowhere: {missing}. Add them to the "
         "log table in docs/operations/notification-webhooks.md, with what each field carries — an "

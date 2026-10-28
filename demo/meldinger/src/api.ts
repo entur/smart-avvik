@@ -260,6 +260,10 @@ export interface Summary extends WindowFields {
   /** The train is missing from the day's timetable and no cancellation was published
    *  (`KIX:PlanRemoved:`). Served at 1.0 like a relayed cancellation, but ET declared nothing. */
   removed: Segment;
+  /** «Med bytte»: a departure that reaches the destination only with a change, judged end to end
+   *  and labelled on the arrival there. Resolved ahead of every other segment. Optional for
+   *  responses served before multi-leg U11. */
+  transfer?: Segment;
   /** Decided before the flag existed (2026-08-05); in no segment. */
   n_unsegmented: number;
 }

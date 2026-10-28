@@ -378,6 +378,54 @@ def test_a_batch_writes_one_record_and_not_one_per_pair(monkeypatch):
     assert checks[0].fields["asked"] == 12 and checks[0].fields["established"] == 12
 
 
+def test_the_sweeps_seam_widens_with_the_flag_and_never_establishes_a_pair_with_no_plan(monkeypatch):
+    """KTD15 on `varsel._service_verdicts`, the one seam BOTH servability sweeps run on, so the
+    browser caveat and the webhook `servable` stay one answer. With TRIP_PLANS_ENABLED on a pair no
+    direct trip serves is servable when a held plan has a watched trip with a change (R3), and not
+    when the plan has none; with no plan the transfer half is unestablished, so the answer is None,
+    which neither sweep writes -- the record keeps its last verdict and is re-asked until the plan
+    lands. With the flag off the direct answer passes through untouched (AE6)."""
+    from datetime import UTC, datetime, timedelta
+
+    import trips
+    import varsel
+
+    today = datetime.now(UTC).astimezone(varsel._OSLO).date()
+    dep = datetime.now(UTC) + timedelta(hours=1)
+
+    def plan(*operators):
+        legs = tuple(
+            trips.PlanLeg(
+                operator=op, refs=((op, f"j{i}"),), line=None, public_code=None,
+                mode="rail" if op == "VYG" else "bus", board_stop_place=f"S{i}",
+                alight_stop_place=f"S{i + 1}", board_quay=None, alight_quay=None,
+                board_position=0, alight_position=1, aimed_departure=dep + timedelta(minutes=20 * i),
+                aimed_arrival=dep + timedelta(minutes=20 * i + 10), service_date=today,
+            )
+            for i, op in enumerate(operators)
+        )
+        return trips.DayPlan(trips=(trips.PlanTrip(legs=legs),))
+
+    plans = {("A", "B", today): plan("RUT", "VYG"), ("A", "D", today): plan("RUT", "RUT")}
+    asked: list = []
+    monkeypatch.setattr(varsel, "_connectivity_batch_provider", lambda pairs: [
+        (to_refs == ("C",), False) for _from_refs, to_refs in pairs
+    ])
+    monkeypatch.setattr(varsel, "_trip_plans", lambda f, t, d: asked.append((f, t)) or plans.get((f, t, d)))
+    pairs = [("A", "B"), ("A", "C"), ("A", "D"), ("A", "E")]
+    before = os.environ.pop("TRIP_PLANS_ENABLED", None)
+    try:
+        assert varsel._service_verdicts(pairs) == [(False, False), (True, False), (False, False), (False, False)]
+        assert asked == [], "the flag off reads no plan"
+        os.environ["TRIP_PLANS_ENABLED"] = "true"
+        assert varsel._service_verdicts(pairs) == [(True, False), (True, False), (False, False), None]
+        assert ("A", "C") not in asked, "a direct answer needs no plan"
+    finally:
+        os.environ.pop("TRIP_PLANS_ENABLED", None)
+        if before is not None:
+            os.environ["TRIP_PLANS_ENABLED"] = before
+
+
 class _MonkeyPatch:
     """Minimal monkeypatch shim so the tests run standalone (without pytest)."""
 

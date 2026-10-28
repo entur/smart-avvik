@@ -134,6 +134,10 @@ export interface Summary {
    *  (`KIX:PlanRemoved:`). Served at 1.0 like a relayed cancellation, but ET declared nothing.
    *  Absent from responses served before 2026-09-23, hence optional. */
   removed?: Segment;
+  /** «Med bytte»: a departure that reaches the destination only with a change, judged end to end
+   *  and labelled on the arrival there. Resolved ahead of every other segment. Absent from
+   *  responses served before multi-leg U11, hence optional. */
+  transfer?: Segment;
   /** Decided before the flag existed; in neither segment. While this dominates, the split covers
    *  only a slice of the window. */
   n_unsegmented: number;

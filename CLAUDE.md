@@ -205,6 +205,14 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   - `.claude/rules/meldinger.md` — `/meldinger`, the prompt replay, and its Vertex bounds.
   - `.claude/rules/rushvarsel.md` — Rushvarsel (`/rushvarsel`), its push rounds, the
     `SHOW_RUSHVARSEL` gate, and `/rushhistorikk`.
+- **Departures with a change are behind `TRIP_PLANS_ENABLED`** (2026-10-28, plan
+  `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`): on in dev, off in tst and prd until
+  the owner turns prd on after the dev review meets the plan's pass marks. Read per call; off is
+  today's behaviour everywhere but two strict-schema fields (`coverage.transfers: not_evaluated`,
+  `trip: null`). The leader fetches Journey Planner day plans (`trip_plans.py`) into Firestore
+  `trip_plans`, and `trips.py` judges them. Each surface's part is in the varsel,
+  notification-webhooks, historikk and meldinger rules files above; the Journey Planner budget, the
+  two poller phases and the log events are in `docs/operations/notification-webhooks.md`.
 
 - The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
   Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)

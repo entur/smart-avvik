@@ -459,6 +459,8 @@ def test_coverage_names_the_served_operators_and_reads_the_stop_cache_over_every
             "operators": list(notification_pull.SERVED_OPERATORS),
             "from_stop_in_timetable_today": True,
             "to_stop_in_timetable_today": False,
+            # Always present (R16): TRIP_PLANS_ENABLED is off here, so no trip was judged.
+            "transfers": "not_evaluated",
         }
         # Only a COLLAPSED ref of NSR_B's place is in the cache: the place is served.
         varsel.set_stop_aliases({"NSR:StopPlace:999": NSR_B})
@@ -1089,11 +1091,11 @@ def _hold_matcher(monkeypatch):
     calls = []
     original = _ORIGINAL_MATCH
 
-    def held(journey, now=None, *, with_alternative=False, path="poller"):
+    def held(journey, now=None, *, with_alternative=False, path="poller", standing=None):
         if with_alternative:
             calls.append(path)
             event.wait(5)
-        return original(journey, now, with_alternative=with_alternative, path=path)
+        return original(journey, now, with_alternative=with_alternative, path=path, standing=standing)
 
     monkeypatch.setattr(varsel, "match_journey", held)
     return event, calls
@@ -1620,11 +1622,11 @@ def _failing_enrichment_matcher(monkeypatch):
     calls = []
     original = _ORIGINAL_MATCH
 
-    def failing(journey, now=None, *, with_alternative=False, path="poller"):
+    def failing(journey, now=None, *, with_alternative=False, path="poller", standing=None):
         if with_alternative:
             calls.append(path)
             raise RuntimeError("boom")
-        return original(journey, now, with_alternative=with_alternative, path=path)
+        return original(journey, now, with_alternative=with_alternative, path=path, standing=standing)
 
     monkeypatch.setattr(varsel, "match_journey", failing)
     return calls
@@ -1758,6 +1760,41 @@ def test_the_pass_warms_a_registered_definition_and_the_read_then_computes_nothi
     # The control, and the falsification: a definition the pass did NOT warm still computes, so the
     # stubbed matcher is reached and the read fails the way it should.
     assert _get(begin="05:00", end="06:00", wait=0).status_code == 503
+
+
+def test_the_pass_warms_a_trip_with_a_change_and_the_read_lists_it(monkeypatch):
+    """Multi-leg U5: with TRIP_PLANS_ENABLED on the pass's alerts include a departure with a
+    change, and the warm hands them to the read as they are. Here the first leg is one we do not
+    score, so its figures are null (KTD6): the read must list the train and carry the nulls in the
+    payload rather than fail on them. `payload.trip` itself is pinned further down; this is the read
+    not breaking."""
+    import trips
+    from test_varsel import _plan_leg, _trips_on
+
+    _reset()
+    dep = datetime.now(tz=_OSLO) + timedelta(hours=2)
+    via = "NSR:StopPlace:C"
+    snapshot = {"S9": [
+        FakeCall("t30", via, 1, dep + timedelta(minutes=13), situation_number="S9",
+                 p_impact_dep=0.95, p_dep_ge10=0.1),
+        FakeCall("t30", NSR_B, 4, None, situation_number="S9", aimed_arr=dep + timedelta(minutes=48)),
+    ]}
+    _use_snapshot(snapshot)
+    _register_here(monkeypatch)
+    plan = trips.DayPlan(trips=(trips.PlanTrip(legs=(
+        _plan_leg("t17", NSR_A, via, dep, dep + timedelta(minutes=7)),
+        _plan_leg("t30", via, NSR_B, dep + timedelta(minutes=13), dep + timedelta(minutes=48)),
+    )),))
+    with _trips_on({(NSR_A, NSR_B, dep.date()): plan}), _warming():
+        varsel.check_and_notify(snapshot)
+        monkeypatch.setattr(varsel, "match_journey", lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("the read ran the matcher for a definition the pass warmed")
+        ))
+        r = _get(**REGISTERED, wait=0)
+    assert r.status_code == 200, r.text
+    [entry] = r.json()["alerts"]
+    assert (entry["phase"], entry["train"]["journey_ref"]) == ("predicted", "t17"), entry
+    assert entry["payload"]["probabilities"]["cancellation"] is None
 
 
 def test_a_warm_on_a_fresh_process_establishes_the_generation_it_stores_under():
@@ -1974,7 +2011,12 @@ def _status_reset(rows=None, *, now=STATUS_NOW):
 
     _reset(now=now)
     journey_status.reset_state()
-    journey_status.configure(predictions_refreshed_at=lambda: LOADED_AT, place_refs=varsel.place_refs)
+    # The strip's plan reader goes through `varsel`'s, as `main` wires both to `trip_plans.read_plan`,
+    # so `test_varsel._trips_on` drives the strip and the coverage block alike.
+    journey_status.configure(
+        predictions_refreshed_at=lambda: LOADED_AT, place_refs=varsel.place_refs,
+        trip_plans=lambda *key: varsel._trip_plans(*key) if varsel._trip_plans is not None else None,
+    )
     if rows is not None:
         journey_status.set_spine(journey_status.CallTable(rows, now - timedelta(minutes=30)))
 
@@ -2136,6 +2178,354 @@ def test_journey_status_response_models_forbid_unknown_fields():
     for model in (notification_pull.JourneyStatusResponse, journey_status.TrainStatus,
                   journey_status.AsOf, journey_status.WindowSpan):
         assert model.model_config.get("extra") == "forbid", model.__name__
+
+
+# ---- Multi-leg U8: the trips with a change on the read (KTD1, KTD4, KTD13, R16) -----------------
+# One window, 06:00-12:00 today, read at 07:00: the read needs a plan for 07:00-10:00
+# (`PLAN_HORIZON_H`). The trip is A -> C on t17, then C -> B on t30, its first train at 0.9.
+
+TRIP_NOW = datetime(2026, 9, 10, 7, 0, tzinfo=_OSLO)
+TRIP_WINDOW = {"begin": "06:00", "end": "12:00", "days": [TRIP_NOW.weekday()]}
+VIA = "NSR:StopPlace:C"
+
+
+def _with_a_change(dep, *, operator="VYG", mode="rail"):
+    import trips
+    from test_varsel import _plan_leg
+
+    return trips.PlanTrip(legs=(
+        _plan_leg("t17", NSR_A, VIA, dep, dep + timedelta(minutes=7), operator=operator, mode=mode),
+        _plan_leg("t30", VIA, NSR_B, dep + timedelta(minutes=13), dep + timedelta(minutes=48),
+                  operator=operator, mode=mode),
+    ))
+
+
+def _change_rows(dep):
+    return [
+        FakeCall("t17", NSR_A, 1, dep, situation_number="S9", p_impact_dep=0.9),
+        FakeCall("t17", VIA, 3, None, aimed_arr=dep + timedelta(minutes=7), situation_number="S9",
+                 p_arr_ge5=0.1, p_arr_ge10=0.05),
+        FakeCall("t30", VIA, 1, dep + timedelta(minutes=13), situation_number="S9", p_impact_dep=0.1),
+        FakeCall("t30", NSR_B, 4, None, aimed_arr=dep + timedelta(minutes=48), situation_number="S9"),
+    ]
+
+
+def _covered(start, end):
+    import trips
+
+    return (trips.CoveredRange(start=start, end=end, fetched_at=TRIP_NOW),)
+
+
+def test_with_the_flag_off_the_read_carries_transfers_not_evaluated_no_trip_and_fetches_nothing():
+    """AE6 and R16: off, `coverage.transfers` is `not_evaluated` -- the strict schema's one addition
+    -- no payload has a `trip` key, no plan is read and the trigger is never pulled, though a plan
+    with an alerting trip is there to be read."""
+    import trips
+    from test_varsel import _trips_on
+
+    _reset(now=TRIP_NOW)
+    dep = TRIP_NOW + timedelta(hours=1)
+    _use_snapshot({"S1": _train(dep + timedelta(minutes=5), p_impact_dep=0.9), "S9": _change_rows(dep)})
+    asked = []
+    notification_pull.configure(refreshed_at=lambda: LOADED_AT, plan_fetch=lambda *a: asked.append(a))
+    plan = trips.DayPlan(trips=(_with_a_change(dep),), covered=_covered(dep - timedelta(hours=2), dep + timedelta(hours=4)))
+    with _trips_on({(NSR_A, NSR_B, TRIP_NOW.date()): plan}, enabled=False):
+        body = _get(**TRIP_WINDOW, wait=0).json()
+    assert body["coverage"]["transfers"] == "not_evaluated"
+    assert [e["train"]["journey_ref"] for e in body["alerts"]] == ["t1"]
+    assert all("trip" not in e["payload"] for e in body["alerts"])
+    assert asked == []
+
+
+def test_a_read_for_an_unplanned_pair_answers_direct_trains_until_its_plan_lands_then_lists_the_trip():
+    """KTD1 and KTD4: a pod with no plan for the pair answers the direct trains, `not_evaluated`,
+    `complete: false` (`no-store`), and starts the fetch through the injected trigger -- in its own
+    thread on the `plans_pull` path, never on an enrichment worker, and never into the leader's
+    plans. The next read after it lands lists the departure with a change, with `payload.trip`,
+    and says `evaluated`: the figures are keyed on the plans they were computed over. The window
+    ends at the fetch horizon, so the fetch covers all of it ahead (a longer one stays
+    `not_evaluated` past the horizon: `test_a_whole_day_read_never_reads_hours_nobody_fetched_as_evaluated`)."""
+    import threading
+
+    import trip_plans
+    from test_varsel import _trips_on
+
+    _reset(now=TRIP_NOW)
+    dep = TRIP_NOW + timedelta(hours=1)
+    trip = _with_a_change(dep)
+    _use_snapshot({"S1": _train(dep + timedelta(minutes=5), p_impact_dep=0.9), "S9": _change_rows(dep)})
+    flights, fetched = [], []
+
+    def fetch(from_stop, to_stop, start, end, *, from_places, path="plans"):
+        fetched.append((path, threading.current_thread().name, start, end))
+        found = tuple(t for t in (trip,) if start <= t.aimed_departure <= end)
+        return trip_plans.FetchResult(result="complete", trips=found, directs=(), pages=1)
+
+    notification_pull.configure(
+        refreshed_at=lambda: LOADED_AT,
+        plan_fetch=lambda *a: flights.extend(trip_plans.fetch_for_read(*a, places=lambda ref: (ref,))),
+    )
+    real_fetch = trip_plans.fetch_range
+    trip_plans.fetch_range = fetch
+    trip_plans.reset_public()
+    try:
+        with _trips_on({}):
+            varsel._trip_plans = trip_plans.read_plan  # as main wires it; `_trips_on` puts it back
+            window = {**TRIP_WINDOW, "end": "10:00"}  # TRIP_NOW + PLAN_HORIZON_H
+            first = _get(**window, wait=0)
+            for flight in flights:
+                flight.join(5)
+            second = _get(**window, wait=0)
+    finally:
+        trip_plans.fetch_range = real_fetch
+        trip_plans.reset_public()
+    body = first.json()
+    assert body["coverage"]["transfers"] == "not_evaluated" and body["complete"] is False
+    assert first.headers["Cache-Control"] == "no-store"
+    assert [e["train"]["journey_ref"] for e in body["alerts"]] == ["t1"], "the direct train, as today"
+    assert len(flights) == 1 and [f[:2] for f in fetched] == [("plans_pull", "plans-pull")]
+    assert fetched[0][2:] == (TRIP_NOW, TRIP_NOW + timedelta(hours=notification_pull.PLAN_HORIZON_H))
+    assert trip_plans.day_plan(NSR_A, NSR_B, TRIP_NOW.date()) is None, "never the leader's plans"
+    body = second.json()
+    assert body["coverage"]["transfers"] == "evaluated", body["coverage"]
+    by_ref = {e["train"]["journey_ref"]: e for e in body["alerts"]}
+    assert set(by_ref) == {"t1", "t17"}, by_ref
+    assert by_ref["t17"]["payload"]["trip"]["problem"]["kind"] == "departure"
+    assert by_ref["t17"]["payload"]["arrival"] is None and "trip" not in by_ref["t1"]["payload"]
+    # Worded off the trip document (U7's template), as the pass words it: one match, one wording.
+    notification = by_ref["t17"]["payload"]["notification"]
+    assert ", framme kl " in notification["title"], notification
+    assert "\nVentet framme kl " in notification["body"], notification
+    assert len(flights) == 1, "landed: no second fetch"
+
+
+def test_coverage_transfers_is_none_not_evaluated_or_evaluated_by_the_plan_for_the_window():
+    """KTD13's three values off the plan the matcher reads, and `complete: false` only for the
+    `not_evaluated` a fetch can still answer: a window outside the plan's covered ranges. A plan
+    whose trips with a change ride no train we score is terminal -- nothing will change it."""
+    import trips
+    from test_varsel import _trips_on
+
+    _reset(now=TRIP_NOW)
+    _use_snapshot({})
+    dep = TRIP_NOW + timedelta(hours=1)
+    wide = _covered(TRIP_NOW - timedelta(hours=1), TRIP_NOW + timedelta(hours=6))
+
+    def read(plan):
+        notification_pull.reset_state()
+        with _trips_on({(NSR_A, NSR_B, TRIP_NOW.date()): plan}):
+            body = _get(**TRIP_WINDOW, wait=0).json()
+        return body["coverage"]["transfers"], body["complete"]
+
+    assert read(trips.DayPlan(covered=wide)) == ("none", True)
+    assert read(trips.DayPlan(trips=(_with_a_change(dep),), covered=wide)) == ("evaluated", True)
+    unwatched = _with_a_change(dep, operator="RUT", mode="bus")
+    assert read(trips.DayPlan(trips=(unwatched,), covered=wide)) == ("not_evaluated", True)
+    narrow = _covered(TRIP_NOW, TRIP_NOW + timedelta(hours=1))
+    assert read(trips.DayPlan(trips=(_with_a_change(dep),), covered=narrow)) == ("not_evaluated", False)
+    later = _with_a_change(TRIP_NOW + timedelta(hours=4))
+    assert read(trips.DayPlan(trips=(later,), covered=wide)) == ("evaluated", True), (
+        "past the fetch horizon but held by the plan: the matcher judges it, so it is not `none`"
+    )
+
+
+def test_a_whole_day_read_never_reads_hours_nobody_fetched_as_evaluated():
+    """`PLAN_HORIZON_H` bounds what a read FETCHES, not what its coverage speaks for. A whole-day
+    favourite (the read's default period) on a pair whose plan covers only the next three hours --
+    what a read miss's own fetch leaves -- is `not_evaluated`: no plan says which trips with a
+    change run later today. And `complete: true`, cacheable, with no fetch started: a later read
+    would not fetch past the horizon either, so `complete: false` would promise it something it
+    never does. A plan covering the whole day is `evaluated`, and a trip past the horizon is listed
+    under it -- never under `none`."""
+    import trips
+    from test_varsel import _trips_on
+
+    whole_day = {"days": [TRIP_NOW.weekday()]}
+    midnight = TRIP_NOW.replace(hour=0, minute=0)
+    horizon = _covered(TRIP_NOW, TRIP_NOW + timedelta(hours=notification_pull.PLAN_HORIZON_H))
+    whole = _covered(midnight, midnight + timedelta(hours=23, minutes=59))
+    soon, afternoon = TRIP_NOW + timedelta(hours=1), TRIP_NOW + timedelta(hours=5)
+    asked = []
+
+    def read(plan, snapshot):
+        _reset(now=TRIP_NOW)
+        _use_snapshot(snapshot)
+        notification_pull.configure(refreshed_at=lambda: LOADED_AT, plan_fetch=lambda *a: asked.append(a))
+        with _trips_on({(NSR_A, NSR_B, TRIP_NOW.date()): plan}):
+            return _get(**whole_day, wait=0)
+
+    r = read(trips.DayPlan(trips=(_with_a_change(soon),), covered=horizon), {})
+    body = r.json()
+    assert [(w["start"], w["end"]) for w in body["windows"]] == [
+        (midnight.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+         (midnight + timedelta(hours=23, minutes=59)).astimezone(UTC).isoformat().replace("+00:00", "Z")),
+    ], "the read's default period is the whole day"
+    assert (body["coverage"]["transfers"], body["complete"]) == ("not_evaluated", True), body["coverage"]
+    assert r.headers["Cache-Control"] == "public, max-age=60" and asked == []
+
+    r = read(trips.DayPlan(trips=(_with_a_change(afternoon),), covered=whole), {"S9": _change_rows(afternoon)})
+    body = r.json()
+    assert body["coverage"]["transfers"] == "evaluated", body["coverage"]
+    assert [(e["train"]["journey_ref"], "trip" in e["payload"]) for e in body["alerts"]] == [("t17", True)]
+    assert asked == []
+
+
+def test_a_fetch_reaches_past_the_horizon_so_the_next_reads_are_served_from_it():
+    """The range a read needs moves with the clock, so a read miss fetches `PLAN_FETCH_MARGIN_H`
+    past the horizon. A read 59 minutes after the fetch landed is still covered -- no second fetch,
+    `complete: true`, cacheable -- and one 61 minutes after fetches again. Fetched to the horizon
+    exactly, every read after the first missed by the seconds since: a refetch of the same hours and
+    `no-store`, read after read."""
+    import trip_plans
+    from test_varsel import _trips_on
+
+    reach = timedelta(hours=notification_pull.PLAN_HORIZON_H + notification_pull.PLAN_FETCH_MARGIN_H)
+    fetched = []
+
+    def fetch(from_stop, to_stop, start, end, *, from_places, path="plans"):
+        fetched.append((start, end))
+        return trip_plans.FetchResult(result="complete", trips=(), directs=(), pages=1)
+
+    def read(at):
+        notification_pull._now = lambda: at
+        flights = []
+        notification_pull.configure(
+            refreshed_at=lambda: LOADED_AT,
+            plan_fetch=lambda *a: flights.extend(trip_plans.fetch_for_read(*a, places=lambda ref: (ref,))),
+        )
+        r = _get(days=[TRIP_NOW.weekday()], wait=0)
+        for flight in flights:
+            flight.join(5)
+        return r
+
+    _reset(now=TRIP_NOW)
+    _use_snapshot({})
+    real_fetch = trip_plans.fetch_range
+    trip_plans.fetch_range = fetch
+    trip_plans.reset_public()
+    try:
+        with _trips_on({}):
+            varsel._trip_plans = trip_plans.read_plan  # as main wires it; `_trips_on` puts it back
+            assert read(TRIP_NOW).json()["complete"] is False
+            assert fetched == [(TRIP_NOW, TRIP_NOW + reach)]
+            later = read(TRIP_NOW + timedelta(minutes=59))
+            assert len(fetched) == 1, fetched
+            assert later.json()["complete"] is True and later.headers["Cache-Control"] == "public, max-age=60"
+            read(TRIP_NOW + timedelta(minutes=61))
+            assert len(fetched) == 2, "past the margin the read asks again"
+    finally:
+        trip_plans.fetch_range = real_fetch
+        trip_plans.reset_public()
+
+
+def _status_window_plan(dep, *, start, end):
+    """A day plan for the status read's pair today, holding `_with_a_change(dep)`, covering
+    `[start, end]` as one `complete` fetch would."""
+    import trips
+
+    return trips.DayPlan(
+        trips=(_with_a_change(dep),),
+        covered=(trips.CoveredRange(start=start, end=end, fetched_at=STATUS_NOW),),
+    )
+
+
+STATUS_WINDOW = {"begin": "07:00", "end": "09:00", "days": [1]}
+STATUS_END = datetime(2026, 9, 22, 9, 0, tzinfo=_OSLO)
+
+
+def test_journey_status_with_the_flag_off_carries_trip_null_and_transfers_not_evaluated():
+    """R16 and AE6: off, the strip is today's but for the two strict-schema fields -- `trip: null`
+    on every train and `coverage.transfers: not_evaluated` -- and nothing is fetched, though a plan
+    with a trip in the window is there to be read."""
+    from test_varsel import _trips_on
+
+    dep = STATUS_NOW + timedelta(minutes=20)
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    _use_snapshot({"S9": _change_rows(dep)})
+    asked = []
+    notification_pull.configure(refreshed_at=lambda: LOADED_AT, plan_fetch=lambda *a: asked.append(a))
+    plan = _status_window_plan(dep, start=STATUS_NOW - timedelta(hours=1), end=STATUS_END)
+    with _trips_on({(NSR_A, NSR_B, STATUS_NOW.date()): plan}, enabled=False):
+        r = _status(**STATUS_WINDOW)
+    body = r.json()
+    assert [(t["jkey"], t["trip"]) for t in body["trains"]] == [("a", None)]
+    assert body["coverage"]["transfers"] == "not_evaluated"
+    assert asked == [] and r.headers["Cache-Control"] == "public, max-age=60"
+
+
+def test_journey_status_for_an_unplanned_pair_says_not_evaluated_starts_the_fetch_then_lists_the_trip():
+    """KTD14 and KTD4: a pod without the plan answers the direct trains, `transfers: not_evaluated`
+    (never an empty, calm list of trips) and `no-store`, and starts the background fetch through the
+    injected trigger for the period ahead -- the ranges journey-alerts asks for -- without waiting
+    on it. Once the plan lands the trip is listed, keyed on its first leg with its trip facts,
+    graded red because its first train is over the gate, and journey-alerts alerts on the same
+    departure: the strip is never red where the alert stays silent."""
+    from test_varsel import _trips_on
+
+    dep = STATUS_NOW + timedelta(minutes=20)
+    _status_reset(_status_train("a", STATUS_NOW + timedelta(minutes=6)))
+    _use_snapshot({"S9": _change_rows(dep)})
+    asked = []
+    notification_pull.configure(refreshed_at=lambda: LOADED_AT, plan_fetch=lambda *a: asked.append(a))
+    plans = {}
+    with _trips_on(plans):
+        first = _status(**STATUS_WINDOW)
+        plans[(NSR_A, NSR_B, STATUS_NOW.date())] = _status_window_plan(
+            dep, start=STATUS_NOW, end=STATUS_END
+        )
+        second = _status(**STATUS_WINDOW)
+        alerts = _get(**STATUS_WINDOW, wait=0).json()
+    body = first.json()
+    assert [(t["jkey"], t["trip"]) for t in body["trains"]] == [("a", None)]
+    assert body["coverage"]["transfers"] == "not_evaluated"
+    assert first.headers["Cache-Control"] == "no-store"
+    assert asked == [(NSR_A, NSR_B, [(STATUS_NOW.date(), STATUS_NOW, STATUS_END)])]
+    body = second.json()
+    assert body["coverage"]["transfers"] == "evaluated"
+    assert second.headers["Cache-Control"] == "public, max-age=60"
+    assert [t["jkey"] for t in body["trains"]] == ["a", "t17"]
+    trip_row = body["trains"][1]
+    assert (trip_row["level"], trip_row["alert_worthy"]) == ("red", True)
+    assert [leg["board_stop_place"] for leg in trip_row["trip"]["legs"]] == [NSR_A, VIA]
+    assert trip_row["trip"]["problem"]["kind"] == "departure"
+    assert "t17" in [e["train"]["journey_ref"] for e in alerts["alerts"]]
+    assert len(asked) == 1, "landed: no second fetch"
+
+
+def test_journey_status_after_the_window_says_whether_the_plan_held_it_and_fetches_nothing():
+    """A window that is over has no period ahead: nothing is fetched for it (a departed trip alerts
+    nobody). The strip still lists the trips the plan held, so `transfers` says whether the plan
+    covered the window -- `evaluated`, or `not_evaluated` with none held -- rather than `none`."""
+    from test_varsel import _trips_on
+
+    window = {"begin": "06:00", "end": "07:30", "days": [1]}
+    dep = datetime(2026, 9, 22, 6, 40, tzinfo=_OSLO)
+    _status_reset(_status_train("a", dep - timedelta(minutes=10)))
+    asked = []
+    notification_pull.configure(refreshed_at=lambda: LOADED_AT, plan_fetch=lambda *a: asked.append(a))
+    plan = _status_window_plan(dep, start=datetime(2026, 9, 22, 6, 0, tzinfo=_OSLO),
+                               end=datetime(2026, 9, 22, 7, 30, tzinfo=_OSLO))
+    with _trips_on({(NSR_A, NSR_B, STATUS_NOW.date()): plan}):
+        held = _status(**window)
+    with _trips_on({}):
+        unheld = _status(**window)
+    assert held.json()["coverage"]["transfers"] == "evaluated"
+    assert [t["jkey"] for t in held.json()["trains"]] == ["a", "t17"]
+    assert unheld.json()["coverage"]["transfers"] == "not_evaluated"
+    assert asked == []
+    assert unheld.headers["Cache-Control"] == "public, max-age=60", "nothing is coming to change it"
+
+
+def test_the_read_never_imports_trip_plans():
+    """KTD4: the read reaches the plan fetch only through the trigger `main` injects."""
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(notification_pull.__file__).read_text())
+    names = {alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names}
+    names |= {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module}
+    assert "varsel" in names and "trips" in names, "control: the walk sees imports"
+    assert "trip_plans" not in names
 
 
 def _run():

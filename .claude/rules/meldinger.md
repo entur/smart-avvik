@@ -153,13 +153,14 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     narrowest of them (`_MATCH_WORKERS`/`_LLM_WORKERS` 16 each, `_PUSH_WORKERS` 32), because those run
     on the poller thread on a cadence nobody triggers while this one is reachable from a public
     unauthenticated endpoint -- so the cap costs three rounds, ~7 s typically.
-    (4) **A wording cache keyed on subject + replayed `decided_at` + `llm_message.PROMPT_VERSION`**,
+    (4) **A wording cache keyed on subject + replayed `decided_at` + the row's prompt version**
+    (`llm_message.prompt_version_for` of its stored input since 2026-10-28, see the last bullet),
     10 000 entries, process-lifetime for stable results, and only 60 s for a transient failure so a
     red badge does not stick after Vertex recovers. Which failures get which is the same
     cut `varsel` makes with `_message_attempts` vs `_message_errors` (2026-08-22), arrived at
     independently and expressed here as a cache lifetime rather than a counter: `rejected` and
     `ungrounded` remain until eviction or restart because they are payload-determined -- the same stored `message_input` under
-    the same `PROMPT_VERSION` will be refused again, and re-asking spends a Vertex call to learn
+    the same prompt version will be refused again, and re-asking spends a Vertex call to learn
     nothing -- while `error` says only that the backend was unreachable a minute ago. Do not unify
     the two lifetimes on the grounds that both are failures. Both halves of the key are
     load-bearing: the prompt version is what makes an edit invalidate the page rather than show
@@ -318,3 +319,18 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `verdict`, `alerted_only` and `resolved_only` narrow by outcome and never reach it — filtering
     to hits would make precision read 100 % — and `sx_only` is withheld from it on the same
     grounds.
+  - **A departure with a change replays under the TRIP brief** (2026-10-28, KTD12 of
+    `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`). A stored input carrying
+    `reise_med_bytte` (`llm_message.TRIP_KEY`) is worded under `_TRIP_SYSTEM_PROMPT`, versioned
+    `TRIP_PROMPT_VERSION`; every other input keeps the direct brief and `PROMPT_VERSION`, byte for byte.
+    `llm_message.prompt_version_for(input)` is the ONE selector — this page's cache key and comparison
+    (`meldinger._prompt_version`), the decision row's `prompt_version` and the wording keys all read
+    it — so an edit to one brief invalidates only its own rows, and reading `PROMPT_VERSION` directly
+    anywhere would file trip rows under the wrong brief with no error. **Owed before prd**: the trip
+    brief has not been replayed. It must be, on all three models a wording can come from — 3.8 Flash
+    first, then `_attempt_models`' fallback, 3.1 Flash-Lite or, for a predicted cancellation, 3.5 Flash
+    — and Flash-Lite most closely, the model already measured weakest on quoting figures. Three
+    nynorsk strings also await the owner's review (Q4): «mistar overgangen», «ankomst ukjend» and the
+    nynorsk pair in `notification_wording.TRIP_SITUATION_TEXTS`. `/summary` gains a fifth row, «Med
+    bytte» (`transfer`), resolved ahead of every other provenance as on `/historikk` (see
+    `.claude/rules/historikk.md`).

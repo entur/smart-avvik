@@ -47,6 +47,19 @@
 -- quietly manufacture correct rejections and inflate every precision figure computed downstream.
 -- The same thinness decides the removed-train branch (`removed_subjects` below), where the error
 -- runs the other way: a train missing from ET counts as a hit only where ET carried its line.
+--
+-- DEPARTURES WITH A CHANGE (multi-leg U11, KTD16). Such a subject is its FIRST leg's boarding call,
+-- so the `realized` join below sees only that call; `trip_leg_rows` .. `trip_verdicts` judge the
+-- trip end to end from the legs snapshot the decision row carries (`trip_legs`: every continuation
+-- of the first train the verdict was taken over, the planned one first). «connection held» covers
+-- the planned continuation's changes only; the arrival delay covers every continuation, and makes
+-- `actual_trouble` (>= 10 min, or every continuation broken), so a trip cushioned by a sibling that
+-- got there in time and stayed silent is no miss. Honest NULLs throughout: an unrecorded leg is
+-- NULL, never TRUE. Known limit: a trip subject attached to a `KIX:PlanRemoved:` situation goes to
+-- the removed branch, whose train-number keys its first leg does not have, and stays NULL.
+-- COST: adds aimedArrivalTime and arrivalTime across the ET slice. A dry run of this SELECT in dev on
+-- 2026-10-28 (the new columns shimmed as typed NULLs, before the deploy that adds them) reported
+-- 2.54 GB against the 2.30 GB above: +0.24 GB, still ~$0.016 a run.
 
 -- The outcomes table itself is created at app startup, alongside the decision log it is
 -- derived from (disruptions/api/create_varsel_decisions.sql). One definition, in the one
@@ -98,7 +111,9 @@ INSERT INTO `disruptions.varsel_decision_outcomes` (
   channel, n_subscriptions,
   -- 2026-10-19, the same operator step again: deploy (the startup ALTER adds both), then
   -- `bq update --transfer_config` in dev and prd in the same sitting.
-  destination_cancelled, actual_destination_cancelled
+  destination_cancelled, actual_destination_cancelled,
+  -- Multi-leg U11 (KTD16), and the same step once more: deploy, then both transfer configs.
+  trip_legs, connection_held, arrival_delay_min
 )
 WITH
 -- The decision subjects to label. The grouping itself lives in the
@@ -130,6 +145,9 @@ et AS (
     -- An "estimated" row is a prediction from the producer, not an observation. Nulling it is what
     -- keeps an un-departed call from being scored as punctual.
     IF(COALESCE(estimated, FALSE), NULL, departureTime) AS actual_dep,
+    -- The arrival side, read by the trip branch only (`trip_et`), nulled on the same rule.
+    aimedArrivalTime AS aimed_arr,
+    IF(COALESCE(estimated, FALSE), NULL, arrivalTime) AS actual_arr,
     -- Read by the removed-train branch only (see `removed_et` below); the existing join
     -- never looks at them.
     operatingDate, lineRef, stopPointRef, vehicleMode
@@ -163,12 +181,133 @@ destination_cancelled_et AS (
     ON q.id = e.stopPointRef
   WHERE e.call_cancelled
 ),
+-- DEPARTURES WITH A CHANGE (see the header): one row per leg of every continuation in the subject's
+-- legs snapshot, which `disruptions.trips.legs_snapshot` writes; test_historikk pins these paths
+-- against its keys, since nothing executes both sides. `jkey` is in the decision row's own key form.
+trip_leg_rows AS (
+  SELECT
+    g.journey_digest, g.operator, g.jkey, g.call_date, g.stop_order, g.situation_number,
+    c_off AS continuation,
+    SAFE_CAST(JSON_VALUE(c, '$.planned') AS BOOL) AS planned,
+    l_off AS leg,
+    JSON_VALUE(l, '$.operator') AS leg_operator,
+    JSON_VALUE(l, '$.jkey') AS leg_jkey,
+    JSON_VALUE(l, '$.board_stop_place') AS board_stop_place,
+    JSON_VALUE(l, '$.alight_stop_place') AS alight_stop_place,
+    SAFE_CAST(JSON_VALUE(l, '$.aimed_departure') AS TIMESTAMP) AS aimed_departure,
+    SAFE_CAST(JSON_VALUE(l, '$.aimed_arrival') AS TIMESTAMP) AS aimed_arrival,
+    SAFE_CAST(JSON_VALUE(l, '$.walk_after_s') AS INT64) AS walk_after_s
+  FROM grouped AS g,
+    UNNEST(JSON_QUERY_ARRAY(g.trip_legs, '$.continuations')) AS c WITH OFFSET AS c_off,
+    UNNEST(JSON_QUERY_ARRAY(c, '$.legs')) AS l WITH OFFSET AS l_off
+  WHERE g.trip_legs IS NOT NULL
+),
+-- ET's calls on the journeys some leg rides, at their stop PLACE (stopPointRef is a quay), resolved
+-- as `destination_cancelled_et` resolves them.
+trip_et AS (
+  SELECT e.operator, e.jkey, e.call_date, e.call_cancelled, e.aimed_dep, e.actual_dep,
+         e.aimed_arr, e.actual_arr, q.stopPlaceRef AS stop_place
+  FROM et AS e
+  JOIN (SELECT DISTINCT leg_operator, leg_jkey FROM trip_leg_rows) AS r
+    ON r.leg_operator = e.operator AND r.leg_jkey = e.jkey
+  JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` AS q
+    ON q.id = e.stopPointRef
+),
+-- Each leg's boarding and alighting call: its journey, its stop place and the nearest aimed time,
+-- with `realized`'s date rule. Never a stop position, which the plan numbers the Journey Planner's
+-- way (unverified against ET for buses). A call not found, or found and neither cancelled nor
+-- operated, is UNRECORDED: its time stays NULL, never "on time".
+trip_leg_calls AS (
+  SELECT
+    l.*,
+    b.call_cancelled AS board_cancelled,
+    IF(b.call_cancelled, NULL, b.actual_dep) AS board_dep,
+    a.call_cancelled AS alight_cancelled,
+    IF(a.call_cancelled, NULL, a.actual_arr) AS alight_arr
+  FROM trip_leg_rows AS l
+  LEFT JOIN trip_et AS b
+    ON  b.operator = l.leg_operator AND b.jkey = l.leg_jkey AND b.stop_place = l.board_stop_place
+    AND (b.call_date = DATE(l.aimed_departure, 'Europe/Oslo') OR STARTS_WITH(l.leg_jkey, 'DatedServiceJourney:'))
+  LEFT JOIN trip_et AS a
+    ON  a.operator = l.leg_operator AND a.jkey = l.leg_jkey AND a.stop_place = l.alight_stop_place
+    AND (a.call_date = DATE(l.aimed_arrival, 'Europe/Oslo') OR STARTS_WITH(l.leg_jkey, 'DatedServiceJourney:'))
+  -- One row per leg. The two joins are independent, so ordering on the boarding candidate's
+  -- distance and then the alighting one's picks the nearest of each.
+  QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY l.journey_digest, l.operator, l.jkey, l.call_date, l.stop_order, l.situation_number,
+                 l.continuation, l.leg
+    ORDER BY ABS(TIMESTAMP_DIFF(b.aimed_dep, l.aimed_departure, SECOND)) NULLS LAST,
+             ABS(TIMESTAMP_DIFF(a.aimed_arr, l.aimed_arrival, SECOND)) NULLS LAST
+  ) = 1
+),
+-- Per continuation. BROKEN: a ridden leg's boarding or alighting call cancelled, or a change missed
+-- -- the arriving leg's realized arrival plus the walk later than the connecting leg's realized
+-- departure. UNRECORDED: a change with no realized time on one side. `arrival` is the last leg's.
+trip_continuations AS (
+  SELECT
+    journey_digest, operator, jkey, call_date, stop_order, situation_number, continuation,
+    LOGICAL_OR(planned) AS planned,
+    LOGICAL_OR(COALESCE(board_cancelled, FALSE) OR COALESCE(alight_cancelled, FALSE)
+               OR COALESCE(TIMESTAMP_ADD(alight_arr, INTERVAL walk_after_s SECOND) > next_board_dep, FALSE))
+      AS broken,
+    LOGICAL_OR(has_next AND (alight_arr IS NULL OR next_board_dep IS NULL)) AS unrecorded,
+    ARRAY_AGG(STRUCT(aimed_arrival AS aimed, alight_arr AS actual) ORDER BY leg DESC LIMIT 1)[OFFSET(0)]
+      AS arrival
+  FROM (
+    SELECT
+      *,
+      LEAD(board_dep) OVER w AS next_board_dep,
+      (LEAD(leg) OVER w) IS NOT NULL AS has_next
+    FROM trip_leg_calls
+    WINDOW w AS (
+      PARTITION BY journey_digest, operator, jkey, call_date, stop_order, situation_number, continuation
+      ORDER BY leg
+    )
+  )
+  GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number, continuation
+),
+-- Per subject, KTD16. «connection held» reads the PLANNED continuation alone, FALSE beating NULL.
+-- The arrival reads EVERY continuation, a broken one supplying none: the earliest a continuation
+-- that held actually arrived, and the earliest planned arrival of one still unresolved (it may
+-- have got there first).
+trip_outcomes AS (
+  SELECT
+    journey_digest, operator, jkey, call_date, stop_order, situation_number,
+    CASE
+      WHEN LOGICAL_OR(planned AND broken) THEN FALSE
+      WHEN LOGICAL_OR(planned AND unrecorded) THEN NULL
+      WHEN LOGICAL_OR(planned) THEN TRUE
+    END AS connection_held,
+    COUNTIF(broken) = COUNT(*) AS all_broken,
+    MIN(arrival.aimed) AS aimed_at,
+    MIN(IF(NOT broken AND NOT unrecorded, arrival.actual, NULL)) AS arrived_at,
+    MIN(IF(NOT broken AND (unrecorded OR arrival.actual IS NULL), arrival.aimed, NULL)) AS unresolved_at
+  FROM trip_continuations
+  GROUP BY journey_digest, operator, jkey, call_date, stop_order, situation_number
+),
+trip_verdicts AS (
+  SELECT
+    journey_digest, operator, jkey, call_date, stop_order, situation_number, connection_held,
+    IF(unresolved_at < arrived_at, NULL, TIMESTAMP_DIFF(arrived_at, aimed_at, MINUTE)) AS arrival_delay_min,
+    CASE
+      WHEN all_broken THEN TRUE
+      -- An unresolved continuation could only have been EARLIER, so this settles it either way.
+      WHEN TIMESTAMP_DIFF(arrived_at, aimed_at, MINUTE) < 10 THEN FALSE
+      WHEN unresolved_at < arrived_at THEN NULL
+      ELSE TIMESTAMP_DIFF(arrived_at, aimed_at, MINUTE) >= 10   -- same bar as varsel.TROUBLE_DELAY_MIN
+    END AS actual_trouble
+  FROM trip_outcomes
+),
 labelled AS (
   SELECT
     g.*,
     r.call_cancelled AS actual_cancelled,
     IF(r.call_cancelled, NULL, r.dep_delay_min) AS actual_dep_delay_min,
     CASE
+      -- A departure with a change is judged end to end (KTD16), never on its first leg's boarding
+      -- call: a calm first train whose change broke is trouble, and a late one whose sibling
+      -- continuation got there within 10 minutes is not. NULL when `trip_verdicts` has no row.
+      WHEN g.trip_legs IS NOT NULL THEN t.actual_trouble
       -- The train never reached the traveller's destination: trouble whatever the boarding call
       -- did, and even when the boarding call is not in ET at all -- an unknown departure cannot
       -- rescue a trip whose end was cancelled. Before 2026-10-19 such a train labelled on the
@@ -183,7 +322,9 @@ labelled AS (
       -- manufactured a correct_reject out of missing data -- the one thing this table must never do.
       ELSE r.dep_delay_min >= 10                 -- same bar as varsel.TROUBLE_DELAY_MIN
     END AS actual_trouble,
-    COALESCE(dc.is_cancelled, FALSE) AS actual_destination_cancelled
+    COALESCE(dc.is_cancelled, FALSE) AS actual_destination_cancelled,
+    t.connection_held,
+    t.arrival_delay_min
   FROM grouped AS g
   -- At most one row per subject (a LOGICAL_OR), so this LEFT JOIN cannot duplicate one; the date
   -- rule is the realized join's below.
@@ -205,6 +346,14 @@ labelled AS (
     AND dc.call_date        = g.call_date
     AND dc.stop_order       = g.stop_order
     AND dc.situation_number = g.situation_number
+  -- One row per subject (trip_verdicts is grouped on its key), so this cannot duplicate one either.
+  LEFT JOIN trip_verdicts AS t
+    ON  t.journey_digest   = g.journey_digest
+    AND t.operator         = g.operator
+    AND t.jkey             = g.jkey
+    AND t.call_date        = g.call_date
+    AND t.stop_order       = g.stop_order
+    AND t.situation_number = g.situation_number
   LEFT JOIN realized AS r
     ON  r.operator   = g.operator
     AND r.jkey       = g.jkey
@@ -324,7 +473,10 @@ labelled_removed AS (
       -- (on another line, a boarding call only estimated, or not recorded at all): unknown.
     END AS actual_trouble,
     -- Not judged here: a removed train is absent from ET, so it has no destination call either.
-    CAST(NULL AS BOOL) AS actual_destination_cancelled
+    CAST(NULL AS BOOL) AS actual_destination_cancelled,
+    -- Nor are a trip's (see the header's known limit). Typed, so the UNION ALL lines up.
+    CAST(NULL AS BOOL) AS connection_held,
+    CAST(NULL AS INT64) AS arrival_delay_min
   FROM removed_subjects AS g
   LEFT JOIN removed_boarding AS b
     ON  b.operator = g.operator AND b.od = g.r_od AND b.trainno = g.r_trainno AND b.line = g.r_line
@@ -381,7 +533,9 @@ SELECT
   -- n_subscriptions, exactly as it takes the highest n_devices. Restating either here would be a
   -- second definition of which channel a shared definition belongs to.
   channel, n_subscriptions,
-  destination_cancelled, actual_destination_cancelled
+  destination_cancelled, actual_destination_cancelled,
+  -- From the view (the snapshot the verdict judges) and from `trip_verdicts`; NULL when direct.
+  trip_legs, connection_held, arrival_delay_min
 FROM labelled_all AS l
 -- Idempotent, but only for subjects that actually RESOLVED. A subject labelled while ET had not yet
 -- caught up carries actual_trouble = NULL; skipping it here too would freeze that "unknown" forever,

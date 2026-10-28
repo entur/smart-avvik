@@ -1312,6 +1312,279 @@ def test_situations_text_never_mixes_languages_and_is_none_without_an_operator_m
     assert nw.situations_text([with_nn, untranslated])[2] is None
 
 
+# ---- multi-leg U7: a departure with a change (KTD12, AE1) ----------------------------------------
+TRIP_DEP = datetime(2026, 10, 27, 6, 17, tzinfo=UTC)  # 07:17 Europe/Oslo (CET)
+
+
+def _trip(kind="missed_connection", index=0, *, expected=TRIP_DEP + timedelta(minutes=63)):
+    """AE1's trip as U3 builds it: the R13 07:17 Lier -> Drammen, then the R12 07:30 to Oslo S."""
+    from alternatives import TripFacts, TripLeg, TripProblem, TripTransfer
+
+    return TripFacts(
+        legs=[
+            TripLeg(mode="rail", line="VYG:Line:R13", public_code="R13", from_name="Lier",
+                    to_name="Drammen", board_stop_place="NSR:StopPlace:L",
+                    alight_stop_place="NSR:StopPlace:D", aimed_departure=TRIP_DEP,
+                    aimed_arrival=TRIP_DEP + timedelta(minutes=9)),
+            TripLeg(mode="rail", line="VYG:Line:R12", public_code="R12", from_name="Drammen",
+                    to_name="Oslo S", board_stop_place="NSR:StopPlace:D",
+                    alight_stop_place="NSR:StopPlace:O", aimed_departure=TRIP_DEP + timedelta(minutes=13),
+                    aimed_arrival=TRIP_DEP + timedelta(minutes=48), cancelled=kind == "leg_cancelled"),
+        ],
+        transfers=[TripTransfer(stop_place="NSR:StopPlace:D", stop_name="Drammen", walk_min=0, slack_min=4)],
+        expected_arrival=expected,
+        problem=TripProblem(kind=kind, index=index, probability=0.8, threshold=0.65),
+    )
+
+
+def _trip_input(trip=None, *, confirmed=False):
+    from types import SimpleNamespace
+
+    alert = SimpleNamespace(
+        situation_number="S1", line="VYG:Line:R13", mode="Tog", departure_time=TRIP_DEP,
+        impact_probability=0.31, cancel_probability=0.02, delay_p50_min=2, delay_p90_min=6,
+        has_situation=True, cancelled=False, destination_cancelled=False,
+        trip=trip if trip is not None else _trip(), trip_confirmed=confirmed,
+    )
+    impact = SimpleNamespace(
+        lines=[], situations=[SimpleNamespace(situation_number="S1", summary="Signalfeil ved Asker",
+                                              description=None)],
+    )
+    return llm_message.build_message_input(
+        {"from_stop": "NSR:StopPlace:L", "to_stop": "NSR:StopPlace:O"}, impact, alert,
+        now=TRIP_DEP - timedelta(hours=1),
+    )
+
+
+def test_a_missed_connection_names_the_transfer_stop_and_the_expected_arrival():
+    """AE1 (R7): the 07:17 alerts as a predicted missed connection at Drammen. The title says whether
+    this departure gets the traveller there -- the change it may miss and when they are expected --
+    and so does the body, in all three summary vocabularies; an unknown arrival is said, not guessed."""
+    mi = _trip_input()
+    assert nw.outcome_verb(mi) == "kan miste overgangen"
+    title = nw.notification_title(mi, "Lier", "Oslo S")
+    assert title == "Tog R13 07:17 kan miste overgangen i Drammen, framme kl 08:20", title
+    assert nw.deterministic_body(mi) == (
+        "Signalfeil ved Asker\n"
+        "Tog R13 07:17: kan miste overgangen i Drammen (4 min planlagt byttetid)\n"
+        "Ventet framme kl 08:20"
+    )
+    one = [(mi, [_sit("S1")])]
+    assert nw.alerts_summary(one) == (
+        "Tog R13 07:17 kan miste overgangen i Drammen, framme kl 08:20",
+        "Train R13 07:17 may miss the connection at Drammen, arrives 08:20",
+        "Tog R13 07:17 kan miste overgangen i Drammen, framme kl 08:20",
+    )
+    unknown = _trip_input(_trip(expected=None))
+    assert nw.notification_title(unknown, "Lier", "Oslo S").endswith("i Drammen, ankomst ukjent")
+    assert nw.deterministic_body(unknown).endswith("\nAnkomst ukjent")
+    assert [s.rsplit(", ", 1)[1] for s in nw.alerts_summary([(unknown, [_sit("S1")])])] == [
+        "ankomst ukjent", "arrival unknown", "ankomst ukjend",
+    ]
+
+
+def test_a_cancelled_later_leg_is_named_and_a_confirmed_one_is_stated_as_fact():
+    """The leg at fault is named on the detail line. A confirmed trip (KTD19: no continuation cushions
+    it) takes the certain verb, ranks with the certainties and earns «Bekreftet:» like a declared
+    cancellation; the same reason with only a predicted cushion is the forecast verb."""
+    confirmed = _trip_input(_trip("leg_cancelled", 1), confirmed=True)
+    assert nw.outcome_verb(confirmed) == "mister overgangen"
+    assert nw.notification_title(confirmed, "Lier", "Oslo S", confirmed=True) == (
+        "Bekreftet: Tog R13 07:17 mister overgangen i Drammen, framme kl 08:20"
+    )
+    assert "Tog R13 07:17: tog R12 07:30 fra Drammen er innstilt\n" in nw.deterministic_body(confirmed)
+    assert "%" not in nw.deterministic_body(confirmed), "a certainty quoted as a percentage"
+    predicted = _trip_input(_trip("leg_cancelled", 1))
+    assert nw.outcome_verb(predicted) == "kan miste overgangen"
+    assert not nw.notification_title(predicted, "Lier", "Oslo S", confirmed=True).startswith("Bekreftet")
+    # A first-leg reason keeps today's verb off today's figures, with the arrival beside it.
+    first = _trip_input(_trip("departure", 0))
+    assert nw.notification_title(first, "Lier", "Oslo S") == "Tog R13 07:17 kan bli forsinket, framme kl 08:20"
+    order = nw._VERB_ORDER
+    assert order.index("kjører ikke helt fram") < order.index("mister overgangen") < order.index("kan bli innstilt")
+    assert order.index("kan bli innstilt") < order.index("kan miste overgangen") < order.index("kan bli forsinket")
+
+
+def test_the_summary_counts_a_missed_connection_under_its_own_verb_in_its_place():
+    """One count per outcome, worst first: the forecast after a likely cancellation and before a delay,
+    in each language's words."""
+    trains = [(_mi("07:03", verb="likely"), [_sit("S1", "Melding 1")]),
+              (_trip_input(), [_sit("S2", "Melding 2")]),
+              (_mi("07:42"), [_sit("S3", "Melding 3")]),
+              (_mi("07:48"), [_sit("S4", "Melding 4")])]
+    assert _nb(trains) == "Tog L1 07:03 kan bli innstilt, 1 til kan miste overgangen og 2 kan bli forsinket"
+    assert _en(trains) == "Train L1 07:03 may be cancelled, 1 more may miss the connection and 2 may be delayed"
+    assert _nn(trains) == "Tog L1 07:03 kan bli innstilt, 1 til kan miste overgangen og 2 kan bli forseinka"
+
+
+def test_a_direct_wording_key_is_byte_identical_and_a_trip_key_carries_its_reason():
+    """KTD12: the direct key is the nine elements it always was, prompt version included. A trip key
+    adds the reason kind and the 0-based index -- categorical, never a figure, so a rescored P(miss)
+    does not re-word -- and the trip prompt's version, so a reason change from the first leg's delay
+    to a cancelled leg 2 is never served the old wording."""
+    from types import SimpleNamespace
+
+    pair = ("NSR:StopPlace:A", "NSR:StopPlace:B")
+    direct = nw.wording_key(pair, _Winner(), None, tomorrow=False)
+    assert direct == (pair, "S1", DEP.isoformat(), False, False, False, None, "b12a7867", SNAPSHOT.isoformat())
+
+    def winner(kind, index, probability=0.8, confirmed=False):
+        w = _Winner()
+        w.trip = SimpleNamespace(problem=SimpleNamespace(kind=kind, index=index, probability=probability))
+        w.trip_confirmed = confirmed
+        return w
+
+    delayed = nw.wording_key(pair, winner("departure", 0), None, tomorrow=False)
+    assert delayed[:7] == direct[:7] and delayed[-1] == direct[-1]
+    assert delayed[7] == "departure:0" and delayed[8] == llm_message.TRIP_PROMPT_VERSION
+    assert nw.wording_key(pair, winner("leg_cancelled", 1), None, tomorrow=False) != delayed
+    assert nw.wording_key(pair, winner("departure", 0, probability=0.97), None, tomorrow=False) == delayed
+    # «kan miste overgangen» becoming «mister overgangen» on the same reason is a new wording, in the
+    # same one element, so the key keeps its ten.
+    predicted = nw.wording_key(pair, winner("leg_cancelled", 1), None, tomorrow=False)
+    confirmed = nw.wording_key(pair, winner("leg_cancelled", 1, confirmed=True), None, tomorrow=False)
+    assert len(confirmed) == len(predicted) and confirmed[7] == "leg_cancelled:1:c", confirmed
+
+
+def test_a_trip_reply_over_300_characters_falls_back_to_the_template():
+    """KTD12: the cap stands, so the template carries the over-long trip wording -- and it is the trip
+    template, naming Drammen, not the first train's delay."""
+    _reset(provider="claude")
+    mi = _trip_input()
+    long_reply = json.dumps({"melding": "Tog R13 07:17 kan miste overgangen i Drammen. " * 7})
+    llm_message._BACKENDS["claude"] = lambda body: long_reply
+    try:
+        wording = nw.write_wording(ROUTE, nw.DepartureWordingFacts(situation_number="S1"),
+                                   subject_id="s", message_input=mi)
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert wording.body == nw.deterministic_body(mi) and "i Drammen" in wording.body, wording
+
+
+def test_typed_facts_carry_a_trip_so_every_channel_words_the_same_trip_document():
+    """`write_wording` built from typed facts -- no shared message input handed in -- words a trip
+    alert from its trip document, under the trip prompt's version and with the trip template, as the
+    pass and the read do off an `Alert`. A direct train's facts build exactly the document they
+    always did. Delivery is off, so no backend is ever asked."""
+    _reset(webhook_delivery=False)
+    direct = nw.build_message_input(ROUTE, _facts())
+    assert llm_message.TRIP_KEY not in direct
+    assert nw.build_message_input(ROUTE, _facts(trip=None, trip_confirmed=False)) == direct
+    wording = nw.write_wording(
+        ROUTE, _facts(trip=_trip("leg_cancelled", 1), trip_confirmed=True), subject_id="s"
+    )
+    mi = wording.message_input
+    assert llm_message.is_trip_input(mi)
+    assert llm_message.prompt_version_for(mi) == llm_message.TRIP_PROMPT_VERSION
+    assert mi[llm_message.TRIP_KEY]["bekreftet"] is True and "sannsynlighet_prosent" not in mi
+    assert wording.status == "not_delivered" and "mister overgangen" in wording.title, wording
+
+
+# ---- multi-leg U10: the /varsel card says what the template says -------------------------------
+PWA = pathlib.Path(__file__).resolve().parents[2] / "demo" / "avviksvarsel"
+TRIP_WORDING_FIXTURE = PWA / "test" / "fixtures" / "trip-wording.json"
+
+
+def _trip_wording_cases() -> list[dict]:
+    """Each case: the `/varsel-api` alert a trip card renders from, and the template's title and body
+    for it. No summary and no alternative, so the body is the two lines the card restates: «<train>:
+    <driver>» and the arrival. No stop-name registry either (`_reset`), so every name comes off the
+    trip facts, which is all the PWA has; with a registry the server may name a stop differently."""
+    from types import SimpleNamespace
+
+    from alternatives import TripTransfer
+
+    def case(name, trip, **alert):
+        fields = {
+            "mode": "Tog", "line": "VYG:Line:R13", "destination": None, "departure_time": TRIP_DEP,
+            "cancelled": False, "destination_cancelled": False, "cancel_probability": 0.02,
+            "delay_p50_min": 2, "delay_p90_min": 6, "impact_probability": 0.31, "trip_confirmed": False,
+            **alert,
+        }
+        facts = SimpleNamespace(situation_number="S1", has_situation=True, trip=trip, **fields)
+        mi = llm_message.build_message_input(
+            {"from_stop": "NSR:StopPlace:L", "to_stop": "NSR:StopPlace:O"},
+            SimpleNamespace(lines=[], situations=[]), facts, now=TRIP_DEP - timedelta(hours=1),
+        )
+        return {
+            "name": name,
+            "alert": {**fields, "departure_time": TRIP_DEP.isoformat(), "trip": trip.model_dump(mode="json")},
+            "title": nw.notification_title(mi, "Lier", "Oslo S"),
+            "body": nw.deterministic_body(mi),
+        }
+
+    tight = _trip().model_copy(update={"transfers": [
+        TripTransfer(stop_place="NSR:StopPlace:D", stop_name="Drammen", walk_min=2, slack_min=-1)
+    ]})
+    bus = _trip("leg_cancelled", 1)
+    bus.legs[1] = bus.legs[1].model_copy(update={
+        "mode": "bus", "line": "RUT:Line:500", "public_code": "500", "destination": "Asker"
+    })
+    nameless = _trip()
+    nameless.transfers[0] = nameless.transfers[0].model_copy(update={"stop_name": None})
+    nameless_leg = _trip("leg_cancelled", 1)
+    nameless_leg.legs[1] = nameless_leg.legs[1].model_copy(update={"from_name": None})
+    unscored = {"impact_probability": None, "cancel_probability": None, "delay_p50_min": None,
+                "delay_p90_min": None}
+    # A first train that never leaves, as `varsel._trip_alert` builds it unscored: the certainty.
+    gone = {**unscored, "impact_probability": 1.0, "cancel_probability": 1.0, "cancelled": True,
+            "trip_confirmed": True}
+    return [
+        case("AE1: a change likely missed", _trip()),
+        case("a change likely missed, arrival unknown", _trip(expected=None)),
+        case("a change missed for certain, in a plan already too tight", tight, trip_confirmed=True),
+        case("a later leg cancelled, nothing cushions it", _trip("leg_cancelled", 1), trip_confirmed=True),
+        case("a later leg cancelled, the cushion only predicted to fail", _trip("leg_cancelled", 1)),
+        case("a later leg out of the plan", _trip("leg_removed", 1), trip_confirmed=True),
+        case("a later leg's own figure", _trip("leg_departure", 1)),
+        case("the first train's delay", _trip("departure", 0)),
+        case("the first train likely cancelled", _trip("departure", 0), cancel_probability=0.62),
+        case("the first leg unscored", _trip("departure", 0), **unscored),
+        case("listed below the bar", _trip().model_copy(update={"problem": None})),
+        case("the first train cancelled", _trip("leg_cancelled", 0), cancelled=True, trip_confirmed=True),
+        case("the first leg unscored, cancelled by the journey planner", _trip("leg_cancelled", 0),
+             **gone),
+        case("the first train out of the plan", _trip("leg_removed", 0), **gone),
+        case("a bus onward, and a destination on the first line", bus, destination="Spikkestad"),
+        case("a change the service could not name", nameless),
+        case("a later leg the service could not name", nameless_leg),
+    ]
+
+
+def test_the_committed_trip_wording_fixture_is_what_the_template_says():
+    """The PWA's trip card restates the template's title and body (`tripModel.test.mjs` reads this
+    file), so the expected strings are the producer's, rebuilt here from the inputs the file records,
+    never a hand transcription. Regenerate with `WRITE_TRIP_WORDING_FIXTURE=1 python
+    test_notification_wording.py` after a deliberate wording change, then run `npm test` in
+    demo/avviksvarsel: the card must follow."""
+    expected = {
+        "$comment": "GENERATED by disruptions/api/test_notification_wording.py::_trip_wording_cases "
+        "from notification_wording.notification_title and deterministic_body. Do not edit; "
+        "regenerate with WRITE_TRIP_WORDING_FIXTURE=1 python test_notification_wording.py.",
+        "cases": _trip_wording_cases(),
+    }
+    if os.environ.get("WRITE_TRIP_WORDING_FIXTURE"):
+        TRIP_WORDING_FIXTURE.parent.mkdir(exist_ok=True)
+        TRIP_WORDING_FIXTURE.write_text(json.dumps(expected, ensure_ascii=False, indent=2) + "\n")
+    assert TRIP_WORDING_FIXTURE.exists(), f"{TRIP_WORDING_FIXTURE} is missing; regenerate it"
+    committed = json.loads(TRIP_WORDING_FIXTURE.read_text())
+    assert committed == expected, "the trip wording changed; regenerate the fixture and update the PWA"
+
+
+def test_the_pwa_names_a_leg_mode_with_this_table():
+    """`format.ts`'s LEG_MODE_NOUN is a copy of `_LEG_MODE_NOUN`, as `levels.ts` copies togvarsel's
+    texts: the card names the trip's legs and the alternative's, and the push names the same legs
+    from this table. A mode one side gains and the other lacks fails here, in either direction."""
+    import re
+
+    source = (PWA / "src" / "format.ts").read_text()
+    block = re.search(r"export const LEG_MODE_NOUN: Record<string, string> = \{\n(.*?)\n\};", source, re.DOTALL)
+    assert block, "format.ts no longer carries LEG_MODE_NOUN"
+    copy = dict(re.findall(r"^\s*(\w+): '([^']*)',$", block[1], re.MULTILINE))
+    assert len(copy) == len(block[1].splitlines()), "a LEG_MODE_NOUN line this check cannot read"
+    assert copy == nw._LEG_MODE_NOUN, copy
+
+
 def _run():
     logging.getLogger("notification_wording").setLevel(logging.CRITICAL)
     tests = sorted(

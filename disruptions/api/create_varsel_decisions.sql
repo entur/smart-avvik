@@ -149,7 +149,14 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decisions`
   -- downstream of it -- test_notification_contract greps this file for exactly those.
   channel               STRING    OPTIONS(description="Which channel(s) watched this journey definition when the row was written: 'browser' (a /varsel registration), 'webhook' (a client subscription only) or 'both'. Added 2026-09-13 (KTD4) -- webhook routes were not recorded at all before it, so NULL means the row predates the column, never 'no channel'. It is aggregated onto the subject and is NOT in varsel_decision_groups' GROUP BY: a definition both channels share is ONE subject with one matching decision, which is the premise of the shared match and the shared wording. Three things follow. `pushed` means a notification was ISSUED on any channel, so a 'both' row can say pushed with no Web Push behind it. `n_devices` stays browser-only and `n_subscriptions` counts the client side, so neither is a count of the other's recipients. And the two LLM delivery switches are separate, so where a rollout has them disagreeing, `message` on a 'both' row is the browser's wording and the client received the other one."),
   n_subscriptions       INT64     OPTIONS(description="How many live webhook subscriptions shared this journey definition when the row was written -- the client side's count, beside n_devices' browser side. 0 on a browser-only row; NULL means the row predates the column (2026-09-13). No client identity is recorded anywhere in this table (KTD10): the grain is the journey DEFINITION, which is a route and a window and names nobody."),
-  destination_cancelled BOOL      OPTIONS(description="ET had ALREADY declared the train's call at the journey's to_stop cancelled when we decided, while its boarding call ran: the train leaves and never gets there (R14 on 2026-10-12, cancelled Lysaker-Asker). impact_probability/cancel_probability are then 1.0 by construction, as for et_cancelled, which stays FALSE because the BOARDING call was not cancelled. A relayed fact, so it segments with et_cancelled as relayed. NULL = written before the column (2026-10-19).")
+  destination_cancelled BOOL      OPTIONS(description="ET had ALREADY declared the train's call at the journey's to_stop cancelled when we decided, while its boarding call ran: the train leaves and never gets there (R14 on 2026-10-12, cancelled Lysaker-Asker). impact_probability/cancel_probability are then 1.0 by construction, as for et_cancelled, which stays FALSE because the BOARDING call was not cancelled. A relayed fact, so it segments with et_cancelled as relayed. NULL = written before the column (2026-10-19)."),
+  -- A departure with a change (multi-leg U11, KTD16), behind TRIP_PLANS_ENABLED. The grain does
+  -- not move: the row is still one definition's view of one situation on one FIRST-LEG departure,
+  -- and these four say what the end-to-end verdict was taken over. All NULL on a direct train.
+  trip_legs             STRING    OPTIONS(description="A departure with a change only: JSON {continuations: [{planned, legs: [{operator, jkey, board_stop_place, alight_stop_place, aimed_departure, aimed_arrival, walk_after_s}]}]} -- EVERY continuation of the first train the verdict was taken over (KTD19), the planned one first and marked; jkey in the same key form as jkey above. The nightly labeller reads connection_held and arrival_delay_min off it. Names the route, so like message_input it never enters an API SELECT. NULL on a direct train, which is what /historikk's «med bytte» segment is told apart by."),
+  trip_reason_kind      STRING    OPTIONS(description="Why a departure with a change alerts, on its planned route (KTD13): departure | leg_cancelled | leg_departure | missed_connection | leg_removed. NULL below the bar and on a direct train. A change of it or of trip_reason_index writes a row however thinned the subject is. impact_probability/alert_threshold beside it are the DECIDING reason's figure and bar, which may be another continuation's (KTD19)."),
+  trip_reason_index     INT64     OPTIONS(description="The 0-based leg index of trip_reason_kind, or the transfer index for missed_connection (transfer i sits between legs i and i+1 of the planned route). NULL with trip_reason_kind."),
+  trip_p_miss           FLOAT64   OPTIONS(description="The planned route's P(missed connection) from our own predictions (KTD7): the highest over its changes, whatever reason decided and below the bar too. NULL when none of its changes is scored by us -- a miss by the Journey Planner's expected times (KTD8) is a verdict, not a figure, and shows as missed_connection at impact_probability 1.0 -- and on a direct train.")
 )
 PARTITION BY DATE(decided_at)
 CLUSTER BY operator, situation_number
@@ -234,7 +241,11 @@ ALTER TABLE `disruptions.varsel_decisions`
   ADD COLUMN IF NOT EXISTS message_deterministic STRING OPTIONS(description="The template wording (varsel._deterministic_body) for this decision, computed on EVERY decision from 2026-08-07 — including the ~83 % sub-threshold rows nothing is ever sent for — whether or not it was the one delivered. Its presence is what DATES a row as post-change: message_llm cannot, since a NULL there means either 'no model wording' or 'written before the column existed', and at deploy time every existing row is the latter. NULL therefore reads as 'not recorded then', never 'no wording' — the same third-bucket rule /historikk states for n_unsegmented. Written from the same message_input the model was prompted with, or from the alert's own figures when that could not be built, which is why this can be non-null beside a NULL message_input. Under message_status='ok_cached' it describes a different cycle's input than message_llm does."),
   ADD COLUMN IF NOT EXISTS channel            STRING    OPTIONS(description="Which channel(s) watched this journey definition when the row was written: 'browser' (a /varsel registration), 'webhook' (a client subscription only) or 'both'. Added 2026-09-13 (KTD4) -- webhook routes were not recorded at all before it, so NULL means the row predates the column, never 'no channel'. It is aggregated onto the subject and is NOT in varsel_decision_groups' GROUP BY: a definition both channels share is ONE subject with one matching decision, which is the premise of the shared match and the shared wording. Three things follow. `pushed` means a notification was ISSUED on any channel, so a 'both' row can say pushed with no Web Push behind it. `n_devices` stays browser-only and `n_subscriptions` counts the client side, so neither is a count of the other's recipients. And the two LLM delivery switches are separate, so where a rollout has them disagreeing, `message` on a 'both' row is the browser's wording and the client received the other one."),
   ADD COLUMN IF NOT EXISTS n_subscriptions    INT64     OPTIONS(description="How many live webhook subscriptions shared this journey definition when the row was written -- the client side's count, beside n_devices' browser side. 0 on a browser-only row; NULL means the row predates the column (2026-09-13). No client identity is recorded anywhere in this table (KTD10): the grain is the journey DEFINITION, which is a route and a window and names nobody."),
-  ADD COLUMN IF NOT EXISTS destination_cancelled BOOL OPTIONS(description="ET had ALREADY declared the train's call at the journey's to_stop cancelled when we decided, while its boarding call ran: the train leaves and never gets there (R14 on 2026-10-12, cancelled Lysaker-Asker). impact_probability/cancel_probability are then 1.0 by construction, as for et_cancelled, which stays FALSE because the BOARDING call was not cancelled. A relayed fact, so it segments with et_cancelled as relayed. NULL = written before the column (2026-10-19).");
+  ADD COLUMN IF NOT EXISTS destination_cancelled BOOL OPTIONS(description="ET had ALREADY declared the train's call at the journey's to_stop cancelled when we decided, while its boarding call ran: the train leaves and never gets there (R14 on 2026-10-12, cancelled Lysaker-Asker). impact_probability/cancel_probability are then 1.0 by construction, as for et_cancelled, which stays FALSE because the BOARDING call was not cancelled. A relayed fact, so it segments with et_cancelled as relayed. NULL = written before the column (2026-10-19)."),
+  ADD COLUMN IF NOT EXISTS trip_legs          STRING    OPTIONS(description="A departure with a change only: JSON {continuations: [{planned, legs: [{operator, jkey, board_stop_place, alight_stop_place, aimed_departure, aimed_arrival, walk_after_s}]}]} -- EVERY continuation of the first train the verdict was taken over (KTD19), the planned one first and marked; jkey in the same key form as jkey above. The nightly labeller reads connection_held and arrival_delay_min off it. Names the route, so like message_input it never enters an API SELECT. NULL on a direct train, which is what /historikk's «med bytte» segment is told apart by."),
+  ADD COLUMN IF NOT EXISTS trip_reason_kind   STRING    OPTIONS(description="Why a departure with a change alerts, on its planned route (KTD13): departure | leg_cancelled | leg_departure | missed_connection | leg_removed. NULL below the bar and on a direct train. A change of it or of trip_reason_index writes a row however thinned the subject is. impact_probability/alert_threshold beside it are the DECIDING reason's figure and bar, which may be another continuation's (KTD19)."),
+  ADD COLUMN IF NOT EXISTS trip_reason_index  INT64     OPTIONS(description="The 0-based leg index of trip_reason_kind, or the transfer index for missed_connection (transfer i sits between legs i and i+1 of the planned route). NULL with trip_reason_kind."),
+  ADD COLUMN IF NOT EXISTS trip_p_miss        FLOAT64   OPTIONS(description="The planned route's P(missed connection) from our own predictions (KTD7): the highest over its changes, whatever reason decided and below the bar too. NULL when none of its changes is scored by us -- a miss by the Journey Planner's expected times (KTD8) is a verdict, not a figure, and shows as missed_connection at impact_probability 1.0 -- and on a direct train.");
 
 
 
@@ -278,7 +289,7 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
 
   actual_cancelled       BOOL    OPTIONS(description="ET declared the boarding call cancelled."),
   actual_dep_delay_min   INT64   OPTIONS(description="Realized departure delay in minutes; null if the call was never operated."),
-  actual_trouble         BOOL    OPTIONS(description="cancelled OR >= 10 min late. NULL = unknown (no realized call found), NOT 'no trouble'."),
+  actual_trouble         BOOL    OPTIONS(description="cancelled OR >= 10 min late at the boarding call, or (2026-10-19) the destination call cancelled. On a departure with a change (trip_legs non-NULL, multi-leg U11) it is the trip's own: arrival_delay_min >= 10 or every continuation broken. NULL = unknown (no realized call found), NOT 'no trouble'."),
   verdict                STRING  OPTIONS(description="'hit' | 'false_alarm' | 'miss' | 'correct_reject'; NULL when the outcome is unknown."),
   labelled_at            TIMESTAMP,
   -- New columns go LAST here, matching where ALTER ADD COLUMN puts them on an existing table.
@@ -296,7 +307,12 @@ CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`
   -- 2026-10-19: a train that leaves and never reaches the destination. Two columns, and the same
   -- operator step as the two above: deploy, then `bq update --transfer_config` in dev and prd.
   destination_cancelled        BOOL OPTIONS(description="ET had already declared the destination call cancelled while the boarding call ran, at the point this verdict judges (same rule as et_cancelled beside it). A relayed fact: it segments as relayed. NULL = every row predates the column (2026-10-19)."),
-  actual_destination_cancelled BOOL OPTIONS(description="What actually happened at the journey's to_stop: SIRI-ET last-recorded holds this train's call there, after the boarding call, as cancelled. TRUE makes actual_trouble TRUE whatever the boarding call did, because the traveller could not complete the trip. FALSE = the call was found and not cancelled, or not found at all (labelled from 2026-10-19; NULL before).")
+  actual_destination_cancelled BOOL OPTIONS(description="What actually happened at the journey's to_stop: SIRI-ET last-recorded holds this train's call there, after the boarding call, as cancelled. TRUE makes actual_trouble TRUE whatever the boarding call did, because the traveller could not complete the trip. FALSE = the call was found and not cancelled, or not found at all (labelled from 2026-10-19; NULL before)."),
+  -- A departure with a change (multi-leg U11, KTD16), and the same operator step once more: deploy,
+  -- then `bq update --transfer_config` in dev and prd in the same sitting.
+  trip_legs              STRING  OPTIONS(description="The legs snapshot (varsel_decisions.trip_legs) of the cycle this verdict judges: the first alerting cycle if we alerted, else the last. Non-NULL marks a departure with a change, which /historikk and /meldinger segment as «med bytte» (provenance 'transfer'), ahead of every other provenance. Names the route, so it never enters an API SELECT."),
+  connection_held        BOOL    OPTIONS(description="A departure with a change: did every change on the PLANNED route hold -- the arriving leg's realized arrival plus the walk no later than the connecting leg's realized departure (SIRI-ET last-recorded, each call found on its stop place and nearest aimed time). FALSE when one did not, or a ridden leg's boarding or alighting call was cancelled; NULL when a leg went unrecorded and none failed (FALSE beats NULL), and on a direct train."),
+  arrival_delay_min      INT64   OPTIONS(description="A departure with a change: the earliest realized arrival at the destination over every continuation in trip_legs that held, minus the earliest planned arrival, in whole minutes; a continuation that broke supplies none. NULL when none held with a recorded arrival, or one still unresolved was planned to arrive earlier than that; NULL on a direct train. actual_trouble on such a row is this >= 10 or every continuation broken, so a cushioned trip that stayed silent is no miss.")
 )
 PARTITION BY call_date
 CLUSTER BY operator, verdict
@@ -312,7 +328,10 @@ ALTER TABLE `disruptions.varsel_decision_outcomes`
   ADD COLUMN IF NOT EXISTS channel         STRING OPTIONS(description="Which channel(s) watched this journey definition, aggregated over the subject's rows: 'browser', 'webhook' or 'both' -- 'both' when any row said so, or when browser rows and webhook rows both occur. NOT part of the grain (KTD4): a definition both channels share is one subject with one verdict. NULL = every row predates the column (2026-09-13)."),
   ADD COLUMN IF NOT EXISTS n_subscriptions INT64  OPTIONS(description="The highest webhook-subscription count any of this subject's rows carried, frozen here like n_devices beside it. 0 on a browser-only subject; NULL = the rows predate the column."),
   ADD COLUMN IF NOT EXISTS destination_cancelled        BOOL OPTIONS(description="ET had already declared the destination call cancelled while the boarding call ran, at the point this verdict judges (same rule as et_cancelled beside it). A relayed fact: it segments as relayed. NULL = every row predates the column (2026-10-19)."),
-  ADD COLUMN IF NOT EXISTS actual_destination_cancelled BOOL OPTIONS(description="What actually happened at the journey's to_stop: SIRI-ET last-recorded holds this train's call there, after the boarding call, as cancelled. TRUE makes actual_trouble TRUE whatever the boarding call did, because the traveller could not complete the trip. FALSE = the call was found and not cancelled, or not found at all (labelled from 2026-10-19; NULL before).");
+  ADD COLUMN IF NOT EXISTS actual_destination_cancelled BOOL OPTIONS(description="What actually happened at the journey's to_stop: SIRI-ET last-recorded holds this train's call there, after the boarding call, as cancelled. TRUE makes actual_trouble TRUE whatever the boarding call did, because the traveller could not complete the trip. FALSE = the call was found and not cancelled, or not found at all (labelled from 2026-10-19; NULL before)."),
+  ADD COLUMN IF NOT EXISTS trip_legs         STRING OPTIONS(description="The legs snapshot (varsel_decisions.trip_legs) of the cycle this verdict judges: the first alerting cycle if we alerted, else the last. Non-NULL marks a departure with a change, which /historikk and /meldinger segment as «med bytte» (provenance 'transfer'), ahead of every other provenance. Names the route, so it never enters an API SELECT."),
+  ADD COLUMN IF NOT EXISTS connection_held   BOOL   OPTIONS(description="A departure with a change: did every change on the PLANNED route hold -- the arriving leg's realized arrival plus the walk no later than the connecting leg's realized departure (SIRI-ET last-recorded, each call found on its stop place and nearest aimed time). FALSE when one did not, or a ridden leg's boarding or alighting call was cancelled; NULL when a leg went unrecorded and none failed (FALSE beats NULL), and on a direct train."),
+  ADD COLUMN IF NOT EXISTS arrival_delay_min INT64  OPTIONS(description="A departure with a change: the earliest realized arrival at the destination over every continuation in trip_legs that held, minus the earliest planned arrival, in whole minutes; a continuation that broke supplies none. NULL when none held with a recorded arrival, or one still unresolved was planned to arrive earlier than that; NULL on a direct train. actual_trouble on such a row is this >= 10 or every continuation broken, so a cushioned trip that stayed silent is no miss.");
 
 
 -- One row per decision SUBJECT: a journey definition's view of one situation on one train.
@@ -376,9 +395,15 @@ CREATE OR REPLACE TABLE FUNCTION `disruptions.varsel_decision_groups_between`(
 -- (label_varsel_decisions.sql's INSERT, historikk_decisions.sql, historikk_summary.sql) and none
 -- of them is positional.
 SELECT
-  * EXCEPT (delivered),
+  * EXCEPT (delivered, judged_trip),
   delivered.text   AS message,
-  delivered.source AS message_source
+  delivered.source AS message_source,
+  -- Last, after every existing column: the registered labelling copy's `SELECT *` sees them in
+  -- the same place in both of its UNION ALL branches, and keeps running until it is re-registered.
+  judged_trip.legs         AS trip_legs,
+  judged_trip.reason_kind  AS trip_reason_kind,
+  judged_trip.reason_index AS trip_reason_index,
+  judged_trip.p_miss       AS trip_p_miss
 FROM (
 SELECT
   journey_digest,
@@ -491,7 +516,21 @@ SELECT
   COALESCE(
     ARRAY_AGG(IF(alertworthy, destination_cancelled, NULL) IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)],
     LOGICAL_OR(destination_cancelled)
-  ) AS destination_cancelled
+  ) AS destination_cancelled,
+  -- A departure with a change (multi-leg U11, KTD16): its legs snapshot, reason and P(miss) from
+  -- the cycle the verdict judges -- the first alerting row, else the last -- as et_cancelled is
+  -- resolved. ONE struct per pick, because trip_reason_index points into that cycle's legs.
+  -- Aggregated, never grouped on: the grain stays one first-leg departure. NULL when direct.
+  COALESCE(
+    ARRAY_AGG(IF(alertworthy AND trip_legs IS NOT NULL,
+                 STRUCT(trip_legs AS legs, trip_reason_kind AS reason_kind,
+                        trip_reason_index AS reason_index, trip_p_miss AS p_miss), NULL)
+              IGNORE NULLS ORDER BY decided_at LIMIT 1)[SAFE_OFFSET(0)],
+    ARRAY_AGG(IF(trip_legs IS NOT NULL,
+                 STRUCT(trip_legs AS legs, trip_reason_kind AS reason_kind,
+                        trip_reason_index AS reason_index, trip_p_miss AS p_miss), NULL)
+              IGNORE NULLS ORDER BY decided_at DESC LIMIT 1)[SAFE_OFFSET(0)]
+  ) AS judged_trip
 FROM `disruptions.varsel_decisions`
 -- THE PARTITION PREDICATE, and the only difference between this body and the one that ran until
 -- 2026-09-12. It is on DATE(decided_at), the partitioning column, which is what makes a request
@@ -561,7 +600,8 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- that already landed -- silent and perfectly counterproductive. Newest-first means a truncated run
 -- loses only re-applications. The block stood at 7 statements against that cap of 5, i.e. it could
 -- not complete at all; after the 2026-09-13 prune it is 3 on varsel_decisions and 1 on the outcomes
--- table, which is inside the cap on both. Prune again before adding a fifth to either.
+-- table (2 since multi-leg U11), which is inside the cap on both. Prune again before adding a fifth
+-- to either.
 --
 -- The real fix is to prune: a statement here exists solely to carry reworded text to a table that
 -- already exists, so once it has reached dev AND prd it is dead weight (a fresh environment reads
@@ -609,7 +649,11 @@ ALTER TABLE `disruptions.varsel_decisions`
 ALTER TABLE `disruptions.varsel_decisions`
   ALTER COLUMN n_devices SET OPTIONS(description="How many /varsel registrations share this journey definition -- the BROWSER side only, and it stays that way now that webhook routes are recorded too (2026-09-13, KTD4). A webhook-only row therefore reads 0 here beside a non-zero n_subscriptions, and neither column counts the other's recipients.");
 
--- The outcomes table's own budget: BigQuery's 5-updates-per-10s cap is PER TABLE, and this is the
--- only statement against this one.
+-- The outcomes table's own budget: BigQuery's 5-updates-per-10s cap is PER TABLE, and these two are
+-- the only statements against this one. Newest first, as above: `actual_trouble` changed meaning on
+-- a departure with a change (multi-leg U11), where it is the trip's end-to-end verdict.
+ALTER TABLE `disruptions.varsel_decision_outcomes`
+  ALTER COLUMN actual_trouble SET OPTIONS(description="cancelled OR >= 10 min late at the boarding call, or (2026-10-19) the destination call cancelled. On a departure with a change (trip_legs non-NULL, multi-leg U11) it is the trip's own: arrival_delay_min >= 10 or every continuation broken. NULL = unknown (no realized call found), NOT 'no trouble'.");
+
 ALTER TABLE `disruptions.varsel_decision_outcomes`
   ALTER COLUMN pushed_any SET OPTIONS(description="Whether a notification was ISSUED on any channel for this decision: a Web Push the push service accepted, or a webhook event that was minted (2026-09-13, KTD4). Web Push alone before that date. Read `channel` beside it -- a 'both' subject can say TRUE with no Web Push behind it.");
