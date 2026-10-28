@@ -59,7 +59,8 @@ import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -148,10 +149,22 @@ SITUATION_TRANSLATIONS = "situation_translations"
 #: 24 h after the write. `message_input` in a message's meta names stop refs and a departure time,
 #: as the registrations in this database do.
 VARSEL_CARD_CACHE = "varsel_card_cache"
+#: The lease holder's Journey Planner day plans (multi-leg journeys, KTD2): one document per
+#: (from stop, to stop, Oslo date), its id the unsalted SHA-256 of `from|to|date` (never logged), so
+#: every pod finds the same plan. Written only by the leader's `trip_plans` phase, as a
+#: transactional MERGE (`merge_trip_plan`), never a replace; read into every pod's memory by a seed
+#: and a watermark sync, never on a request. The body is `plan` (the `trips.DayPlan` as canonical
+#: JSON, ONE string: a dumped leg's `refs` is an array of arrays, which Firestore refuses), the pair
+#: and the date, the server stamp the sync pages by, and `expires_at` two days after the date
+#: begins in Oslo. Public timetable data only: stops, lines, journeys and times, no registration,
+#: client or device field (R17). `ponytail:` one document per day: `_MAX_PAGES` pages of 12
+#: patterns is ~600 trips, a few hundred KB, under Firestore's 1 MiB. Upgrade path: one document
+#: per covered range, if a pair's day ever approaches it.
+TRIP_PLANS = "trip_plans"
 
 COLLECTIONS = (
     SUBSCRIPTIONS, SUBJECTS, EVENTS, DELIVERIES, FEEDBACK_CONTEXTS, SITUATION_TRANSLATIONS,
-    VARSEL_CARD_CACHE,
+    VARSEL_CARD_CACHE, TRIP_PLANS,
 )
 
 #: The server-stamped field the translation sync pages by: MIRROR_FIELD's rule (`SERVER_TIMESTAMP`,
@@ -171,6 +184,13 @@ CARD_WRITE_BATCH = 500
 #: A seed reads every live entry (the TTL bounds the collection to about a day's writes), up to
 #: this many pages; a sync reads at most TRANSLATION_SYNC_MAX_PAGES.
 CARD_SEED_MAX_PAGES = 50
+#: A plan expires this many days after its Oslo date begins: its windows end by the next morning
+#: (an overnight one, plus the catch-up grace), so the second midnight is past every reader.
+TRIP_PLAN_KEEP_DAYS = 2
+#: Plans are tens of KB where a translation is a few hundred bytes, so a page holds fewer.
+TRIP_PLAN_PAGE_SIZE = 100
+#: A seed or sync reads at most this many pages (10 000 plans: registered pairs times ~3 dates).
+TRIP_PLAN_MAX_PAGES = 100
 
 # Firestore allows exactly ONE TTL field per collection group, so every group in `COLLECTIONS`
 # uses the same field name: the Terraform resource is then one repeated block rather than a bespoke one per group, and
@@ -1256,6 +1276,19 @@ QUERY_SPECS: tuple[QuerySpec, ...] = (
         order_by=((TRANSLATION_STAMP_FIELD, "ASCENDING"),),
         why="a follower's tick picks up the leader's card cache changes since its watermark",
     ),
+    QuerySpec(
+        name="trip_plans_seed",
+        collection=TRIP_PLANS,
+        order_by=((TRANSLATION_STAMP_FIELD, "DESCENDING"),),
+        why="a pod starting or taking the lease loads the leader's trip plans (multi-leg U2)",
+    ),
+    QuerySpec(
+        name="trip_plans_sync",
+        collection=TRIP_PLANS,
+        inequality=((TRANSLATION_STAMP_FIELD, ">"),),
+        order_by=((TRANSLATION_STAMP_FIELD, "ASCENDING"),),
+        why="a follower's tick picks up the plans the leader merged since its watermark",
+    ),
 )
 
 _SPECS_BY_NAME = {spec.name: spec for spec in QUERY_SPECS}
@@ -1375,6 +1408,9 @@ class _Refs:
     def card_entry(self, kind: str, key: str) -> Any:
         digest = hashlib.sha256(f"{kind}\0{key}".encode()).hexdigest()
         return self._client.collection(VARSEL_CARD_CACHE).document(digest)
+
+    def trip_plan(self, plan_id: str) -> Any:
+        return self._client.collection(TRIP_PLANS).document(plan_id)
 
 
 def _run_transaction(body: Callable[[Any], Any]) -> Any:
@@ -6494,6 +6530,151 @@ def sync_card_entries(
             "varsel_card_cache_sync",
             inequality={TRANSLATION_STAMP_FIELD: since - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)},
             limit=TRANSLATION_PAGE_SIZE * TRANSLATION_SYNC_MAX_PAGES,
+            since=since,
+            now=now or _now(),
+            beat=beat,
+        )
+
+
+# ---- The Journey Planner trip plans (multi-leg journeys U2) -------------------------------------
+#
+# `trip_plans` calls these through an injected handle and never imports this module, as the card
+# caches do. The leader merges each `complete` fetch; every other pod seeds and syncs.
+
+
+@dataclass(frozen=True)
+class StoredTripPlan:
+    """One stored plan: the pair, the Oslo date and the `trips.DayPlan` as canonical JSON."""
+
+    from_stop: str
+    to_stop: str
+    oslo_date: date
+    plan: str
+
+
+def _trip_plan_id(from_stop: str, to_stop: str, oslo_date: date) -> str:
+    """Unsalted, as `situation_english._digest` keys translations, so every pod finds the same
+    document; never logged (KTD2)."""
+    return hashlib.sha256(f"{from_stop}|{to_stop}|{oslo_date.isoformat()}".encode()).hexdigest()
+
+
+def _trip_plan_body(
+    transaction: Any,
+    refs: _Refs,
+    *,
+    plan_id: str,
+    from_stop: str,
+    to_stop: str,
+    oslo_date: date,
+    apply: Callable[[Any], str],
+    stamp: Any,
+    now: datetime,
+) -> str:
+    """Read the stored plan, merge into it with `apply`, write the result: never a replace (KTD2).
+
+    `apply` is the caller's pure merge (`trip_plans.merge` over canonical JSON) and gets the stored
+    plan, or None when there is none or it has expired; it raises on a plan it cannot read, which
+    fails the write rather than replacing it. The server stamp comes in as `stamp`, built by the
+    caller with the clock, per rule 1.
+    """
+    ref = refs.trip_plan(plan_id)
+    stored = _doc(_read(transaction, ref))
+    plan = apply(stored.get("plan") if _not_expired(stored, now) else None)
+    transaction.set(
+        ref,
+        {
+            "plan": plan,
+            "from_stop": from_stop,
+            "to_stop": to_stop,
+            "oslo_date": oslo_date.isoformat(),
+            TRANSLATION_STAMP_FIELD: stamp,
+            TTL_FIELD: datetime.combine(
+                oslo_date + timedelta(days=TRIP_PLAN_KEEP_DAYS), dt_time(0), tzinfo=OSLO
+            ),
+        },
+    )
+    return plan
+
+
+def merge_trip_plan(
+    from_stop: str,
+    to_stop: str,
+    oslo_date: date,
+    apply: Callable[[Any], str],
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Merge one `complete` fetch into the pair's stored plan for the date, in one transaction, and
+    return the STORED result, which the leader then holds in memory. Raises on a store failure or
+    an unreadable stored plan; the caller keeps its own merge in memory then."""
+    instant = now or _now()
+    refs = _Refs(_firestore_client())
+    plan_id = _trip_plan_id(from_stop, to_stop, oslo_date)
+    stamp = _mirror_stamp()
+    with _span("notification_store.merge_trip_plan"):
+        return _run_transaction(
+            lambda txn: _trip_plan_body(
+                txn, refs, plan_id=plan_id, from_stop=from_stop, to_stop=to_stop,
+                oslo_date=oslo_date, apply=apply, stamp=stamp, now=instant,
+            )
+        )
+
+
+def _trip_plan_pages(
+    name: str,
+    *,
+    inequality: Mapping[str, Any] | None,
+    since: datetime | None,
+    now: datetime,
+    beat: Callable[[], None] | None,
+) -> tuple[list[StoredTripPlan], datetime | None]:
+    """`_card_pages` for the trip plans: an expired or unreadable document is skipped, while its
+    stamp still moves the watermark."""
+    entries: list[StoredTripPlan] = []
+    newest = since
+    cursor = None
+    for _page in range(TRIP_PLAN_MAX_PAGES):
+        page = _stream(_query(name, inequality=inequality, limit=TRIP_PLAN_PAGE_SIZE,
+                              start_after=cursor))
+        for snapshot in page:
+            doc = _doc(snapshot)
+            stamp = _as_dt(doc.get(TRANSLATION_STAMP_FIELD))
+            if stamp is not None and (newest is None or stamp > newest):
+                newest = stamp
+            if not _not_expired(doc, now) or not isinstance(doc.get("plan"), str):
+                continue
+            try:
+                oslo_date = date.fromisoformat(str(doc.get("oslo_date")))
+            except ValueError:
+                continue
+            entries.append(StoredTripPlan(str(doc.get("from_stop")), str(doc.get("to_stop")),
+                                          oslo_date, doc["plan"]))
+        if beat is not None:
+            beat()
+        if len(page) < TRIP_PLAN_PAGE_SIZE:
+            break
+        cursor = page[-1]
+    return entries, newest
+
+
+def seed_trip_plans(
+    *, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[StoredTripPlan], datetime | None]:
+    """Every live plan, NEWEST first, for a pod starting or taking the lease."""
+    with _span("notification_store.seed_trip_plans"):
+        return _trip_plan_pages("trip_plans_seed", inequality=None, since=None,
+                                now=now or _now(), beat=beat)
+
+
+def sync_trip_plans(
+    *, since: datetime, now: datetime | None = None, beat: Callable[[], None] | None = None
+) -> tuple[list[StoredTripPlan], datetime | None]:
+    """What the leader merged after `since`, less the mirror's overlap (re-reading a plan is a
+    no-op: it is applied by key), oldest first."""
+    with _span("notification_store.sync_trip_plans"):
+        return _trip_plan_pages(
+            "trip_plans_sync",
+            inequality={TRANSLATION_STAMP_FIELD: since - timedelta(seconds=MIRROR_SYNC_OVERLAP_S)},
             since=since,
             now=now or _now(),
             beat=beat,

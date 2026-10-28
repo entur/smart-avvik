@@ -477,6 +477,53 @@ def _observation_fields(alert: Alert) -> dict:
     }
 
 
+#: :func:`_trip_fields`' keys, which only a departure with a change's row carries.
+_TRIP_COLUMNS = ("trip_legs", "trip_reason_kind", "trip_reason_index", "trip_p_miss")
+
+
+def _trip_fields(alert: Alert) -> dict:
+    """A departure with a change's four columns (multi-leg U11, KTD16); none on a direct train.
+
+    Absent rather than NULL there, which the table reads the same: a direct row stays the bytes it
+    always was, and the streaming insert never rejects one for naming a column the startup ALTER
+    added minutes before (~10 min, `.claude/rules/historikk.md`) -- only a trip row can be.
+
+    `trip_legs` is every continuation the verdict was taken over, planned first, as JSON: what the
+    nightly labeller resolves «connection held» and the arrival delay from, since `trip.legs` is the
+    planned route alone and carries no journey key. The reason kind and index are `trip.problem`'s,
+    so NULL below the bar; `trip_p_miss` is the planned route's own KTD7 figure, whatever decided.
+    The deciding pair itself is `impact_probability`/`alert_threshold` (:func:`_gated_figure`).
+    Cheap enough for :func:`rescored`, so a closing row carries the last look's trip too.
+    """
+    legs = getattr(alert, "trip_legs_snapshot", None)
+    if legs is None:
+        return {}
+    problem = getattr(getattr(alert, "trip", None), "problem", None)
+    return {
+        "trip_legs": json.dumps(legs, separators=(",", ":")),
+        "trip_reason_kind": getattr(problem, "kind", None),
+        "trip_reason_index": getattr(problem, "index", None),
+        "trip_p_miss": getattr(alert, "trip_p_miss", None),
+    }
+
+
+def _gated_figure(alert: Alert) -> float | None:
+    """The figure the alert gate decided on: a departure with a change's DECIDING reason when it is
+    set (multi-leg KTD6), else the boarding call's own. Recording one number and applying another is
+    the failure `alert_policy.gate`'s docstring forbids, and `/historikk`'s precision reads these
+    two columns as the pair the gate applied. The trip's own columns are :func:`_trip_fields`.
+    Restated as `varsel._gated_figure` for the thinning ledger; keep the two in step."""
+    deciding = getattr(alert, "deciding_probability", None)
+    return deciding if deciding is not None else getattr(alert, "impact_probability", None)
+
+
+def _gated_bar(alert: Alert) -> float | None:
+    """The bar beside :func:`_gated_figure`, from the same source."""
+    if getattr(alert, "deciding_probability", None) is not None:
+        return getattr(alert, "deciding_threshold", None)
+    return getattr(alert, "alert_threshold", None)
+
+
 def build_row(
     journey: dict,
     alert: Alert,
@@ -547,6 +594,7 @@ def build_row(
     return {
         **_observation_fields(alert),
         **_alternative_fields(alert),
+        **_trip_fields(alert),
         "message_input": message_input,
         "llm_provider": llm_provider,
         "llm_model": llm_model,
@@ -580,12 +628,12 @@ def build_row(
         # The destination half of the same split (2026-10-19): the boarding call ran and ET had
         # cancelled the call at `to_stop`, so the 1.0s beside it are a relayed fact too.
         "destination_cancelled": bool(getattr(alert, "destination_cancelled", False)),
-        "impact_probability": getattr(alert, "impact_probability", None),
+        "impact_probability": _gated_figure(alert),
         "cancel_probability": getattr(alert, "cancel_probability", None),
         "ge10_probability": getattr(alert, "ge10_probability", None),
         "delay_p50_min": getattr(alert, "delay_p50_min", None),
         "delay_p90_min": getattr(alert, "delay_p90_min", None),
-        "alert_threshold": getattr(alert, "alert_threshold", None),
+        "alert_threshold": _gated_bar(alert),
         "alertworthy": bool(getattr(alert, "alertworthy", False)),
         "pushed": bool(pushed),
         "n_devices": n_devices,
@@ -641,19 +689,21 @@ def rescored(row: dict, alert: Alert) -> dict:
         minutes_to_departure = int((departure - decided_at).total_seconds() // 60)
     impact = getattr(alert, "impact", None)
     return {
-        **row,
+        # A trip row's columns go with it when the last look is a direct train's (the same subject).
+        **{key: value for key, value in row.items() if key not in _TRIP_COLUMNS},
         **_observation_fields(alert),
         **_alternative_fields(alert),
+        **_trip_fields(alert),
         "decided_at": decided_at.isoformat(),
         "minutes_to_departure": minutes_to_departure,
         "et_cancelled": bool(getattr(alert, "cancelled", False)),
         "destination_cancelled": bool(getattr(alert, "destination_cancelled", False)),
-        "impact_probability": getattr(alert, "impact_probability", None),
+        "impact_probability": _gated_figure(alert),
         "cancel_probability": getattr(alert, "cancel_probability", None),
         "ge10_probability": getattr(alert, "ge10_probability", None),
         "delay_p50_min": getattr(alert, "delay_p50_min", None),
         "delay_p90_min": getattr(alert, "delay_p90_min", None),
-        "alert_threshold": getattr(alert, "alert_threshold", None),
+        "alert_threshold": _gated_bar(alert),
         "alertworthy": bool(getattr(alert, "alertworthy", False)),
         "pushed": False,
         "snapshot_refreshed_at": (

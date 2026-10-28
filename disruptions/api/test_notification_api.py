@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -2554,6 +2555,159 @@ def test_the_journey_status_schema_matches_the_response_models_in_both_direction
     alerts = schemas["JourneyAlerts"]["properties"]
     assert top["properties"]["journey"] == alerts["journey"]
     assert set(top["properties"]["coverage"]["properties"]) == set(alerts["coverage"]["properties"])
+
+
+def test_train_status_trip_is_the_one_trip_model_required_and_nullable():
+    """Multi-leg KTD13 and U9: `TrainStatus.trip` is in `required` (the strict schema lists every
+    property, so it is present with the flag off, as null -- R16) and nullable (null on a direct
+    train), and it is `payload.trip`'s one model, `alternatives.TripFacts`. So its shape at every
+    level -- keys, types, enums, `required` -- is the event schema's, with `additionalProperties:
+    false` added as on every other object here; only the descriptions may speak to this read."""
+    import journey_status
+    from alternatives import TripFacts, TripLeg, TripProblem, TripTransfer
+
+    train = OPENAPI["components"]["schemas"]["TrainStatus"]
+    assert "trip" in train["required"]
+    field = journey_status.TrainStatus.model_fields["trip"]
+    assert field.is_required() and field.annotation == TripFacts | None
+    published = train["properties"]["trip"]
+    assert published["type"] == ["object", "null"]
+    for node, model in (
+        (published, TripFacts),
+        (published["properties"]["legs"]["items"], TripLeg),
+        (published["properties"]["transfers"]["items"], TripTransfer),
+        (published["properties"]["problem"], TripProblem),
+    ):
+        assert set(node["properties"]) == set(model.model_fields) == set(node["required"]), model.__name__
+        assert node["additionalProperties"] is False, model.__name__
+
+    def shape(node):
+        if isinstance(node, dict):
+            return {k: shape(v) for k, v in node.items() if k not in ("description", "additionalProperties")}
+        return [shape(v) for v in node] if isinstance(node, list) else node
+
+    event_trip = EVENT_SCHEMA["properties"]["payload"]["properties"]["trip"]
+    assert shape({**published, "type": "object"}) == shape(event_trip)
+
+
+def _real_trip_payload() -> dict[str, Any]:
+    """`_real_payload`'s producer for a departure with a change (multi-leg KTD13): an unscored
+    first leg (no figures of ours) whose change at C is likely missed."""
+    import varsel
+    from alternatives import TripFacts, TripLeg, TripProblem, TripTransfer
+
+    leg = {"mode": "rail", "line": "VYG:Line:R12", "public_code": "R12"}
+    alert = varsel.Alert(
+        situation_number="KIX:Trip:VYG:t17:2026-09-08", summary="Mulig avvik", line="VYG:Line:R13",
+        operator="VYG", jkey="t17", stop_place=FROM, stop_order=1, departure_time=NOW,
+        cancel_probability=None, delay_p50_min=None, delay_p90_min=None, impact_probability=None,
+        alert_threshold=0.85, alertworthy=True, has_situation=False,
+        trip=TripFacts(
+            legs=[
+                TripLeg(**leg, board_stop_place=FROM, alight_stop_place="C", aimed_departure=NOW,
+                        aimed_arrival=NOW + timedelta(minutes=7)),
+                TripLeg(**leg, board_stop_place="C", alight_stop_place=TO,
+                        aimed_departure=NOW + timedelta(minutes=13),
+                        aimed_arrival=NOW + timedelta(minutes=48)),
+            ],
+            transfers=[TripTransfer(stop_place="C", walk_min=0, slack_min=6)],
+            expected_arrival=None,
+            problem=TripProblem(kind="missed_connection", index=0, probability=1.0, threshold=0.85),
+        ),
+        deciding_probability=1.0,
+        deciding_threshold=0.85,
+    )
+    return varsel._webhook_payload(
+        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=("s", "s_en", "s_nn")
+    )
+
+
+def test_payload_trip_is_published_as_the_one_trip_model_and_effect_as_a_closed_vocabulary():
+    """KTD13: `payload.trip` is `TripFacts` dumped, so the schema states that model's key sets at
+    every level, both ways, as plain objects (the generator handles no `oneOf` or `$defs`); it is
+    optional, being absent on a direct train. `effect` enumerates every value the producer can
+    write, `missed_connection` included, which is what gives the typed client its literal union."""
+    from typing import get_args
+
+    from alternatives import (
+        TripFacts,
+        TripLeg,
+        TripProblem,
+        TripReasonKind,
+        TripTransfer,
+    )
+
+    payload = EVENT_SCHEMA["properties"]["payload"]
+    trip = payload["properties"]["trip"]
+    assert "trip" not in payload["required"]
+    assert "$defs" not in json.dumps(EVENT_SCHEMA) and "oneOf" not in json.dumps(EVENT_SCHEMA)
+    for schema, model in (
+        (trip, TripFacts),
+        (trip["properties"]["legs"]["items"], TripLeg),
+        (trip["properties"]["transfers"]["items"], TripTransfer),
+        (trip["properties"]["problem"], TripProblem),
+    ):
+        assert set(schema["properties"]) == set(model.model_fields), model.__name__
+        assert set(schema["required"]) == set(schema["properties"]), model.__name__
+    assert trip["properties"]["problem"]["properties"]["kind"]["enum"] == list(get_args(TripReasonKind))
+
+    effect = payload["properties"]["effect"]["enum"]
+    assert effect == ["cancelled", "delayed", "missed_connection", None]
+    # The producer is `varsel._effect`, an early-return cascade: every literal it returns, and the
+    # payload takes `effect` from nowhere else.
+    assert '"effect": _effect(alert),' in VARSEL_SOURCE
+    block = VARSEL_SOURCE.split("\ndef _effect(", 1)[1].split("\n\n\n", 1)[0]
+    written = set(re.findall(r'^\s*return\s+"([a-z_]+)"\s*$', block, re.MULTILINE))
+    assert written == {"cancelled", "delayed", "missed_connection"}, written
+
+
+def test_a_trip_payload_is_the_direct_shape_plus_trip_and_the_test_event_stays_direct():
+    """The envelope and the open sub-objects keep their key sets on a departure with a change; the
+    one addition is `trip`, whose keys are the schema's. The synthetic event is a direct train, so
+    it carries no `trip` key -- which is what keeps the committed sample unchanged."""
+    real, direct = _real_trip_payload(), _real_payload()
+    assert set(real) == set(direct) | {"trip"}, set(real) ^ set(direct)
+    for key in ("notification", "call", "probabilities"):
+        assert set(real[key]) == set(direct[key]), key
+    schema = EVENT_SCHEMA["properties"]["payload"]["properties"]["trip"]
+    assert set(real["trip"]) == set(schema["properties"])
+    assert set(real["trip"]["legs"][0]) == set(schema["properties"]["legs"]["items"]["properties"])
+    assert real["trip"]["problem"] == {
+        "kind": "missed_connection", "index": 0, "probability": 1.0, "threshold": 0.85,
+    }
+    # A JP-expected miss is 1.0 and PREDICTED: it rides in the problem, never in `probabilities`.
+    assert real["probabilities"]["impact"] is None and real["probabilities"]["cancellation"] is None
+    assert real["effect"] == "missed_connection" and real["arrival"] is None
+    _install()
+    bearer = _provision()
+    try:
+        client = _client()
+        client.post(
+            "/notification-api/v1/subscriptions",
+            json=_body(subscription_id="probe", test=True),
+            headers=_headers(bearer),
+        )
+        client.post(
+            "/notification-api/v1/test-events", json={"subscription_id": "probe"}, headers=_headers(bearer)
+        )
+        assert "trip" not in json.loads(_deliveries[0]["body"])["payload"]
+    finally:
+        _uninstall()
+
+
+def test_both_reads_publish_coverage_transfers_with_required_equal_to_properties():
+    """KTD13 and R16: `CoverageOut` is `extra="forbid"` and shared by journey-alerts and
+    journey-status, so the field is in both published coverage blocks, required (present with the
+    flag off, as `not_evaluated`), with the vocabulary `trips.transfer_coverage` answers in."""
+    from typing import get_args
+
+    import trips
+
+    for name in ("JourneyAlerts", "JourneyStatus"):
+        coverage = OPENAPI["components"]["schemas"][name]["properties"]["coverage"]
+        assert set(coverage["properties"]) == set(notification_pull.CoverageOut.model_fields), name
+        assert set(coverage["required"]) == set(coverage["properties"]), name
+        assert coverage["properties"]["transfers"]["enum"] == list(get_args(trips.TransferCoverage)), name
 
 
 def test_the_call_payload_promises_only_what_both_producers_emit():

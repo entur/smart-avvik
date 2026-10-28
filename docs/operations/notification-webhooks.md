@@ -551,11 +551,23 @@ silently.
 | `notification_pull` | the journey-keyed public read, ONE record per request (`GET /notification-api/v1/journey-alerts`, 2026-09-10) | `result` (`ok`, `not_loaded`, `matcher_failed` — a WARNING whose message names the exception's TYPE only, `rate_limited`, and since U4 `enrich_failed` — the same WARNING shape, for the background enrichment task's matcher run or the task itself), `cache` (`hit`/`miss`), `n_alerts` (what the answer lists, before `limit`), `wait_s`, `ms`, `pair_digest` (`alternatives.pair_digest`, the salted per-process digest of the canonical stop pair), `client_name` (the caller's `ET-Client-Name` header when it is a `[A-Za-z0-9._-]{1,64}` label, `invalid` when it is anything else, null when absent — the one way to tell anonymous callers apart, since the access log sees only the ingress and the ingress only Google's proxy). **Nothing else**: no ref, no name, no departure time, no prose, and a 422 logs nothing at all. **One record under this name is NOT per request**: since U15 the poller emits `result="warm_failed"` with `n` at WARNING, once per PASS, when the pass's figures warm raised for one or more definitions — those reads then compute instead of hitting, which costs latency and nothing else. It carries no `cache`, `n_alerts` or `pair_digest`, and it is counted rather than logged per definition because at a hundred thousand registrations one line per definition is how a real warning stops being read. The process's HTTP access log redacts this path's query string too (`logging_setup._AccessLogRedaction`), because the refs ride in it |
 | `notification_pull_bounded` | a bound binding on the read's enrichment (U4) | `reason` (`queue_full` — the task was refused and every listed entry marked `capped`; `wordings_per_read`; `alternative_lookups`; `wording_allowance` — the PULL allowance answered `rate_limited`; `waiters` — no waiter slot, the read behaved as `wait=0`), `n` (entries the bound touched), `pair_digest`. Nothing identifying. The read's own record also carries `result="enrich_failed"` at WARNING when the task's matcher run raised — the exception's TYPE in the message, never its text |
 | `notification_status` | the journey-status public read, ONE record per request (`GET /notification-api/v1/journey-status`, plan 2026-09-22-001) | `result` (`ok`, `not_loaded` — the day's planned timetable has not been loaded into memory since the pod started, answered 503 `plan_not_loaded`, `status_failed` — the grading raised, answered 503 `status_failed`, with a separate WARNING naming the exception's TYPE only, `rate_limited`), `n_trains` (trains in the answer), `ms`, `pair_digest`, `client_name` (as `notification_pull`'s). **Nothing else**: no ref, no name, no departure time, and a 422 logs nothing. The read is a memory walk — no BigQuery, no matcher, no model — so there is no `cache` field: nothing is cached. **It spends the SAME limiter buckets as `journey-alerts`**, global and per pair: a client reading both routes for one favourite spends the published thirty per pair per minute twice as fast. Its query string is redacted from the access log like `journey-alerts`' |
-| `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"`, `ms`, `cpu_ms`, `result`, and `rss_delta_bytes` where /proc can be read. `cpu_ms` is process CPU for the step, so it includes request-path work served during it and can exceed `ms` when a pool fans out; it is the figure the capacity table above is read from |
+| `trip_plans_fetch` | one Journey Planner plan fetch of one range (multi-leg journeys, 2026-10-28): the leader's `trip_plans` phase, or a pod's background fetch for a public read that missed | `pair_digest`, `path` (`plans` for the leader, `plans_pull` for a read miss), `result` (`complete`; `partial` — some pages landed, never merged; `failed` — none did), `reason` (null when complete; `page_bound`, `rate_limited` — the path's per-minute ceiling refused a page, `fetch_error`, `malformed` — a pattern failed to parse and failed its page, `bad_stop_ref`; `flight_error` when a read-miss thread itself raised, a record that carries only `path`, `result`, `reason`, `error` and `pair_digest`), `error` (the exception's class), `pages`, `trips`, `directs`, `ms`. INFO when `complete`, WARNING otherwise. The share of non-`complete` results is what the owed Grafana rule reads (manual step 11) |
+| `trip_plans_refresh` | the leader's `trip_plans` phase, one record per cycle | `due` (ranges outside the plans' fresh covered ranges), `fetched`, `complete`, `left_due` (what `trip_plans._PHASE_DEADLINE_S` cut off; due again next cycle), `ms` |
+| `trip_plans_store` | a `complete` fetch the store transaction could not write | `result` (`store_error`), `error`, `pair_digest`. The leader merges into its own memory instead and serves it; followers see that range only once a later write of the same pair and date lands |
+| `trip_plans_follow` | a pod reading the stored plans into memory (lifespan, follower tick, taking the lease) | `result` (`seeded` — the first read; `synced` — a watermark read that applied something; `follow_error` with `error`), `applied`, `unreadable` (documents that failed to parse and were skipped). A quiet sync logs nothing |
+| `trip_realtime_fetch` | one per-leg real-time refresh: the leader's `trip_realtime` phase or its held tick, a follower's tick — **per pod, about once a minute each** | `result` (`none` — no unscored leg of a watched trip boarding within the look-ahead; `complete`; `partial`; `failed`), `error`, `wanted` (legs that need an answer), `asked`, `answered`, `requests`, `failed`, `refused` (1 when the `realtime` path's ceiling refused a request), `held` (answers this pod holds), `ms`. WARNING when `failed` or `refused` is non-zero |
+| `trip_plans_read_miss` | a public read that could not start its plan fetch | `result` (`error`), `error`, `pair_digest`. The read answers without the trips with a change |
+| `trip_verdict_error` | `trips.judge` raised inside `impact` | `error`. That call serves the direct trains alone |
+| `trip_merge_error` | `varsel` could not merge one definition's trips with a change | `error`. That definition is served its direct trains alone this cycle |
+| `trips_unwired` | once per process, when `trips.configure(call_lookup=...)` was never called | no field beyond `event`: every leg reads unknown, so nothing with a change alerts. A deployment bug, never a load condition |
+| `poller_phase` | the cycle breakdown | `phase="notification_webhooks"` or `"notification_servability"` — and, with `TRIP_PLANS_ENABLED` on, `"trip_plans"` and `"trip_realtime"` (see [the trips with a change](#trips-with-a-change-two-phases-and-journey-planner-volume)) — `ms`, `cpu_ms`, `result`, and `rss_delta_bytes` where /proc can be read. `cpu_ms` is process CPU for the step, so it includes request-path work served during it and can exceed `ms` when a pool fans out; it is the figure the capacity table above is read from |
 
 **What no `notification_*` or `webhook_*` log line carries:** an origin, a destination, a departure time, a full callback
 URL, a credential secret, or any notification prose. Read the qualifier — it is about these events,
-and the fourth entry below is why it needs one.
+and the fourth entry below is why it needs one. The `trip_*` records hold to a narrower rule of their
+own (multi-leg R17): no stop, line, journey or time, and an exception's class rather than its
+message, because JP's `errors` can echo the request document and the document holds the stop pair.
+`pair_digest` is the most any of them carries.
 
 **What some do carry, named rather than glossed** — this is the honest half of the retention claim:
 
@@ -589,7 +601,13 @@ and the fourth entry below is why it needs one.
   registration with exactly those five fields exists and is alert-worthy now**: a registered
   definition the pass has worded answers complete at once, a cold one waits or answers `pending`.
   The mitigation is that no status ever says so, and that a definition is a stop pair with a
-  period, not a person. (2) **The global ceiling and the wording and Journey Planner allowances are
+  period, not a person. **Trips with a change break that mitigation** (2026-10-28): with
+  `TRIP_PLANS_ENABLED` on, a first read's `coverage.transfers` and `complete` are statuses that
+  answer `evaluated`/complete for the hours a registration on the pair covers (the leader holds its
+  plan) and `not_evaluated`/incomplete elsewhere, so probing narrow windows shows which hours of a
+  pair someone registered. Accepted by the owner while the flag is on in dev only; decide before
+  prd. The fix is to judge a public read only from `trip_plans`' public-read cache, never the
+  leader's plans, at one extra `plans_pull` fetch per pair, date and pod. (2) **The global ceiling and the wording and Journey Planner allowances are
   shared by every anonymous caller**, the app's BFF included, with no reserved slice — one source
   at `MAX_PER_MIN` holds every caller at 429, one at `WORDINGS_PER_DAY` holds every caller
   template-only for the trailing day; the client contract tells the BFF to treat both as ordinary
@@ -790,6 +808,104 @@ share of the cycle, and `capped`/`abandoned`/`overlap_refused` on the emit recor
 triggers above; the oldest pending event; per-destination outcomes;
 suppression reasons; quota breaches; request rejections. **Do not count a 2xx from the BFF as a
 notification on a phone.**
+
+---
+
+## Trips with a change: two phases and Journey Planner volume
+
+Departures that reach the destination only with a change (plan 2026-10-24-001) are behind one flag,
+`TRIP_PLANS_ENABLED`, read per call (`trips.enabled()`; unset or anything but `1`/`true`/`yes`/`on`
+is off). The Helm values turn it on in dev and leave it off in tst and prd; prd waits for the plan's
+U12 dev review and its pass marks. Off, nothing below runs: no plan or real-time request, no store
+read, and the two phases are **absent** from `poller_cycle.phases`, not zero.
+
+**Two poller phases**, each with its own guard, so a JP or store failure keeps the plans and answers
+already held:
+
+- **`trip_plans`** (the leader's): every registered definition's boarding windows on both channels
+  (`varsel.registered_definitions`), grouped by canonical pair, become fetch ranges per Oslo date;
+  a range is fetched when no fresh fetch covers it, and only a `complete` fetch is merged, through a
+  Firestore transaction, into the pair's day plan. Every pod reads the stored plans into memory
+  (`trip_plans.follow`: in the lifespan, on each follower tick and on taking the lease). Bounded by
+  `_PHASE_DEADLINE_S` (20 s), **checked between fetches, never inside one**: with JP down each range
+  fails on its first page, so the phase costs 20 s plus one 3 s timeout (`alternatives._HTTP_TIMEOUT_S`);
+  with JP slow but answering, the overshoot is one range's pages at up to 3 s each — four to six for
+  a one- or two-hour window, `_MAX_PAGES` (50) for a whole-day one — plus one store transaction per
+  `complete` fetch. What the deadline cuts off is `left_due` on `trip_plans_refresh` and stays due.
+- **`trip_realtime`** (every pod's own): JP's real-time state of the legs our figures do not score,
+  for watched trips whose first leg leaves within `REALTIME_LOOKAHEAD_S` (2 h). At most
+  `_REALTIME_MAX_REQUESTS` (3) requests of `_REALTIME_BATCH` (10) legs, so ~9 s with JP down. An
+  answer older than `REALTIME_MAX_AGE_S` (360 s, about two cycles) is no answer: the leg reads
+  unknown, never on time. The leader runs it in this phase and again on a tick whose cycle did not
+  run, once its last refresh is `main._TRIP_REALTIME_TICK_S` (60 s) old; a follower runs it on its
+  tick. It is not a `poller_phase` on those ticks — read `trip_realtime_fetch` instead.
+
+**Both sit right after `line_modes` and above `varsel_stops`**, `trip_realtime` straight after the
+plans it reads, not just before `varsel_notify` where the plan's KTD8 put the real-time read. The
+reason is the orphan window (the comment on `varsel_stops` in `main._rebuild_all`): everything
+between the prediction-cache swap and `varsel_notify` serves the deterministic wording, and 20 s of
+plan fetching plus ~9 s of real-time inside it would widen that window by as much. The price: the
+pass reads real-time answers about one cycle old, judged against the previous cycle's snapshot, and
+under the store backend another pod's new registration is fetched one cycle (~2-3 min) later.
+
+**Journey Planner volume.** Three paths, each its own per-minute page ceiling in
+`alternatives._FETCH_CEILINGS`, all per pod (see "Every number in this table that a process counts
+is PER POD" below):
+
+- **Plan pages a day, the leader's (`plans`, 60 a minute)** ≈ Σ over registered (canonical pair,
+  fetch range, travel date) of **N × P**:
+  - **N = ⌈(24 h + E + 1.5 h) / 3 h⌉**, how often one range is fetched. `varsel.journey_windows`
+    offers a travel date's window from Oslo midnight the day **before** (it offers today's and
+    tomorrow's) until `varsel._WINDOW_CATCH_UP` (90 min) past its end E (hours after midnight), and
+    the range is fetched again whenever its covering fetch is `PLAN_REFRESH_S` (3 h) old. A
+    07:00-08:00 window: ⌈33.5 / 3⌉ = 12 fetches, the first ~31 h before it opens. The plan's KTD1
+    says "the evening before"; the code's answer is midnight the day before.
+  - **P**, the pages one fetch takes: at most `_page_bound` of the range (4 for an hour, 6 for two),
+    in practice one or two for an hour, since a page of 12 patterns covers ~36-180 min of
+    departures (the densities in `trip_plans`' docstring).
+  - The sum runs over distinct ranges, not definitions: definitions on one canonical pair share its
+    plan, and overlapping windows on one date are one range (`trip_plans.fetch_ranges`).
+
+  At ~160 pairs of one-hour windows that is 160 × 12 × 1-2 ≈ **1 900-3 800 pages per travel day**,
+  7 700 at the page bound — two to four times the plan's estimate of ~1 000, which assumed a fetch
+  the evening before and a few refreshes (about six per pair a day). `PLAN_REFRESH_S` is the knob: N
+  scales with its inverse. The fetches come in waves, because a travel date's ranges all fall due at
+  Oslo midnight and each again three hours after its own last fetch; a wave is drained at most 20 s
+  of fetching per cycle and 60 pages a minute, and the rest stays due. **A page the ceiling refused
+  is a `trip_plans_fetch` with `reason="rate_limited"`** — the ceiling working, not JP failing — so
+  read `reason` before acting on the not-`complete` share.
+- **Real-time requests, every pod's (`realtime`, 20 a minute)**: at most 3 per refresh and about one
+  refresh a minute per pod, and none while no watched trip boarding within 2 h has a leg we do not
+  score. So at most ~3 a minute, ~4 300 a day per pod; the path's 20 a minute is headroom rather
+  than the bound. The registered pairs' legs are asked first, the public reads' after.
+- **Public-read plan pages, any pod's (`plans_pull`, 20 a minute)**: a read that finds no plan
+  covering what it needs -- from now to at most `notification_pull.PLAN_HORIZON_H` (3 h) ahead --
+  fetches in the background, never waiting beyond its own `wait`, and reaches
+  `PLAN_FETCH_MARGIN_H` (1 h) further, so at most 10 pages a fetch by the bound, and again about
+  once an hour per (pair, date) while somebody keeps reading it. Without the margin the range a read
+  needs, which moves with the clock, left the fetched one a second later, and every following read
+  missed, refetched the same hours and answered `no-store`. At most `PUBLIC_FLIGHTS_MAX` (4) fetches
+  are in flight on a pod, one per (pair, date). A
+  `complete` plan goes into the pod's own cache of `PUBLIC_PLANS_MAX` (1 000) (pair, date) plans,
+  least recently read dropped first — never stored, never refreshed by the leader. A `partial` or
+  `failed` one is dropped and the next read asks again. A failure to START the fetch is
+  `trip_plans_read_miss`.
+
+**The public read's horizon (2026-10-28).** `coverage.transfers` on journey-alerts and
+journey-status is said over the whole period ahead of the read; the fetch covers only the next
+`PLAN_HORIZON_H` hours. So a window reaching past that, on a pair whose held plans do not cover the
+rest (no registration does), reads `not_evaluated`, and that later part does not by itself make the
+answer `complete: false`: no read fetches it, so a later read would not complete it either. Until
+2026-10-28 coverage was said over the fetched hours only, so a whole-day favourite read `evaluated`
+and `complete: true` for hours nobody had fetched, and a trip past the horizon in a plan that did
+hold it could be listed under `none`. Pinned by `test_notification_pull.py`'s
+`test_a_whole_day_read_never_reads_hours_nobody_fetched_as_evaluated`.
+
+**What to watch:** the not-`complete` share of `trip_plans_fetch` by `path` and `reason` (manual step
+11 is its alert rule); `left_due` above zero on `trip_plans_refresh` cycle after cycle, which means
+the deadline cuts off work faster than it drains; `refused` on `trip_realtime_fetch`; and the two
+phases' `ms` against the ceilings above. None of these records carries a stop, line, journey or time
+(R17).
 
 ---
 
@@ -1612,6 +1728,22 @@ reads it — the other five are read from the account on each pass.
 | `notification_wording.WORDINGS_PER_HOUR` | 2000 |
 | `notification_wording.WORDINGS_PER_DAY` | 10000 |
 | `alternatives._PULL_FETCH_MAX_PER_MIN` | 30 |
+| `alternatives._PLANS_FETCH_MAX_PER_MIN` | 60 |
+| `alternatives._PLANS_PULL_FETCH_MAX_PER_MIN` | 20 |
+| `alternatives._REALTIME_FETCH_MAX_PER_MIN` | 20 |
+| `trip_plans._PAGE_MINUTES` | 30 |
+| `trip_plans._MAX_PAGES` | 50 |
+| `trip_plans.PLAN_REFRESH_S` | 10800 |
+| `trip_plans._PHASE_DEADLINE_S` | 20 |
+| `trip_plans.REALTIME_LOOKAHEAD_S` | 7200 |
+| `trip_plans.REALTIME_MAX_AGE_S` | 360 |
+| `trip_plans._REALTIME_BATCH` | 10 |
+| `trip_plans._REALTIME_MAX_REQUESTS` | 3 |
+| `trip_plans.PUBLIC_PLANS_MAX` | 1000 |
+| `trip_plans.PUBLIC_FLIGHTS_MAX` | 4 |
+| `main._TRIP_REALTIME_TICK_S` | 60 |
+| `notification_pull.PLAN_HORIZON_H` | 3 |
+| `notification_pull.PLAN_FETCH_MARGIN_H` | 1 |
 
 **The journey-keyed pull read** (plan 2026-09-10-001): the `notification_pull.*` rows are the public
 read's own numbers. The first seven are the read without enrichment (U3) — its limiter (a global
@@ -1635,6 +1767,19 @@ spends and nothing else does (R4): its wording ceilings per minute, hour and day
 own latch holder) and its Journey Planner budget (`alternatives._PULL_FETCH_MAX_PER_MIN`). The
 published contract (U5, 2026-09-10) added no row: every number the read publishes was already here,
 and the client contract's rate-limit table quotes these.
+
+**The trips with a change** (multi-leg journeys, plan 2026-10-24-001, KTD18): the rows from
+`alternatives._PLANS_FETCH_MAX_PER_MIN` down. Journey Planner traffic for them has three paths of
+its own beside the alternative lookups', each a per-minute page ceiling, so plan traffic can never
+eat a lookup's share: `plans` for the leader's phase, `plans_pull` for a pod fetching a plan for a
+public read that missed, `realtime` for the batched per-leg real-time reads. A fetch's page bound is
+`trip_plans._page_bound` = min(⌈range minutes / `_PAGE_MINUTES`⌉ + 2, `_MAX_PAGES`): 30 minutes a
+page sits below the densest page measured (~36 min, Nationaltheatret → Oslo S at peak), and 50 is
+the formula's own value for a whole day. The rest are the refresh interval and the phase deadline,
+the real-time look-ahead, answer age, batch, requests per refresh and the leader's off-cycle tick,
+the per-pod public-read cache and its flights, and the read's fetch horizon and the margin its fetch
+reaches past it. What they add up to is
+in [the trips with a change](#trips-with-a-change-two-phases-and-journey-planner-volume).
 
 **Every number in this table that a process counts is PER POD** (2026-10-13, the poller lease's
 KTD12). dev and prd run one to three API pods behind a rolling update and a CPU autoscaler, every pod
@@ -1851,6 +1996,13 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
 10. **Run the client trial**: a test-phone notification for both a predicted and a confirmed event,
    plus a generic HTTPS receiver outside Firebase. No test can stand in for it, because a 2xx from a
    BFF is not a notification on a phone.
+11. **Hand-build the Grafana rule for the trip plan fetches** (multi-leg plan, U12 step 2), in dev
+   and prd, routed to the `alerts-kix` Slack contact point like the other rules: fire when more than
+   **5 %** of `trip_plans_fetch` records over the last **24 h** have `result` other than `complete`
+   (`partial` or `failed`), and only when that window holds **at least 20** of them, since the
+   fetches come in waves a few times a day and a quiet day's two failures out of ten is noise. The
+   same share over the dev review period is one of the three marks prd's flag waits for. Build it by
+   hand rather than through the importer, and prove it can fire before trusting it quiet.
 
 ## Known limitations, recorded rather than smoothed over
 

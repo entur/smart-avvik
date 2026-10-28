@@ -1765,5 +1765,191 @@ def test_the_retriable_set_is_the_sdks_own():
     assert not llm_message._retriable(ValueError("not transport"))
 
 
+# ---- multi-leg U7: a departure with a change ----------------------------------------------------
+# AE1: Lier -> Oslo S, the R13 07:17 continues as the R12 07:30 from Drammen with 4 min of slack.
+TRIP_DEP = datetime(2026, 10, 27, 6, 17, tzinfo=UTC)  # 07:17 Europe/Oslo (CET)
+
+#: Today's direct document for a train with every optional part, captured before U7 (prompt
+#: b12a7867). A trip with a change must not move one byte of it.
+DIRECT_INPUT_GOLDEN = (
+    '{"alternativ_reise": {"ankommer_i_tide": false, "ankomst_kl": "08:57", "avgang_kl": "08:24", '
+    '"egen_risiko": false, "minutter_senere": 4, "reisevei": [{"fra": "Oslo S", "linje": "R10", '
+    '"til": "Drammen", "transportmiddel": "rail"}]}, "avgang_kl": "08:12", "destinasjon": "Skien", '
+    '"forsinkelse_min": {"typisk": 15, "verstefall": 27}, "i_morgen": true, "linje": "R11", '
+    '"linjer": [{"linje": "VYG:Line:R11", "operator": "VYG", "siste_observasjon": {"forsinket_min": '
+    '18, "innstilt": false, "observert_kl": "07:42", "stopp": "Asker"}}], '
+    '"mest_sannsynlig_innstilt": false, "reise": {"fra": "A", "til": "B"}, '
+    '"sannsynlighet_prosent": 93, "situasjoner": [{"beskrivelse": "Vi jobber med feilretting.", '
+    '"sammendrag": "Signalfeil ved Asker"}], "transportmiddel": "Tog"}'
+)
+
+
+def _direct_alert():
+    alert = FakeAlert()
+    alert.situation_number, alert.line, alert.destination = "S1", "VYG:Line:R11", "Skien"
+    alert.alternative_journey = FakeAlternative(arrives_before_original=False, minutes_saved=-4)
+    alert.alternative_journey.minutes_after_original = 4
+    return alert
+
+
+def _trip_facts(kind="missed_connection", index=0, *, expected=TRIP_DEP + timedelta(minutes=63)):
+    """`alternatives.TripFacts` in the fields the builder reads (duck-typed, as the builder is)."""
+    leg = SimpleNamespace
+    legs = [
+        leg(mode="rail", line="VYG:Line:R13", public_code="R13", destination=None, from_name="Lier",
+            to_name="Drammen", board_stop_place="NSR:StopPlace:L", alight_stop_place="NSR:StopPlace:D",
+            aimed_departure=TRIP_DEP, aimed_arrival=TRIP_DEP + timedelta(minutes=9), cancelled=False),
+        leg(mode="rail", line="VYG:Line:R12", public_code="R12", destination="Kongsberg",
+            from_name="Drammen", to_name="Oslo S", board_stop_place="NSR:StopPlace:D",
+            alight_stop_place="NSR:StopPlace:O", aimed_departure=TRIP_DEP + timedelta(minutes=13),
+            aimed_arrival=TRIP_DEP + timedelta(minutes=48), cancelled=kind == "leg_cancelled"),
+    ]
+    transfers = [SimpleNamespace(stop_place="NSR:StopPlace:D", stop_name="Drammen", walk_min=0, slack_min=4)]
+    problem = SimpleNamespace(kind=kind, index=index, probability=0.8, threshold=0.65)
+    return SimpleNamespace(legs=legs, transfers=transfers, expected_arrival=expected, problem=problem)
+
+
+def _trip_alert(trip=None, *, confirmed=False):
+    alert = FakeAlert()
+    alert.departure_time, alert.line, alert.situation_number = TRIP_DEP, "VYG:Line:R13", "S1"
+    alert.impact_probability, alert.cancel_probability = 0.31, 0.02
+    alert.delay_p50_min, alert.delay_p90_min = 2, 6
+    alert.trip = trip if trip is not None else _trip_facts()
+    alert.trip_confirmed = confirmed
+    return alert
+
+
+def test_a_direct_input_and_the_direct_prompt_are_byte_identical_to_before_trips():
+    """KTD12: no direct wording moves on the deploy. The prompt's own hash and a fully-featured direct
+    document are pinned against values captured BEFORE the trip prompt existed, so neither can drift
+    under a refactor that keeps them equal to themselves."""
+    _reset()
+    assert llm_message.PROMPT_VERSION == "b12a7867"
+    impact = FakeImpact(lines=[FakeLine(latest_observation=FakeObservation())])
+    payload = build_message_input(JOURNEY, impact, _direct_alert(), now=DEP - timedelta(hours=10))
+    assert llm_message.message_input_json(payload) == DIRECT_INPUT_GOLDEN
+    assert not llm_message.is_trip_input(payload)
+    assert llm_message.prompt_version_for(payload) == llm_message.PROMPT_VERSION
+    assert llm_message._system_prompt_for(DIRECT_INPUT_GOLDEN) is llm_message._SYSTEM_PROMPT
+
+
+def test_a_trip_input_carries_its_legs_change_reason_and_expected_arrival():
+    """AE1's facts, every one of them a figure the text may quote (`_is_grounded`), every time local
+    HH:MM: an ISO timestamp would leak a UTC hour into the grounding set. The boarding figures do not
+    ride when the reason sits on a later leg or a change -- they describe the first train, and
+    «Typisk 2–6 min forsinket» is not why this traveller misses Drammen."""
+    _reset()
+    payload = build_message_input(JOURNEY, FakeImpact(), _trip_alert(), now=TRIP_DEP - timedelta(hours=1))
+    assert payload["reise_med_bytte"] == {
+        "problem": "missed_connection",
+        "indeks": 0,
+        "byttested": "Drammen",
+        "planlagt_byttetid_min": 4,
+        "ventet_framme_kl": "08:20",
+        "etapper": [
+            {"transportmiddel": "rail", "linje": "R13", "fra": "Lier", "til": "Drammen",
+             "avgang_kl": "07:17", "ankomst_kl": "07:26"},
+            {"transportmiddel": "rail", "linje": "R12", "destinasjon": "Kongsberg", "fra": "Drammen",
+             "til": "Oslo S", "avgang_kl": "07:30", "ankomst_kl": "08:05"},
+        ],
+    }
+    assert payload["avgang_kl"] == "07:17" and payload["linje"] == "R13"
+    for key in ("sannsynlighet_prosent", "mest_sannsynlig_innstilt", "forsinkelse_min", "innstilling_prosent"):
+        assert key not in payload, key
+    body = llm_message.message_input_json(payload)
+    assert "T0" not in body and "+00:00" not in body, "a raw timestamp reached the grounding set"
+    assert llm_message._is_grounded("Du kan miste overgangen i Drammen (4 min) og være framme 08:20.", body)
+
+    # Unknown arrival: absent, never null, never invented.
+    unknown = build_message_input(JOURNEY, FakeImpact(), _trip_alert(_trip_facts(expected=None)))
+    assert "ventet_framme_kl" not in unknown["reise_med_bytte"]
+    # A confirmed trip says so in the block and carries no figure: the unscored path sets 1.0/1.0,
+    # which today's block would turn into «100 % sjanse for innstilling».
+    confirmed = build_message_input(
+        JOURNEY, FakeImpact(), _trip_alert(_trip_facts("leg_cancelled", 1), confirmed=True)
+    )
+    assert confirmed["reise_med_bytte"]["bekreftet"] is True
+    assert confirmed["reise_med_bytte"]["etapper"][1]["innstilt"] is True
+    assert "innstilling_prosent" not in confirmed and "sannsynlighet_prosent" not in confirmed
+    # The first leg's own departure IS the reason: its figures are the ones to quote.
+    first = build_message_input(JOURNEY, FakeImpact(), _trip_alert(_trip_facts("departure", 0)))
+    assert first["forsinkelse_min"] == {"typisk": 2, "verstefall": 6}
+    assert "byttested" not in first["reise_med_bytte"]
+
+
+def test_one_predicate_says_where_a_wording_quotes_the_first_train_s_figures():
+    """`trip_quotes_figures` is the builder's guard and `varsel._feedback_detail`'s, so the card's
+    line and the document cannot disagree: the figures block rides exactly where it is true."""
+    unscored = _trip_alert(_trip_facts("departure", 0))
+    unscored.impact_probability = None
+    for label, alert, quotes in (
+        ("no trip", _direct_alert(), True),
+        ("the first train's own departure", _trip_alert(_trip_facts("departure", 0)), True),
+        ("confirmed", _trip_alert(_trip_facts("departure", 0), confirmed=True), False),
+        ("a reason on a change", _trip_alert(_trip_facts("missed_connection", 0)), False),
+        ("an unscored first leg", unscored, False),
+    ):
+        assert llm_message.trip_quotes_figures(alert) is quotes, label
+        assert ("forsinkelse_min" in build_message_input(JOURNEY, FakeImpact(), alert)) is quotes, label
+
+
+def test_a_trip_input_is_worded_with_the_trip_prompt_and_keyed_on_its_version():
+    """KTD12: a second prompt, its own version, chosen by the input -- and ONLY by the input, so a
+    direct train's wording and its key are untouched. `prompt_version_for` reads the module globals at
+    call time, so a reworded trip brief invalidates trip keys and nothing else."""
+    _reset()
+    trip_input = build_message_input(JOURNEY, FakeImpact(), _trip_alert())
+    direct_input = build_message_input(JOURNEY, FakeImpact(), FakeAlert())
+    assert llm_message.TRIP_PROMPT_VERSION != llm_message.PROMPT_VERSION
+    assert llm_message.TRIP_PROMPT_VERSION == llm_message.hashlib.sha256(
+        llm_message._TRIP_SYSTEM_PROMPT.encode("utf-8")
+    ).hexdigest()[:8]
+    assert llm_message.prompt_version_for(trip_input) == llm_message.TRIP_PROMPT_VERSION
+    assert llm_message.prompt_version_for(direct_input) == llm_message.PROMPT_VERSION
+    assert llm_message.prompt_version_for(None) == llm_message.PROMPT_VERSION
+    before = llm_message.TRIP_PROMPT_VERSION
+    llm_message.TRIP_PROMPT_VERSION = "0000beef"
+    try:
+        assert llm_message.prompt_version_for(trip_input) == "0000beef"
+        assert llm_message.prompt_version_for(direct_input) == llm_message.PROMPT_VERSION
+    finally:
+        llm_message.TRIP_PROMPT_VERSION = before
+    # The trip brief is the direct one plus its own rules, so every rule above still binds.
+    assert llm_message._SYSTEM_PROMPT.split("- Ingen innledning")[0] in llm_message._TRIP_SYSTEM_PROMPT
+    assert "reise_med_bytte" in llm_message._TRIP_SYSTEM_PROMPT
+    assert "reise_med_bytte" not in llm_message._SYSTEM_PROMPT
+    # And the backend is actually handed it: the REAL `_gemini_write` against a recording client.
+    sent = []
+
+    def generate_content(*, model, contents, config):
+        sent.append(config["system_instruction"])
+        return SimpleNamespace(candidates=[SimpleNamespace(finish_reason="STOP")],
+                               text='{"melding": "Tog R13 07:17 kan miste overgangen i Drammen."}')
+
+    saved = llm_message._gemini_client
+    llm_message._gemini_client = lambda **_: SimpleNamespace(models=SimpleNamespace(generate_content=generate_content))
+    _reset(provider="gemini")
+    try:
+        assert llm_message.write_message_detailed(trip_input).status == "ok"
+        assert llm_message.write_message_detailed(direct_input).status in ("ok", "ungrounded")
+    finally:
+        llm_message._gemini_client = saved
+    assert sent == [llm_message._TRIP_SYSTEM_PROMPT, llm_message._SYSTEM_PROMPT]
+
+
+def test_a_trip_reply_over_300_characters_is_discarded_for_the_template():
+    """KTD12: the cap is not relaxed for a longer story -- the template carries most trip alerts."""
+    _reset(provider="claude")  # pinned: under "auto" a rejection falls through to the REAL Gemini
+    trip_input = build_message_input(JOURNEY, FakeImpact(), _trip_alert())
+    long_reply = json.dumps({"melding": "Tog R13 07:17 kan miste overgangen i Drammen. " * 7})
+    assert len(json.loads(long_reply)["melding"].strip()) > llm_message._MAX_CHARS
+    llm_message._BACKENDS["claude"] = lambda body: long_reply
+    try:
+        result = llm_message.write_message_detailed(trip_input)
+    finally:
+        llm_message._BACKENDS["claude"] = llm_message._claude_write
+    assert result.text is None and result.status == "rejected", result
+
+
 if __name__ == "__main__":
     _run()

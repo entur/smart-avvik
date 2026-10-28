@@ -976,6 +976,23 @@ def test_a_train_taken_out_of_the_plan_is_its_own_segment_not_a_relayed_one():
     assert sum(s[k]["n_hit"] for k in segments) == s["n_hit"]
 
 
+def test_a_departure_with_a_change_is_its_own_segment():
+    """/historikk's fifth segment, mirrored (multi-leg U11, R15): «med bytte» beside the four
+    provenances, and the five add up to the blend."""
+    _reset([{
+        "n_hit": 9, "n_false_alarm": 2, "precision": 9 / 11,
+        "n_hit_predicted": 3, "n_hit_relayed": 2, "n_hit_no_sx": 0, "n_hit_removed": 1,
+        "n_false_alarm_predicted": 1,
+        "n_hit_transfer": 3, "n_false_alarm_transfer": 1, "precision_transfer": 0.75,
+        "n_unsegmented": 0,
+    }])
+    s = client.get("/meldinger-api/summary").json()
+    assert s["transfer"]["n_hit"] == 3 and s["transfer"]["precision"] == 0.75
+    segments = ("predicted", "relayed", "no_sx", "removed", "transfer")
+    assert sum(s[k]["n_hit"] for k in segments) == s["n_hit"]
+    assert sum(s[k]["n_false_alarm"] for k in segments) == s["n_false_alarm"]
+
+
 def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
     """Removed rows carry `et_cancelled = TRUE`, so a CASE testing the flag first files them all as
     `relayed` with no error. Both CASEs in the summary test the prefix first, and `n_unsegmented`
@@ -991,7 +1008,11 @@ def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
         removed = case.index("'KIX:PlanRemoved:'")
         assert removed < case.index("et_cancelled IS NULL")
         assert removed < case.index("et_cancelled IS TRUE")
+        # Multi-leg U11: «med bytte» ahead of every branch, on the outcome's legs snapshot -- a
+        # trip's first leg can read as any other provenance.
+        assert "THEN 'transfer'" in case and case.index("trip_legs IS NOT NULL") < removed
     assert "COUNTIF(provenance IS NULL AND verdict IS NOT NULL) AS n_unsegmented" in body
+    assert "o.trip_legs" in body, "the discriminator must come from the verdict row"
 
 
 def test_summary_survives_an_empty_window():
@@ -2236,6 +2257,74 @@ def test_a_bytes_cap_refusal_is_told_apart_from_a_log_that_was_never_written():
         "an unrelated failure must keep the unwritten-log sentence, or the branch is a guard that "
         f"cannot fail: {missing.json()['detail']}"
     )
+
+
+# ---- multi-leg U7: a stored trip input replays under the trip prompt ----------------------------
+#: A stored `message_input` for a departure with a change (AE1), as `build_message_input` writes it.
+TRIP_INPUT = {
+    "avgang_kl": "07:17",
+    "linje": "R13",
+    "transportmiddel": "Tog",
+    "reise": {"fra": "Lier", "til": "Oslo S"},
+    "situasjoner": [{"sammendrag": "Signalfeil ved Asker"}],
+    "linjer": [],
+    "reise_med_bytte": {
+        "problem": "missed_connection", "indeks": 0, "byttested": "Drammen",
+        "planlagt_byttetid_min": 4, "ventet_framme_kl": "08:20",
+        "etapper": [
+            {"transportmiddel": "rail", "linje": "R13", "fra": "Lier", "til": "Drammen",
+             "avgang_kl": "07:17", "ankomst_kl": "07:26"},
+            {"transportmiddel": "rail", "linje": "R12", "fra": "Drammen", "til": "Oslo S",
+             "avgang_kl": "07:30", "ankomst_kl": "08:05"},
+        ],
+    },
+}
+TRIP_INPUT_JSON = llm_message.message_input_json(TRIP_INPUT)
+
+
+def test_a_stored_trip_row_replays_under_the_trip_prompt_and_a_direct_row_under_the_old_one():
+    """KTD12: the version a replay is keyed on and compared against is the one the input selects --
+    `TRIP_PROMPT_VERSION` for a trip row, `PROMPT_VERSION` for a direct one -- so a trip brief edit
+    re-words trip cards and leaves every direct card's cached wording alone."""
+    trip_row = _message_row(situation_number="S2", message_input=TRIP_INPUT_JSON)
+    _reset(message_rows=[_message_row(), trip_row])
+    seen = []
+    with _backends(lambda body: seen.append(body) or OK_REPLY):
+        body = _messages()
+        # The pool words rows concurrently, so the order the backend sees them in is not the page's.
+        assert sorted(seen) == sorted([INPUT_JSON, TRIP_INPUT_JSON]), (
+            "a stored trip input must reach the backend verbatim", seen,
+        )
+        direct, trip = body["messages"]
+        assert direct["current_prompt_version"] == llm_message.PROMPT_VERSION
+        assert trip["current_prompt_version"] == llm_message.TRIP_PROMPT_VERSION
+        assert trip["prompt_version"] == "a1b2c3d4", "the row's own version is still the row's"
+        before = llm_message.TRIP_PROMPT_VERSION
+        llm_message.TRIP_PROMPT_VERSION = "0000beef"
+        try:
+            again = _messages()
+        finally:
+            llm_message.TRIP_PROMPT_VERSION = before
+    assert len(seen) == 3 and seen[-1] == TRIP_INPUT_JSON, "only the trip row misses the cache"
+    assert again["messages"][1]["current_prompt_version"] == "0000beef"
+    assert again["messages"][0]["current_prompt_version"] == llm_message.PROMPT_VERSION
+
+
+def test_a_stored_trip_input_reproduces_the_trip_template():
+    """The template arm is a pure function of the stored document, so a trip row replays to exactly
+    the template the poller would have sent -- naming Drammen and the expected arrival."""
+    import notification_wording
+
+    _reset(message_rows=[_message_row(message_input=TRIP_INPUT_JSON)])
+    meldinger._deterministic_writer = notification_wording.deterministic_body
+    try:
+        with _backends(lambda body: OK_REPLY):
+            entry = _messages()["messages"][0]
+    finally:
+        meldinger._deterministic_writer = _fake_deterministic
+    assert entry["deterministic_message"] == notification_wording.deterministic_body(TRIP_INPUT)
+    assert "kan miste overgangen i Drammen" in entry["deterministic_message"]
+    assert "Ventet framme kl 08:20" in entry["deterministic_message"]
 
 
 def _run():

@@ -17,6 +17,7 @@ main injects a reader via `configure()`, the same pattern reisevalg/varsel/llm_m
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 from collections.abc import Callable, Iterable
@@ -26,8 +27,14 @@ from typing import Any, Literal, NamedTuple
 
 import alert_policy
 import alternatives
-from alternatives import AlternativeCandidate, AlternativeJourney, AlternativePrediction
-from pydantic import BaseModel, Field
+import trips
+from alternatives import (
+    AlternativeCandidate,
+    AlternativeJourney,
+    AlternativePrediction,
+    TripFacts,
+)
+from pydantic import BaseModel, Field, PrivateAttr
 
 logger = logging.getLogger("impact")
 
@@ -150,6 +157,11 @@ class CallPred:
     alighting_allowed: bool = True
     # SIRI-SX `reportType` (INCIDENT / GENERAL) as published; None on a synthetic `KIX:` row.
     report_type: str | None = None
+    # The stacks' 5-minute points, which only a trip's connection reads (KTD7: P(miss) off the
+    # arriving call's survival, a slack shift off the connecting call's). Defaulted, like the fields
+    # above, so a table built before them, and every hand-written call in the suites, still loads.
+    p_arr_ge5: float | None = None
+    p_dep_ge5: float | None = None
 
 
 class StopPrediction(BaseModel):
@@ -356,6 +368,74 @@ class LineImpact(BaseModel):
     )
 
 
+class TripSubject(BaseModel):
+    """One first-leg departure with a change, judged end to end (multi-leg U3, `trips.judge`).
+
+    Shaped like :class:`SituationImpact` where the two mean the same thing, so a caller turns one
+    into an alert as it turns a situation: the situation it attaches to, the boarding call's
+    identity and prediction, and the gate's answer. What differs is that the gate has ALREADY been
+    applied, per reason and composed across continuations (KTD6, KTD19), so `alertworthy` and the
+    deciding pair are read here rather than recomputed off `departure_prediction`.
+
+    Internal working state: it rides on :attr:`ImpactResponse.trip_subjects`, which is never on
+    the wire, and the trip facts reach a payload only through the units that publish them.
+    """
+
+    # The situation the subject attaches to (U3 step 5): the problem's reason when it alerts, else
+    # the deciding one. A scored call's own situation, a removed train's `KIX:PlanRemoved:`, or the
+    # leg's synthetic `KIX:Trip:` with no SX message and no report type.
+    situation_number: str
+    summary: str | None
+    description: str | None
+    has_situation: bool
+    report_type: str | None
+    # The first leg's boarding call, pinned in the plan (KTD5): `jkey` in the cache's key form,
+    # `stop_order` JP's position + 1 (ET's for Vy, `trip_plans`' docstring). `(operator, jkey,
+    # departure_time)` is KTD3's departure key, `key`.
+    operator: str | None
+    line: str | None
+    jkey: str
+    stop_place: str
+    stop_order: int | None
+    departure_time: datetime
+    # That call's prediction when it is scored, with the confirmed overwrite `_trip_cells` gives a
+    # cancelled destination (impact and cancellation 1.0, delays null). None when it is unscored:
+    # there is then no figure of ours for the boarding call, and none is made up.
+    departure_prediction: StopPrediction | None
+    trip: TripFacts
+    deciding_probability: float
+    deciding_threshold: float
+    alertworthy: bool
+    confirmed: bool
+    # The first train never leaves, as a fact (`trips.Verdict.first_cancelled`): its boarding call
+    # declared cancelled or the train out of today's plan, scored or not.
+    first_cancelled: bool = False
+    # KTD20: False when waiting for the next direct train is at least as fast. The caller keeps such
+    # a subject only while it holds a standing alert; otherwise it is an alternative at most.
+    admitted: bool
+    # False while an unknown leg could change the verdict (KTD8); `unknown_legs` are the planned
+    # route's, by index.
+    complete: bool
+    unknown_legs: tuple[int, ...] = ()
+    # Each leg's refs in the cache's key form, as the plan holds them (`trips.PlanLeg.refs`), which
+    # `TripLeg` does not carry: what the trip's own alternative lookup excludes and matches on (U6).
+    leg_refs: tuple[tuple[tuple[str | None, str], ...], ...] = ()
+    # For the decision log only (U11, KTD16): every continuation the verdict was taken over
+    # (`trips.legs_snapshot`) and the planned route's P(miss), neither of which `trip` carries.
+    legs_snapshot: dict | None = None
+    p_miss: float | None = None
+    # That lookup's outcome, field for field `SituationImpact`'s four (`AlternativeOutcome`), set by
+    # `_alternatives_by_situation`; the defaults are a lookup that never ran.
+    alternative_journey: AlternativeJourney | None = None
+    original_is_best: bool = False
+    alternative_subject: tuple[str | None, str] | None = None
+    answered: bool = True
+
+    @property
+    def key(self) -> tuple[str | None, str, datetime]:
+        return self.operator, self.jkey, self.departure_time
+
+
 class ImpactResponse(BaseModel):
     """Situations and lines affecting a passenger's intended trip, per-train scored.
 
@@ -422,6 +502,19 @@ class ImpactResponse(BaseModel):
         description="`situations[0]`'s `answered`, echoed like the two fields above; True when "
         "there are no situations, since nothing was asked.",
     )
+    # The departures with a change `for_trip(plans=...)` judged (multi-leg U3). A private attribute
+    # rather than an excluded field: FastAPI collects every model a FIELD's type reaches into the
+    # OpenAPI document, excluded or not, so a field put five orphan `Trip*` components into the
+    # published `/impact` schema. This is never a field, so never in the schema or the JSON;
+    # `model_copy` carries it.
+    _trip_subjects: list[TripSubject] | None = PrivateAttr(default=None)
+
+    @property
+    def trip_subjects(self) -> list[TripSubject] | None:
+        """The departures with a change judged BESIDE the direct trains, never inside their
+        per-situation selection, and unmerged. None when no plan was given or the verdict failed
+        (trips not evaluated); a list, possibly empty, when it ran."""
+        return self._trip_subjects
 
 
 @dataclass(frozen=True)
@@ -619,12 +712,9 @@ def _expected_departure(c: CallPred) -> datetime | None:
     25 min late, which is why this is not simply a comparison against the aimed time."""
     if c.aimed_dep is None:
         return None
-    typ = (
-        c.dep_delay_p50_stack_min
-        if c.dep_delay_p50_stack_min is not None
-        else c.dep_delay_typ_min
+    return c.aimed_dep + timedelta(
+        minutes=trips.typical_delay_min(c.dep_delay_p50_stack_min, c.dep_delay_typ_min)
     )
-    return c.aimed_dep + timedelta(minutes=max(typ or 0, 0))
 
 
 #: Every usable alighting call at one stop, per train `(operator, jkey)`, with the situation that
@@ -1106,8 +1196,9 @@ def _predicted_arrival(cell: TripCell) -> datetime | None:
     arrival = cell.arrival
     if arrival is None or arrival.scheduled_time is None:
         return None
-    delay = arrival.delay_p50_min if arrival.delay_p50_min is not None else arrival.delay_typ_min
-    return arrival.scheduled_time + timedelta(minutes=max(delay or 0, 0))
+    return arrival.scheduled_time + timedelta(
+        minutes=trips.typical_delay_min(arrival.delay_p50_min, arrival.delay_typ_min)
+    )
 
 
 # ---- Scoring Journey Planner candidates -------------------------------------------------------
@@ -1382,13 +1473,24 @@ def score_candidates(
     Fail open per candidate. This is the third boundary on this path — `alternatives` guards the
     fetch inside its TTL cache and the parse after it — and it needs its own for the same reason:
     one uninterpretable candidate must cost that candidate, not every alternative for the trip.
+
+    **With TRIP_PLANS_ENABLED on, a candidate's change is checked too** (multi-leg U6, KTD10): see
+    :func:`_missed_change`. A candidate whose change we expect missed is `risky`, and its expected
+    arrival becomes that of the earliest later candidate in the same pool riding the same first leg
+    and still usable, or null when there is none: unknown, which nothing ranks (KTD9's rule for a
+    trip's own arrival). Behind the flag because it moves what direct alerts are offered too, and
+    the alternative is part of the wording key.
     """
     refs = set(affected_refs or ())
     lines = set(affected_lines or ())
+    check_changes = trips.enabled()
     scored: list[CandidateScore] = []
+    missed: list[AlternativeCandidate] = []
     for cand in candidates:
         try:
-            scored.append(_score_candidate(cand, affected_refs=refs, affected_lines=lines))
+            score = _score_candidate(cand, affected_refs=refs, affected_lines=lines)
+            if check_changes and _missed_change(cand):
+                missed.append(cand)
         except Exception:
             logger.warning(
                 "Could not score a Journey Planner candidate (#%s); dropping it",
@@ -1396,10 +1498,76 @@ def score_candidates(
                 exc_info=True,
                 extra={"fields": {"event": "alternatives_error", "reason": "scoring_failed"}},
             )
+            continue
+        scored.append(score)
+    missed_ids = {id(cand) for cand in missed}
+    for cand in missed:
+        boarding = _boarding(cand)
+        sibling = min(
+            (
+                other for other in (s.candidate for s in scored)
+                if id(other) not in missed_ids and _boarding(other) == boarding
+                and not (other.cancelled or other.likely_cancelled)
+                and not any(ref in refs for ref in other.transit_refs)
+                and other.arrival_time is not None and cand.arrival_time is not None
+                and other.arrival_time > cand.arrival_time
+            ),
+            key=lambda other: other.arrival_time,
+            default=None,
+        )
+        # ponytail: with its sibling in the pool the two tie on cost and arrival, and JP's ordinal
+        # decides, so the risky change can be offered at the sibling's arrival. Upgrade path: drop
+        # a candidate whose feasible sibling is in the pool, or a flag-gated tie-break on `risky`.
+        cand.risky = True
+        cand.arrival_time, cand.predicted_arrival_time = (
+            (sibling.arrival_time, sibling.predicted_arrival_time)
+            if sibling is not None else (None, None)
+        )
     return scored
 
 
-def _likely_cancelled(p_cancel: float | None, call: TripCell | CallPred) -> bool:
+def _boarding(cand: AlternativeCandidate) -> tuple | None:
+    """A candidate's first ridden leg, what its siblings share: refs, stop and aimed departure."""
+    if not cand.transit_legs:
+        return None
+    first = cand.transit_legs[0]
+    return first.refs, first.board_stop_place, first.aimed_departure
+
+
+def _missed_change(cand: AlternativeCandidate) -> bool:
+    """KTD7 on a candidate with a change: does any change's P(miss) clear the gate?
+
+    The arriving call is the leg's row at its alighting stop and aimed arrival, resolved through
+    the call lookup as the candidate's other calls are; unscored, the change is not judged (no
+    figure, as for the verdict). A row declared cancelled is not judged here either: `risky`
+    already reads it at 1.0. The slack is `trips.connection_slack_min`'s, the connecting call's
+    shift included, and the bar is the arriving row's own operator and `has_situation`.
+    """
+    for arriving, connecting in itertools.pairwise(cand.transit_legs):
+        if None in (arriving.alight_stop_place, arriving.aimed_arrival, connecting.aimed_departure):
+            continue
+        rows = [
+            c for ref in arriving.refs for c in _lookup_journey_calls(*ref)
+            if c.stop_place == arriving.alight_stop_place and c.aimed_arr == arriving.aimed_arrival
+        ]
+        if not rows or any(c.et_declared_cancelled for c in rows):
+            continue
+        onward = [
+            c for ref in connecting.refs for c in _lookup_journey_calls(*ref)
+            if c.stop_place == connecting.board_stop_place
+            and c.aimed_dep == connecting.aimed_departure
+        ]
+        slack = trips.connection_slack_min(
+            arriving.aimed_arrival, arriving.walk_after_s, connecting.aimed_departure, onward
+        )
+        for c in rows:
+            p = trips.p_miss(c, slack)
+            if p is not None and alert_policy.gate(p, c.operator, has_situation=c.has_situation)[1]:
+                return True
+    return False
+
+
+def _likely_cancelled(p_cancel: float | None, call: TripCell | CallPred | TripSubject) -> bool:
     """Our cancellation probability at or over the operator's alert gate (2026-10-13). The gate is
     the impact threshold reused; `p_cancel` is overconfident below it, so a lower bar would drop
     trains that nearly always run."""
@@ -1479,11 +1647,16 @@ def _reconcile_original_arrival(
     against, so an optimistic reading of it is what produces "stay put" — and the cost of being
     wrong is asymmetric: telling a traveller their train is fine when it is not strands them, while
     offering an alternative to a train that turns out fine costs them a choice they can decline.
+
+    JP's copy is the candidate riding every ref the original rides: the subject train for a direct
+    one, every leg for a trip (multi-leg U6), so the same first train with a later connection is
+    never read as the trip's own arrival.
     """
-    if subject is None or original.arrival_time is None:
+    rides = set(original.transit_refs)
+    if subject is None or not rides or original.arrival_time is None:
         return
     own = next(
-        (c for c in candidates if not c.is_original and subject in c.transit_refs), None
+        (c for c in candidates if not c.is_original and rides <= set(c.transit_refs)), None
     )
     if own is None or own.arrival_time is None:
         return
@@ -1547,17 +1720,9 @@ def _best_remaining_journey(
 
     subject = (cell.operator, cell.jkey) if cell.jkey else None
     # Only DISRUPTED cells, plus the subject itself (whose JP copy must not win its own contest).
-    # Since nosx scoring every running train in the window has a cell, so "every cell" excluded
-    # every in-window rival and the offer fell back to a train before the window (prd 2026-09-23:
-    # R22 17:00 removed, 16:00 and 16:29 running, offered the 13:00). A rival under the gate is
-    # still judged on its own predictions by `score_candidates`.
-    disrupted = [
-        c for c in affected if c.departure.cancelled or c.destination_cancelled or _over_alert_gate(c)
-    ]
-    affected_refs = {(c.operator, c.jkey) for c in disrupted if c.jkey}
+    affected_refs, affected_lines = _disrupted(affected)
     if subject is not None:
         affected_refs.add(subject)
-    affected_lines = {c.line for c in disrupted if c.line}
     original = _original_candidate(
         cell,
         from_stop=from_stop,
@@ -1565,6 +1730,130 @@ def _best_remaining_journey(
         deadline=deadline,
         predicted_arrival=predicted_arrival,
     )
+    return _fetch_and_select(
+        original,
+        deadline=deadline,
+        departure=cell.departure.scheduled_time,
+        subject=subject,
+        affected_refs=affected_refs,
+        affected_lines=affected_lines,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_end=window_end,
+        now=now,
+        path=path,
+    )
+
+
+def _disrupted(affected: list[TripCell]) -> tuple[set[tuple[str | None, str]], set[str]]:
+    """The refs and lines of the DISRUPTED cells on the trip: cancelled, never reaching `to_stop`,
+    or over the operator's gate. Not every cell: since nosx scoring every running train in the
+    window has a cell, so "every cell" excluded every in-window rival and the offer fell back to a
+    train before the window (prd 2026-09-23: R22 17:00 removed, 16:00 and 16:29 running, offered
+    the 13:00). A rival under the gate is still judged on its own predictions by
+    `score_candidates`."""
+    disrupted = [
+        c for c in affected if c.departure.cancelled or c.destination_cancelled or _over_alert_gate(c)
+    ]
+    return {(c.operator, c.jkey) for c in disrupted if c.jkey}, {c.line for c in disrupted if c.line}
+
+
+def _broken_legs(trip: TripFacts) -> list[int]:
+    """The legs a trip's problem breaks (KTD13's numbering): the leg a leg reason names, and for a
+    missed change every leg after it. The first leg only when the problem is on it: otherwise the
+    same first train with a later connection must be free to compete (KTD10, AE2)."""
+    problem = trip.problem
+    if problem is None:
+        return []
+    if problem.kind == "missed_connection":
+        return list(range(problem.index + 1, len(trip.legs)))
+    return [problem.index]
+
+
+def _best_trip_journey(
+    subject: TripSubject,
+    *,
+    affected: list[TripCell],
+    from_stop: str,
+    to_stop: str,
+    window_end: datetime,
+    now: datetime,
+    path: alternatives.FetchPath = "request",
+) -> AlternativeOutcome:
+    """:func:`_best_remaining_journey` for a departure with a change (multi-leg U6, KTD10).
+
+    The trip competes as the original, built from its legs and refs: its deadline is the last leg's
+    aimed arrival, and its own arrival KTD9's end-to-end expected one. That arrival is null when
+    nothing in the plan gets the traveller there, and null is unknown, never late: the original is
+    then unrankable and leaves the pool as anything unrankable does (`select_best`'s pool rule), so
+    "stay put" is never claimed for it, and the materiality anchor is the PLAN, so a rival never wins
+    on the unknown alone. What lets one win is the trip's own trouble, `risky`, the gate's verdict.
+
+    The hard exclusion is the broken legs (:func:`_broken_legs`) plus the disrupted direct trains,
+    never the first leg merely for being the subject's: JP's copy of the broken trip is excluded,
+    and the same first train with a later connection competes.
+    """
+    trip = subject.trip
+    deadline = trip.legs[-1].aimed_arrival
+    if deadline is None or not alternatives.within_lookahead(deadline, now):
+        return NO_ALTERNATIVE
+    affected_refs, affected_lines = _disrupted(affected)
+    for i in _broken_legs(trip):
+        affected_refs.update(subject.leg_refs[i])
+        if trip.legs[i].line:
+            affected_lines.add(trip.legs[i].line)
+    board = subject.departure_prediction
+    original = AlternativeCandidate(
+        departure_time=subject.departure_time,
+        aimed_departure_time=subject.departure_time,
+        arrival_time=trip.expected_arrival,
+        aimed_arrival_time=deadline,
+        # Confirmed: the planned route cannot get the traveller there, as a fact (KTD19), which is
+        # what `Alert.trip_cancelled` folds in, and a boarding call declared cancelled with it.
+        cancelled=subject.confirmed or bool(board and board.cancelled),
+        risky=subject.alertworthy,
+        # The first train expected cancelled, as for a direct one. `subject` stands in for the
+        # boarding row's operator and `has_situation`, as `varsel._trip_alert` reads its bar.
+        likely_cancelled=_likely_cancelled(board.cancel_probability if board else None, subject),
+        is_original=True,
+        transit_refs=[ref for refs in subject.leg_refs for ref in refs],
+        lines=[leg.line for leg in trip.legs if leg.line],
+        board_stop_place=from_stop,
+        alight_stop_place=to_stop,
+        ordinal=-1,
+    )
+    return _fetch_and_select(
+        original,
+        deadline=deadline,
+        departure=subject.departure_time,
+        subject=(subject.operator, subject.jkey),
+        affected_refs=affected_refs,
+        affected_lines=affected_lines,
+        from_stop=from_stop,
+        to_stop=to_stop,
+        window_end=window_end,
+        now=now,
+        path=path,
+    )
+
+
+def _fetch_and_select(
+    original: AlternativeCandidate,
+    *,
+    deadline: datetime,
+    departure: datetime | None,
+    subject: tuple[str | None, str] | None,
+    affected_refs: set[tuple[str | None, str]],
+    affected_lines: set[str],
+    from_stop: str,
+    to_stop: str,
+    window_end: datetime,
+    now: datetime,
+    path: alternatives.FetchPath,
+) -> AlternativeOutcome:
+    """The two queries, the reconciliation, the scoring and the selection, for one original against
+    its own deadline: the shared half of :func:`_best_remaining_journey` and
+    :func:`_best_trip_journey`. `departure` anchors the late query."""
 
     def scored_pool(candidates: list[AlternativeCandidate]) -> list[AlternativeCandidate]:
         """Annotate every candidate with what we know of it, and filter nothing.
@@ -1587,8 +1876,9 @@ def _best_remaining_journey(
             original=original,
             original_arrival_time=deadline,
             # The reconciled figure, not the raw prediction: whichever of the two readings is later.
-            # Read at call time, so a second pass sees what the fallback reply taught us.
-            original_predicted_arrival=original.arrival_time,
+            # Read at call time, so a second pass sees what the fallback reply taught us. An unknown
+            # arrival (a trip's, KTD9) is measured as the plan, never as late.
+            original_predicted_arrival=original.arrival_time or deadline,
             now=now,
             window_end=window_end,
             affected_refs=affected_refs,
@@ -1612,7 +1902,7 @@ def _best_remaining_journey(
     after: list[AlternativeCandidate] = []
     after_query: dict[str, Any] = {"answered": False}
     if by_deadline_query.get("answered", True):
-        departure = cell.departure.scheduled_time or now
+        departure = departure or now
         quantum = alternatives._DATE_TIME_QUANTUM.total_seconds()
         floored = datetime.fromtimestamp(departure.timestamp() // quantum * quantum, tz=UTC)
         after_query = {}
@@ -1660,6 +1950,7 @@ _MAX_ALTERNATIVE_LOOKUPS = 3
 def _alternatives_by_situation(
     cells: list[TripCell],
     *,
+    subjects: Iterable[TripSubject] = (),
     from_stop: str,
     to_stop: str,
     window_end: datetime,
@@ -1694,6 +1985,12 @@ def _alternatives_by_situation(
     not establish that", which every wording downstream already handles — and the cap is logged
     rather than silent, because a suppressed offer is otherwise indistinguishable from a trip that
     had none.
+
+    **A departure with a change spends the same budget** (multi-leg U6, KTD10): each alert-worthy
+    subject `trips.judge` admits is one more train in the same soonest-first order, ranked on its
+    deciding figure within a departure, and answered by :func:`_best_trip_journey` against its own
+    deadline. Its outcome is written onto the subject, never into `by_train`: a direct train's
+    answer is a claim against another deadline, even about the same first train.
     """
     by_sit: dict[str, list[TripCell]] = {}
     for cell in cells:
@@ -1703,35 +2000,45 @@ def _alternatives_by_situation(
     # situation ties at impact 1.0, so severity alone would spend the budget arbitrarily — and the
     # train the traveller can still act on is the next one, not whichever the dict happened to hold
     # first.
-    def order(item: tuple[str, list[TripCell]]) -> tuple:
-        cell = _worst_cell(item[1])
-        departure = cell.departure.scheduled_time if cell is not None else None
+    def order(departure: datetime | None, severity: tuple) -> tuple:
         return (
             departure is None,  # unknown departure last, never in the middle of the budget
             departure or now,
-            tuple(-v for v in severity_key(cell.departure)) if cell is not None else (),
+            tuple(-v for v in severity),
         )
 
-    eligible = [
-        (sit_num, group)
-        for sit_num, group in sorted(by_sit.items(), key=order)
-        if _worth_an_alternative(group, min_impact)
+    # (order, situation and its cells) per situation worth a lookup, then (order, None, subject) per
+    # trip. The sort is stable, so a trip tying a direct train on every key comes after it.
+    eligible: list[tuple[tuple, str | None, list[TripCell] | TripSubject]] = []
+    for sit_num, group in by_sit.items():
+        if _worth_an_alternative(group, min_impact):
+            cell = _worst_cell(group)
+            departure = cell.departure
+            eligible.append((order(departure.scheduled_time, severity_key(departure)), sit_num, group))
+    eligible += [
+        (order(subject.departure_time, (subject.deciding_probability, 0, 0.0)), None, subject)
+        for subject in subjects
+        if subject.alertworthy and subject.admitted
     ]
+    eligible.sort(key=lambda entry: entry[0])
 
     outcomes: dict[str, AlternativeOutcome] = {}
     by_train: dict[tuple[str | None, str], AlternativeOutcome] = {}
     spent = 0
-    for sit_num, group in eligible:
-        cell = _worst_cell(group)
-        train = (cell.operator, cell.jkey) if cell is not None and cell.jkey else None
-        if train is not None and train in by_train:
-            outcomes[sit_num] = by_train[train]
-            continue
+    for done, (_order, sit_num, item) in enumerate(eligible):
+        trip = isinstance(item, TripSubject)
+        train = None
+        if not trip:
+            cell = _worst_cell(item)
+            train = (cell.operator, cell.jkey) if cell is not None and cell.jkey else None
+            if train is not None and train in by_train:
+                outcomes[sit_num] = by_train[train]
+                continue
         if spent >= _MAX_ALTERNATIVE_LOOKUPS:
             logger.info(
                 "Alternative lookups capped for %s; %d situation(s) left unanswered",
                 alternatives.pair_digest(from_stop, to_stop),
-                len(eligible) - len(outcomes),
+                len(eligible) - done,
                 extra={
                     "fields": {
                         "event": "alternatives_capped",
@@ -1743,9 +2050,10 @@ def _alternatives_by_situation(
             )
             break
         spent += 1
+        lookup = _best_trip_journey if trip else _best_remaining_journey
         try:
-            outcome = _best_remaining_journey(
-                group,
+            outcome = lookup(
+                item,
                 affected=cells,
                 from_stop=from_stop,
                 to_stop=to_stop,
@@ -1782,6 +2090,10 @@ def _alternatives_by_situation(
             # un-attempted lookup leaves behind (no subject), while the pull read can still tell
             # this transient failure from a terminal "did not look".
             outcome = AlternativeOutcome(answered=False)
+        if trip:
+            (item.alternative_journey, item.original_is_best, item.alternative_subject,
+             item.answered) = outcome
+            continue
         outcomes[sit_num] = outcome
         if train is not None:
             by_train[train] = outcome
@@ -2103,6 +2415,7 @@ def for_trip(
     with_alternative: bool = True,
     min_impact: float = 0.0,
     path: alternatives.FetchPath = "request",
+    plans: trips.DayPlan | None = None,
 ) -> ImpactResponse:
     """Score a trip against the live per-call cache and shape the /impact response.
 
@@ -2121,6 +2434,12 @@ def for_trip(
     unwired caller can never spend the poller's reservation. `main._varsel_impact` passes
     `"poller"`; the public `/impact` route leaves the default, which is the whole point of the
     split: an unauthenticated caller inventing stop pairs must not be able to starve the push cycle.
+
+    `plans` (multi-leg U3) is the canonical pair's day plan. Given one, and a `to_stop`, the
+    departures with a change in the window are judged (`trips.judge`) and returned on the
+    response's `trip_subjects` (never serialised), beside the direct answer, which is the same
+    object it is without a plan. Left None, nothing changes: not the answer, not the `/impact`
+    JSON, not its schema (KTD4).
     """
     if _snapshot_provider is None:
         raise RuntimeError("impact.configure(snapshot_provider=...) was never called")
@@ -2151,12 +2470,21 @@ def for_trip(
         destinations=destinations,
     )
 
+    # Judged before the lookups, which a departure with a change shares with the direct trains (U6).
+    subjects = None
+    if plans is not None and to_stop is not None:
+        subjects = _judge_trips(
+            plans, to_stop=to_stop, window_start=window_start, window_end=window_end,
+            catchable_after=catchable_after,
+        )
+
     # One lookup per disrupted train, not one per trip — the guard against a raising Journey Planner
     # pattern lives per train inside, so a bad answer costs one train's advice and nothing else.
     alternatives_by_situation: dict[str, AlternativeOutcome] = {}
-    if with_alternative and to_stop is not None and cells:
+    if with_alternative and to_stop is not None and (cells or subjects):
         alternatives_by_situation = _alternatives_by_situation(
             cells,
+            subjects=subjects or (),
             from_stop=from_stop,
             to_stop=to_stop,
             window_end=window_end,
@@ -2165,12 +2493,69 @@ def for_trip(
             path=path,
         )
 
-    return _impact_response(
+    response = _impact_response(
         cells,
         from_stop=from_stop,
         to_stop=to_stop,
         refreshed_at=refreshed_at,
         alternatives_by_situation=alternatives_by_situation,
         now=now,
+    )
+    response._trip_subjects = subjects
+    return response
+
+
+def _judge_trips(plan: trips.DayPlan, **query: Any) -> list[TripSubject] | None:
+    """`trips.judge`'s verdicts as subjects; None when it raised. Fails open: a broken trip verdict
+    costs the trips with a change, never the direct trains answered beside them. The record names
+    the error class only, as `trip_plans` does: a message could quote a stop (R17)."""
+    try:
+        return [_trip_subject(verdict) for verdict in trips.judge(plan, **query)]
+    except Exception as exc:  # noqa: BLE001 - fail open, logged below
+        logger.warning(
+            "Could not judge the trips with a change (%s); serving the direct trains alone",
+            type(exc).__name__,
+            extra={"fields": {"event": "trip_verdict_error", "error": type(exc).__name__}},
+        )
+        return None
+
+
+def _trip_subject(verdict: trips.Verdict) -> TripSubject:
+    first = verdict.trip.legs[0]
+    operator, jkey = trips.leg_ref(first)
+    board = _worst_call(verdict.board)
+    departure = None
+    if board is not None:
+        departure = (
+            _unreachable_departure_prediction(board)
+            if verdict.confirmed and not _certainly_cancelled(board)
+            else _departure_prediction(board)
+        )
+    reason = verdict.reason
+    return TripSubject(
+        situation_number=reason.situation_number,
+        summary=reason.summary,
+        description=reason.description,
+        has_situation=reason.has_situation,
+        report_type=reason.report_type,
+        operator=operator,
+        line=first.line,
+        jkey=jkey,
+        stop_place=first.board_stop_place,
+        stop_order=None if first.board_position is None else first.board_position + 1,
+        departure_time=first.aimed_departure,
+        departure_prediction=departure,
+        trip=verdict.facts,
+        deciding_probability=verdict.deciding.probability,
+        deciding_threshold=verdict.deciding.threshold,
+        alertworthy=verdict.alertworthy,
+        confirmed=verdict.confirmed,
+        first_cancelled=verdict.first_cancelled,
+        admitted=verdict.admitted,
+        complete=verdict.complete,
+        unknown_legs=verdict.unknown_legs,
+        leg_refs=tuple(leg.refs for leg in verdict.trip.legs),
+        legs_snapshot=trips.legs_snapshot(verdict.continuations),
+        p_miss=verdict.p_miss,
     )
 

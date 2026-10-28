@@ -208,6 +208,11 @@
       "collectionGroup": "varsel_card_cache",
       "fieldPath": "value",
       "indexes": []
+    },
+    {
+      "collectionGroup": "trip_plans",
+      "fieldPath": "plan",
+      "indexes": []
     }
   ]
 }

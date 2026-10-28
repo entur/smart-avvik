@@ -700,3 +700,47 @@ body {
   margin: 0.25rem 0 0;
   color: var(--colors-blues-blueMain, var(--lavender-90));
 }
+
+/* ---- A departure with a change (multi-leg U10) ------------------------------------------------
+   The verdict heads the alert as the push title does; the legs follow as a plain list in travel
+   order; the alternative sits apart behind a rule under its own heading, so the trip and the
+   alternative never read as one. Linje tokens only, so ?brand=none reskins them. */
+.av-alert-verdict {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+.av-trip-legs {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.av-trip-more {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.av-trip-alternative {
+  margin-top: 0.75rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--basecolors-stroke-subdued, var(--blue-50));
+}
+
+.av-trip-alternative-heading {
+  font-weight: 600;
+}
+
+/* «Bytte i Drammen» under the tapped trip's label. */
+.dr-detail-note {
+  display: block;
+}

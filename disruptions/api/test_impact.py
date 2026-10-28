@@ -10,6 +10,7 @@ latest_observation resolution, the scoring of Journey Planner alternatives again
 index, and the /impact response contract togpuls depends on.
 """
 
+import contextlib
 import logging
 import os
 from datetime import UTC, datetime, timedelta
@@ -23,6 +24,7 @@ import alert_policy
 import alternatives
 import impact
 import main
+import trips
 from test_varsel import FakeCall
 
 # The engine reads its snapshot through an injected provider (main owns the cache). These tests
@@ -34,6 +36,17 @@ impact.configure(
     snapshot_provider=lambda: (_snapshot, None),
     call_lookup=lambda operator, jkey: _index.get((operator, jkey)),
 )
+
+
+def _snapshot_calls(operator, jkey):
+    """The trip verdict's call lookup (multi-leg U3): the rows of whatever snapshot the engine is
+    reading, indexed by journey, as `main._impact_journey_calls` serves the poller's own."""
+    snapshot, _stamp = impact._snapshot_provider()
+    found = [c for calls in snapshot.values() for c in calls if (c.operator, c.jkey) == (operator, jkey)]
+    return found or None
+
+
+trips.configure(call_lookup=_snapshot_calls)
 
 
 def _install_snapshot(by_situation):
@@ -1137,8 +1150,10 @@ class _JourneyPlanner:
         return self.replies[index] if index < len(self.replies) else []
 
 
-def _for_trip(scope, jp, *, now, to_stop=B, min_impact=0.0, window_min=(-5, 120), index=None):
-    """Run `for_trip` over `scope` with `jp` standing in for the Journey Planner."""
+def _for_trip(scope, jp, *, now, to_stop=B, min_impact=0.0, window_min=(-5, 120), index=None,
+              plans=None):
+    """Run `for_trip` over `scope` with `jp` standing in for the Journey Planner (and `plans`, the
+    pair's day plan, judging the departures with a change beside the direct trains)."""
     _install_snapshot(scope)
     _index.clear()
     _index.update(index or {})
@@ -1153,6 +1168,7 @@ def _for_trip(scope, jp, *, now, to_stop=B, min_impact=0.0, window_min=(-5, 120)
             select="worst",
             with_alternative=True,
             min_impact=min_impact,
+            plans=plans,
         )
     finally:
         alternatives.fetch_candidates = original
@@ -2388,8 +2404,11 @@ _WINDOW_MAIN = (_at(7), _at(9))
 _WINDOW_LATE = (_at(8), _at(10))
 
 
-def _assert_prune_identity(seeds, *, index_builder=None):
+def _assert_prune_identity(seeds, *, index_builder=None, with_plans=False, trip_subjects=None):
     """Run the differential over `seeds`, returning the number of responses compared.
+
+    `with_plans` (multi-leg U3) asks every query again with a day plan drawn from the snapshot
+    (:func:`_plan_from`), and counts the trip subjects judged into `trip_subjects[0]`.
 
     **One generation serves a seed's WHOLE query list**, which is what makes the memos observable.
     Installed per QUERY -- as this was until 2026-09-12 -- every generation served exactly one
@@ -2420,13 +2439,15 @@ def _assert_prune_identity(seeds, *, index_builder=None):
         scope = _random_snapshot(rng)
         stamp = _at(6) + timedelta(seconds=seed)
         queries = _identity_queries(rng, scope)
+        plan = _plan_from(scope) if with_plans else None
+        trip_subjects = trip_subjects if trip_subjects is not None else [0]
         _generation(scope, refreshed_at=stamp)
         if index_builder is not None:
             # Built over the dict the engine will actually serve, so the postings carry the same
             # situation KEYS and the same `CallPred` objects the reference scan reads.
             _generation_state["index"] = index_builder(_generation_state["snapshot"])
 
-        def run_seed(queries=queries, stamp=stamp, seed=seed):
+        def run_seed(queries=queries, stamp=stamp, seed=seed, plan=plan, counted=trip_subjects):
             n = 0
             for query in queries:
                 situation = query.get("situation")
@@ -2461,6 +2482,34 @@ def _assert_prune_identity(seeds, *, index_builder=None):
                 assert got.model_dump() == want.model_dump(), (
                     f"seed {seed}, query {query}: the prune changed the answer"
                 )
+                if plan is not None:
+                    # With a plan (multi-leg U3): the direct answer is the same one, and the trips
+                    # judged beside it are what `trips.judge` says of the same snapshot -- the trip
+                    # path reads the call lookup, never the pruned scope.
+                    planned = impact.for_trip(
+                        from_stop=A, to_stop=query["to_stop"],
+                        window_start=window_start, window_end=window_end,
+                        select=query["select"], at=query["at"],
+                        catchable_after=query["catchable_after"],
+                        situation=situation, with_alternative=False, plans=plan,
+                    )
+                    want_dump = want.model_dump()
+                    assert planned.model_dump() == {**want_dump, "as_of": planned.as_of}, (
+                        f"seed {seed}, query {query}: a plan changed the direct answer"
+                    )
+                    reference = None if query["to_stop"] is None else [
+                        impact._trip_subject(verdict).model_dump()
+                        for verdict in trips.judge(
+                            plan, to_stop=query["to_stop"], window_start=window_start,
+                            window_end=window_end, catchable_after=query["catchable_after"],
+                        )
+                    ]
+                    judged = (
+                        None if planned.trip_subjects is None
+                        else [subject.model_dump() for subject in planned.trip_subjects]
+                    )
+                    assert judged == reference, f"seed {seed}, query {query}: trips differ"
+                    counted[0] += len(judged or ())
                 n += 1
             return n, impact.index_stats()
 
@@ -2867,6 +2916,637 @@ def test_the_fallback_takes_the_first_arrival_after_boarding():
     [cell] = _cells(_scope(S1=[b], S2=[again, first]), select="worst")
     assert not cell.destination_cancelled
     assert cell.arrival.scheduled_time == _at(8, 40)
+
+
+# ---- Characterization: `for_trip` without plans (multi-leg U3) ----------------------------------
+# Pinned on the code before `plans=` existed, and unchanged since: `for_trip`'s answer, the
+# serialized `/impact` JSON and the response schema stay what they were when no plan is passed
+# (AE6, KTD4). A difference anywhere -- a field, an order, a figure -- fails against the golden text
+# at the bottom of this file. Regenerate it only for a deliberate change to the direct answer.
+
+_FROZEN_NOW = datetime(2026, 7, 29, 7, 30, tzinfo=UTC)
+
+
+class _FrozenDatetime(datetime):
+    """`impact.datetime` with a fixed `now`, so `as_of` and the observation cut are pinned too."""
+
+    @classmethod
+    def now(cls, tz=None):
+        return _FROZEN_NOW if tz is not None else _FROZEN_NOW.replace(tzinfo=None)
+
+
+def _characterization_scope():
+    """Direct-only trains in the shapes the matcher distinguishes: two on one line, a no-SX train,
+    an ET relay, a cancelled destination, an observed late call and a bus."""
+    scored = _train("j1", 8, p_impact_dep=0.7, p_cancel=0.2) + _train(
+        "j2", 8, 30, p_impact_dep=0.2, p_cancel=0.05
+    )
+    scored[0].call_source, scored[0].et_dep_delay_min = "recorded", 6
+    scored[0].aimed_dep = _at(7, 10)
+    nosx = _train("j3", 7, 45, line="VYG:Line:L1", situation_number=NOSX_SIT,
+                  has_situation=False, p_impact_dep=0.88)
+    relay = _train("j4", 8, 15, line="VYG:Line:R11", situation_number=RELAY_SIT,
+                   et_declared_cancelled=True, has_situation=False)
+    unreachable = _train("j5", 8, 40, line="VYG:Line:R12", situation_number="S2",
+                         p_impact_dep=0.3, report_type="INCIDENT", description="Signalfeil")
+    unreachable[1].et_declared_cancelled = True
+    bus = _train("ServiceJourney:b1", 8, 5, line="RUT:Line:150", operator="RUT",
+                 situation_number="S3", p_impact_dep=0.6, arr_delay_p50_stack_min=4,
+                 p_arr_ge10=0.3, p_impact=0.4)
+    return _scope(
+        S1=scored, **{NOSX_SIT: nosx, RELAY_SIT: relay}, S2=unreachable, S3=bus,
+    )
+
+
+def _characterize():
+    """Every serialized answer the characterization pins, keyed by what produced it."""
+    from fastapi.testclient import TestClient
+
+    _install_snapshot(_characterization_scope())
+    original_datetime = impact.datetime
+    impact.datetime = _FrozenDatetime
+    try:
+        def call(**kw):
+            kw = {"from_stop": A, "to_stop": B, "window_start": _at(7), "window_end": _at(9),
+                  "select": "worst", "with_alternative": False, **kw}
+            return impact.for_trip(**kw).model_dump_json()
+
+        out = {
+            "worst": call(),
+            "worst_catchable": call(catchable_after=_at(7, 20)),
+            "nearest": call(select="nearest", at=_at(8)),
+            "no_to_stop": call(to_stop=None),
+            "situation": call(situation="S2"),
+        }
+        original = impact.alternatives.fetch_candidates
+        impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network from the suite
+        try:
+            r = TestClient(main.app).get(
+                "/impact", params={"from_stop": A, "to_stop": B, "at": _at(8).isoformat()},
+            )
+        finally:
+            impact.alternatives.fetch_candidates = original
+        assert r.status_code == 200, r.text
+        out["http"] = r.text
+    finally:
+        impact.datetime = original_datetime
+    return out
+
+
+def test_for_trip_without_plans_answers_exactly_what_it_answered_before():
+    """By digest, the text itself being ~9 KB a query; a failure prints the new text of each
+    query that moved, so the change can be read before the digest is regenerated."""
+    import hashlib
+
+    got = {name: hashlib.sha256(text.encode()).hexdigest() for name, text in _characterize().items()}
+    moved = sorted(name for name in got if got[name] != _GOLDEN_FOR_TRIP.get(name))
+    assert got == _GOLDEN_FOR_TRIP, {name: _characterize()[name] for name in moved}
+
+
+def test_the_impact_response_schema_is_unchanged():
+    """The published `/impact` schema: the OpenAPI component FastAPI serves, by digest."""
+    import hashlib
+    import json
+
+    schemas = main.app.openapi()["components"]["schemas"]
+    names = sorted(n for n in schemas if n in {
+        "ImpactResponse", "SituationImpact", "LineImpact", "StopPrediction", "LatestObservation",
+        "AlternativeJourney", "AlternativeLeg", "AlternativePrediction",
+    })
+    digest = hashlib.sha256(
+        json.dumps({n: schemas[n] for n in names}, sort_keys=True).encode()
+    ).hexdigest()
+    assert (names, digest) == (_GOLDEN_SCHEMA_NAMES, _GOLDEN_SCHEMA_DIGEST), (names, digest)
+    # And no trip model reaches `/impact`'s components through the excluded carrier. Asked of those
+    # components rather than of the whole document since multi-leg U5: `/varsel-api`'s `Alert`
+    # carries the trip shape on purpose (KTD13), which puts `Trip*` components in the app's schema.
+    assert "#/components/schemas/Trip" not in json.dumps({n: schemas[n] for n in names})
+    assert {n for n in schemas if n.startswith("Trip")} <= {
+        "TripFacts", "TripLeg", "TripProblem", "TripTransfer",
+    }, "the one trip shape, and never `TripSubject`"
+
+
+# ---- The trip path: `for_trip(plans=...)` (multi-leg U3) -----------------------------------------
+# `trips.judge` itself is `test_trips.py`'s. These pin what `for_trip` does with it: the trips ride
+# BESIDE the direct answer, which a plan never changes, and a broken verdict costs only the trips.
+
+
+def _plan_leg(jkey, board, alight, dep, arr, *, operator="VYG", mode="rail", position=0):
+    return trips.PlanLeg(
+        operator=operator, refs=((operator, jkey),), line=f"{operator}:Line:R12",
+        public_code="R12", mode=mode, board_stop_place=board, alight_stop_place=alight,
+        board_quay=None, alight_quay=None, board_position=position, alight_position=position + 3,
+        aimed_departure=dep, aimed_arrival=arr, service_date=dep.date(),
+    )
+
+
+def _plan(*legs_per_trip, directs=()):
+    return trips.DayPlan(
+        trips=tuple(trips.PlanTrip(legs=legs) for legs in legs_per_trip), directs=directs
+    )
+
+
+def _plan_from(scope):
+    """A day plan over a random snapshot (the oracle's): every journey boarding at A that also calls
+    at C becomes a first leg A -> C, continued by an unscored train C -> B."""
+    legs = {}
+    for calls in scope.values():
+        for board in calls:
+            if board.stop_place != A or board.aimed_dep is None:
+                continue
+            for alight in calls:
+                if (alight.operator, alight.jkey) == (board.operator, board.jkey) and (
+                    alight.stop_place == C and alight.aimed_arr is not None
+                ):
+                    first = _plan_leg(board.jkey, A, C, board.aimed_dep, alight.aimed_arr,
+                                      operator=board.operator)
+                    onward = _plan_leg("onward", C, B, alight.aimed_arr + timedelta(minutes=8),
+                                       alight.aimed_arr + timedelta(minutes=30))
+                    legs[(first, onward)] = None
+    return _plan(*legs)
+
+
+def test_the_pruned_scan_and_the_trips_agree_with_a_plan_given():
+    """The oracle again, every query also asked with a plan: the direct answer is the one the full
+    scan gives, and the trips beside it are `trips.judge`'s over the same snapshot."""
+    judged = [0]
+    compared = _assert_prune_identity(_IDENTITY_SEEDS, with_plans=True, trip_subjects=judged)
+    assert compared >= 200 and judged[0] >= 20, (compared, judged)
+
+
+def _frozen(fn):
+    original = impact.datetime
+    impact.datetime = _FrozenDatetime
+    try:
+        return fn()
+    finally:
+        impact.datetime = original
+
+
+def _ae1_scope():
+    """AE1 on this suite's stops: the 07:11 direct A -> B, and the 07:17 A -> C (an operator message
+    names it; 0.9 to be 5+ min late at C, P(miss) 0.7943 at its 6-minute change) continuing as a 07:30 C -> B nothing scores, which reaches
+    B (08:05) before the next direct departure after it does (the 07:41, at 08:20)."""
+    direct = _train("d0711", 7, 11, p_impact_dep=0.2)
+    board = FakeCall("t0717", A, 1, _at(7, 17), situation_number="S9", p_impact_dep=0.3)
+    at_c = FakeCall("t0717", C, 3, None, aimed_arr=_at(7, 24), situation_number="S9",
+                    p_arr_ge5=0.9, p_arr_ge10=0.8, p_arr_ge20=0.1)
+    directs = tuple(
+        trips.DirectDeparture(operator="VYG", refs=(("VYG", jkey),), board_stop_place=A,
+                              aimed_departure=dep, aimed_arrival=arr)
+        for jkey, dep, arr in (("d0711", _at(7, 11), _at(7, 51)), ("d0741", _at(7, 41), _at(8, 20)))
+    )
+    plan = _plan(
+        (_plan_leg("t0717", A, C, _at(7, 17), _at(7, 24)),
+         _plan_leg("t1230", C, B, _at(7, 30), _at(8, 5))),
+        directs=directs,
+    )
+    return _scope(S1=direct, S9=[board, at_c]), plan
+
+
+def _ask(plan=None, **kw):
+    query = {"from_stop": A, "to_stop": B, "window_start": _at(7), "window_end": _at(8),
+             "select": "worst", "with_alternative": False, **kw}
+    return _frozen(lambda: impact.for_trip(**query, plans=plan))
+
+
+def test_ae1_the_trip_rides_beside_the_direct_answer_which_a_plan_leaves_unchanged():
+    scope, plan = _ae1_scope()
+    _install_snapshot(scope)
+    without, with_plan = _ask(), _ask(plan)
+    assert with_plan.model_dump_json() == without.model_dump_json(), "the /impact JSON"
+    assert without.trip_subjects is None
+    assert [s.situation_number for s in with_plan.situations] == ["S1"], "the 07:11, as today"
+    [subject] = with_plan.trip_subjects
+    assert subject.alertworthy and not subject.confirmed and subject.admitted
+    assert (subject.trip.problem.kind, subject.trip.problem.index) == ("missed_connection", 0)
+    assert (round(subject.deciding_probability, 4), subject.deciding_threshold) == (0.7943, 0.65)
+    assert subject.situation_number == "S9" and subject.has_situation
+    assert subject.key == ("VYG", "t0717", _at(7, 17)) and subject.stop_order == 1
+    assert subject.departure_prediction.impact_probability == 0.3, "the boarding call's own figure"
+    assert subject.trip.expected_arrival is None
+    assert "trip_subjects" not in with_plan.model_dump()
+
+
+def test_a_trip_never_displaces_a_direct_train_that_shares_its_situation():
+    """A line suspension on the trip's second leg is one situation over both trains: the direct
+    train keeps its cell, and the trip attaches to the same situation beside it."""
+    direct = _train("d1", 7, 40, situation_number="LINE", p_impact_dep=0.3)
+    second = FakeCall("t2", C, 1, _at(7, 45), situation_number="LINE", p_impact_dep=0.9)
+    _install_snapshot(_scope(LINE=direct + [second]))
+    plan = _plan((_plan_leg("t1", A, C, _at(7, 15), _at(7, 30)),
+                  _plan_leg("t2", C, B, _at(7, 45), _at(8, 10))))
+    without, with_plan = _ask(), _ask(plan)
+    assert with_plan.model_dump() == without.model_dump()
+    assert [(s.situation_number, s.jkey) for s in with_plan.situations] == [("LINE", "d1")]
+    [subject] = with_plan.trip_subjects
+    assert subject.situation_number == "LINE" and subject.alertworthy
+    assert (subject.trip.problem.kind, subject.trip.problem.index) == ("leg_departure", 1)
+    assert subject.departure_prediction is None, "an unscored first leg has no figure of ours"
+
+
+def test_ae7_a_first_train_direct_for_the_pair_is_no_trip_even_when_it_is_not_the_worst():
+    worse = _train("worse", 7, 5, p_impact_dep=0.95)
+    local = _train("local", 7, 20, p_impact_dep=0.7)
+    local.append(FakeCall("local", C, 3, None, aimed_arr=_at(7, 35)))
+    _install_snapshot(_scope(S1=worse + local))
+    plan = _plan((_plan_leg("local", A, C, _at(7, 20), _at(7, 35)),
+                  _plan_leg("express", C, B, _at(7, 40), _at(7, 55))))
+    resp = _ask(plan)
+    assert [s.jkey for s in resp.situations] == ["worse"], "per-line selection keeps the worse one"
+    assert resp.trip_subjects == [], "the direct verdict decides the local, wherever it ranks"
+
+
+def test_a_confirmed_trip_carries_the_certainty_on_its_scored_boarding_call():
+    board = FakeCall("t1", A, 1, _at(7, 15), situation_number="S1", p_impact_dep=0.2)
+    second = FakeCall("t2", C, 1, _at(7, 45), situation_number="S2", et_declared_cancelled=True)
+    _install_snapshot(_scope(S1=[board], S2=[second]))
+    plan = _plan((_plan_leg("t1", A, C, _at(7, 15), _at(7, 30)),
+                  _plan_leg("t2", C, B, _at(7, 45), _at(8, 10))))
+    [subject] = _ask(plan).trip_subjects
+    assert subject.confirmed and subject.situation_number == "S2"
+    departure = subject.departure_prediction
+    assert (departure.impact_probability, departure.cancel_probability) == (1.0, 1.0)
+    assert departure.cancelled is False, "the boarding call itself runs"
+    assert departure.delay_p50_min is None and departure.delay_p90_min is None
+
+
+def test_a_broken_trip_verdict_costs_the_trips_and_never_the_direct_answer():
+    scope, plan = _ae1_scope()
+    _install_snapshot(scope)
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    def broken(*_a, **_k):
+        raise ValueError("NSR:StopPlace:A at 07:17")
+
+    handler = _Capture(level=logging.WARNING)
+    impact.logger.addHandler(handler)
+    original = trips.judge
+    trips.judge = broken
+    try:
+        without, with_plan = _ask(), _ask(plan)
+    finally:
+        trips.judge = original
+        impact.logger.removeHandler(handler)
+    assert with_plan.trip_subjects is None, "not evaluated, never an empty calm list"
+    assert with_plan.model_dump() == without.model_dump()
+    [record] = [r for r in records if getattr(r, "fields", {}).get("event") == "trip_verdict_error"]
+    assert "NSR:" not in record.getMessage() and "07:17" not in record.getMessage()
+
+
+def test_no_trips_are_judged_without_a_destination():
+    scope, plan = _ae1_scope()
+    _install_snapshot(scope)
+    assert _ask(plan, to_stop=None).trip_subjects is None
+
+
+def test_the_direct_check_agrees_with_the_matchers_eligibility():
+    """KTD3's helper restates `_trip_cells`' eligibility on calls; for every shape the matcher tells
+    apart, the first train is direct exactly when `_trip_cells` gives it a cell."""
+    def shape(**alight):
+        board = FakeCall("j", A, 2, _at(7, 15), **alight.pop("board", {}))
+        if alight.pop("none", False):
+            return [board]
+        return [board, FakeCall("j", B, alight.pop("order", 5), None,
+                                aimed_arr=alight.pop("arr", _at(7, 55)), **alight)]
+
+    shapes = {
+        "usable": shape(),
+        "alighting_closed": shape(alighting_allowed=False),
+        "boarding_closed": shape(board={"boarding_allowed": False}),
+        "wrong_direction": shape(order=1),
+        "no_call_at_b": shape(none=True),
+        "no_arrival_time": shape(arr=None),
+        "in_another_situation": shape(situation_number="S2"),
+    }
+    leg = (_plan_leg("j", A, C, _at(7, 15), _at(7, 30)), _plan_leg("k", C, B, _at(7, 40), _at(8)))
+    trip = trips.PlanTrip(legs=leg)
+    verdicts = {}
+    for name, calls in shapes.items():
+        scope = {}
+        for call in calls:
+            scope.setdefault(call.situation_number, []).append(call)
+        _install_snapshot(scope)
+        matched = {c.jkey for c in _cells(scope, select="worst", start=_at(7), end=_at(8))}
+        helper = trips.direct_for_pair(trip, trips.DayPlan(trips=(trip,)), B)
+        assert helper == ("j" in matched), (name, helper, matched)
+        verdicts[name] = helper
+    assert verdicts["usable"] and verdicts["in_another_situation"]
+    assert sum(verdicts.values()) == 2, verdicts
+
+
+def test_the_prediction_rows_five_minute_points_reach_the_call():
+    class Row:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    numbers = dict.fromkeys([
+        "summary", "description", "stop_name", "aimed_arr", "et_dep_delay_min",
+        "dep_delay_typ_min", "dep_delay_p90_min", "arr_delay_typ_min", "arr_delay_p90_min",
+        "p_arr_ge10", "p_arr_ge20", "arr_delay_p50_stack_min", "arr_delay_p90_stack_min",
+        "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
+        "dep_delay_p90_stack_min",
+    ])
+    fields = {
+        "situationNumber": "S1", "jkey": "j1", "lineRef": "VYG:Line:R10", "stop_place": A,
+        "stop_order": 1, "aimed_dep": _at(8), "et_declared_cancelled": False,
+        "call_source": "estimated", "p_cancel": 0.1, "p_impact_dep": 0.9, **numbers,
+    }
+    older = main._call_pred_from_row(Row(**fields), "VYG")
+    assert (older.p_arr_ge5, older.p_dep_ge5) == (None, None), "a table built before them"
+    newer = main._call_pred_from_row(Row(**fields, p_arr_ge5=0.8, p_dep_ge5=0.6), "VYG")
+    assert (newer.p_arr_ge5, newer.p_dep_ge5) == (0.8, 0.6)
+
+
+def test_the_kix_trip_situations_are_fed_their_texts_with_the_predictions():
+    """main names every held plan's `KIX:Trip:` situations to `situation_english` on each load, so
+    a trip reason judged from Journey Planner real-time serves its English and nynorsk."""
+    from types import SimpleNamespace
+
+    import situation_english
+    import trip_plans
+
+    _, plan = _ae1_scope()
+    number = trips.trip_situation(plan.trips[0].legs[1])
+    saved = (main.bq_client, main._call_pred_by_key, main._call_pred_by_jkey_index,
+             main._call_pred_by_situation, main._call_pred_by_stop_ref,
+             main._call_pred_refreshed_at, dict(trip_plans._plans))
+    main.bq_client = SimpleNamespace(
+        query=lambda _q: SimpleNamespace(result=lambda timeout=None: [])
+    )
+    trip_plans._plans[(A, B, _at(7).date())] = plan
+    try:
+        main.refresh_call_predictions_cache(translate=False)
+        english = situation_english.english(number, None, None)
+        nynorsk = situation_english.nynorsk(number, None, None)
+    finally:
+        (main.bq_client, main._call_pred_by_key, main._call_pred_by_jkey_index,
+         main._call_pred_by_situation, main._call_pred_by_stop_ref,
+         main._call_pred_refreshed_at, plans) = saved
+        trip_plans._plans.clear()
+        trip_plans._plans.update(plans)
+        situation_english.reset_state()
+    assert english.summary == "Disruption on part of the journey" and not english.machine_translated
+    assert nynorsk.summary == "Avvik på ein del av reisa"
+
+
+# ---- Alternatives for trips (multi-leg U6, KTD10) ------------------------------------------------
+# A departure with a change gets its own lookup, on the direct trains' budget, with the trip as the
+# original and its broken legs as the exclusion; and, behind the flag, every candidate with a change
+# is checked for its connection. Timed off a live `now`, like the direct lookups above.
+
+
+@contextlib.contextmanager
+def _trip_flag(on):
+    before = os.environ.get("TRIP_PLANS_ENABLED")
+    os.environ["TRIP_PLANS_ENABLED"] = "true" if on else "false"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("TRIP_PLANS_ENABLED", None)
+        else:
+            os.environ["TRIP_PLANS_ENABLED"] = before
+
+
+def _broken_change(now, *, dep_min=10):
+    """AE2's trip: A -> C on t1 (+dep_min, 10 min), then C -> B on t2 (5 min later, 25 min), whose
+    boarding call at C ET has declared cancelled; nothing else in the plan continues t1. Returns
+    (the cache's calls, the plan's legs)."""
+    dep = now + timedelta(minutes=dep_min)
+    legs = (
+        _plan_leg("t1", A, C, dep, dep + timedelta(minutes=10)),
+        _plan_leg("t2", C, B, dep + timedelta(minutes=15), dep + timedelta(minutes=40)),
+    )
+    return [FakeCall("t2", C, 1, legs[1].aimed_departure, situation_number="S9",
+                     et_declared_cancelled=True)], legs
+
+
+def _riding(*legs, ordinal=0):
+    """A Journey Planner candidate riding `legs` (`trips.PlanLeg`s, for brevity) on time, as
+    `parse_candidates` builds one: every leg's refs, and each ridden leg for the change check."""
+    return alternatives.AlternativeCandidate(
+        departure_time=legs[0].aimed_departure, arrival_time=legs[-1].aimed_arrival,
+        aimed_departure_time=legs[0].aimed_departure, aimed_arrival_time=legs[-1].aimed_arrival,
+        legs=[alternatives.AlternativeLeg(mode=leg.mode, line=leg.line) for leg in legs],
+        transit_refs=[ref for leg in legs for ref in leg.refs],
+        lines=[leg.line for leg in legs],
+        board_stop_place=legs[0].board_stop_place, alight_stop_place=legs[-1].alight_stop_place,
+        transit_legs=[
+            alternatives.CandidateLeg(leg.refs, leg.board_stop_place, leg.alight_stop_place,
+                                      leg.aimed_departure, leg.aimed_arrival, leg.walk_after_s)
+            for leg in legs
+        ],
+        ordinal=ordinal,
+    )
+
+
+def _hot_transfer(leg, p_miss=0.85):
+    """`leg`'s arriving call at its transfer stop, scored: 0.85 to be 5+ min late there, and calm on
+    the gate `risky` already reads, so only the change check can make a candidate riding it risky."""
+    return FakeCall(leg.refs[0][1], leg.alight_stop_place, 4, None, aimed_arr=leg.aimed_arrival,
+                    p_impact_dep=None, p_impact=0.3, p_arr_ge5=p_miss, p_arr_ge10=0.6,
+                    p_arr_ge20=0.3)
+
+
+def test_ae2_a_cancelled_second_leg_is_answered_by_the_same_first_train_and_a_later_connection():
+    """`affected_refs` holds the broken leg, never the first: JP's own copy of the broken trip is
+    excluded, and the same first train with the next connection competes and wins over a direct
+    train arriving later still. The trip is the original, and with nothing in the plan getting the
+    traveller there it is unrankable rather than the winner."""
+    now = datetime.now(UTC)
+    calls, (first, cancelled) = _broken_change(now)
+    later = _plan_leg("t3", C, B, cancelled.aimed_departure + timedelta(minutes=15),
+                      cancelled.aimed_arrival + timedelta(minutes=15))
+    direct = _plan_leg("d1", A, B, first.aimed_departure + timedelta(minutes=5),
+                       cancelled.aimed_arrival + timedelta(minutes=40))
+    jp = _JourneyPlanner(
+        [_riding(first, cancelled)], [_riding(first, later), _riding(direct, ordinal=1)]
+    )
+    resp = _for_trip(_scope(S9=calls), jp, now=now, plans=_plan((first, cancelled)))
+    [subject] = resp.trip_subjects
+    assert subject.confirmed and subject.trip.expected_arrival is None, "control: AE2's subject"
+    alt = subject.alternative_journey
+    assert alt is not None, "the trip got its own lookup"
+    assert (alt.departure_time, alt.arrival_time) == (first.aimed_departure, later.aimed_arrival), (
+        "the same first train with the next connection, not the broken trip nor the later direct"
+    )
+    assert alt.minutes_after_original == 15, "against the trip's own planned arrival"
+    assert subject.original_is_best is False and subject.answered is True
+    assert subject.alternative_subject == ("VYG", "t1"), "a claim about the first-leg departure"
+    assert [q["date_time"] for q in jp.calls if q["arrive_by"]] == [cancelled.aimed_arrival]
+    assert resp.alternative_journey is None and resp.situations == [], "no direct train in play"
+
+
+def test_only_an_alert_worthy_admitted_trip_asks_the_journey_planner():
+    """A subject KTD20 does not admit (waiting for the next direct train is faster) is an
+    alternative at most, and one under the bar has nothing to advise on: neither spends a lookup."""
+    now = datetime.now(UTC)
+    calls, (first, cancelled) = _broken_change(now)
+    faster = trips.DirectDeparture(
+        operator="VYG", refs=(("VYG", "d1"),), board_stop_place=A,
+        aimed_departure=first.aimed_departure + timedelta(minutes=2),
+        aimed_arrival=cancelled.aimed_arrival - timedelta(minutes=5),
+    )
+    calm = FakeCall("t1", A, 1, first.aimed_departure, situation_number="S9", p_impact_dep=0.2)
+    for scope, directs, control in (
+        (calls, (faster,), (True, False)), ([calm], (), (False, True)),
+    ):
+        jp = _JourneyPlanner()
+        resp = _for_trip(_scope(S9=scope), jp, now=now,
+                         plans=_plan((first, cancelled), directs=directs))
+        [subject] = resp.trip_subjects
+        assert (subject.alertworthy, subject.admitted) == control, "control: (alert-worthy, admitted)"
+        assert subject.alternative_subject is None and jp.calls == [], control
+
+
+def test_a_trips_own_copy_in_the_reply_is_the_one_riding_every_leg_not_a_sibling():
+    """The reconciliation takes JP's reading of the original when it is later than ours. For a trip
+    that reading is the candidate riding all its legs: the same first train with a later connection
+    is another way there, and read as the trip's own arrival it would hand the win to a rival."""
+    now = datetime.now(UTC)
+    first = _plan_leg("t1", A, C, now + timedelta(minutes=10), now + timedelta(minutes=20))
+    onward = _plan_leg("t2", C, B, now + timedelta(minutes=25), now + timedelta(minutes=50))
+    later = _plan_leg("t3", C, B, now + timedelta(minutes=40), now + timedelta(minutes=65))
+    rival = _plan_leg("d1", A, B, now + timedelta(minutes=15), now + timedelta(minutes=55))
+    late_first = FakeCall("t1", A, 1, first.aimed_departure, situation_number="S9", p_cancel=0.1)
+    jp = _JourneyPlanner([_riding(first, later), _riding(first, onward, ordinal=1)], [_riding(rival)])
+    resp = _for_trip(_scope(S9=[late_first]), jp, now=now, plans=_plan((first, onward)))
+    [subject] = resp.trip_subjects
+    assert subject.trip.problem.kind == "departure" and subject.trip.expected_arrival == (
+        onward.aimed_arrival
+    ), "control: the first train is late leaving, and the change still holds"
+    assert subject.original_is_best is True and subject.alternative_journey is None, (
+        "the trip arrives on plan by its own copy, which a rival five minutes late cannot beat"
+    )
+
+
+def test_a_trip_whose_arrival_is_unknown_is_beaten_on_its_trouble_never_on_the_unknown():
+    """KTD9's null arrival is unknown, never late. The trip leaves the selection's pool as anything
+    unrankable does, so "stay put" is never claimed for it, and a rival's minutes are counted
+    against the PLAN. What lets a rival win is the trip's own trouble (the gate's verdict); without
+    it, a rival one minute earlier than the plan is no advice, as for any train."""
+    now = datetime.now(UTC)
+    calls, (first, cancelled) = _broken_change(now)
+    resp = _for_trip(_scope(S9=calls), _JourneyPlanner(), now=now, plans=_plan((first, cancelled)))
+    [subject] = resp.trip_subjects
+    rival = _plan_leg("d1", A, B, first.aimed_departure + timedelta(minutes=2),
+                      cancelled.aimed_arrival - timedelta(minutes=1))
+
+    def lookup(trip):
+        original = alternatives.fetch_candidates
+        alternatives.fetch_candidates = _JourneyPlanner([_riding(rival)])
+        try:
+            return impact._best_trip_journey(
+                trip, affected=[], from_stop=A, to_stop=B, window_end=now + timedelta(hours=2),
+                now=now,
+            )
+        finally:
+            alternatives.fetch_candidates = original
+
+    quiet = lookup(subject.model_copy(update={"alertworthy": False, "confirmed": False}))
+    assert quiet.journey is None, "a minute against the plan is no reason to leave it"
+    assert quiet.original_is_best is False, "and an unrankable trip never wins its own contest"
+    assert quiet.subject == ("VYG", "t1"), "control: the lookup ran"
+    troubled = lookup(subject)
+    assert troubled.journey is not None and troubled.journey.minutes_saved == 1, (
+        "offered on the trip's trouble, its minutes counted against the planned arrival"
+    )
+    assert troubled.original_is_best is False
+
+
+def test_a_candidate_whose_change_we_expect_missed_is_risky_and_arrives_with_its_sibling():
+    """KTD7 on a candidate with a change, behind the flag: P(miss) at the planned slack less the
+    walk, gated at the arriving call's own bar. A missed change makes the candidate
+    risky, and its expected arrival is that of a later candidate sharing its first leg -- or null,
+    which nothing can rank. Off, nothing moves."""
+    first = _plan_leg("c1", A, C, _at(9), _at(9, 20))
+    tight = _plan_leg("c2", C, B, _at(9, 25), _at(9, 50))  # 5 min planned: P(miss) 0.7666
+    roomy = _plan_leg("c3", C, B, _at(9, 45), _at(10, 10))  # 25 min: p_arr_ge20's 0.3, P(miss) 0.08
+    index = {("VYG", "c1"): [_hot_transfer(first)]}
+
+    with _trip_flag(True):
+        missed, sibling = (s.candidate for s in _scored(
+            [_riding(first, tight), _riding(first, roomy, ordinal=1)], index=index
+        ))
+        [alone] = (s.candidate for s in _scored([_riding(first, tight)], index=index))
+    assert missed.risky and not sibling.risky
+    assert missed.arrival_time == sibling.arrival_time == _at(10, 10)
+    assert missed.predicted_arrival_time == sibling.predicted_arrival_time
+    assert alone.risky and alone.arrival_time is None, "no sibling: unknown, never JP's 09:50"
+
+    with _trip_flag(False):
+        [off] = (s.candidate for s in _scored([_riding(first, tight)], index=index))
+    assert not off.risky and off.arrival_time == _at(9, 50)
+
+
+def test_with_the_flag_off_a_direct_trains_alternative_is_what_it_was():
+    """The check changes what direct alerts are offered too, so it sits behind the flag (KTD10).
+    Off, the answer is field for field what a candidate carrying no legs to check got before U6;
+    on, a change our figures say is missed no longer wins on an arrival it will not make."""
+    now = datetime.now(UTC)
+    scope = _scope(S1=_live_train(now, "gone", dep_min=10, arr_min=50, et_declared_cancelled=True))
+    first = _plan_leg("c1", A, C, now + timedelta(minutes=20), now + timedelta(minutes=35))
+    tight = _plan_leg("c2", C, B, now + timedelta(minutes=40), now + timedelta(minutes=55))
+    direct = _plan_leg("d2", A, B, now + timedelta(minutes=30), now + timedelta(minutes=75))
+    index = {("VYG", "c1"): [_hot_transfer(first)]}
+
+    def ask(*, legs_kept=True):
+        pool = [_riding(first, tight), _riding(direct, ordinal=1)]
+        if not legs_kept:
+            for cand in pool:
+                cand.transit_legs = []
+        resp = _for_trip(scope, _JourneyPlanner([], pool), now=now, index=index)
+        return resp.situations[0].alternative_journey
+
+    with _trip_flag(False):
+        off, before = ask(), ask(legs_kept=False)
+    with _trip_flag(True):
+        on = ask()
+    assert off.model_dump() == before.model_dump()
+    assert off.arrival_time == tight.aimed_arrival, "control: the change wins with the flag off"
+    assert on.arrival_time == direct.aimed_arrival, "and loses on its missed connection with it on"
+
+
+def test_a_trip_spends_the_direct_trains_lookup_budget_soonest_first():
+    """One budget per call, `_MAX_ALTERNATIVE_LOOKUPS`, spent soonest departure first across the
+    direct trains and the trips: the trip leaving between the first and second disrupted trains
+    takes the second lookup, and the train leaving fourth gets none."""
+    now = datetime.now(UTC)
+    trains = {
+        f"S{i}": _live_train(now, f"j{i}", dep_min=dep, arr_min=dep + 40, p_impact_dep=0.93,
+                             line=f"VYG:Line:R{i}", situation_number=f"S{i}")
+        for i, dep in enumerate((10, 30, 40))
+    }
+    calls, legs = _broken_change(now, dep_min=20)
+    jp = _PerDeadlinePlanner({}, now)
+    resp = _for_trip(_scope(**trains, S9=calls), jp, now=now, plans=_plan(legs),
+                     window_min=(-5, 300))
+    assert jp.deadlines() == [50, 60, 70], "the +10 train, the +20 trip, the +30 train"
+    [subject] = resp.trip_subjects
+    assert subject.alternative_subject == ("VYG", "t1")
+    looked_up = {s.jkey for s in resp.situations if s.alternative_subject is not None}
+    assert looked_up == {"j0", "j1"}, looked_up
+
+
+# The characterization's golden digests, taken on the code before `for_trip(plans=)` existed.
+_GOLDEN_FOR_TRIP = {
+    "http": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
+    "nearest": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
+    "no_to_stop": "253875cdcdc24979efd81486a7b3d1fd92099cd437c079d400dc706daae14793",
+    "situation": "f5deeb8d676920fd9afe14b238fb5fb75a99770bfebe3c181973914458229387",
+    "worst": "42a423594b94c36c34abcef092aae7adcddd20615663ebb8fafdb4f55b8845c1",
+    "worst_catchable": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
+}
+_GOLDEN_SCHEMA_NAMES = [
+    "AlternativeJourney", "AlternativeLeg", "AlternativePrediction", "ImpactResponse",
+    "LatestObservation", "LineImpact", "SituationImpact", "StopPrediction",
+]
+_GOLDEN_SCHEMA_DIGEST = "4cc727b04b53ed5fb834449d40a1b004fc867b145b913c65249742e4ce5a29a7"
 
 if __name__ == "__main__":
     _run()

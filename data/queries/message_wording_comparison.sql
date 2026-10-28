@@ -80,6 +80,12 @@
 --      Expect it empty or near it: varsel keeps these trains out of the per-train pushes and the
 --      writing pass (they reach the traveller in one morning digest), so few of them carry a pair.
 --
+--   8. A FIFTH SINCE multi-leg U11: `transfer` («med bytte»), a departure with a change. Its
+--      `message_input` carries the trip facts and its wording comes from a second system prompt
+--      with its own `prompt_version` (KTD12), so it is yet another writing task. The CASE tests the
+--      legs snapshot (`g.trip_legs`) FIRST, ahead of `removed` -- the first leg of a trip can be any
+--      of the other four.
+--
 -- Also worth pinning before drawing a conclusion: `prompt_version` (a prompt edit mid-window makes
 -- rows incomparable -- that is what the column is for) and `llm_provider` (dev has been answering
 -- on Gemini with Claude latched off, so a result there is not a verdict on Sonnet).
@@ -117,11 +123,13 @@ subjects AS (
 )
 SELECT
   -- `et_cancelled` comes from the VIEW, never re-derived here (trap 5); the prefix test is the
-  -- same one historikk_summary.sql spells, in the same resolution order -- `removed` first (trap 7:
-  -- its flag is TRUE with nothing declared), then NULL (unsegmented), then `relayed`, which wins
+  -- same one historikk_summary.sql spells, in the same resolution order -- a trip first (trap 8),
+  -- then `removed` (trap 7: its flag is TRUE with nothing declared), then NULL (unsegmented), then
+  -- `relayed`, which wins
   -- over `no_sx` because a no-SX call declared cancelled between the scoring cycle and the judged
   -- cycle DID reach the traveller as a relayed fact (trap 6).
   CASE
+    WHEN g.trip_legs IS NOT NULL                           THEN 'transfer'
     WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
     WHEN g.et_cancelled IS TRUE OR g.destination_cancelled IS TRUE THEN 'relayed'
@@ -192,6 +200,7 @@ SELECT
   -- before reading two texts against each other: a `no_sx` pair and a `predicted` pair were
   -- written from structurally different inputs (trap 6).
   CASE
+    WHEN g.trip_legs IS NOT NULL                           THEN 'transfer'
     WHEN STARTS_WITH(situation_number, 'KIX:PlanRemoved:') THEN 'removed'
     WHEN g.et_cancelled IS NULL                            THEN NULL
     WHEN g.et_cancelled IS TRUE OR g.destination_cancelled IS TRUE THEN 'relayed'

@@ -42,7 +42,9 @@ for the Journey Planner cache's life (`alternatives._TTL`). A transient outcome 
 A REGISTERED definition -- one a browser or a webhook subscription holds, read by its five fields
 verbatim -- serves the poller's own wording for a train the pass already worded, byte for byte the
 event's (KTD6, R3), and spends no pull wording on it. The entry says whether its text is the model's
-or the template, never whether the definition is registered.
+or the template, never whether the definition is registered. One accepted exception, published as
+exposure 1 in both docs: with trips with a change on, `coverage.transfers` and `complete` differ for
+the hours a registration on the pair covers, because the leader holds that plan (2026-10-28, dev only).
 
 Bounds this module owns, each a number so it can be checked, and each published in
 `docs/operations/notification-webhooks.md`'s constants table:
@@ -74,8 +76,9 @@ from collections import OrderedDict, deque
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from time import monotonic
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import alert_policy
@@ -89,6 +92,7 @@ import notification_api
 import notification_auth
 import notification_events
 import notification_wording
+import trips
 import varsel
 from fastapi import APIRouter, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -247,19 +251,46 @@ _PENDING = "pending"
 _CAPPED = "capped"
 _NOT_WORDED = "not_worded"
 
+#: How far ahead of the read a missing plan is fetched for the trips with a change (multi-leg KTD1,
+#: KTD18): each window from NOW for at most this many hours. A departed trip alerts nobody, and a
+#: whole-day favourite (the read's default `00:00`-`23:59`) would otherwise need up to
+#: `trip_plans._MAX_PAGES` (50) pages per date against the `plans_pull` path's 20 a minute --
+#: refused part-way, `partial`, never cached, so `not_evaluated` on every read while each one spent
+#: the minute's pages again. Only this part makes an answer `complete: false`; `coverage.transfers`
+#: is said over the whole period ahead, so a later part no plan covers reads `not_evaluated` --
+#: never `evaluated` or `none` for hours nobody fetched, and never `complete: false`, which would
+#: promise a later read a fetch it will not start.
+PLAN_HORIZON_H = 3
+#: How far past the horizon a read's fetch reaches. The range a read needs moves with `now`, so a
+#: fetch of exactly `now`..`now + PLAN_HORIZON_H` stops covering the next read's a second later: that
+#: read would miss, fetch the same hours again and answer `complete: false`, and so would every read
+#: after it. With the margin one fetch serves a pair's reads for this long, at most 10 pages a date
+#: (`trip_plans._page_bound` of four hours) once an hour while somebody keeps reading.
+PLAN_FETCH_MARGIN_H = 1
+
 _refreshed_at_provider: Callable[[], datetime | None] | None = None
+#: The read-miss trigger (multi-leg KTD4): `(from_stop, to_stop, [(Oslo date, start, end), ...])`,
+#: the ranges no plan covers. `main` wires `trip_plans.fetch_for_read`, which starts a background
+#: fetch and returns at once; this module never imports `trip_plans`. None: nothing is fetched.
+_plan_fetch: Callable[[str, str, list[tuple[date, datetime, datetime]]], object] | None = None
 
 
-def configure(*, refreshed_at: Callable[[], datetime | None]) -> None:
-    """Wire in the freshness provider (`main._varsel_refreshed_at`), once, at startup.
+def configure(
+    *,
+    refreshed_at: Callable[[], datetime | None],
+    plan_fetch: Callable[[str, str, list[tuple[date, datetime, datetime]]], object] | None = None,
+) -> None:
+    """Wire in the freshness provider (`main._varsel_refreshed_at`), once, at startup, and the
+    read-miss plan trigger (multi-leg U8).
 
-    The only injection this module takes. The stop cache the `coverage` block reads comes off the
-    provider `varsel.configure` already holds (:func:`_stop_rows`), rather than through a second
-    parameter here: the two must describe the same picker rows, and one seam cannot drift from
-    itself.
+    The stop cache the `coverage` block reads comes off the provider `varsel.configure` already
+    holds (:func:`_stop_rows`), rather than through a second parameter here: the two must describe
+    the same picker rows, and one seam cannot drift from itself. The plans come the same way, off
+    `varsel.trip_plan_reader()`, which is what the matcher reads them through.
     """
-    global _refreshed_at_provider
+    global _refreshed_at_provider, _plan_fetch
     _refreshed_at_provider = refreshed_at
+    _plan_fetch = plan_fetch
 
 
 def _wall_clock() -> datetime:
@@ -316,12 +347,19 @@ class CoverageOut(BaseModel):
     in TODAY's planned timetable as the poller's stop cache knows it -- checked over every ref of
     the place (`varsel.place_refs`), so a collapsed ref is not read as absent -- and fail OPEN: an
     empty cache reads True for both, because "we do not know" must not be reported as "not served".
+
+    `transfers` (multi-leg KTD13) is `trips.transfer_coverage`'s answer, always present: with
+    TRIP_PLANS_ENABLED off it is `not_evaluated` (R16), which is what the strict schema needs.
     """
 
     model_config = ConfigDict(extra="forbid")
     operators: list[str]
     from_stop_in_timetable_today: bool
     to_stop_in_timetable_today: bool
+    transfers: trips.TransferCoverage = Field(
+        description="Whether the trips with a change on this definition were judged: `evaluated`, "
+        "`none` (the day's plan holds no trip with a change in the window) or `not_evaluated`."
+    )
 
 
 class TrainOut(BaseModel):
@@ -365,9 +403,10 @@ class JourneyAlertOut(BaseModel):
         "truncated answer lists the soonest trains and may therefore lack some ranks."
     )
     phase: str = Field(
-        description="`confirmed` when ET has declared the train cancelled, or when a Vy train that "
-        "runs on this weekday is missing from today's timetable (`KIX:PlanRemoved:`), else "
-        "`predicted`."
+        description="`confirmed` when ET has declared the train cancelled, when a departure with a "
+        "change cannot get there for a declared cancellation of one of its legs (`payload.trip`), or "
+        "when a Vy train that runs on this weekday is missing from today's timetable "
+        "(`KIX:PlanRemoved:`), else `predicted`."
     )
     train: TrainOut
     aimed_departure_time: datetime
@@ -392,7 +431,8 @@ class JourneyAlertsResponse(BaseModel):
     refreshed_at: datetime = Field(description="When the prediction cache the figures come from was loaded.")
     complete: bool = Field(
         description="Whether every listed entry's wording and alternative reached a terminal status. "
-        "False while any is pending or transiently refused; the answer is then `no-store`."
+        "False while any is pending or transiently refused, and while the plan for the trips with a "
+        "change is still being fetched; the answer is then `no-store`."
     )
     n_alerts: int = Field(description="Alert-worthy trains ahead, before `limit` was applied.")
     truncated: bool
@@ -565,8 +605,79 @@ _figures_inflight: dict[tuple, threading.Event] = {}
 _figures_generation: datetime | None = None
 
 
-def _cache_key(journey_key: str, refreshed_at: datetime, now: datetime) -> tuple:
-    return (journey_key, refreshed_at, now.astimezone(_OSLO).date().isoformat())
+def _cache_key(journey_key: str, refreshed_at: datetime, now: datetime, plans: tuple = ()) -> tuple:
+    """`plans` is :func:`_plans_seen`'s marker: the figures of a definition are the matcher's over
+    the plans it read, so a plan landing mid-cycle -- a read miss's fetch -- is a new key, and the
+    next read lists the trip rather than the figures computed without it."""
+    return (journey_key, refreshed_at, now.astimezone(_OSLO).date().isoformat(), plans)
+
+
+class _PlanWindow(NamedTuple):
+    """One window as the plan reader keys it: the Oslo date it begins on (`varsel.match_journey`'s
+    key), the plan held for that date or None, and two ranges from `lo`: to `hi`, the part a read
+    fetches a missing plan for, and to `end`, the period ahead the matcher lists trips for."""
+
+    day: date
+    plan: trips.DayPlan | None
+    lo: datetime
+    hi: datetime
+    end: datetime
+
+
+def _plan_windows(definition: dict, windows: list[tuple[datetime, datetime]], now: datetime) -> list[_PlanWindow]:
+    """Each window with its plan, through the reader the matcher uses (`varsel.trip_plan_reader`),
+    from `now`: to the window's end, and to the part a read fetches, at most :data:`PLAN_HORIZON_H`.
+    A window with nothing ahead is left out. Empty with TRIP_PLANS_ENABLED off: no plan is read
+    (AE6)."""
+    reader = varsel.trip_plan_reader()
+    if reader is None or not trips.enabled():
+        return []
+    out: list[_PlanWindow] = []
+    for start, end in windows:
+        lo = max(start, now)
+        hi = min(end, lo + timedelta(hours=PLAN_HORIZON_H))
+        if hi < lo:
+            continue
+        day = start.astimezone(_OSLO).date()
+        plan = reader(definition["from_stop"], definition["to_stop"], day)
+        out.append(_PlanWindow(day, plan, lo, hi, end))
+    return out
+
+
+def _plans_seen(plan_windows: list[_PlanWindow]) -> tuple:
+    """The figures-cache marker: each date's plan by its covered ranges, which every merge and every
+    store sync moves (a `complete` fetch adds one, stamped). `()` with the flag off."""
+    return tuple((day, None if plan is None else plan.covered) for day, plan, *_ranges in plan_windows)
+
+
+def _transfers(plan_windows: list[_PlanWindow]) -> tuple[trips.TransferCoverage, bool]:
+    """`coverage.transfers` over the whole period ahead -- every trip the matcher may list, so a plan
+    covering only the next :data:`PLAN_HORIZON_H` hours of a longer window is `not_evaluated` -- and
+    whether a plan is missing for the part a read fetches, the only part a later read can complete."""
+    transfers, _ = trips.transfer_coverage((plan, lo, end) for _day, plan, lo, _hi, end in plan_windows)
+    _, missing = trips.transfer_coverage((plan, lo, hi) for _day, plan, lo, hi, _end in plan_windows)
+    return transfers, missing
+
+
+def _status_plan_windows(
+    definition: dict, window: tuple[datetime, datetime] | None, now: datetime
+) -> tuple[list[_PlanWindow], bool]:
+    """journey-status' plan windows (multi-leg U9): journey-alerts' own over the strip's one window
+    (:func:`_plan_windows`, the period ahead), so its coverage and its fetch are journey-alerts'.
+    And whether a missing plan is fetched for them.
+
+    A window that is over has no period ahead, and nothing is fetched for it -- a departed trip
+    alerts nobody -- but the strip still lists the trips its plan held, so `transfers` is then said
+    of the held plan over the whole window rather than `none`."""
+    if window is None:
+        return [], False
+    ahead = _plan_windows(definition, [window], now)
+    reader = varsel.trip_plan_reader()
+    if ahead or window[1] >= now or reader is None or not trips.enabled():
+        return ahead, True
+    day = window[0].astimezone(_OSLO).date()
+    plan = reader(definition["from_stop"], definition["to_stop"], day)
+    return [_PlanWindow(day, plan, *window, window[1])], False
 
 
 def _enter_generation(refreshed_at: datetime) -> bool:
@@ -757,7 +868,8 @@ def warm_figures(journey_key: str, definition: dict, alerts: list[varsel.Alert],
     refreshed_at = provider() if provider is not None else None
     if refreshed_at is None:
         return
-    key = _cache_key(journey_key, refreshed_at, now)
+    plans = _plans_seen(_plan_windows(definition, varsel.journey_windows(definition, now), now))
+    key = _cache_key(journey_key, refreshed_at, now, plans)
     if _cached_figures(key, refreshed_at) is not None:
         return
     _remember_figures(key, refreshed_at, _figures_from_alerts(definition, alerts, now, journey_key=journey_key))
@@ -782,11 +894,6 @@ def _message_input(definition: dict, alert: varsel.Alert, now: datetime) -> dict
     except Exception:
         logger.debug("Could not build a message input for a pull read; wording from the alert", exc_info=True)
         return varsel._message_input_from_alert(alert)
-
-
-#: `llm_message.PROMPT_VERSION`, through the leaf module both surfaces key on (KTD9). Kept as a
-#: module-level name because the log record and the cache key both read it here.
-_prompt_version = notification_wording.prompt_version
 
 
 # ---- The enrichment caches (KTD3, phase 2) -----------------------------------------------------
@@ -815,8 +922,9 @@ class _AlternativeRecord:
 
 _enrichment_lock = threading.Lock()
 #: wording key -> (expires at, record). The key is KTD3's: `(pair, situation_number, departure,
-#: cancelled, i_morgen, alternative identity, PROMPT_VERSION)`, so a wording written while a train
-#: was merely at risk is never served once ET has declared it cancelled, one written at 23:00 for
+#: cancelled, i_morgen, alternative identity, prompt version)` -- for a departure with a change
+#: also its reason kind, index and confirmation, and the trip brief's version (multi-leg U7) -- so a wording
+#: written while a train was merely at risk is never served once ET has declared it cancelled, one written at 23:00 for
 #: «i morgen» is never served for the same train read after midnight, and a changed alternative --
 #: or a prompt edit -- re-words rather than reuses.
 _wordings: OrderedDict[tuple, tuple[float, _WordingRecord]] = OrderedDict()
@@ -1490,11 +1598,12 @@ def _present_stop_places() -> frozenset | None:
     return present
 
 
-def _coverage(definition: dict) -> CoverageOut:
+def _coverage(definition: dict, transfers: trips.TransferCoverage) -> CoverageOut:
     present = _present_stop_places()
     if present is None:
         return CoverageOut(
-            operators=list(SERVED_OPERATORS), from_stop_in_timetable_today=True, to_stop_in_timetable_today=True
+            operators=list(SERVED_OPERATORS), from_stop_in_timetable_today=True,
+            to_stop_in_timetable_today=True, transfers=transfers,
         )
 
     def known(ref: str) -> bool:
@@ -1504,7 +1613,33 @@ def _coverage(definition: dict) -> CoverageOut:
         operators=list(SERVED_OPERATORS),
         from_stop_in_timetable_today=known(definition["from_stop"]),
         to_stop_in_timetable_today=known(definition["to_stop"]),
+        transfers=transfers,
     )
+
+
+def _fetch_missing(pair: tuple[str, str], plan_windows: list[_PlanWindow], digest: str) -> None:
+    """A read miss (KTD1, KTD4): hand the ranges no plan covers to the injected trigger, which
+    starts its own background fetch and returns at once -- on the `plans_pull` path, off this
+    module's enrichment pool, so the read never waits on it beyond what it already waits for. A
+    failure here costs the trips with a change their fetch, never the read: the type only, as the
+    matcher's failure is logged, because a message could quote a ref (R11)."""
+    if _plan_fetch is None:
+        return
+    margin = timedelta(hours=PLAN_FETCH_MARGIN_H)
+    missing = [
+        (day, lo, min(end, hi + margin))
+        for day, plan, lo, hi, end in plan_windows
+        if plan is None or not plan.covers(lo, hi)
+    ]
+    try:
+        _plan_fetch(pair[0], pair[1], missing)
+    except Exception as exc:  # noqa: BLE001 - the read answers without the trips, logged
+        logger.warning(
+            "Could not start a trip plan fetch for a pull read: %s",
+            type(exc).__name__,
+            extra={"fields": {"event": "trip_plans_read_miss", "result": "error",
+                              "error": type(exc).__name__, "pair_digest": digest}},
+        )
 
 
 def _assembled_entry(
@@ -1773,7 +1908,12 @@ async def journey_alerts(
         )
         raise _retry_later("predictions_not_loaded")
 
-    cache_key = _cache_key(key, refreshed_at, now)
+    # The trips with a change (multi-leg U8): the plans the matcher will read and what they cover.
+    # A miss is answered `not_evaluated` and `complete: false` until its fetch lands, which keys the
+    # figures afresh (`_plans_seen`). Nothing with TRIP_PLANS_ENABLED off.
+    plan_windows = _plan_windows(definition, windows, now)
+    transfers, plan_missing = _transfers(plan_windows)
+    cache_key = _cache_key(key, refreshed_at, now, _plans_seen(plan_windows))
     figures = _cached_figures(cache_key, refreshed_at)
     cache = "hit"
     if figures is None:
@@ -1798,6 +1938,11 @@ async def journey_alerts(
             )
             raise _retry_later("matcher_failed") from None
 
+    # The miss's fetch, started only now: the figures above are then the matcher's over the plans the
+    # coverage was read off, not over one that landed in between.
+    if plan_missing:
+        _fetch_missing(pair, plan_windows, digest)
+
     # The enrichment (KTD5, KTD9). Owed when any listed entry has nothing terminal or standing in
     # the caches; submitted once per definition per day, joined by every later read; waited on for
     # `wait` seconds from a bounded number of waiter slots, and without one the read is a `wait=0`
@@ -1816,6 +1961,7 @@ async def journey_alerts(
             states = _listed_states(definition, key, pair, listed, now, enabled=enabled)
 
     alerts, n_alerts, complete, summary = _assemble(definition, alive, states, limit, now)
+    complete = complete and not plan_missing
     response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE if complete else _CACHE_CONTROL_INCOMPLETE
     _log(
         "ok", cache=cache, n_alerts=n_alerts, wait_s=wait, started=started, pair_digest=digest,
@@ -1829,7 +1975,7 @@ async def journey_alerts(
         truncated=n_alerts > len(alerts),
         journey=JourneyOut(**definition),
         windows=[WindowOut(start=s, end=e) for s, e in windows],
-        coverage=_coverage(definition),
+        coverage=_coverage(definition, transfers),
         summary=summary[0],
         summary_en=summary[1],
         summary_nn=summary[2],
@@ -1900,6 +2046,8 @@ async def journey_status_read(
 ) -> JourneyStatusResponse:
     """Every Vy and SJ Norge train in today's window on this definition, each graded: `confirmed`
     where the outcome is known, `predicted` where the model has a figure, `unknown` otherwise.
+    Beside them, each departure with a change the service judges, keyed on its first leg and
+    graded end to end, with `trip` set; `coverage.transfers` says whether those were judged.
 
     Built per request from memory: the day's planned timetable (rebuilt hourly), the prediction
     cache (every poller cycle) and today's recorded calls. `as_of` says how old each is. A day not
@@ -1932,9 +2080,22 @@ async def journey_status_read(
     if status is None:
         _log_status("not_loaded", n_trains=None, started=started, pair_digest=digest, client_name=client)
         raise _retry_later("plan_not_loaded")
-    coverage = _coverage(definition).model_copy(update={"operators": list(journey_status.OPERATORS)})
+    # The trips with a change (multi-leg U9, KTD14): `transfers` by journey-alerts' classifier over
+    # the strip's window. A plan this pod does not hold is fetched in the background through the
+    # injected trigger, as journey-alerts fetches one (KTD4); until it lands the strip lists no trip
+    # with a change, says `not_evaluated` and is `no-store`, so the read after it lands is not a
+    # cached copy of the calm one. `JourneyStatus` has no `complete` (a strict-schema addition).
+    window = (status.window.start, status.window.end) if status.window is not None else None
+    plan_windows, fetchable = _status_plan_windows(definition, window, now)
+    transfers, plan_missing = _transfers(plan_windows)
+    plan_missing = plan_missing and fetchable
+    if plan_missing:
+        _fetch_missing(pair, plan_windows, digest)
+    coverage = _coverage(definition, transfers).model_copy(
+        update={"operators": list(journey_status.OPERATORS)}
+    )
     summary, summary_en, summary_nn = await _status_summary(definition, now)
-    response.headers["Cache-Control"] = _CACHE_CONTROL_COMPLETE
+    response.headers["Cache-Control"] = _CACHE_CONTROL_INCOMPLETE if plan_missing else _CACHE_CONTROL_COMPLETE
     _log_status("ok", n_trains=len(status.trains), started=started, pair_digest=digest, client_name=client)
     return JourneyStatusResponse(
         **dict(status),
@@ -1959,8 +2120,9 @@ async def _status_summary(definition: dict, now: datetime) -> tuple[str | None, 
     refreshed_at = _refreshed_at_provider() if _refreshed_at_provider is not None else None
     if refreshed_at is None:
         return None, None, None
-    key = _cache_key(varsel.journey_key(definition), refreshed_at, now)
     try:
+        plans = _plans_seen(_plan_windows(definition, varsel.journey_windows(definition, now), now))
+        key = _cache_key(varsel.journey_key(definition), refreshed_at, now, plans)
         figures = _cached_figures(key, refreshed_at)
         if figures is None:
             figures = await run_in_threadpool(_figures_for, definition, key, refreshed_at, now)

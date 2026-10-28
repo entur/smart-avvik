@@ -573,6 +573,31 @@ def test_a_train_taken_out_of_the_plan_is_its_own_segment_not_a_relayed_one():
     assert s["removed"]["n_hit"] == 0 and s["removed"]["precision"] is None
 
 
+def test_a_departure_with_a_change_is_its_own_segment():
+    """R15, KTD16: «med bytte» (`transfer`) beside the four provenances. Its precision and recall
+    are U12's two pass marks for turning the flag on in prd, so they are served per segment like
+    the others; the blend still counts the rows, and the five segments add up to it."""
+    _reset([{
+        "n_hit": 14, "n_false_alarm": 4, "n_miss": 2, "precision": 14 / 18,
+        "n_hit_predicted": 5, "n_false_alarm_predicted": 2, "n_hit_relayed": 4,
+        "n_hit_no_sx": 1, "n_hit_removed": 2, "n_false_alarm_removed": 1,
+        "n_hit_transfer": 2, "n_false_alarm_transfer": 1, "n_miss_transfer": 2,
+        "precision_transfer": 2 / 3, "recall_transfer": 0.5,
+        "median_lead_min_on_hits_transfer": 35, "n_hit_trains_transfer": 2,
+        "n_miss_predicted": 0, "n_unsegmented": 0,
+    }])
+    s = client.get("/historikk-api/summary").json()
+    assert s["transfer"]["n_hit"] == 2 and s["transfer"]["precision"] == 2 / 3
+    assert s["transfer"]["recall"] == 0.5 and s["transfer"]["median_lead_min_on_hits"] == 35
+    segments = ("predicted", "relayed", "no_sx", "removed", "transfer")
+    assert sum(s[k]["n_hit"] for k in segments) == s["n_hit"]
+    assert sum(s[k]["n_false_alarm"] for k in segments) == s["n_false_alarm"]
+
+    _reset([])
+    s = client.get("/historikk-api/summary").json()
+    assert s["transfer"]["n_hit"] == 0 and s["transfer"]["precision"] is None
+
+
 def _provenance_cases(path) -> list[str]:
     """Every provenance CASE in a file: the CASE ... END blocks that test the no-SX prefix."""
     code = "\n".join(re.sub(r"--.*$", "", ln) for ln in path.read_text().splitlines())
@@ -600,6 +625,13 @@ def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
         for case in cases:
             assert "'KIX:PlanRemoved:'" in case, f"{path.name}: a CASE with no removed arm"
             assert "THEN 'removed'" in case, f"{path.name}: the removed arm names no segment"
+            # Multi-leg U11 (KTD16): a departure with a change is «med bytte» whatever its flags or
+            # prefix say -- its first leg can be a relayed cancellation, a no-SX train or a removed
+            # one -- so its arm, discriminated on the legs column, goes ahead of every other.
+            assert "THEN 'transfer'" in case, f"{path.name}: no «med bytte» arm"
+            assert case.index("trip_legs IS NOT NULL") < case.index("'KIX:PlanRemoved:'"), (
+                f"{path.name}: tested after another branch, a trip row lands in that segment"
+            )
             removed = case.index("'KIX:PlanRemoved:'")
             assert removed < case.index("et_cancelled IS NULL"), (
                 f"{path.name}: the removed prefix must be tested before the NULL flag"
@@ -612,13 +644,9 @@ def test_a_removed_train_is_resolved_before_the_et_cancelled_flag():
     assert "COUNTIF(et_cancelled IS NULL AND verdict IS NOT NULL)" not in code
 
 
-def test_the_labeller_labels_removed_trains_in_their_own_branch():
-    """The nightly job's removed-train branch, pinned statically because CI executes no SQL. Each
-    assertion is a way the branch fails SILENTLY: a `labelled` that also takes the removed rows
-    writes them twice (one NULL copy from a join that can never match); a `labelled_all` that
-    drops an arm, or a final SELECT that reads `labelled`, leaves the removed segment empty; an
-    absent arm tested before the boarding call files a train Vy put back as a hit; and an absent
-    arm without the two-day guard freezes a hit the first night, before a late re-add has landed."""
+def _labeller() -> tuple[str, dict[str, str]]:
+    """label_varsel_decisions.sql with its comments stripped, and each CTE body (whitespace
+    collapsed) by name. Static, because CI executes no SQL."""
     import pathlib
 
     path = pathlib.Path(__file__).parents[2] / "data/queries/label_varsel_decisions.sql"
@@ -627,6 +655,103 @@ def test_the_labeller_labels_removed_trains_in_their_own_branch():
         name: " ".join(body.split())
         for name, body in re.findall(r"^(\w+) AS \(\n(.*?)^\),?$", code, flags=re.MULTILINE | re.DOTALL)
     }
+    return code, ctes
+
+
+def _select_names(select: str) -> list[str]:
+    """The output names of a SELECT list: each top-level item's alias, else the bare column."""
+    items, depth, buf = [], 0, ""
+    for ch in select:
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            items.append(buf)
+            buf = ""
+        else:
+            buf += ch
+    return [re.split(r"\bAS\b", item)[-1].strip() for item in [*items, buf]]
+
+
+def test_the_labelling_insert_lists_the_outcomes_columns_in_table_order():
+    """The INSERT names its columns and the SELECT feeding it is POSITIONAL against that list, so
+    three lists must agree: the outcomes table's CREATE order (a fresh environment's, and an ALTERed
+    one's while new columns go last), the INSERT's, and the final SELECT's. A swap between two
+    columns of one type -- U11's three, appended last -- would write each into the other with no
+    error anywhere, which no other check here could see."""
+    import decisions
+
+    body = re.search(
+        r"CREATE TABLE IF NOT EXISTS `disruptions.varsel_decision_outcomes`\s*\((.*?)\)\s*PARTITION BY",
+        decisions._ALL_DDL_SQL, re.DOTALL,
+    ).group(1)
+    table = re.findall(r"^\s*(\w+)\s+(?:STRING|BOOL|INT64|FLOAT64|TIMESTAMP|DATE)\b", body, re.MULTILINE)
+    code, _ctes = _labeller()
+    insert = code[code.index("INSERT INTO `disruptions.varsel_decision_outcomes` (") :]
+    insert = insert[insert.index("(") + 1 : insert.index(")\nWITH")]
+    final = code[code.index("\nlabelled_all AS (") :]
+    final = final[re.search(r"^\)$", final, flags=re.MULTILINE).end() :]
+    final = final[final.index("SELECT") + len("SELECT") : final.index("FROM labelled_all")]
+    assert table[-3:] == ["trip_legs", "connection_held", "arrival_delay_min"], table[-3:]
+    assert [c.strip() for c in insert.split(",")] == table
+    assert _select_names(final) == table
+
+
+def test_the_labeller_judges_a_departure_with_a_change_end_to_end():
+    """KTD16 in the nightly job, pinned statically -- each assertion a way it fails SILENTLY:
+
+    * a trip judged on its first leg's boarding call (the `realized` join) reads a calm first
+      train whose change broke as no trouble, so the trip arm goes first;
+    * «connection held» must test FALSE before NULL (FALSE beats NULL) and read the planned
+      continuation alone, while the arrival delay reads every continuation and takes none from one
+      that broke -- or a sibling that held could never cushion a broken planned change;
+    * the trouble CASE settles "every continuation broken" first, and a known arrival under the
+      bar before an unresolved continuation can make it NULL (one could only have been earlier);
+    * an estimated arrival is a prediction, and each leg's call is found on its stop PLACE, never
+      on a stop position, which the plan numbers JP's way;
+    * the removed branch projects the two columns as typed NULLs so the UNION ALL lines up.
+    And the snapshot's JSON keys are `trips.legs_snapshot`'s: nothing executes both sides."""
+    import trips
+
+    code, ctes = _labeller()
+    labelled = re.search(r"\bCASE\b(.*?)\bEND AS actual_trouble", ctes["labelled"]).group(1)
+    assert labelled.strip().startswith("WHEN g.trip_legs IS NOT NULL THEN t.actual_trouble")
+
+    held = re.search(r"\bCASE\b(.*?)\bEND AS connection_held", ctes["trip_outcomes"]).group(1)
+    failed = held.index("planned AND broken) THEN FALSE")
+    assert failed < held.index("planned AND unrecorded) THEN NULL") < held.index("THEN TRUE")
+    arrived = re.search(r"MIN\((.*?)\) AS arrived_at", ctes["trip_outcomes"]).group(1)
+    assert "NOT broken" in arrived and "planned" not in arrived, "every continuation that held"
+
+    trouble = re.search(r"\bCASE\b(.*?)\bEND AS actual_trouble", ctes["trip_verdicts"]).group(1)
+    arms = [trouble.index(s) for s in ("WHEN all_broken THEN TRUE", "< 10 THEN FALSE", "THEN NULL")]
+    assert arms == sorted(arms) and ">= 10" in trouble
+    assert "IF(COALESCE(estimated, FALSE), NULL, arrivalTime) AS actual_arr" in ctes["et"]
+    calls = ctes["trip_leg_calls"]
+    assert "stop_place = l.board_stop_place" in calls and "stop_place = l.alight_stop_place" in calls
+    assert "stop_order" not in calls.split("QUALIFY")[0], "a stop position is no join key here"
+    assert "CAST(NULL AS BOOL) AS connection_held" in ctes["labelled_removed"]
+    assert "CAST(NULL AS INT64) AS arrival_delay_min" in ctes["labelled_removed"]
+
+    paths = set(re.findall(r"'\$\.(\w+)'", code))
+    leg = trips.PlanLeg(
+        operator="VYG", refs=(("VYG", "DatedServiceJourney:1"),), line=None, public_code=None,
+        mode="rail", board_stop_place="A", alight_stop_place="B", board_quay=None,
+        alight_quay=None, board_position=0, alight_position=2, aimed_departure=DEP,
+        aimed_arrival=DEP + timedelta(minutes=9), service_date=DEP.date(),
+    )
+    [continuation] = trips.legs_snapshot([trips.PlanTrip(legs=(leg, leg))])["continuations"]
+    keys = {"continuations", *continuation, *continuation["legs"][0]}
+    assert {"planned", "jkey", "walk_after_s", "aimed_arrival"} <= paths, "the guard must bite"
+    assert paths <= keys, f"read but never written: {sorted(paths - keys)}"
+
+
+def test_the_labeller_labels_removed_trains_in_their_own_branch():
+    """The nightly job's removed-train branch, pinned statically because CI executes no SQL. Each
+    assertion is a way the branch fails SILENTLY: a `labelled` that also takes the removed rows
+    writes them twice (one NULL copy from a join that can never match); a `labelled_all` that
+    drops an arm, or a final SELECT that reads `labelled`, leaves the removed segment empty; an
+    absent arm tested before the boarding call files a train Vy put back as a hit; and an absent
+    arm without the two-day guard freezes a hit the first night, before a late re-add has landed."""
+    code, ctes = _labeller()
 
     assert "WHERE NOT STARTS_WITH(COALESCE(g.situation_number, ''), 'KIX:PlanRemoved:')" in (
         ctes["labelled"]

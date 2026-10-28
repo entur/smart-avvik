@@ -618,6 +618,12 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "svv_baselines",
         # Each line's JP transport mode (KIX-23), above `varsel_stops` for the orphan window's reason.
         "line_modes",
+        # The leader's Journey Planner day plans (multi-leg U2), behind TRIP_PLANS_ENABLED, above
+        # `varsel_stops` for the same reason: JP only, no prediction snapshot.
+        "trip_plans",
+        # This pod's JP real-time for unscored trip legs (multi-leg U4), above `varsel_stops` too:
+        # up to three JP requests inside the orphan window would widen it by their wait.
+        "trip_realtime",
         "varsel_stops",
         "rail_planned_calls",
         # The trains Vy took out of today's plan (plan 2026-09-23-001): after the table it
@@ -659,6 +665,9 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
     # of the one before -- a whole cycle's lag on every create, replace and revocation, with
     # nothing anywhere that looks wrong.
     assert phases.index("notification_mirror") < phases.index("varsel_notify"), phases
+    # `trip_plans` is above `varsel_stops`, outside the orphan window above, and before the pass.
+    assert phases.index("trip_plans") < phases.index("varsel_stops") < phases.index(
+        "varsel_notify"), phases
     # And the alerting step is still isolated exactly as it was: its own try/except, so a client
     # store outage inside it degrades alerting alone and the feed rebuild above it is untouched.
     # `_phase` re-raises by design (test_phase_does_not_swallow_the_exception), so the try/except
@@ -1810,16 +1819,20 @@ def test_follow_last_build_follows_the_stored_translations_and_returns_the_load_
 
     sentinel = {"call_predictions": "loaded"}
     follows = []
-    saved = (poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches)
+    saved = (poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches,
+             main.trip_plans.follow)
     poller_follow.follow_last_build = lambda *a, **k: sentinel
     situation_english.follow = lambda **k: follows.append(("translations", k)) or 0
     # The /varsel card caches (U7) likewise: without it a follower's card shows the SX summary.
     main.varsel.follow_card_caches = lambda **k: follows.append(("cards", k))
+    # And the leader's trip plans (multi-leg U2): without it a follower judges direct trains only.
+    main.trip_plans.follow = lambda **k: follows.append(("plans", k))
     try:
         assert main.follow_last_build() is sentinel
     finally:
-        poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches = saved
-    assert follows == [("translations", {}), ("cards", {})], follows
+        (poller_follow.follow_last_build, situation_english.follow, main.varsel.follow_card_caches,
+         main.trip_plans.follow) = saved
+    assert follows == [("translations", {}), ("cards", {}), ("plans", {})], follows
 
 
 def test_the_lifespan_configures_the_translation_store_before_the_first_follow():
@@ -1834,6 +1847,9 @@ def test_the_lifespan_configures_the_translation_store_before_the_first_follow()
     cards = "varsel.configure_card_store(notification_store if _varsel_store is not None else None)"
     assert cards in source
     assert source.index(cards) < source.index("follow_last_build()")
+    plans = "trip_plans.configure(store=notification_store if _varsel_store is not None else None)"
+    assert plans in source
+    assert source.index(plans) < source.index("follow_last_build()")
 
 
 def test_the_card_caches_are_written_after_the_pass_and_only_by_a_leader():
@@ -1847,6 +1863,276 @@ def test_the_card_caches_are_written_after_the_pass_and_only_by_a_leader():
     phase = source.index('_phase("varsel_card_cache"')
     assert notify < gate < phase < source.index('_phase("notification_webhooks"')
     assert "varsel.flush_card_writes()" in source[phase:phase + 200]
+
+
+# ---- the trip plans (multi-leg U2) --------------------------------------------------------------
+
+
+def test_the_trip_plans_phase_is_gated_on_the_flag_guarded_and_fed_by_registered_definitions():
+    """AE6: with `TRIP_PLANS_ENABLED` off the phase is never entered, so its key is ABSENT from
+    `poller_cycle.phases` (not zero) and nothing is fetched. Checked over the source, as the other
+    gated phases are: running `_rebuild_all` would spend BigQuery. The gate is outside the phase,
+    or an ungated cycle still times a step it skipped; the guard is its own, because `_phase`
+    re-raises and a JP or store failure must cost the plans only."""
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    phase = source.index('_phase("trip_plans"')
+    gate = source.rindex("if trips.enabled():", 0, phase)
+    assert source.index('_phase("line_modes"') < gate < phase < source.index('_phase("varsel_stops"')
+    assert source.count("trips.enabled()") == 1
+    step = source[gate:source.index('_phase("varsel_stops"')]
+    # Two guards: the plans' and U4's real-time phase below, each its own.
+    assert step.count("except Exception:") == 2 and "_refresh_trip_plans(" in step
+    assert source.index("try:", gate) < phase
+
+
+def test_the_trip_realtime_phase_follows_the_plans_under_the_same_gate_with_its_own_guard():
+    """Multi-leg U4: right after `trip_plans` (the plans it reads), inside the one flag gate so its
+    key is absent with the flag off, above `varsel_stops` (the orphan window's reason, the phase-
+    order test above), and guarded on its own so a JP failure costs the real-time only."""
+    import inspect
+
+    source = inspect.getsource(main._rebuild_all)
+    gate = source.index("if trips.enabled():")
+    plans = source.index('_phase("trip_plans"')
+    realtime = source.index('_phase("trip_realtime"')
+    assert gate < plans < realtime < source.index('_phase("varsel_stops"')
+    between = source[source.index("except Exception:", plans):realtime]
+    assert "try:" in between, "its own try, not inside the plans' guard"
+    step = source[realtime:source.index('_phase("varsel_stops"')]
+    assert "_refresh_trip_realtime()" in step and "except Exception:" in step
+
+
+def test_every_real_time_refresh_hands_over_the_plans_public_reads_fetched():
+    """Multi-leg U8: the leader's phase, its held tick and a follower's tick each pass this pod's
+    public-read plans, so their unscored legs are asked after the registered pairs' (KTD8)."""
+    import inspect
+    import re
+
+    source = inspect.getsource(main)
+    calls = source.count("trip_plans.refresh_realtime(")
+    passing = source.count(
+        "trip_plans.refresh_realtime(datetime.now(UTC), public=trip_plans.public_plans())"
+    )
+    # One call, which passes them, in the helper all three refreshes go through.
+    assert calls == passing == 1, (calls, passing)
+    assert passing == inspect.getsource(main._refresh_trip_realtime).count(
+        "trip_plans.refresh_realtime(datetime.now(UTC), public=trip_plans.public_plans())"
+    )
+    sites = re.findall(r"^\s+_refresh_trip_realtime\(\)$", source, flags=re.MULTILINE)
+    assert len(sites) == 3, sites
+
+
+def test_every_pod_reads_trip_legs_through_the_real_time_reader():
+    """`trips`' unwired reader answers every leg unknown; the lifespan replaces it on every pod,
+    leader or not."""
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+    configure = source[source.index("trips.configure("):]
+    configure = configure[:configure.index(")")]
+    assert "realtime=trip_plans.realtime_for" in configure, configure
+    assert "call_lookup=_impact_journey_calls" in configure and "places=varsel.place_refs" in configure
+
+
+def test_the_reads_get_the_leaders_plans_then_the_pods_own_and_the_read_miss_trigger():
+    """Multi-leg U8 (KTD1, KTD4): `varsel` reads plans through `trip_plans.read_plan` (the leader's,
+    then this pod's public-read cache), and the public read gets the read-miss trigger, bound to
+    the place refs, from main -- the one module that may import `trip_plans`. The «I dag» strip
+    reads the same plans (U9), through its own configure, so each call is checked on its own: the
+    reader named once anywhere would pass for both."""
+    import inspect
+
+    source = inspect.getsource(main.lifespan)
+
+    def call(name):
+        configure = source[source.index(f"\n    {name}.configure("):]
+        return configure[:configure.index("\n    )")]
+
+    assert "trip_plans=trip_plans.read_plan," in call("varsel")
+    assert "trip_plans=trip_plans.read_plan," in call("journey_status")
+    assert "held_plans=trip_plans.held" in call("journey_status"), "the digest's pre-filter (AE13)"
+    configure = call("notification_pull")
+    assert "plan_fetch=functools.partial(trip_plans.fetch_for_read, places=varsel.place_refs)" in configure
+
+
+def test_taking_the_lease_follows_the_trip_plans_as_it_does_the_card_caches():
+    import inspect
+
+    source = inspect.getsource(main._on_lease_acquired)
+    assert "trip_plans.follow(beat=_beat)" in source
+    assert source.index("varsel.follow_card_caches(beat=_beat)") < source.index(
+        "trip_plans.follow(beat=_beat)") < source.index("_force_rebuild = True")
+
+
+@contextmanager
+def _trip_plan_state(fetch):
+    import trip_plans
+
+    saved = (dict(trip_plans._plans), trip_plans._store, trip_plans._watermark,
+             trip_plans.fetch_range, main.varsel.registered_definitions)
+    trip_plans._plans.clear()
+    trip_plans.configure(store=None)
+    trip_plans.fetch_range = fetch
+    try:
+        yield trip_plans
+    finally:
+        trip_plans._plans.clear()
+        trip_plans._plans.update(saved[0])
+        (trip_plans._store, trip_plans._watermark, trip_plans.fetch_range,
+         main.varsel.registered_definitions) = saved[1:]
+
+
+def _plan_fetch():
+    import trip_plans
+
+    calls = []
+
+    def fetch(from_stop, to_stop, start, end, *, from_places, path="plans"):
+        calls.append((from_stop, to_stop, start, end, from_places))
+        return trip_plans.FetchResult("complete", (), (), 1)
+
+    fetch.calls = calls
+    return fetch
+
+
+def _definition(from_stop, to_stop, begin="07:00", end="08:00", days=(2,)):
+    return {"from_stop": from_stop, "to_stop": to_stop, "begin": begin, "end": end,
+            "days": list(days)}
+
+
+def test_the_phase_fetches_tomorrows_window_on_the_first_cycle_that_offers_it():
+    """KTD1 says a morning window is fetched "the evening before". What `journey_windows` really
+    does is offer TOMORROW's window from the first cycle after Oslo midnight, so a Wednesday-only
+    07:00-08:00 is first fetched on Tuesday's 00:05 cycle, ~31 h ahead, and refreshed every
+    `PLAN_REFRESH_S` from there. Pinned as it is; the report carries the mismatch."""
+    from zoneinfo import ZoneInfo
+
+    oslo = ZoneInfo("Europe/Oslo")
+    fetch = _plan_fetch()
+    with _trip_plan_state(fetch) as trip_plans:
+        main.varsel.registered_definitions = lambda: [_definition("NSR:StopPlace:426", "NSR:StopPlace:337")]
+        # Monday 2026-10-26 23:50: neither Monday nor Tuesday is a registered day.
+        main._refresh_trip_plans(datetime(2026, 10, 26, 23, 50, tzinfo=oslo))
+        assert fetch.calls == []
+        # Tuesday 00:05: Wednesday's window is offered, and fetched under Wednesday's Oslo date.
+        main._refresh_trip_plans(datetime(2026, 10, 27, 0, 5, tzinfo=oslo))
+        assert len(fetch.calls) == 1
+        _from, _to, start, end, _places = fetch.calls[0]
+        assert (start, end) == (datetime(2026, 10, 28, 7, 0, tzinfo=oslo),
+                                datetime(2026, 10, 28, 8, 0, tzinfo=oslo))
+        assert list(trip_plans._plans) == [("NSR:StopPlace:426", "NSR:StopPlace:337",
+                                            datetime(2026, 10, 28).date())]
+        refresh = timedelta(seconds=trip_plans.PLAN_REFRESH_S)
+        main._refresh_trip_plans(datetime(2026, 10, 27, 0, 5, tzinfo=oslo) + refresh - timedelta(minutes=1))
+        assert len(fetch.calls) == 1, "not again before PLAN_REFRESH_S"
+        main._refresh_trip_plans(datetime(2026, 10, 27, 0, 5, tzinfo=oslo) + refresh)
+        assert len(fetch.calls) == 2
+
+
+def test_the_phase_fetches_registered_pairs_only_with_the_from_places_refs():
+    """A pair only a public read wants is never on the leader's list (KTD1), so it is never
+    fetched here and never stored; its plan is the reading pod's own (U9). The from-place's refs
+    are `varsel.place_refs`, since JP boards in child stop places."""
+    from zoneinfo import ZoneInfo
+
+    oslo = ZoneInfo("Europe/Oslo")
+    fetch = _plan_fetch()
+    saved_places = main.varsel.place_refs
+    main.varsel.place_refs = lambda ref: (ref, f"{ref}-child")
+    try:
+        with _trip_plan_state(fetch):
+            main.varsel.registered_definitions = lambda: [
+                _definition("NSR:StopPlace:1", "NSR:StopPlace:2"),
+                _definition("NSR:StopPlace:3", "NSR:StopPlace:4", begin="16:00", end="17:00"),
+            ]
+            main._refresh_trip_plans(datetime(2026, 10, 27, 12, 0, tzinfo=oslo))
+    finally:
+        main.varsel.place_refs = saved_places
+    assert {(call[0], call[1]) for call in fetch.calls} == {
+        ("NSR:StopPlace:1", "NSR:StopPlace:2"), ("NSR:StopPlace:3", "NSR:StopPlace:4")}
+    assert {call[4] for call in fetch.calls} == {
+        frozenset({"NSR:StopPlace:1", "NSR:StopPlace:1-child"}),
+        frozenset({"NSR:StopPlace:3", "NSR:StopPlace:3-child"})}
+
+
+def test_registered_definitions_are_both_channels_once_per_journey_key():
+    """The browser registrations and the webhook subscriptions, through the pass's own parser (it
+    canonicalizes the refs), one per `journey_key`; another channel's document and an unreadable
+    one are skipped; with the webhook channel off, the browser half alone."""
+    varsel = main.varsel
+    shared = _definition("NSR:StopPlace:1", "NSR:StopPlace:2")
+
+    class _Registrations:
+        def all_journeys(self):
+            return [("j1", dict(shared, device_id="d1")), ("j2", dict(shared, device_id="d2"))]
+
+    docs = [
+        {"recipient_id": "s1", **shared},
+        {"recipient_id": "s2", **_definition("NSR:StopPlace:3", "NSR:StopPlace:4")},
+        {"recipient_id": "s3", "channel": "web_push", **_definition("NSR:StopPlace:5", "NSR:StopPlace:6")},
+        {"recipient_id": "s4", "from_stop": "NSR:StopPlace:7"},
+    ]
+    saved = (varsel._registrations, varsel._webhook_provider, varsel._webhook_enabled,
+             dict(varsel._stop_aliases))
+    varsel._registrations = _Registrations()
+    varsel._webhook_provider = lambda: docs
+    try:
+        varsel._webhook_enabled = lambda: True
+        got = varsel.registered_definitions()
+        assert sorted(varsel.journey_key(j) for j in got) == sorted(
+            {varsel.journey_key(shared), varsel.journey_key(docs[1])}), got
+        varsel._webhook_enabled = lambda: False
+        got = varsel.registered_definitions()
+        assert [varsel.journey_key(j) for j in got] == [varsel.journey_key(shared)]
+        # A browser registration on a ref the stop registry has since collapsed is enumerated on
+        # the primary, as the pass will see it once `varsel_stops` heals it this cycle.
+        varsel._stop_aliases["NSR:StopPlace:1"] = "NSR:StopPlace:9"
+        assert [j["from_stop"] for j in varsel.registered_definitions()] == ["NSR:StopPlace:9"]
+    finally:
+        varsel._registrations, varsel._webhook_provider, varsel._webhook_enabled = saved[:3]
+        varsel._stop_aliases.clear()
+        varsel._stop_aliases.update(saved[3])
+
+
+def test_with_the_flag_off_no_pod_reads_the_plans_or_spends_a_plan_fetch():
+    """AE6 on the follower side: `follow_last_build` runs in every lifespan and on every follower
+    tick, and with the flag off it must neither read the collection nor reach Journey Planner."""
+    import alternatives
+    import poller_follow
+    import situation_english
+    import trip_plans
+
+    reads = []
+
+    class _Store:
+        def seed_trip_plans(self, **kwargs):
+            reads.append("seed")
+            return [], None
+
+        def sync_trip_plans(self, **kwargs):
+            reads.append("sync")
+            return [], None
+
+    saved = (poller_follow.follow_last_build, situation_english.follow,
+             main.varsel.follow_card_caches, trip_plans._store, trip_plans._watermark)
+    poller_follow.follow_last_build = lambda *a, **k: {}
+    situation_english.follow = lambda **k: 0
+    main.varsel.follow_card_caches = lambda **k: None
+    trip_plans.configure(store=_Store())
+    spent = list(alternatives._fetch_calls["plans"])
+    try:
+        with _env(TRIP_PLANS_ENABLED=None):
+            main.follow_last_build()
+            main.follow_last_build()
+        assert reads == [] and alternatives._fetch_calls["plans"] == spent
+        with _env(TRIP_PLANS_ENABLED="true"):
+            main.follow_last_build()
+        assert reads == ["seed"], "the same wiring reads once the flag is on"
+    finally:
+        (poller_follow.follow_last_build, situation_english.follow,
+         main.varsel.follow_card_caches, trip_plans._store, trip_plans._watermark) = saved
 
 
 class _StrictRow:

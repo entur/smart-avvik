@@ -92,10 +92,11 @@ export interface NotificationEvent {
    * `predicted` is a forecast from our models. `confirmed` is a cancellation the operator's own
    * real-time feed has already declared, of the boarding call or (since 2026-10-19) of the
    * destination call while the vehicle still leaves -- either way the traveller cannot make the
-   * trip on this departure, and `payload.arrival.cancelled` says which end failed. A fact, not a
-   * forecast, which is why its probabilities are 1.0 and its delay figures are null (every one of
-   * them meant "if it runs"). `withdrawn` means the FORECAST changed, not that normal service is
-   * guaranteed.
+   * trip on this departure, and `payload.arrival.cancelled` says which end failed -- or, on a
+   * departure with a change (`payload.trip`), of a leg no other continuation of the same first
+   * train can replace. A fact, not a forecast, which is why its probabilities are 1.0 and its
+   * delay figures are null (every one of them meant "if it runs"). `withdrawn` means the FORECAST
+   * changed, not that normal service is guaranteed.
    */
   phase: "predicted" | "confirmed" | "withdrawn";
   /**
@@ -220,7 +221,10 @@ export interface NotificationEvent {
      * Impact and cancellation probabilities at the BOARDING call; `arrival` carries the
      * destination call's. Both are 1.0 and the delay figures are null when `phase` is `confirmed`,
      * including a confirmed cancellation of the destination call: the trip is then as impossible
-     * as if the boarding call were cancelled.
+     * as if the boarding call were cancelled. On a departure with a change (`trip`) they stay the
+     * FIRST leg's own, which may be calm while a later leg is not, and are null under `predicted`
+     * when the service does not score that leg; the figure the alert was decided on is
+     * `trip.problem.probability`.
      */
     probabilities?: { [key: string]: unknown };
     /**
@@ -238,11 +242,168 @@ export interface NotificationEvent {
      * cancellation (since 2026-10-19), and `arrival.cancelled` true beside a running `call` is how
      * to tell the two apart. A forecast here (`cancellation`) moves nothing. Like `delay_ge10` and
      * `delay`, every figure that means 'if it runs' is null when `cancelled` is true. Null when we
-     * could not resolve the destination call, and absent from an event minted before the field
-     * existed.
+     * could not resolve the destination call, and on a departure with a change (`trip`), where no
+     * one vehicle reaches the destination; absent from an event minted before the field existed.
      */
     arrival?: { [key: string]: unknown } | null;
-    effect?: string | null;
+    /**
+     * Present only on a departure with a change -- the traveller changes vehicles on the way --
+     * and ABSENT on a direct train, so a receiver that never reads it is unaffected. The departure
+     * is still the first leg's boarding call: `call`, `probabilities` and `delay` describe it, and
+     * `arrival` is null because no one vehicle reaches the destination. `legs` are the ridden legs
+     * in travel order and `transfers` the changes, both counted from 0, transfer `i` sitting
+     * between legs `i` and `i + 1`. `expected_arrival` is when the traveller is expected at the
+     * destination: on the planned route, or after a broken change on the earliest planned
+     * continuation of the same first train that still holds; null when nothing in the plan gets
+     * them there. `arrives_via` says where that other continuation leaves the planned route, and
+     * is null on the planned route. `problem` is what breaks the planned ride and the figure the
+     * alert was decided on, null when the departure does not alert. Each leg's `data_source` says
+     * what it was judged from. Absent from an event minted before the field existed.
+     */
+    trip?: {
+      /**
+       * The ridden legs, in travel order, from 0.
+       */
+      legs: ({
+        /**
+         * The Journey Planner's transport mode: `rail`, `bus`, ...
+         */
+        mode: string | null;
+        /**
+         * Line ref, e.g. `VYG:Line:R12`.
+         */
+        line: string | null;
+        /**
+         * The line as shown to passengers, e.g. `R12`.
+         */
+        public_code: string | null;
+        /**
+         * Where the leg is boarded, when the service knows the name.
+         */
+        from_name: string | null;
+        /**
+         * Where the leg is left, when the service knows the name.
+         */
+        to_name: string | null;
+        /**
+         * Where the vehicle terminates, when known.
+         */
+        destination: string | null;
+        /**
+         * The Journey Planner's expected departure, when it has a live one for this leg.
+         */
+        start_time: string | null;
+        /**
+         * The Journey Planner's expected arrival, when it has a live one for this leg.
+         */
+        end_time: string | null;
+        /**
+         * NSR StopPlace ref where the leg is boarded.
+         */
+        board_stop_place: string | null;
+        /**
+         * NSR StopPlace ref where the leg is left.
+         */
+        alight_stop_place: string | null;
+        /**
+         * Aimed (timetabled) departure from the boarding stop.
+         */
+        aimed_departure: string | null;
+        /**
+         * Aimed (timetabled) arrival at the alighting stop.
+         */
+        aimed_arrival: string | null;
+        /**
+         * The boarding or alighting call of this leg is declared cancelled.
+         */
+        cancelled: boolean;
+        /**
+         * What the leg was judged from: `prediction`, the service's own figures for both its ends
+         * (or its train is taken out of today's timetable); `jp_realtime`, the Journey Planner's
+         * real-time data; `none`, nothing -- no live data for this leg, so the departure cannot be
+         * judged on it. Null where the leg was not judged.
+         */
+        data_source: "prediction" | "jp_realtime" | "none" | null;
+        [key: string]: unknown;
+      })[];
+      /**
+       * The changes, from 0: transfer `i` sits between legs `i` and `i + 1`.
+       */
+      transfers: ({
+        /**
+         * NSR StopPlace ref where the arriving leg is left.
+         */
+        stop_place: string | null;
+        /**
+         * Its name, when the service knows it.
+         */
+        stop_name: string | null;
+        /**
+         * Minutes on foot to the next leg's boarding stop.
+         */
+        walk_min: number;
+        /**
+         * Planned slack in minutes: the next leg's aimed departure, minus the arriving leg's aimed
+         * arrival, minus the walk. Negative when the plan is already too tight.
+         */
+        slack_min: number;
+        [key: string]: unknown;
+      })[];
+      /**
+       * When the traveller is expected at the destination; null when nothing in the plan gets them
+       * there.
+       */
+      expected_arrival: string | null;
+      /**
+       * Where the continuation `expected_arrival` belongs to leaves the planned route -- its stop
+       * name, or its NSR StopPlace ref when the service has no name for it. Set only when a change
+       * on the planned route breaks and another continuation of the same first train, arriving
+       * less than 10 minutes after the planned arrival, still holds -- the traveller then gets
+       * there via this stop. Null on the planned route, however late.
+       */
+      arrives_via: string | null;
+      /**
+       * What breaks the planned ride, and the figure the alert was decided on. `kind` and `index`
+       * name the reason on the route the traveller planned; `probability` and `threshold` are the
+       * figure and bar the decision was taken on, which can come from another continuation of the
+       * same first train when that one decided it. `index` is the leg for a leg reason and the
+       * transfer for `missed_connection`.
+       */
+      problem: {
+        /**
+         * `departure`: the first leg's own departure. `leg_cancelled`: a ridden leg's boarding or
+         * alighting call declared cancelled. `leg_departure`: a later leg's departure.
+         * `missed_connection`: the change is likely missed. `leg_removed`: a ridden leg's train is
+         * taken out of today's timetable.
+         */
+        kind: "departure" | "leg_cancelled" | "leg_departure" | "missed_connection" | "leg_removed";
+        /**
+         * The leg index, or the transfer index for `missed_connection`, from 0.
+         */
+        index: number;
+        /**
+         * The deciding figure, 0-1; 1.0 for a certainty.
+         */
+        probability: number;
+        /**
+         * The bar the alert gate applied to `probability`.
+         */
+        threshold: number;
+        [key: string]: unknown;
+      } | null;
+      [key: string]: unknown;
+    };
+    /**
+     * What happens to the traveller's trip. `cancelled`: the trip is impossible on this departure
+     * (`phase` `confirmed`), the boarding call or the destination call cancelled --
+     * `arrival.cancelled` says which -- or, on a departure with a change, no continuation gets
+     * there. `missed_connection`: a departure with a change whose planned ride breaks at a change
+     * -- a likely missed connection, or a later leg cancelled while the alternative continuations
+     * are only predicted to fail -- whatever the first leg's own delay. `delayed`: a departure
+     * delay figure was established. `null`: none of these. More values may be added: treat a value
+     * you do not know as other, never as an error or as one of these.
+     */
+    effect?: "cancelled" | "delayed" | "missed_connection" | null;
     /**
      * Where the train terminates, as a departure board names it (`Drammen`), and the same value
      * `notification.title` names the train with: «Tog R14 Drammen 14:59». Null when we do not know
@@ -414,10 +575,11 @@ export interface Subscription {
    */
   status?: "active" | "deleted";
   /**
-   * Whether any planned direct trip runs between the two places. `null` means the answer could not
-   * be established -- an outage, a timeout -- and must never render as an all-clear. A
-   * subscription no direct trip can serve carries the caveat and is NEVER refused: weekend-only
-   * and seasonal routes are why a refusal would be wrong.
+   * Whether the service can alert on any planned trip between the two places: a direct trip, or --
+   * where this deployment evaluates trips with a change -- a trip with a change on a Vy or SJ
+   * Norge train. `null` means the answer could not be established -- an outage, a timeout -- and
+   * must never render as an all-clear. A subscription the service cannot serve carries the caveat
+   * and is NEVER refused: weekend-only and seasonal routes are why a refusal would be wrong.
    */
   servable?: boolean | null;
   /**

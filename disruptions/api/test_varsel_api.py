@@ -109,7 +109,7 @@ impact.configure(snapshot_provider=lambda: (_active_snapshot["value"], None))
 
 
 def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_after=None,
-                     with_alternative=False, min_impact=0.0, path="poller"):
+                     with_alternative=False, min_impact=0.0, path="poller", plans=None):
     return impact.for_trip(
         from_stop=from_stop,
         to_stop=to_stop,
@@ -125,6 +125,8 @@ def _impact_provider(*, from_stop, to_stop, window_start, window_end, catchable_
         # Likewise: a provider that accepts `path` and drops it satisfies the Protocol, and the only
         # thing that can tell is the ledger (test_the_suites_provider_forwards_the_fetch_path).
         path=path,
+        # And the day plan (multi-leg U5), which `main._varsel_impact` forwards with the flag on.
+        plans=plans,
     )
 
 
@@ -206,6 +208,10 @@ def _reset_state():
         # Why a record went away (2026-09-04). A leaked tombstone makes a fresh registration in the
         # next test inherit an old `created_ts`, which reads like the restore logic misfiring.
         varsel._device_tombstones.clear()
+        # What each departure with a change last alerted on (multi-leg U5, KTD8). Leaked, a later
+        # test's subject inherits a reason it never had, which reads as the withdrawal hold
+        # misfiring.
+        varsel._trip_reasons.clear()
     # The card caches' store handle, baseline and watermark (translation store U7). A leaked baseline
     # reads exactly like a flush that silently stopped writing.
     varsel.configure_card_store(None)
@@ -245,6 +251,9 @@ def _reset_state():
     # which is what an un-wired deployment holds.
     varsel._webhook_enabled = None
     varsel._webhook_provider = None
+    # The trip-plan reader (multi-leg U5), off like the two above: a leaked one would hand a later
+    # test a plan nobody in it set up.
+    varsel._trip_plans = None
     # The tracing seam (U1, 2026-09-12), reset for the same reason and with a sharper failure: a
     # recorder left behind by an earlier test keeps appending to a list that test still holds, so
     # its assertions about span counts drift with the order the suite happens to run in.
@@ -3415,8 +3424,8 @@ def test_listing_surfaces_the_alternative_the_poller_found(monkeypatch):
     )
     real_match = varsel.match_journey
 
-    def with_alt(journey, now=None, *, with_alternative=False):
-        alerts = real_match(journey, now, with_alternative=with_alternative)
+    def with_alt(journey, now=None, *, with_alternative=False, standing=None):
+        alerts = real_match(journey, now, with_alternative=with_alternative, standing=standing)
         if with_alternative:  # emulate the poller's JP hit
             for a in alerts:
                 a.alternative_journey = fake_alt
@@ -7737,6 +7746,13 @@ def test_a_card_cache_key_round_trips_to_the_same_tuple():
         rebuilt = varsel._card_key(kind, varsel._card_key_json(key))
         assert rebuilt == key and hash(rebuilt) == hash(key), (rebuilt, key)
     assert wording[6] is not None and isinstance(wording[6][0], datetime)
+    # A departure with a change carries its reason in the key (multi-leg U7): ten elements, which a
+    # follower must read back too, or every trip wording is skipped on every pod but the leader's.
+    alert.trip = SimpleNamespace(problem=SimpleNamespace(kind="missed_connection", index=0))
+    trip_key = varsel.notification_wording.wording_key(pair, alert, _some_alternative(), tomorrow=True)
+    assert len(trip_key) == len(wording) + 1
+    rebuilt = varsel._card_key(varsel._CARD_MESSAGE, varsel._card_key_json(trip_key))
+    assert rebuilt == trip_key and hash(rebuilt) == hash(trip_key), (rebuilt, trip_key)
 
 
 def test_an_alternative_round_trips_through_its_stored_json():
@@ -7947,6 +7963,728 @@ def test_a_stored_entry_that_does_not_parse_is_skipped_not_applied():
         logging.getLogger("varsel").disabled = False
     assert applied == 1 and not varsel._messages
     assert varsel._alternatives == {(("A", "B"), "S1", ""): _some_alternative()}
+
+
+# ---- Multi-leg U5: a departure with a change through the pass ----------------------------------
+# test_varsel pins the merge; these pin what the PASS does with a trip subject: one match and one
+# wording for both channels, the daily cap, the standing alert across a leader change, the
+# lifecycle (catchable until the first leg departs, the phase), the removed-train guards, the
+# decision row, isolation, and the servability texts. The real judge, over this suite's snapshot.
+
+import threading
+
+import notification_events
+import notification_store
+import notification_wording
+import trips
+from test_varsel import _change, _change_calls, _plan_leg, _trips_on
+
+TRIP_DEP = DEP + timedelta(minutes=17)
+TRIP_KEY = "A|B|00:00|23:59|0,1,2,3,4,5,6"
+
+
+def _trip_plans(plan):
+    return {("A", "B", TRIP_DEP.date()): plan}
+
+
+def _trip_mark(recipient_id="sub-0001", dep=TRIP_DEP):
+    """The webhook `alert_id` of the trip's first-leg boarding call, as the plan pins it (KTD5)."""
+    return notification_events.alert_id_for(
+        recipient_id, operator="VYG", line="VYG:Line:R12", journey_ref="t17", stop_place="A",
+        stop_order=1, departure_time=dep,
+    )
+
+
+def _direct_after(minutes_after=3, arrives_after=43):
+    """A direct departure the plan holds, leaving after the trip and arriving before it: KTD20 then
+    admits the trip only while this one is cancelled or out of the plan."""
+    return trips.DirectDeparture(
+        operator="VYG", refs=(("VYG", "d1"),), board_stop_place="A",
+        aimed_departure=TRIP_DEP + timedelta(minutes=minutes_after),
+        aimed_arrival=TRIP_DEP + timedelta(minutes=arrives_after),
+    )
+
+
+def _d1(cancelled):
+    dep = TRIP_DEP + timedelta(minutes=3)
+    return [
+        FakeCall("d1", "A", 1, dep, situation_number="S5", et_declared_cancelled=cancelled,
+                 p_cancel=1.0 if cancelled else 0.05, p_impact_dep=1.0 if cancelled else 0.05),
+        FakeCall("d1", "B", 5, None, situation_number="S5", aimed_arr=dep + timedelta(minutes=40)),
+    ]
+
+
+def _spy_matches(monkeypatch):
+    seen: list[list] = []
+    real = varsel.match_journey
+
+    def spying(journey, *a, **kw):
+        alerts = real(journey, *a, **kw)
+        seen.append(alerts)
+        return alerts
+
+    monkeypatch.setattr(varsel, "match_journey", spying)
+    return seen
+
+
+def _trip_of(alerts):
+    return next((a for a in alerts if a.trip is not None), None)
+
+
+def test_a_trip_subject_costs_one_match_and_one_wording_between_both_channels(monkeypatch):
+    """AE1 for a departure with a change: a browser and a webhook recipient on one definition get
+    one match and one wording between them, by call count, and the provider is still called once
+    per window -- the plan rides on one of those calls, it buys none of its own."""
+    _reset_state()
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    written = _capture_writes(monkeypatch)
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    snapshot = {"S9": _change_calls(TRIP_DEP)}
+    _use_snapshot(snapshot)
+    _register(DEVICE)
+    matches: list = []
+    real_match = varsel.match_journey
+    monkeypatch.setattr(
+        varsel, "match_journey",
+        lambda journey, *a, **kw: matches.append(varsel.journey_key(journey)) or real_match(journey, *a, **kw),
+    )
+    provider_calls = _count_provider_calls(monkeypatch)
+    with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+        outcome = varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    assert matches == [TRIP_KEY], matches
+    assert written == [(TRIP_KEY, "S9")], written
+    windows = varsel.journey_windows(next(iter(varsel._journeys.values())), datetime.now(UTC))
+    assert len(provider_calls) == len(windows), provider_calls
+    assert sum("plans" in kw for kw in provider_calls) == 1, "one call carries the plan"
+    [subject] = _subjects(outcome)
+    assert (subject.journey_ref, subject.stop_order, subject.alertworthy) == ("t17", 1, True)
+
+
+def test_a_trip_subject_spends_one_of_the_four_daily_slots_soonest_first(monkeypatch):
+    """R11: the trip shares the registration's cap of four with the direct alerts, spent soonest
+    departure first, so here it takes the first slot and the latest direct train waits."""
+    _reset_state()
+    trains = {"S9": _change_calls(TRIP_DEP)}
+    for i in range(4):
+        dep = TRIP_DEP + timedelta(minutes=10 * (i + 1))
+        trains[f"S{i + 1}"] = [
+            FakeCall(f"t{i + 1}", "A", 1, dep, situation_number=f"S{i + 1}", p_cancel=0.82,
+                     p_impact_dep=0.9),
+            FakeCall(f"t{i + 1}", "B", 5, None, situation_number=f"S{i + 1}",
+                     aimed_arr=dep + timedelta(minutes=40)),
+        ]
+    _use_snapshot(trains)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    jid = _register(DEVICE)
+    with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+        varsel.check_and_notify(trains)
+    _use_snapshot(SNAPSHOT)
+    assert [p["tag"].split("|")[2] for p in sent] == ["t17", "t1", "t2", "t3"], [p["tag"] for p in sent]
+    assert varsel._daily_pushes[jid][1] == varsel._MAX_ALERT_PUSHES_PER_JOURNEY_PER_DAY
+
+
+def test_a_trip_a_cancellation_made_a_subject_stays_one_after_it_lifts_across_a_leader_change(
+    monkeypatch,
+):
+    """KTD20: the trip became a subject when the direct train after it was cancelled, and alerted.
+    The cancellation lifting must not leave that alert without a subject: the push ledger says the
+    registration holds one, on the store document a new leader's mirror is seeded from -- and the
+    subject then withdraws by today's rules (it eases under the bar and stays listed)."""
+    _reset_state()
+    backend, fake = _store_backend(monkeypatch)
+    monkeypatch.setattr(varsel, "_registrations", backend)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    client.post("/varsel-api/devices", json={"device_id": DEVICE, "subscription": SUBSCRIPTION})
+    _register_journey(DEVICE)
+    _seed_cycle_mirror(fake)
+    seen = _spy_matches(monkeypatch)
+    plan = trips.DayPlan(trips=(_change(TRIP_DEP),), directs=(_direct_after(),))
+    cancelled = {"S9": _change_calls(TRIP_DEP), "S5": _d1(cancelled=True)}
+    running = {"S9": _change_calls(TRIP_DEP), "S5": _d1(cancelled=False)}
+    eased = {"S9": _change_calls(TRIP_DEP, board={"p_impact_dep": 0.2}), "S5": _d1(cancelled=False)}
+    with _trips_on(_trip_plans(plan)):
+        _use_snapshot(cancelled)
+        varsel.check_and_notify(cancelled)
+        assert "t17" in [p["tag"].split("|")[2] for p in sent], "the trip alerted while admitted"
+
+        _use_snapshot(running)
+        # A leader change: the cycle's mirror reset and seeded again from the documents.
+        varsel_state.notification_store.subscription_mirror().reset()
+        _seed_cycle_mirror(fake)
+        varsel.check_and_notify(running)
+        kept = _trip_of(seen[-1])
+        assert kept is not None and kept.alertworthy, "KTD20 no longer admits it, and it stands"
+
+        _use_snapshot(eased)
+        varsel.check_and_notify(eased)
+        eased_trip = _trip_of(seen[-1])
+        assert eased_trip is not None and not eased_trip.alertworthy, "withdraws by today's rules"
+
+        # The control: a registration never pushed about it holds nothing, so it is dropped.
+        _use_snapshot(running)
+        assert _trip_of(varsel.match_journey(
+            dict(JOURNEY_BODY), datetime.now(UTC), standing=lambda alert: False,
+        )) is None
+    _use_snapshot(SNAPSHOT)
+
+
+def test_a_webhook_subject_keeps_its_trip_while_it_stands_and_lets_it_go_once_withdrawn(monkeypatch):
+    """The webhook half of KTD20's standing read. While the subject mirror is not seeded the
+    subscription's delivered marks answer; once it is, a withdrawn subject no longer stands. The
+    kept trip's below-threshold reading is an ordinary withdrawal observation."""
+    _reset_state()
+    _use_notification_store(monkeypatch, [{**WEBHOOK_DOC_ROUTED, "delivered": [_trip_mark()]}])
+    plan = trips.DayPlan(trips=(_change(TRIP_DEP),), directs=(_direct_after(),))
+    snapshot = {"S9": _change_calls(TRIP_DEP), "S5": _d1(cancelled=False)}
+    eased = {"S9": _change_calls(TRIP_DEP, board={"p_impact_dep": 0.2}), "S5": _d1(cancelled=False)}
+    def trip(outcome):
+        # The direct train beside it is observed too, under the bar: below-threshold trains always
+        # are, which is what a withdrawal is counted from.
+        return [s.alertworthy for s in _subjects(outcome) if s.journey_ref == "t17"]
+
+    with _trips_on(_trip_plans(plan)):
+        _use_snapshot(snapshot)
+        assert trip(varsel.check_and_notify(snapshot)) == [True], "standing, so kept"
+        _use_snapshot(eased)
+        assert trip(varsel.check_and_notify(eased)) == [False], "a withdrawal observation"
+
+        withdrawn = notification_events._Standing(
+            phases={_trip_mark(): notification_store.PHASE_WITHDRAWN}, complete=True
+        )
+        monkeypatch.setattr(notification_events, "_standing", lambda ids, now: dict.fromkeys(ids, withdrawn))
+        _use_snapshot(snapshot)
+        assert trip(varsel.check_and_notify(snapshot)) == [], "a withdrawn subject holds nothing"
+    _use_snapshot(SNAPSHOT)
+
+
+def test_ae8_a_trip_whose_first_leg_has_departed_is_no_longer_catchable(monkeypatch):
+    """R10: alerts go out only before the first leg departs, as for a direct train -- whatever its
+    connection does afterwards. No push and no event."""
+    _reset_state()
+    gone = datetime.now(tz=_OSLO) - timedelta(minutes=10)
+    snapshot = {"S9": _change_calls(gone, connecting={"et_declared_cancelled": True})}
+    _use_snapshot(snapshot)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+    with _trips_on({("A", "B", gone.date()): trips.DayPlan(trips=(_change(gone),))}):
+        outcome = varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    assert sent == [] and _subjects(outcome) == []
+
+
+def test_the_phase_follows_a_confirmed_reason_and_a_changed_reason_mints_nothing(monkeypatch):
+    """A confirmed reason makes the observation a confirmed cancellation; a predicted one keeps
+    `predicted`, and a reason that changes on a standing subject while its phase holds is the same
+    train in the same phase -- which the store's transition rule answers with no mint (Q2)."""
+    _reset_state()
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    plan = trips.DayPlan(trips=(_change(TRIP_DEP),))
+    readings = {
+        "departure": {"S9": _change_calls(TRIP_DEP)},
+        "missed": {"S9": [
+            *_change_calls(TRIP_DEP, board={"p_impact_dep": 0.3})[:1],
+            FakeCall("t17", "C", 3, None, aimed_arr=TRIP_DEP + timedelta(minutes=7),
+                     situation_number="S9", p_arr_ge5=0.9, p_arr_ge10=0.8),
+            *_change_calls(TRIP_DEP)[2:],
+        ]},
+        "confirmed": {"S9": _change_calls(TRIP_DEP, board={"p_impact_dep": 0.1},
+                                          connecting={"et_declared_cancelled": True})},
+    }
+    subjects = {}
+    with _trips_on(_trip_plans(plan)):
+        for name, snapshot in readings.items():
+            _use_snapshot(snapshot)
+            [subjects[name]] = _subjects(varsel.check_and_notify(snapshot))
+    _use_snapshot(SNAPSHOT)
+    phase = notification_events.requested_phase
+    assert phase(subjects["departure"]) == phase(subjects["missed"]) == notification_store.PHASE_PREDICTED
+    assert phase(subjects["confirmed"]) == notification_store.PHASE_CONFIRMED
+    assert len({notification_events.train_ref(s) for s in subjects.values()}) == 1, "one train"
+    assert notification_events.skip_reason(notification_store.PHASE_PREDICTED, subjects["missed"]) == (
+        "unchanged"
+    ), "a changed reason mints nothing"
+
+
+def test_ae13_a_trip_reason_on_a_train_out_of_the_plan_is_never_pushed_or_emitted(monkeypatch):
+    """KTD6: a ridden leg on a train Vy took out of today's plan attaches to that train's
+    `KIX:PlanRemoved:` situation, which the existing guards keep out of every push and event."""
+    _reset_state()
+    day = TRIP_DEP.astimezone(_OSLO).date().isoformat()
+    removed_jkey = f"RemovedJourney:1230_{day}"
+    situation = notification_wording.plan_removed_situation(removed_jkey)
+    snapshot = {
+        "S9": _change_calls(TRIP_DEP, second="DatedServiceJourney:1230_X",
+                            board={"p_impact_dep": 0.1}, scored_second=False),
+        situation: [FakeCall(removed_jkey, "C", 1, TRIP_DEP + timedelta(minutes=13),
+                             situation_number=situation, et_declared_cancelled=True,
+                             p_cancel=1.0, p_impact_dep=1.0)],
+    }
+    _use_snapshot(snapshot)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    _register(DEVICE)
+    seen = _spy_matches(monkeypatch)
+    plan = trips.DayPlan(trips=(_change(TRIP_DEP, second="DatedServiceJourney:1230_X"),))
+    with _trips_on(_trip_plans(plan)):
+        outcome = varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    trip = _trip_of(seen[-1])
+    assert trip is not None and trip.alertworthy and trip.situation_number == situation, seen[-1]
+    assert sent == [] and _subjects(outcome) == []
+
+
+def _removed_connecting(dep, second="DatedServiceJourney:1230_X"):
+    """`_change(dep, second=...)` with its connecting train out of today's plan: the relay's key and
+    situation for it, the relay's row at the change, and the spine's rows for it, C -> B."""
+    import journey_status
+
+    removed_jkey = f"RemovedJourney:1230_{dep.astimezone(_OSLO).date().isoformat()}"
+    situation = notification_wording.plan_removed_situation(removed_jkey)
+    relay = [FakeCall(removed_jkey, "C", 1, dep + timedelta(minutes=13), situation_number=situation,
+                      et_declared_cancelled=True, p_cancel=1.0, p_impact_dep=1.0,
+                      call_source="removed", has_situation=False)]
+    common = {"operator": "VYG", "jkey": removed_jkey, "line": "VYG:Line:R12", "dep_delay_min": None,
+              "arr_delay_min": None, "call_cancelled": True, "call_source": "removed"}
+    spine = journey_status.CallTable([
+        journey_status.PlannedCall(stop_place="C", stop_order=1, aimed_dep=dep + timedelta(minutes=13),
+                                   aimed_arr=None, **common),
+        journey_status.PlannedCall(stop_place="B", stop_order=5, aimed_dep=None,
+                                   aimed_arr=dep + timedelta(minutes=48), **common),
+    ], _at(3, 10))
+    return situation, relay, spine
+
+
+def _strip_reads_the_trips(plan):
+    """`journey_status` wired as `main` wires it, through `varsel`'s plan reader (`_trips_on`)."""
+    import journey_status
+
+    journey_status.configure(
+        predictions_refreshed_at=lambda: None, place_refs=varsel.place_refs,
+        trip_plans=lambda *key: varsel._trip_plans(*key), held_plans=lambda: [plan],
+    )
+
+
+def test_ae13_the_digest_names_a_trips_connecting_train_and_its_dated_mark_is_not_resent(monkeypatch):
+    """AE13 and KTD6: a departure with a change whose CONNECTING train Vy took out of today's plan.
+    No per-train push and no webhook event -- the trip attaches to the relay's `KIX:PlanRemoved:`
+    situation, which the guards keep out of both -- and the morning digest names it instead: as the
+    connecting train, «R12 07:30» from the change, never the 07:17 first leg, which runs. Its mark is
+    that situation, dated by the Oslo day. So on the next cycle, with the relay gone from the cache
+    (the blob prune's live set) and the trip still red off the spine, the mark survives the prune
+    and nothing is sent again."""
+    _reset_state()
+    dep = _at(7, 17)
+    day = dep.astimezone(_OSLO).date()
+    second = "DatedServiceJourney:1230_X"
+    situation, relay, spine = _removed_connecting(dep, second)
+    first_leg = _change_calls(dep, second=second, board={"p_impact_dep": 0.1}, scored_second=False)
+    plan = trips.DayPlan(trips=(_change(dep, second=second),))
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    jid = _register(DEVICE)
+    outcomes = []
+    with _spine(spine), _trips_on({("A", "B", day): plan}):
+        _strip_reads_the_trips(plan)
+        for now, snapshot in ((_at(6, 0), {"S9": first_leg, situation: relay}), (_at(6, 5), {"S9": first_leg})):
+            _use_snapshot(snapshot)
+            outcomes.append(varsel.check_and_notify(snapshot, now=now))
+    (push,) = sent
+    assert push["title"] == "1 tog er tatt ut av rutetabellen i dag"
+    assert _wording(push).startswith("R12 07:30 går ikke i dag."), push["body"]
+    assert "07:17" not in push["body"], "never the first leg, which runs"
+    assert push["tag"] == f"{jid}|plan-removed|{day.isoformat()}"
+    notified = varsel._registrations.push_ledger(jid).notified
+    assert situation in notified and situation.endswith(f"_{day.isoformat()}"), notified
+    assert all(_subjects(outcome) == [] for outcome in outcomes), "no webhook event"
+
+
+def test_ae13_a_removed_connecting_train_under_a_predicted_cushion_is_named_by_the_digest(monkeypatch):
+    """KTD19 beside AE13: the same first train also stays on to D, where train `u` reaches B 4 min
+    after the planned arrival -- a cushion, but one only predicted to fail (0.9 at its boarding). So
+    the trip alerts without being confirmed, still on the removed train's `KIX:PlanRemoved:`
+    situation: no per-train push and no event, and the digest names the removed train exactly as
+    when nothing cushions it, and does not send it again."""
+    _reset_state()
+    dep = _at(7, 17)
+    day = dep.astimezone(_OSLO).date()
+    second = "DatedServiceJourney:1230_X"
+    situation, relay, spine = _removed_connecting(dep, second)
+    first_leg = _change_calls(dep, second=second, board={"p_impact_dep": 0.1}, scored_second=False) + [
+        FakeCall("t17", "D", 4, None, aimed_arr=dep + timedelta(minutes=12), situation_number="S9",
+                 p_arr_ge5=0.1, p_arr_ge10=0.05),
+        FakeCall("u", "D", 1, dep + timedelta(minutes=18), situation_number="S9", p_impact_dep=0.9),
+        FakeCall("u", "B", 4, None, aimed_arr=dep + timedelta(minutes=52), situation_number="S9"),
+    ]
+    sibling = trips.PlanTrip(legs=(
+        _plan_leg("t17", "A", "D", dep, dep + timedelta(minutes=12)),
+        _plan_leg("u", "D", "B", dep + timedelta(minutes=18), dep + timedelta(minutes=52)),
+    ))
+    plan = trips.DayPlan(trips=(_change(dep, second=second), sibling))
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    jid = _register(DEVICE)
+    seen = _spy_matches(monkeypatch)
+    outcomes, verdicts, pushed = [], [], []
+    with _spine(spine), _trips_on({("A", "B", day): plan}):
+        _strip_reads_the_trips(plan)
+        for now, snapshot in ((_at(6, 0), {"S9": first_leg, situation: relay}), (_at(6, 5), {"S9": first_leg})):
+            _use_snapshot(snapshot)
+            outcomes.append(varsel.check_and_notify(snapshot, now=now))
+            verdicts += trips.judge(plan, to_stop="B", window_start=dep, window_end=dep)
+            pushed.append(len(sent))
+    trip = _trip_of(seen[0])
+    assert trip is not None and trip.alertworthy and trip.situation_number == situation, seen[0]
+    assert (verdicts[0].alertworthy, verdicts[0].confirmed) == (True, False), "a predicted cushion"
+    assert pushed == [1, 1], "named on the cycle the relay is in the cache, and not again"
+    (push,) = sent
+    assert push["title"] == "1 tog er tatt ut av rutetabellen i dag"
+    assert _wording(push).startswith("R12 07:30 går ikke i dag."), push["body"]
+    assert "07:17" not in push["body"], "never the first leg, which runs"
+    assert push["tag"] == f"{jid}|plan-removed|{day.isoformat()}"
+    notified = varsel._registrations.push_ledger(jid).notified
+    assert situation in notified and situation.endswith(f"_{day.isoformat()}"), notified
+    assert all(_subjects(outcome) == [] for outcome in outcomes), "no webhook event"
+
+
+def test_with_trips_on_a_direct_removed_trains_digest_is_byte_identical(monkeypatch):
+    """AE13's change reaches a trip's row only: a direct train out of the plan is named, tagged and
+    worded exactly as before, with TRIP_PLANS_ENABLED off or on and a held plan beside it."""
+    pushes = []
+    for on in (False, True):
+        _reset_state()
+        sent: list = []
+        monkeypatch.setattr(varsel, "_send_push", lambda sub, payload, sent=sent: sent.append(payload) or "sent")
+        jid = _register(DEVICE)
+        dep = _at(7, 17)
+        plan = trips.DayPlan(trips=(_change(dep),))
+        with _spine(_removed_spine((7, 10), (7, 40), bus=(1,))), _trips_on(
+            {("A", "B", dep.astimezone(_OSLO).date()): plan}, enabled=on
+        ):
+            _strip_reads_the_trips(plan)
+            varsel.check_and_notify({}, now=_at(6, 0))
+        (push,) = sent
+        pushes.append({key: value.replace(jid, "<jid>") for key, value in push.items()})
+    assert pushes[0] == pushes[1]
+    assert _wording(pushes[1]).startswith("L1 07:10 og L1 07:40 går ikke i dag."), pushes[1]
+
+
+def test_a_trip_decision_row_records_the_deciding_pair_beside_its_boarding_figure(monkeypatch):
+    """KTD6: the row's `impact_probability` and `alert_threshold` are what the gate applied -- here
+    a missed change at C at 0.7943 (0.88 read off a 6-minute change, corrected) -- while the Alert
+    keeps the calm boarding call's own 0.3."""
+    _reset_state()
+    log = _use_decision_log(monkeypatch)
+    snapshot = {"S9": [
+        *_change_calls(TRIP_DEP, board={"p_impact_dep": 0.3})[:1],
+        FakeCall("t17", "C", 3, None, aimed_arr=TRIP_DEP + timedelta(minutes=7),
+                 situation_number="S9", p_arr_ge5=0.9, p_arr_ge10=0.8),
+        *_change_calls(TRIP_DEP)[2:],
+    ]}
+    _use_snapshot(snapshot)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    seen = _spy_matches(monkeypatch)
+    with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+        varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    trip = _trip_of(seen[-1])
+    assert trip.impact_probability == 0.3 and round(trip.deciding_probability, 4) == 0.7943
+    [row] = [r for r in log.rows if r["situation_number"] == "S9"]
+    assert (round(row["impact_probability"], 4), row["alert_threshold"], row["alertworthy"]) == (
+        0.7943, 0.65, True
+    )
+
+
+def test_a_raise_in_one_definitions_trips_leaves_its_direct_alerts_and_the_other_definitions(
+    monkeypatch,
+):
+    """Decision 7: the definition whose trip evaluation raised still gets its direct alerts on the
+    same cycle, the raise is logged by class, and the definition beside it keeps its trip."""
+    _reset_state()
+    snapshot = {"S1": SNAPSHOT["S1"], "S9": _change_calls(TRIP_DEP)}
+    _use_snapshot(snapshot)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    _register("dev-other-0001", begin="00:01")
+    seen = _spy_matches(monkeypatch)
+    real = varsel._trip_alert
+    calls: list = []
+    lock = threading.Lock()
+
+    def flaky(*a, **kw):
+        with lock:
+            calls.append(1)
+            first = len(calls) == 1
+        if first:
+            raise RuntimeError("nothing to see")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(varsel, "_trip_alert", flaky)
+    with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+        varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    assert sorted(_trip_of(alerts) is not None for alerts in seen) == [False, True], seen
+    assert all("S1" in {a.situation_number for a in alerts} for alerts in seen), "direct kept"
+
+
+def test_a_trip_reason_with_no_row_of_ours_is_pushed_once_while_a_held_plan_names_it(monkeypatch):
+    """A Journey Planner cancellation of the connecting train attaches to that leg's `KIX:Trip:`
+    situation, which no prediction row carries. The pass sweeps every push mark whose situation is
+    not live, so main names the held plans' (`main._varsel_live`). The control is why: swept, the
+    blob's mark goes, and the per-train tag makes the re-push a cap-exempt replacement, every cycle."""
+    from test_varsel import _snapshot_calls
+
+    _reset_state()
+    connecting = _change(TRIP_DEP).legs[1]
+    trips.configure(
+        call_lookup=_snapshot_calls, places=varsel.place_refs,
+        realtime=lambda leg: trips.LegRealtime(board_cancelled=True) if leg == connecting else None,
+    )
+    snapshot = {"S9": _change_calls(TRIP_DEP, board={"p_impact_dep": 0.1}, scored_second=False)}
+    live = {**snapshot, trips.trip_situation(connecting): []}
+    _use_snapshot(snapshot)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+    try:
+        with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+            varsel.check_and_notify(live)
+            varsel.check_and_notify(live)
+            assert len(sent) == 1 and sent[0]["tag"].split("|")[2] == "t17", sent
+            varsel.check_and_notify(snapshot)
+            assert len(sent) == 2, "control: the mark swept, the same train is pushed again"
+    finally:
+        trips.configure(call_lookup=_snapshot_calls, places=varsel.place_refs)
+        _use_snapshot(SNAPSHOT)
+
+
+def test_the_same_bus_on_the_next_day_is_another_trip_situation_and_is_pushed_again(monkeypatch):
+    """`KIX:Trip:` numbers carry the leg's service date. A bus `ServiceJourney` jkey repeats every
+    operating day, and the browser's push marks are per SITUATION -- live while a held plan names
+    it, seven days in the store -- so an undated number would let the first day's mark swallow the
+    next day's push about the same bus. Day two runs on its own clock, after day one's train left."""
+    from test_varsel import _snapshot_calls
+
+    _reset_state()
+
+    def bus_then_train(dep):
+        return trips.PlanTrip(legs=(
+            _plan_leg("ServiceJourney:b1", "A", "C", dep, dep + timedelta(minutes=7),
+                      operator="RUT", mode="bus"),
+            _plan_leg("t30", "C", "B", dep + timedelta(minutes=13), dep + timedelta(minutes=48)),
+        ))
+
+    first, second = bus_then_train(TRIP_DEP), bus_then_train(TRIP_DEP + timedelta(days=1))
+    assert first.legs[0].refs == second.legs[0].refs, "control: one bus jkey, two operating days"
+    assert trips.trip_situation(first.legs[0]) != trips.trip_situation(second.legs[0])
+    buses = {first.legs[0], second.legs[0]}
+    # JP's expected arrival 10 minutes late against 6 of slack: a JP-expected miss (KTD8).
+    trips.configure(
+        call_lookup=_snapshot_calls, places=varsel.place_refs,
+        realtime=lambda leg: (
+            trips.LegRealtime(expected_arrival=leg.aimed_arrival + timedelta(minutes=10))
+            if leg in buses else None
+        ),
+    )
+    plans = {
+        ("A", "B", trip.legs[0].service_date): trips.DayPlan(trips=(trip,)) for trip in (first, second)
+    }
+    # What `main._varsel_live` names: both plans are held, so both days' situations stay live.
+    live = {situation: [] for situation in trips.situation_texts(plans.values())}
+    _use_snapshot({})
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _capture_writes(monkeypatch)
+    _register(DEVICE)
+    try:
+        day_one = dict(list(plans.items())[:1])
+        with _trips_on(day_one):
+            varsel.check_and_notify(live)
+        assert len(sent) == 1, sent
+        with _trips_on(dict(list(plans.items())[1:])):
+            varsel.check_and_notify(live, now=TRIP_DEP.astimezone(UTC) + timedelta(hours=2))
+        assert len(sent) == 2, "the next day's reason about the same bus reached the phone"
+    finally:
+        trips.configure(call_lookup=_snapshot_calls, places=varsel.place_refs)
+        _use_snapshot(SNAPSHOT)
+
+
+def test_an_unscored_first_leg_goes_through_the_whole_pass_with_its_figures_null(monkeypatch):
+    """KTD6 through every reader the pass has: a first leg we do not score has no figure of ours,
+    and the push, the webhook payload (whose `probabilities` stay the boarding call's) and the
+    decision row (which records the deciding pair) all take the nulls without a raise."""
+    _reset_state()
+    snapshot = {"S9": _change_calls(TRIP_DEP, scored_first=False, connecting={"p_impact_dep": 0.95})}
+    _use_snapshot(snapshot)
+    sent: list = []
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
+    _use_notification_store(monkeypatch, [WEBHOOK_DOC_ROUTED])
+    log = _use_decision_log(monkeypatch)
+    _register(DEVICE)
+    with _trips_on(_trip_plans(trips.DayPlan(trips=(_change(TRIP_DEP),)))):
+        outcome = varsel.check_and_notify(snapshot)
+    _use_snapshot(SNAPSHOT)
+    assert [p["tag"].split("|")[2] for p in sent] == ["t17"], sent
+    [observation] = outcome.webhook_observations
+    assert observation.alertworthy and not observation.cancelled
+    probabilities = observation.payload["probabilities"]
+    assert (probabilities["impact"], probabilities["cancellation"]) == (None, None), probabilities
+    [row] = [r for r in log.rows if r["situation_number"] == "S9"]
+    assert (row["impact_probability"], row["cancel_probability"], row["pushed"]) == (0.95, None, True)
+
+
+def test_with_no_plan_the_alerts_are_todays(monkeypatch):
+    """AE5: the flag on and no plan for the pair (Journey Planner down all morning) is the direct
+    answer, exactly as it is with the flag off."""
+    _reset_state()
+    _use_snapshot(SNAPSHOT)
+    monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: "sent")
+    _register(DEVICE)
+    seen = _spy_matches(monkeypatch)
+    now = datetime.now(UTC)
+    varsel.check_and_notify(SNAPSHOT, now=now)
+    with _trips_on({}):
+        varsel.check_and_notify(SNAPSHOT, now=now)
+    assert [a.model_dump_json() for a in seen[0]] == [a.model_dump_json() for a in seen[1]]
+    assert seen[0], "control: the direct train matched"
+
+
+def _plan_with(first, second):
+    """A plan fetched just now whose one trip with a change rides `first` A -> C, then `second`
+    C -> B: watched when either is Vy (R3)."""
+    def mode(operator):
+        return "rail" if operator == "VYG" else "bus"
+
+    legs = (
+        _plan_leg("x0", "A", "C", TRIP_DEP, TRIP_DEP + timedelta(minutes=10), operator=first,
+                  mode=mode(first)),
+        _plan_leg("x1", "C", "B", TRIP_DEP + timedelta(minutes=20),
+                  TRIP_DEP + timedelta(minutes=40), operator=second, mode=mode(second)),
+    )
+    covered = (trips.CoveredRange(start=TRIP_DEP - timedelta(hours=1),
+                                  end=TRIP_DEP + timedelta(hours=1), fetched_at=datetime.now(UTC)),)
+    return trips.DayPlan(trips=(trips.PlanTrip(legs=legs),), covered=covered)
+
+
+def test_a_pair_served_only_with_a_change_loses_its_warning_the_cycle_after_its_plan_lands():
+    """KTD15: registered before the pair has a plan, the definition says the trips with a change
+    are not evaluated yet (U10's copy, word for word) -- never that a direct departure is required.
+    The plan lands with a watched trip: the warning goes, and the sweep, due at once rather than in
+    six hours, clears the stored flag the reach count reads."""
+    _reset_state()
+    _use_snapshot({})
+    _use_connectivity((False, False))
+    plans: dict = {}
+    try:
+        with _trips_on(plans):
+            r = client.post("/varsel-api/journeys", json=_JOURNEY)
+            assert r.json()["warning"] == varsel._NO_DIRECT_TRANSFERS_NOT_EVALUATED
+            assert "direkteavgang." not in r.json()["warning"], "R14"
+            jid = r.json()["journey_id"]
+            plans[("A", "B", datetime.now(UTC).astimezone(_OSLO).date())] = _plan_with("VYG", "RUT")
+            listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+            assert listed[0]["warning"] is None
+            varsel.recheck_service()
+            with varsel._state_lock:
+                assert "no_direct_service" not in varsel._journeys[jid]
+    finally:
+        _no_connectivity()
+        _use_snapshot(SNAPSHOT)
+
+
+def test_a_plan_with_nothing_watched_says_nothing_can_alert_and_the_flag_off_says_todays():
+    """KTD15's other row: a plan is held but no trip with a change has a leg we score, so there is
+    nothing to alert on, and the text says so. With the flag off the warning is today's, byte for
+    byte (AE6)."""
+    _reset_state()
+    _use_snapshot({})
+    _use_connectivity((False, False))
+    today = datetime.now(UTC).astimezone(_OSLO).date()
+    plans = {("A", "B", today): _plan_with("RUT", "RUT")}
+    try:
+        with _trips_on(plans):
+            r = client.post("/varsel-api/journeys", json=_JOURNEY)
+            assert r.json()["warning"] == varsel._NOTHING_TO_ALERT_ON
+        listed = client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"]
+        assert listed[0]["warning"] == (
+            "Vi fant ingen direkteavganger mellom disse stoppene i dag. Sjekk at du valgte riktige "
+            "stoppesteder — varsler krever en direkteavgang."
+        )
+    finally:
+        _no_connectivity()
+        _use_snapshot(SNAPSHOT)
+
+
+# ---- Multi-leg U10: what the PWA reads -----------------------------------------------------------
+
+
+def test_the_service_warnings_are_the_copy_tables_words():
+    """U10's copy table, word for word: neither text says a direct departure is required (R14)."""
+    assert varsel._NO_DIRECT_TRANSFERS_NOT_EVALUATED == (
+        "Vi fant ingen direkteavganger mellom disse stoppene i dag, og reiser med bytte er ikke vurdert ennå."
+    )
+    assert varsel._NOTHING_TO_ALERT_ON == (
+        "Vi fant ingen avganger mellom disse stoppene i dag som vi kan varsle om. Sjekk at du valgte riktige "
+        "stoppesteder."
+    )
+
+
+def test_a_journey_says_whether_its_trips_with_a_change_were_judged():
+    """`Journey.transfers` is `trips.transfer_coverage` over the strip's window and the plan the
+    matcher reads, which the PWA words as «Reiser med bytte er ikke vurdert ennå.» under the strip.
+    Null with TRIP_PLANS_ENABLED off, so the card says nothing it did not say before (AE6)."""
+    _reset_state()
+    _use_snapshot({})
+    today = datetime.now(UTC).astimezone(_OSLO).date()
+    midnight = datetime.combine(today, time(0, 0), tzinfo=_OSLO)
+    noon = midnight + timedelta(hours=12)
+    covered = (trips.CoveredRange(start=midnight, end=midnight + timedelta(days=1), fetched_at=datetime.now(UTC)),)
+    watched = trips.DayPlan(trips=(trips.PlanTrip(legs=(
+        _plan_leg("x0", "A", "C", noon, noon + timedelta(minutes=10)),
+        _plan_leg("x1", "C", "B", noon + timedelta(minutes=20), noon + timedelta(minutes=40)),
+    )),), covered=covered)
+    plans: dict = {}
+
+    def transfers():
+        return client.get(f"/varsel-api/journeys?device_id={DEVICE}").json()["journeys"][0]["transfers"]
+
+    try:
+        assert client.post("/varsel-api/journeys", json=_JOURNEY).json()["transfers"] is None
+        assert transfers() is None, "the flag off: nothing for the PWA to word"
+        with _trips_on(plans):
+            assert transfers() == "not_evaluated", "no plan yet"
+            plans[("A", "B", today)] = watched
+            assert transfers() == "evaluated"
+            plans[("A", "B", today)] = trips.DayPlan(trips=(), covered=covered)
+            assert transfers() == "none"
+            plans[("A", "B", today)] = trips.DayPlan(trips=watched.trips, covered=())
+            assert transfers() == "not_evaluated", "the window outside the plan's covered ranges"
+    finally:
+        _use_snapshot(SNAPSHOT)
+
+
+def test_the_feedback_snapshot_reads_a_trip_card_as_the_card_and_the_template_do():
+    """`_feedback_detail` is the card's detail line, and a trip card's names the leg or change at
+    fault (`tripModel.alertDriver`). Over the generated fixture the PWA's own test reads, it is the
+    template body's first line, «<train>: <driver>», in the card's «<train> · <driver>»."""
+    import pathlib
+
+    fixture = pathlib.Path(__file__).resolve().parents[2] / "demo/avviksvarsel/test/fixtures/trip-wording.json"
+    for case in json.loads(fixture.read_text())["cases"]:
+        alert = varsel.Alert.model_validate(
+            {**case["alert"], "situation_number": "S1", "summary": None, "alert_threshold": 0.65, "alertworthy": True}
+        )
+        train, _, driver = case["body"].split("\n")[0].partition(": ")
+        assert varsel._feedback_detail(alert) == (f"{train} · {driver}" if driver else train), case["name"]
 
 
 if __name__ == "__main__":

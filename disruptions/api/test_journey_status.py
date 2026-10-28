@@ -8,30 +8,40 @@ engine reads through `impact.configure(call_lookup=...)`, exactly as `main` wire
 from __future__ import annotations
 
 import ast
+import os
 import random
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import impact
 import journey_status as js
+import trips
 
 OSLO = ZoneInfo("Europe/Oslo")
 FROM = "NSR:StopPlace:337"  # Oslo S
 MID = "NSR:StopPlace:444"  # Sandvika
 TO = "NSR:StopPlace:418"  # Asker, rail side -- where every rail call sits
 TO_CANONICAL = "NSR:StopPlace:3247"  # Asker, the busier bus side the picker collapses onto
+VIA = "NSR:StopPlace:9"  # a second change point, for KTD19's sibling continuation
 
 # 2026-09-22 is a Tuesday (weekday 1).
 DEFINITION = {"from_stop": FROM, "to_stop": TO, "begin": "07:00", "end": "09:00", "days": [0, 1, 2, 3, 4]}
+DAY = date(2026, 9, 22)
 
 _index: dict[tuple[str, str], list[impact.CallPred]] = {}
 impact.configure(
     snapshot_provider=lambda: ({}, None),
     call_lookup=lambda operator, jkey: _index.get((operator, jkey)),
 )
+# The trips with a change (multi-leg U9): the day plans the strip reads through its injected reader,
+# keyed (from, to, Oslo date) as `trip_plans.read_plan` keys them, and JP's real-time answers per leg.
+# The verdict reads the SAME call index the strip does, as `main` wires both.
+_plans: dict[tuple[str, str, date], trips.DayPlan] = {}
+_realtime: dict[trips.PlanLeg, trips.LegRealtime] = {}
 
 
 def _oslo(h: int, m: int = 0, day: int = 22) -> datetime:
@@ -86,15 +96,38 @@ def _scored(jkey, dep, *, sit="S1", board=None, alight=None, **both):
     return [b, a]
 
 
-def _install(rows, preds=(), *, actuals=None, place_refs=None):
+def _install(rows, preds=(), *, actuals=None, place_refs=None, plan=None, realtime=None):
     _index.clear()
     for p in preds:
         _index.setdefault((p.operator, p.jkey), []).append(p)
+    _plans.clear()
+    if plan is not None:
+        _plans[(FROM, TO, DAY)] = plan
+    _realtime.clear()
+    _realtime.update(realtime or {})
+    trips.configure(call_lookup=lambda operator, jkey: _index.get((operator, jkey)), realtime=_realtime.get)
     js.reset_state()
-    js.configure(predictions_refreshed_at=lambda: _oslo(7, 40), place_refs=place_refs or (lambda r: (r,)))
+    js.configure(
+        predictions_refreshed_at=lambda: _oslo(7, 40), place_refs=place_refs or (lambda r: (r,)),
+        trip_plans=lambda from_stop, to_stop, day: _plans.get((from_stop, to_stop, day)),
+    )
     js.set_spine(js.CallTable(rows, _oslo(7, 5)))
     if actuals is not None:
         js.set_actuals(js.CallTable(actuals, _oslo(7, 35)))
+
+
+@contextmanager
+def _trips_on(on=True):
+    """TRIP_PLANS_ENABLED, put back after."""
+    before = os.environ.get("TRIP_PLANS_ENABLED")
+    os.environ["TRIP_PLANS_ENABLED"] = "true" if on else "false"
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("TRIP_PLANS_ENABLED", None)
+        else:
+            os.environ["TRIP_PLANS_ENABLED"] = before
 
 
 def _strip(now, definition=DEFINITION):
@@ -537,10 +570,15 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
     each so the matcher's per-line pick cannot hide one (a split train's second half is in a
     situation of its own), go through both, and the train sets must match. Trains call the origin
     at most once: for a loop the two knowingly differ (see `_trains`).
+
+    Over both paths since multi-leg U9: the trips with a change too, against `trips.judge` (below).
+    A trip that alerted while admitted and still stands for a definition (`varsel`'s `standing`) is
+    the one the two knowingly differ on: that is per-registration state a public strip cannot see.
     """
     rng = random.Random(7)
     stops = [MID, TO, "NSR:StopPlace:9"]
     start, end = _oslo(7, 0), _oslo(9, 0)
+    seen = {"listed": 0, "direct_won": 0, "not_admitted": 0}
     for _ in range(200):
         rows, scope = [], {}
         for j in range(rng.randint(0, 10)):
@@ -576,10 +614,426 @@ def test_the_train_set_agrees_with_the_push_matchers_eligibility():
                               alighting_allowed=r.alighting_allowed, **certainty)
                         for r in part_rows
                     ]
-        _install(rows)
-        strip = {t.jkey for t in js.status_for(DEFINITION, _oslo(8, 0)).trains}
+        # The trips with a change (multi-leg U9): the same matcher's other half, `trips.judge`, over a
+        # random day plan. Every first leg carries a figure, so the strip's figure-less departures
+        # (which `judge` leaves out by default) cannot make the comparison tautological. Some first
+        # legs are a spine train's own departure (AE7: the direct row wins, as `varsel`'s merge has a
+        # direct alert win), and some trips arrive after a direct departure leaving at or after them
+        # (KTD20: not a subject, so the request-path matcher does not list them either).
+        plan_trips, directs, trip_preds = [], [], []
+        boards = [r for r in rows if r.stop_place == FROM and r.aimed_dep is not None]
+        for k in range(rng.randint(0, 4)):
+            first, dep = f"t{k}", _oslo(6, 45) + timedelta(minutes=rng.randint(0, 150))
+            if boards and rng.random() < 0.25:
+                shared = rng.choice(boards)
+                first, dep = shared.jkey, shared.aimed_dep
+            via = rng.choice([MID, VIA])
+            plan_trips.append(trips.PlanTrip(legs=(
+                _plan_leg(first, FROM, via, dep, dep + timedelta(minutes=10)),
+                _plan_leg(f"u{k}", via, TO, dep + timedelta(minutes=16),
+                          dep + timedelta(minutes=rng.randint(25, 60))),
+            )))
+            trip_preds.append(_pred(first, 1, FROM, dep, None, sit=f"T{k}", p_impact_dep=rng.random()))
+            if rng.random() < 0.3:
+                leaves = dep + timedelta(minutes=rng.randint(-10, 30))
+                directs.append(trips.DirectDeparture(
+                    operator="VYG", refs=(("VYG", f"d{k}"),), board_stop_place=FROM,
+                    aimed_departure=leaves, aimed_arrival=leaves + timedelta(minutes=rng.randint(15, 70)),
+                ))
+        plan = trips.DayPlan(trips=tuple(plan_trips), directs=tuple(directs))
+        _install(rows, trip_preds, plan=plan)
+        with _trips_on():
+            status = js.status_for(DEFINITION, _oslo(8, 0))
+            judged = trips.judge(plan, to_stop=TO, window_start=start, window_end=end)
+        strip = {t.jkey for t in status.trains if t.trip is None}
         matcher = {c.jkey for c in impact._trip_cells(scope, FROM, TO, start, end, select="worst")}
         assert strip == matcher, (strip, matcher)
+        direct_keys = {(t.operator, t.jkey, t.departure_time) for t in status.trains if t.trip is None}
+        strip_trips = {(t.operator, t.jkey, t.departure_time) for t in status.trains if t.trip is not None}
+        subjects = {v.key for v in judged if v.admitted}
+        assert strip_trips == subjects - direct_keys, (strip_trips, subjects, direct_keys)
+        seen["listed"] += len(strip_trips)
+        seen["direct_won"] += len(subjects & direct_keys)
+        seen["not_admitted"] += sum(not v.admitted for v in judged)
+    # Each rule did some work, or the comparison above proved less than it claims.
+    assert all(seen.values()), seen
+
+
+# ---- Trips with a change (multi-leg U9, KTD14) --------------------------------------------------
+# `_change(dep)`: train `f` from FROM at `dep` to MID ten minutes later, a six-minute change, then
+# train `s` from MID to TO, arriving forty minutes after `dep`. Neither train calls at both ends, so
+# neither is a direct row. The plan is (FROM, TO)'s for 2026-09-22.
+
+
+def _plan_leg(jkey, board, alight, dep, arr, *, operator="VYG", mode="rail", walk=0):
+    return trips.PlanLeg(
+        operator=operator, refs=((operator, jkey),), line=f"{operator}:Line:R12", public_code="R12",
+        mode=mode, board_stop_place=board, alight_stop_place=alight, board_quay=None,
+        alight_quay=None, board_position=0, alight_position=4, aimed_departure=dep,
+        aimed_arrival=arr, service_date=dep.astimezone(OSLO).date(), walk_after_s=walk,
+    )
+
+
+def _change(dep, *, first="f", second="s", first_operator="VYG", first_mode="rail"):
+    return trips.PlanTrip(legs=(
+        _plan_leg(first, FROM, MID, dep, dep + timedelta(minutes=10), operator=first_operator,
+                  mode=first_mode),
+        _plan_leg(second, MID, TO, dep + timedelta(minutes=16), dep + timedelta(minutes=40)),
+    ))
+
+
+def _change_rows(dep, *, first="f", second="s", board_kw=None, transfer_kw=None, connect_kw=None,
+                 alight_kw=None):
+    """The spine's rows for `_change`'s trains: `f` FROM (3) -> MID (5) -> VIA (7), and `s` MID (2)
+    -> TO (6), its terminus."""
+    return [
+        _row(first, 3, FROM, dep, None, **(board_kw or {})),
+        _row(first, 5, MID, dep + timedelta(minutes=11), dep + timedelta(minutes=10), **(transfer_kw or {})),
+        _row(first, 7, VIA, dep + timedelta(minutes=21), dep + timedelta(minutes=20)),
+        _row(second, 2, MID, dep + timedelta(minutes=16), dep + timedelta(minutes=15), **(connect_kw or {})),
+        _row(second, 6, TO, None, dep + timedelta(minutes=40), **(alight_kw or {})),
+    ]
+
+
+def _change_preds(dep, *, first="f", second="s", board=None, transfer=None, connect=None, arrive=None):
+    """The cache's rows for `_change`: both trains scored at both their ends, quiet by default --
+    a 1-minute typical delay and a P(miss) read-off of 0.02 against the change's 6 minutes of slack."""
+    return [
+        _pred(first, 3, FROM, dep, None, **(board or {})),
+        _pred(first, 5, MID, dep + timedelta(minutes=11), dep + timedelta(minutes=10), **(transfer or {})),
+        _pred(second, 2, MID, dep + timedelta(minutes=16), dep + timedelta(minutes=15), **(connect or {})),
+        _pred(second, 6, TO, None, dep + timedelta(minutes=40), **(arrive or {})),
+    ]
+
+
+def _plan(*trip_list, directs=()):
+    return trips.DayPlan(trips=trip_list, directs=directs)
+
+
+def _status(now):
+    status = js.status_for(DEFINITION, now)
+    assert status is not None
+    return status
+
+
+def _trip_row(now):
+    """The one trip row on the strip at `now`."""
+    [row] = [t for t in _status(now).trains if t.trip is not None]
+    return row
+
+
+def test_a_trip_with_a_change_is_listed_keyed_on_its_first_leg_beside_the_direct_trains():
+    """R13: one row per first-leg departure, in departure order with the direct trains, carrying
+    the one trip shape (KTD13). Graded end to end: green on an expected arrival 1 min late."""
+    dep = _oslo(7, 50)
+    with _trips_on():
+        _install(_train("d", _oslo(7, 20)) + _change_rows(dep), _change_preds(dep), plan=_plan(_change(dep)))
+        status = _status(_oslo(7, 42))
+    assert [(js_time(t.departure_time), t.trip is not None) for t in status.trains] == [
+        ("07:20", False), ("07:50", True)
+    ]
+    row = status.trains[1]
+    assert (row.operator, row.jkey, row.line, row.mode) == ("VYG", "f", "VYG:Line:R12", "rail")
+    assert (row.departure_time, row.arrival_time) == (dep, dep + timedelta(minutes=40))
+    assert (row.state, row.level, row.cancelled, row.alert_worthy) == ("predicted", "green", False, False)
+    assert row.delay_p50_min == 1, "the end-to-end arrival, not the first train's"
+    assert row.impact_probability == 0.03, "the figure the verdict was taken on"
+    assert row.expected_departure_time == dep + timedelta(minutes=1)
+    assert [leg.board_stop_place for leg in row.trip.legs] == [FROM, MID]
+    assert [t.stop_place for t in row.trip.transfers] == [MID]
+    assert row.trip.expected_arrival == dep + timedelta(minutes=41) and row.trip.problem is None
+    assert status.trains[0].trip is None, "a direct train carries no trip"
+
+
+def test_a_bus_then_train_trip_grades_the_bus_from_jp_real_time_and_the_train_from_the_spine():
+    """KTD14: an unscored bus leg is graded from JP's real-time answer, the train as today. JP's
+    expected arrival 1 min late keeps the change; 12 min late misses it (AE4), which is red. With no
+    answer for the bus the trip is grey, never green. Once the train has arrived, its recorded call
+    in the spine grades the trip, as it grades a train, and nothing else is needed."""
+    dep = _oslo(7, 50)
+    trip = _change(dep, first="ServiceJourney:b1", first_operator="RUT", first_mode="bus")
+    bus = trip.legs[0]
+    rows = _change_rows(dep)[3:]  # the train only: the spine is Vy and SJ Norge
+    preds = _change_preds(dep)[2:]  # the train's two ends; no message names the bus
+    late = {
+        minutes: trips.LegRealtime(expected_departure=dep, expected_arrival=dep + timedelta(minutes=minutes))
+        for minutes in (11, 22)
+    }
+    with _trips_on():
+        _install(rows, preds, plan=_plan(trip), realtime={bus: late[11]})
+        row = _trip_row(_oslo(7, 42))
+        assert (row.operator, row.mode, row.state, row.level) == ("RUT", "bus", "predicted", "green")
+        assert [leg.data_source for leg in row.trip.legs] == ["jp_realtime", "prediction"]
+        _install(rows, preds, plan=_plan(trip), realtime={bus: late[22]})
+        row = _trip_row(_oslo(7, 42))
+        assert (row.state, row.level, row.alert_worthy) == ("predicted", "red", True)
+        assert (row.trip.problem.kind, row.trip.problem.index) == ("missed_connection", 0)
+        _install(rows, preds, plan=_plan(trip))
+        row = _trip_row(_oslo(7, 42))
+        assert (row.state, row.level, row.alert_worthy) == ("unknown", "grey", False), "never green"
+        assert [leg.data_source for leg in row.trip.legs] == ["none", "prediction"], "«mangler sanntid»"
+        recorded = _change_rows(dep, alight_kw={"source": "recorded", "arr_delay_min": 6})[3:]
+        _install(recorded, plan=_plan(trip))
+        row = _trip_row(_oslo(8, 45))
+    assert (row.state, row.level, row.delay_min) == ("confirmed", "yellow", 6)
+    assert row.observed_at == dep + timedelta(minutes=40)
+
+
+def test_a_trip_is_never_green_while_a_leg_is_grey():
+    """R13: a leg nothing can say anything about greys the trip, however quiet the rest is (the bus
+    case above). A no-SX figure more than `NOSX_HORIZON_MIN` out is nothing, as it is for a direct
+    train (KTD7): the same quiet figures are green inside the horizon and grey beyond it."""
+    dep = _oslo(8, 50)
+    nosx = [replace(p, situation_number="KIX:NoSituation:x", has_situation=False) for p in _change_preds(dep)]
+    with _trips_on():
+        _install(_change_rows(dep), nosx, plan=_plan(_change(dep)))
+        far, near = _trip_row(_oslo(6, 30)), _trip_row(_oslo(7, 42))
+    assert (far.state, far.level) == ("unknown", "grey")
+    assert (near.state, near.level) == ("predicted", "green")
+
+
+def test_an_observed_missed_connection_after_departure_is_red():
+    """AE8: the first train recorded 9 min late at the change, the connecting train recorded on
+    time, and its departure has passed: the change was not made. Red and a fact, named as the
+    problem, whatever the (stale) forecast said. Before the connecting train leaves it is not yet
+    an observation."""
+    dep = _oslo(7, 20)
+    arrived_late = {"source": "recorded", "dep_delay_min": 9}
+    left = {"source": "recorded", "dep_delay_min": 0}
+    with _trips_on():
+        _install(_change_rows(dep, board_kw=left, transfer_kw=arrived_late, connect_kw=left),
+                 _change_preds(dep), plan=_plan(_change(dep)))
+        row = _trip_row(_oslo(7, 45))
+        assert (row.state, row.level, row.cancelled, row.alert_worthy) == ("confirmed", "red", False, False)
+        assert (row.trip.problem.kind, row.trip.problem.index) == ("missed_connection", 0)
+        assert (row.trip.problem.probability, row.observed_at) == (1.0, dep + timedelta(minutes=10))
+        assert (row.trip.expected_arrival, row.impact_probability) == (None, None)
+        _install(_change_rows(dep, board_kw=left, transfer_kw=arrived_late),
+                 _change_preds(dep), plan=_plan(_change(dep)))
+        row = _trip_row(_oslo(7, 35))
+    assert (row.state, row.level, row.trip.problem) == ("predicted", "green", None)
+
+
+def test_a_change_is_not_observed_missed_before_the_connecting_departure_is_recorded():
+    """AE8: the first train recorded 9 min late at the change and the connecting train's aimed
+    departure passed, but its departure is not recorded yet -- it may be held or late too, so the
+    change is no fact yet. JP's expected departure for it, once passed, is one."""
+    dep = _oslo(7, 20)
+    arrived_late = {"source": "recorded", "dep_delay_min": 9}
+    rows = _change_rows(dep, board_kw={"source": "recorded", "dep_delay_min": 0}, transfer_kw=arrived_late)
+    trip = _change(dep)
+    with _trips_on():
+        _install(rows, _change_preds(dep), plan=_plan(trip))
+        row = _trip_row(_oslo(7, 45))
+        assert (row.state, row.trip.problem) == ("predicted", None)
+        expected = trips.LegRealtime(expected_departure=dep + timedelta(minutes=18),
+                                     expected_arrival=dep + timedelta(minutes=42))
+        _install(rows, _change_preds(dep), plan=_plan(trip), realtime={trip.legs[1]: expected})
+        row = _trip_row(_oslo(7, 45))
+    assert (row.state, row.level) == ("confirmed", "red")
+    assert (row.trip.problem.kind, row.trip.problem.index) == ("missed_connection", 0)
+
+
+def test_a_broken_change_whose_cushion_holds_is_graded_on_the_cushions_arrival_never_red():
+    """AE11 and KTD19: the change at MID is likely missed (P(miss) 0.79), but the same first train
+    stays on to VIA and reaches TO 6 min later through a change that holds. The alert stays silent,
+    so the strip is not red: it is graded on the cushion's arrival, 7 min late (yellow). With the
+    VIA continuation in trouble too, both are red."""
+    dep = _oslo(7, 50)
+    planned = _change(dep)
+    sibling = trips.PlanTrip(legs=(
+        _plan_leg("f", FROM, VIA, dep, dep + timedelta(minutes=20)),
+        _plan_leg("u", VIA, TO, dep + timedelta(minutes=26), dep + timedelta(minutes=46)),
+    ))
+    plan = _plan(planned, sibling)
+    rows = _change_rows(dep) + [
+        _row("u", 2, VIA, dep + timedelta(minutes=26), dep + timedelta(minutes=25)),
+        _row("u", 6, TO, None, dep + timedelta(minutes=46)),
+    ]
+
+    def preds(u_board):
+        return _change_preds(dep, transfer={"p_arr_ge5": 0.9, "p_arr_ge10": 0.8}) + [
+            _pred("f", 7, VIA, dep + timedelta(minutes=21), dep + timedelta(minutes=20)),
+            _pred("u", 2, VIA, dep + timedelta(minutes=26), dep + timedelta(minutes=25), p_impact_dep=u_board),
+            _pred("u", 6, TO, None, dep + timedelta(minutes=46)),
+        ]
+
+    window = {"to_stop": TO, "window_start": _oslo(7), "window_end": _oslo(9)}
+    with _trips_on():
+        _install(rows, preds(0.03), plan=plan)
+        row = _trip_row(_oslo(7, 42))
+        [verdict] = trips.judge(plan, **window)
+        assert (row.level, row.alert_worthy, verdict.alertworthy) == ("yellow", False, False)
+        assert (row.delay_p50_min, row.trip.expected_arrival) == (7, dep + timedelta(minutes=47))
+        assert row.trip.problem is None and row.arrival_time == dep + timedelta(minutes=40)
+        assert row.trip.arrives_via == VIA, "«fram 08:37 via ...»: no name on our rows, the ref"
+        _install(rows, preds(0.9), plan=plan)
+        row = _trip_row(_oslo(7, 42))
+        [verdict] = trips.judge(plan, **window)
+    assert (row.level, row.alert_worthy, verdict.alertworthy) == ("red", True, True)
+    assert row.trip.problem.kind == "missed_connection", "the planned route's reason (KTD13)"
+
+
+def test_a_trip_whose_connecting_train_is_taken_out_of_the_plan_is_red_and_says_so():
+    """AE13 and KTD6: the connecting train is out of today's plan (the relay's `KIX:PlanRemoved:`
+    certainty), with no continuation to cushion it. Red, cancelled, and the problem says
+    `leg_removed` on leg 1 -- «toget videre fra Sandvika er tatt ut av rutetabellen».
+
+    The morning digest's set has it, as the CONNECTING train (`removed_train`): its own relay key,
+    dated by the day, its line and its departure from the change -- never the first leg, which
+    runs. `removed_from_plan` stays False on the wire, since it would name this row's first train;
+    and `removed_today` names the trip's from-place, which the removed train never calls at."""
+    dep = _oslo(7, 50)
+    removed = "RemovedJourney:2105_2026-09-22"
+    trip = _change(dep, second="DatedServiceJourney:2105_SVI-ASR_26-09-22")
+    certainty = {"et_declared_cancelled": True, "p_cancel": 1.0, "p_impact_dep": 1.0,
+                 "call_source": "removed", "has_situation": False, "sit": f"KIX:PlanRemoved:{removed}"}
+    preds = _change_preds(dep)[:2] + [
+        _pred(removed, 2, MID, dep + timedelta(minutes=16), dep + timedelta(minutes=15), **certainty),
+        _pred(removed, 6, TO, None, dep + timedelta(minutes=40), **certainty),
+    ]
+    out = {"source": "removed", "call_cancelled": True, "bus_for_train": True}
+    rows = _change_rows(dep, second=removed, connect_kw=out, alight_kw={**out, "destination": "Asker stasjon"})
+    with _trips_on():
+        _install(rows, preds, plan=_plan(trip))
+        js.configure(predictions_refreshed_at=lambda: _oslo(7, 40), place_refs=lambda r: (r,),
+                     trip_plans=lambda *key: _plans.get(key), held_plans=lambda: list(_plans.values()))
+        row = _trip_row(_oslo(7, 42))
+        stops = js.removed_today()
+    assert (row.state, row.level, row.cancelled, row.alert_worthy, row.impact_probability) == (
+        "predicted", "red", True, True, 1.0
+    )
+    assert (row.trip.problem.kind, row.trip.problem.index) == ("leg_removed", 1)
+    assert (row.removed_from_plan, row.bus_for_train) == (False, False)
+    assert js.removed_train(row) == js.RemovedTrain(
+        jkey=removed, line="VYG:Line:R12", departure_time=dep + timedelta(minutes=16),
+        destination="Asker", bus_for_train=True,
+    )
+    assert FROM in stops, "the trip's from-place, which the removed train never calls at"
+    with _trips_on(False):
+        assert FROM not in js.removed_today(), "flag off: the spine's own stops only"
+
+
+def test_a_removed_connecting_train_a_cushion_holds_is_no_digest_train():
+    """KTD19 first (KTD6): the same first train stays on to VIA and gets there 6 min later, so the
+    trip is not red and the digest does not name the removed train for it. With that cushion only
+    predicted to fail, the trip is red on a forecast and the digest does name it."""
+    dep = _oslo(7, 50)
+    removed = "RemovedJourney:2105_2026-09-22"
+    planned = _change(dep, second="DatedServiceJourney:2105_SVI-ASR_26-09-22")
+    sibling = trips.PlanTrip(legs=(
+        _plan_leg("f", FROM, VIA, dep, dep + timedelta(minutes=20)),
+        _plan_leg("u", VIA, TO, dep + timedelta(minutes=26), dep + timedelta(minutes=46)),
+    ))
+    certainty = {"et_declared_cancelled": True, "p_cancel": 1.0, "p_impact_dep": 1.0,
+                 "call_source": "removed", "has_situation": False, "sit": f"KIX:PlanRemoved:{removed}"}
+    preds = _change_preds(dep)[:2] + [
+        _pred(removed, 2, MID, dep + timedelta(minutes=16), dep + timedelta(minutes=15), **certainty),
+        _pred("f", 7, VIA, dep + timedelta(minutes=21), dep + timedelta(minutes=20)),
+        _pred("u", 2, VIA, dep + timedelta(minutes=26), dep + timedelta(minutes=25)),
+        _pred("u", 6, TO, None, dep + timedelta(minutes=46)),
+    ]
+    with _trips_on():
+        _install(_change_rows(dep, second=removed), preds, plan=_plan(planned, sibling))
+        row = _trip_row(_oslo(7, 42))
+        assert (row.level, row.cancelled, row.trip.problem) == ("yellow", False, None)
+        assert js.removed_train(row) is None
+        # The cushion only predicted to fail: red on a forecast, not confirmed, and the removed
+        # train is still the digest's -- the per-train push and the event drop its situation.
+        preds[-2] = replace(preds[-2], p_impact_dep=0.9)
+        _install(_change_rows(dep, second=removed), preds, plan=_plan(planned, sibling))
+        row = _trip_row(_oslo(7, 42))
+    assert (row.state, row.level, row.cancelled, row.alert_worthy) == ("predicted", "red", False, True)
+    assert (row.trip.problem.kind, row.trip.problem.index) == ("leg_removed", 1)
+    assert js.removed_train(row) == js.RemovedTrain(
+        jkey=removed, line="VYG:Line:R12", departure_time=dep + timedelta(minutes=16),
+        destination=None, bus_for_train=False,
+    )
+
+
+def test_a_run_trip_keeps_a_cancellation_the_cache_has_let_go_of():
+    """The cache holds calls from 60 min back, so an hour after a cancelled connecting train its
+    rows are gone. The spine still has the cancellation, as it does for a direct train: still red,
+    filled once the last leg's aimed departure has passed, and named on leg 1."""
+    dep = _oslo(7, 20)
+    gone = {"call_cancelled": True}
+    with _trips_on():
+        _install(_change_rows(dep, connect_kw=gone, alight_kw=gone), plan=_plan(_change(dep)))
+        row = _trip_row(_oslo(8, 50))
+    assert (row.state, row.level, row.cancelled) == ("confirmed", "red", True)
+    assert (row.trip.problem.kind, row.trip.problem.index) == ("leg_cancelled", 1)
+
+
+def test_a_first_leg_the_spine_lists_as_a_direct_train_is_one_direct_row():
+    """AE7 and KTD3: the train boards at FROM and reaches TO itself, so the traveller stays on board
+    and the direct row decides that departure. Here the cache has only its boarding row and JP's
+    plan dropped it as a direct pattern, so `direct_for_pair` cannot see it -- the strip drops the
+    trip on its departure key, as `varsel`'s merge has a direct alert win."""
+    dep = _oslo(7, 50)
+    trip = _change(dep, first="d")
+    plan = _plan(trip)
+    with _trips_on():
+        _install(_train("d", dep) + _change_rows(dep)[3:], [_pred("d", 3, FROM, dep, None, p_impact_dep=0.9)]
+                 + _change_preds(dep)[2:], plan=plan)
+        status = _status(_oslo(7, 42))
+        judged = trips.judge(plan, to_stop=TO, window_start=_oslo(7), window_end=_oslo(9))
+    assert [(t.jkey, t.trip) for t in status.trains] == [("d", None)]
+    assert [v.key for v in judged] == [("VYG", "d", dep)], "control: the matcher's half does list it"
+
+
+def test_a_trip_waiting_for_the_next_direct_train_beats_is_not_listed():
+    """KTD20: the direct 07:55 reaches TO at 08:20, before the trip's 08:30, so the trip is only an
+    alternative -- not a subject, and the request-path matcher shows admitted trips only."""
+    dep = _oslo(7, 50)
+    direct = trips.DirectDeparture(operator="VYG", refs=(("VYG", "dd"),), board_stop_place=FROM,
+                                   aimed_departure=dep + timedelta(minutes=5),
+                                   aimed_arrival=dep + timedelta(minutes=30))
+    plan = _plan(_change(dep), directs=(direct,))
+    with _trips_on():
+        _install(_change_rows(dep), _change_preds(dep), plan=plan)
+        status = _status(_oslo(7, 42))
+        [verdict] = trips.judge(plan, to_stop=TO, window_start=_oslo(7), window_end=_oslo(9))
+    assert [t for t in status.trains if t.trip is not None] == []
+    assert verdict.admitted is False
+
+
+def test_a_trip_already_run_is_listed():
+    """R13: the strip lists today's trips in the window, the ones that already ran included -- the
+    matcher drops those (R10), the strip does not."""
+    dep = _oslo(7, 5)
+    with _trips_on():
+        _install(_change_rows(dep, alight_kw={"source": "recorded", "arr_delay_min": 2}),
+                 plan=_plan(_change(dep)))
+        row = _trip_row(_oslo(8, 10))
+        assert trips.judge(_plan(_change(dep)), to_stop=TO, window_start=_oslo(7), window_end=_oslo(9),
+                           catchable_after=_oslo(8, 10)) == []
+    assert (row.state, row.level, row.delay_min) == ("confirmed", "green", 2)
+
+
+def test_with_the_flag_off_or_no_plan_the_strip_is_todays_with_trip_null_on_every_train():
+    """R16 and AE6: off, the answer is exactly what it is with no plan at all, and every train
+    carries `trip: null`; the plan is not even read. On with no plan held, no trip row (the read
+    says `not_evaluated`, never calm)."""
+    dep = _oslo(7, 50)
+    rows, preds = _change_rows(dep) + _train("d", _oslo(7, 20)), _change_preds(dep)
+    read = []
+
+    def counting(*key):
+        read.append(key)
+        return _plan(_change(dep))
+
+    with _trips_on(False):
+        _install(rows, preds, plan=_plan(_change(dep)))
+        js.configure(predictions_refreshed_at=lambda: _oslo(7, 40), place_refs=lambda r: (r,),
+                     trip_plans=counting)
+        off = _status(_oslo(7, 42))
+    with _trips_on():
+        _install(rows, preds)
+        unplanned = _status(_oslo(7, 42))
+    assert read == []
+    assert [t.trip for t in off.trains] == [None]
+    assert off.model_dump() == unplanned.model_dump()
+
 
 # ---- Module boundary ---------------------------------------------------------------------------
 

@@ -242,8 +242,9 @@ class SubscriptionOut(BaseModel):
     ``servable`` plus ``servable_checked_at`` ARE R5's caveat and R6's freshness, and the pair is
     why neither may be collapsed to a boolean: ``null`` means the answer could not be established
     -- an outage, a timeout, the 30/min ceiling on /varsel's own connectivity check -- and must
-    never render as an all-clear. A subscription no direct trip can serve is stored anyway and
-    carries the caveat: weekend-only and seasonal routes are why a refusal would be wrong.
+    never render as an all-clear. A subscription the service cannot serve (no direct trip, nor with
+    TRIP_PLANS_ENABLED a watched trip with a change) is stored anyway and carries the caveat:
+    weekend-only and seasonal routes are why a refusal would be wrong.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -261,8 +262,10 @@ class SubscriptionOut(BaseModel):
     version: int = Field(description="Monotonic; send it back as If-Match to condition a replace.")
     status: str = Field(description='"active" (a tombstone is never served here).')
     servable: bool | None = Field(
-        description="Whether any planned direct trip runs between the two places. null means the "
-        "answer could not be established and must never read as an all-clear.",
+        description="Whether the service can alert on any planned trip between the two places: a "
+        "direct trip, or -- where this deployment evaluates trips with a change -- a trip with a "
+        "change on a Vy or SJ Norge train. null means the answer could not be established and must "
+        "never read as an all-clear.",
     )
     servable_checked_at: datetime | None = Field(description="How fresh that answer is.")
     alerts: AlertStateOut | None = Field(

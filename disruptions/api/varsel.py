@@ -94,7 +94,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from typing import Annotated, Any, Protocol
 from urllib.parse import urlencode
@@ -108,9 +108,11 @@ import journey_status  # every train in a journey's window today, graded -- `Jou
 import line_modes  # each line's Journey Planner transport mode, for `payload.mode` (KIX-23)
 import metrics  # sibling leaf module (no main import): the push-delivery counter (KTD11)
 import notification_events  # the webhook channel's typed hand-off type and its emit step
+import notification_store  # the webhook subjects' phase vocabulary, for KTD20's standing read
 import notification_wording  # the shared wording seam; `_LockedPassBudget` subclasses its budget
 import reserved_budget  # the one reserve-don't-check pass budget
 import situation_english  # the English and nynorsk beside each situation's Norwegian text
+import trips  # trips with a change (multi-leg): the plan records and TRIP_PLANS_ENABLED
 import varsel_state  # where a registration lives: the seam and today's blob backend (U13)
 
 # The alert gate moved out to its own module on 2026-08-06 so `impact` can reach it too (importing
@@ -130,7 +132,7 @@ from alert_policy import (  # noqa: F401
     min_threshold,
     threshold_for,
 )
-from alternatives import AlternativeJourney
+from alternatives import AlternativeJourney, TripFacts
 from deployment import environment_label
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi import (
@@ -141,6 +143,7 @@ from impact import (
     ImpactResponse,
     LatestObservation,
     StopPrediction,
+    TripSubject,
     severity_key,
 )
 
@@ -157,7 +160,7 @@ from notification_wording import mode_label
 from notification_wording import notification_title as _notification_title
 from notification_wording import train_label as _train_label
 from notification_wording import train_label_from_input as _train_label_from_input
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from starlette.concurrency import run_in_threadpool
 
 logger = logging.getLogger(__name__)
@@ -462,6 +465,11 @@ class ImpactProvider(Protocol):
     no type checker, so a provider that accepts the keyword and drops it still satisfies this — the
     pin for that is a test asking the pull ledger whether it was charged
     (`test_varsel.test_the_real_provider_charges_the_pull_ledger`).
+
+    `plans` (multi-leg U5) is the canonical pair's day plan, sent on ONE call per window and only
+    with TRIP_PLANS_ENABLED on (:func:`match_journey`); the provider hands it to `impact.for_trip`,
+    whose `trip_subjects` then carry the departures with a change. Never sent otherwise, so with
+    the flag off a provider is called with exactly the keywords it always was.
     """
 
     def __call__(
@@ -475,6 +483,7 @@ class ImpactProvider(Protocol):
         with_alternative: bool = ...,
         min_impact: float = ...,
         path: alternatives.FetchPath = ...,
+        plans: trips.DayPlan | None = ...,
     ) -> ImpactResponse: ...
 
 
@@ -633,6 +642,11 @@ _beat_provider: Callable[[], None] | None = None
 # `varsel` therefore knows nothing about figures, generations or caches -- it hands over the one
 # thing only pass 1a holds, this definition's alerts, and the read decides what to keep.
 _figures_warmer: Callable[[str, dict, list["Alert"], datetime], None] | None = None
+# The trip-plan reader (multi-leg U5): `trip_plans.read_plan`, (canonical from, canonical to, Oslo
+# date) -> the pair's day plan or None, from memory. Injected because `trip_plans` is imported by
+# `main` only (KTD4). Absent, and with TRIP_PLANS_ENABLED off, there is no plan anywhere, so the
+# match, the servability answer and its warning text are today's.
+_trip_plans: Callable[[str, str, date], trips.DayPlan | None] | None = None
 #: How many definitions the match pass may get through between heartbeats, and likewise how many
 #: wordings the writing pass may. Small enough that a chunk cannot itself outlast
 #: `HEALTH_STALE_AFTER_S` (600 s) — a definition's match is bounded by the Journey Planner's own
@@ -660,6 +674,7 @@ def configure(
     span: Callable[..., Any] | None = None,
     beat: Callable[[], None] | None = None,
     figures_warmer: Callable[[str, dict, list["Alert"], datetime], None] | None = None,
+    trip_plans: Callable[[str, str, date], trips.DayPlan | None] | None = None,
 ) -> None:
     """Wire in main.py's /impact provider, stop list and planned-service check (once, at startup).
 
@@ -695,6 +710,10 @@ def configure(
     the other way is a cycle, and the direction is a plan stop condition pinned both ways. Absent,
     pass 1a is byte-for-byte what it was.
 
+    `trip_plans` is `trip_plans.read_plan` (multi-leg U5, U8), injected because only `main` imports
+    that module (KTD4). Absent, no plan is ever found, which is TRIP_PLANS_ENABLED off by another
+    name.
+
     `registrations` is where a registration LIVES (U13) — `varsel_state.BlobRegistrations` today,
     the Firestore-backed implementation next. Absent keeps the module's own blob backend, which is
     what every suite and every deployment before the cutover gets: the seam is proved by this
@@ -705,6 +724,7 @@ def configure(
     global _impact_provider, _stops_provider, _connectivity_provider, _togvarsel_notify_provider
     global _connectivity_batch_provider
     global _webhook_enabled, _webhook_provider, _span_provider, _beat_provider, _figures_warmer
+    global _trip_plans
     _impact_provider = impact_provider
     _stops_provider = stops_provider
     if registrations is not None:
@@ -717,6 +737,13 @@ def configure(
     _span_provider = span
     _beat_provider = beat
     _figures_warmer = figures_warmer
+    _trip_plans = trip_plans
+
+
+def trip_plan_reader() -> Callable[[str, str, date], trips.DayPlan | None] | None:
+    """The trip-plan reader :func:`configure` was given, or None: what the matcher reads plans
+    through, and `notification_pull` too, so a read never sees other plans than its match."""
+    return _trip_plans
 
 
 def _span(name: str, **attributes: Any):
@@ -977,6 +1004,31 @@ def _parse_webhook_recipient(doc: Mapping[str, Any]) -> WebhookRecipient:
     )
 
 
+def registered_definitions() -> list[dict]:
+    """Every registered journey definition on both channels, once per :func:`journey_key`: what
+    the leader's trip-plan phase fetches for (multi-leg KTD1), and never a public read's pair.
+
+    Both on canonical refs, as the pass sees them once `refresh_varsel_stops` has healed the
+    stored registrations: the browser ones through :func:`canonical_stop` here (the phase runs
+    before that heal), the webhook documents through :func:`_parse_webhook_recipient`; another
+    channel's document or an unreadable one is skipped. Logs nothing: the pass's own load counts
+    them each cycle.
+    """
+    with _state_lock:
+        journeys = [
+            dict(journey, from_stop=canonical_stop(journey["from_stop"]),
+                 to_stop=canonical_stop(journey["to_stop"]))
+            for _jid, journey in _registrations.all_journeys()
+        ]
+    if webhook_channel_enabled() and _webhook_provider is not None:
+        for doc in _webhook_provider():
+            try:
+                journeys.append(_parse_webhook_recipient(doc).journey)
+            except Exception:  # noqa: BLE001, S112 - `_load_webhook_recipients` counts and logs these
+                continue
+    return list({journey_key(journey): journey for journey in journeys}.values())
+
+
 def _load_webhook_recipients() -> list[WebhookRecipient]:
     """This cycle's webhook subscriptions, or an empty list — the pass's one guarded read.
 
@@ -1087,10 +1139,48 @@ _NO_SERVICE_WARNING = (
 )
 
 
+# The two texts KTD15 adds with TRIP_PLANS_ENABLED on, U10's copy table word for word. Neither says
+# that a direct departure is required (R14). With the flag off the warning is the one above.
+_NO_DIRECT_TRANSFERS_NOT_EVALUATED = (
+    "Vi fant ingen direkteavganger mellom disse stoppene i dag, og reiser med bytte er ikke vurdert "
+    "ennå."
+)
+_NOTHING_TO_ALERT_ON = (
+    "Vi fant ingen avganger mellom disse stoppene i dag som vi kan varsle om. Sjekk at du valgte "
+    "riktige stoppesteder."
+)
+
+
+def _held_plans(pair: tuple[str, str], now: datetime) -> list[trips.DayPlan]:
+    """The pair's day plans for today and tomorrow (Oslo), from the injected reader: the dates the
+    leader fetches for, since `journey_windows` offers no other (yesterday's only overnight)."""
+    if _trip_plans is None:
+        return []
+    today = now.astimezone(_OSLO).date()
+    found = (_trip_plans(*pair, day) for day in (today, today + timedelta(days=1)))
+    return [plan for plan in found if plan is not None]
+
+
+def _watched_trip(plans: Iterable[trips.DayPlan]) -> bool:
+    """KTD15's transfer half: a trip with a change we can alert on (R3, a Vy or SJ leg)."""
+    return any(trips.watched(trip) for plan in plans for trip in plan.trips)
+
+
 def _service_warning(rec: dict) -> str | None:
-    """The caveat to show for this registration, or None when there is nothing to say."""
+    """The caveat to show for this registration, or None when there is nothing to say.
+
+    With TRIP_PLANS_ENABLED on (KTD15) `no_direct_service` is the DIRECT half only, and the transfer
+    half is read live off the plans held now, so the warning goes the moment a plan with a watched
+    trip lands, before the sweep clears the record. No plan yet, or Journey Planner down, says the
+    trips with a change were not evaluated; a plan with no watched trip says nothing can alert.
+    """
     if not rec.get("no_direct_service"):
         return None
+    plans = None
+    if trips.enabled():
+        plans = _held_plans(_pair(rec), datetime.now(UTC))
+        if _watched_trip(plans):
+            return None
     if rec.get("service_reverse_only"):
         # The stops ARE connected, just not this way round — near-proof of a swap, and worth saying
         # precisely rather than hiding inside the generic wording.
@@ -1099,7 +1189,9 @@ def _service_warning(rec: dict) -> str | None:
             f"{rec.get('to_name') or rec['to_stop']} i dag, men det går avganger motsatt vei. "
             "Har fra og til byttet plass?"
         )
-    return _NO_SERVICE_WARNING
+    if plans is None:
+        return _NO_SERVICE_WARNING
+    return _NOTHING_TO_ALERT_ON if plans else _NO_DIRECT_TRANSFERS_NOT_EVALUATED
 # How long a "no service" verdict stands before the poller asks again. Hours, not days: a route can
 # start running later the same day (a weekend-only ferry registered on a Friday evening), and until
 # the verdict is refreshed the card carries a warning that has stopped being true.
@@ -1128,11 +1220,21 @@ def _service_check_due(rec: dict, now: datetime) -> bool:
     Wall-clock, not `monotonic()`: the stamp is written into the persisted state file, and a monotonic
     reading means nothing after a restart — it would read as far in the future and suppress the
     re-check for the life of the registration. An absent or unparseable stamp is due now.
+
+    With TRIP_PLANS_ENABLED on it is also due once a plan for the pair landed AFTER the answer
+    (KTD15), so the stored verdict follows a pair served only with a change on the cycle the plan
+    lands rather than six hours later. A plan refreshed since counts too, which at most halves the
+    interval for a pair the plans keep saying nothing about.
     """
     try:
-        return now - datetime.fromisoformat(rec["service_checked_ts"]) >= _SERVICE_RECHECK
+        checked = datetime.fromisoformat(rec["service_checked_ts"])
+        if now - checked >= _SERVICE_RECHECK:
+            return True
     except (KeyError, TypeError, ValueError):
         return True
+    return trips.enabled() and any(
+        span.fetched_at > checked for plan in _held_plans(_pair(rec), now) for span in plan.covered
+    )
 
 
 def _service_verdict(
@@ -1218,7 +1320,26 @@ def _service_verdicts(pairs: Sequence[tuple[str, str]]) -> list[tuple[bool, bool
             },
         )
         return [None] * len(pairs)
+    if trips.enabled():
+        answers = [_with_transfers(pair, answer) for pair, answer in zip(pairs, answers, strict=True)]
     return answers
+
+
+def _with_transfers(
+    pair: tuple[str, str], verdict: tuple[bool, bool] | None
+) -> tuple[bool, bool] | None:
+    """KTD15's widening of a direct answer: a pair no direct trip serves is servable when a plan
+    held for it has a watched trip with a change. With no plan held the transfer half is not
+    established, so neither is the answer: `None` is never written, by either sweep, so the record
+    keeps its last verdict and stays due -- re-asked each cycle until the pair's plan lands, rather
+    than six hours after a `false` stamped before it did. Both sweeps run on this seam, which is
+    what keeps the browser's caveat and the webhook `servable` one answer."""
+    if verdict is None or verdict[0]:
+        return verdict
+    plans = _held_plans((canonical_stop(pair[0]), canonical_stop(pair[1])), datetime.now(UTC))
+    if not plans:
+        return None
+    return _watched_trip(plans), verdict[1]
 
 
 def recheck_service() -> None:
@@ -1356,8 +1477,12 @@ def _impact(
     to_stop: str | None = None,
     *,
     path: alternatives.FetchPath = alternatives._POLLER_PATH,
+    plans: trips.DayPlan | None = None,
 ) -> ImpactResponse | None:
     """One /impact call for a journey's boarding window, or None when unconfigured.
+
+    `plans` is forwarded only when there is one (multi-leg U5), so a call carrying none sends the
+    provider exactly the keywords it was sent before trips with a change existed.
 
     `from_stop`/`to_stop` override the journey's own refs so :func:`match_journey` can ask about the
     other refs of the same physical place (see :func:`place_refs`).
@@ -1382,6 +1507,7 @@ def _impact(
         with_alternative=with_alternative,
         min_impact=min_threshold() if with_alternative else 0.0,
         path=path,
+        **({"plans": plans} if plans is not None else {}),
     )
 
 
@@ -1700,13 +1826,16 @@ def _card_key_json(key: tuple) -> str:
 
 def _card_key(kind: str, text: str) -> tuple:
     """The exact tuple `_card_key_json` was given: `_subject_key`'s three elements for an
-    alternative, `notification_wording.wording_key`'s nine for a message. A shape that no longer
+    alternative, `notification_wording.wording_key`'s nine for a message -- ten for a departure with
+    a change, whose reason string sits before the version (multi-leg U7). A shape that no longer
     matches raises, and the entry is skipped rather than stored under a key nothing derives."""
     data = json.loads(text)
     if kind == _CARD_ALTERNATIVE:
         pair, situation, departure = data
         return (tuple(pair), situation, departure)
-    pair, situation, departure, cancelled, destination_cancelled, tomorrow, identity, version, snapshot = data
+    pair, situation, departure, cancelled, destination_cancelled, tomorrow, identity, *reason, version, snapshot = data
+    if len(reason) > 1:
+        raise ValueError(f"a wording key of {len(data)} elements")
     if identity is not None:
         dep, arr, at_risk, before = identity
         identity = (
@@ -1716,7 +1845,7 @@ def _card_key(kind: str, text: str) -> tuple:
             before,
         )
     return (tuple(pair), situation, departure, cancelled, destination_cancelled, tomorrow, identity,
-            version, snapshot)
+            *reason, version, snapshot)
 
 
 def _card_message_value(text: str | None, meta: dict[str, Any] | None) -> str:
@@ -2173,7 +2302,10 @@ class Alert(BaseModel):
         "certainty (impact and cancellation 1.0, delays null) while `cancelled` stays false. "
         "`trip_cancelled` is the one to read for anything about the TRAVELLER's trip.",
     )
-    cancel_probability: float = Field(description="Calibrated P(the train is cancelled), 0-1.")
+    cancel_probability: float | None = Field(
+        description="Calibrated P(the train is cancelled), 0-1. Null only on a departure with a "
+        "change whose first leg we do not score: there is no figure of ours for it (KTD6)."
+    )
     delay_p50_min: int | None = Field(
         description="Median departure delay (min) if it runs, from the calibrated exceedance stack "
         "— the same figure as /demo's delay column, not the weak raw regression.",
@@ -2234,6 +2366,40 @@ class Alert(BaseModel):
         default=False,
         description="Whether this server currently accepts isolated per-alert feedback.",
     )
+    # Multi-leg U5: set only on a departure with a change (`impact.TripSubject`), so a direct train
+    # carries exactly the values it always did. Additive on the PWA's own API, as
+    # `destination_cancelled` was (PR 340); the public payloads are U8's and U9's.
+    trip: TripFacts | None = Field(
+        default=None,
+        description="The departure with a change this alert is about: its legs in travel order, "
+        "the changes, the expected arrival at the destination and, when it alerts, the problem (the "
+        "reason kind and the 0-based leg or transfer index). Null on a direct train.",
+    )
+    deciding_probability: float | None = Field(
+        default=None,
+        description="The figure the alert gate decided this departure with a change on (KTD6): "
+        "the deciding reason's, which may be another leg's or a change's. The boarding call's own "
+        "figure stays `impact_probability`. Null on a direct train.",
+    )
+    deciding_threshold: float | None = Field(
+        default=None,
+        description="The bar the gate applied to `deciding_probability`. Null on a direct train.",
+    )
+    trip_confirmed: bool = Field(
+        default=False,
+        description="The departure with a change cannot get the traveller there, as a fact: a "
+        "declared cancellation the plan has no continuation to cushion (KTD19). Folded into "
+        "`trip_cancelled`; false on a direct train.",
+    )
+    # Multi-leg U11 (KTD16): what the decision log records beside `trip` and nothing else reads --
+    # every continuation the verdict was taken over and the planned route's P(miss). Excluded like
+    # `impact` below, so no wire changes; set in the constructor, which a PrivateAttr cannot be.
+    trip_legs_snapshot: dict | None = Field(default=None, exclude=True, repr=False)
+    trip_p_miss: float | None = Field(default=None, exclude=True, repr=False)
+    # KTD8: this cycle's reading of a departure with a change is no observation for a WITHDRAWAL --
+    # it is under the bar while a leg it stood on is unknown (`_hold_withdrawal`). Private, so never
+    # on any wire; read by the webhook observation builder only.
+    _hold_withdrawal: bool = PrivateAttr(default=False)
     # Internal: the full /impact response this alert was derived from, handed to the message writer
     # so it sees the complete picture (every situation's text, every line's observation, the
     # alternative) rather than just the headline numbers. exclude=True keeps it out of the API
@@ -2243,9 +2409,10 @@ class Alert(BaseModel):
     @property
     def trip_cancelled(self) -> bool:
         """The traveller cannot make this trip on this departure: ET has declared the boarding call
-        or the destination call cancelled. What `phase` and `effect` read; `cancelled` alone stays
-        the boarding call's, which is what the wording and `et_cancelled` mean by it."""
-        return self.cancelled or self.destination_cancelled
+        or the destination call cancelled, or a departure with a change is confirmed (KTD19). What
+        `phase` and `effect` read; `cancelled` alone stays the boarding call's, which is what the
+        wording and `et_cancelled` mean by it."""
+        return self.cancelled or self.destination_cancelled or self.trip_confirmed
 
 
 def match_journey(
@@ -2254,6 +2421,7 @@ def match_journey(
     *,
     with_alternative: bool = False,
     path: alternatives.FetchPath = alternatives._POLLER_PATH,
+    standing: Callable[[Alert], bool] | None = None,
 ) -> list[Alert]:
     """Situations currently hitting `journey`, worst-first — one :class:`Alert` per situation.
 
@@ -2277,6 +2445,14 @@ def match_journey(
     off and the in-app list shows the cached written message, which already names the alternative.
 
     `path` says whose Journey Planner budget those lookups spend (see :func:`_impact`).
+
+    **Departures with a change** (multi-leg U5, KTD3), with TRIP_PLANS_ENABLED on and a plan held
+    for the pair: one alert per first-leg departure (R5), added AFTER the per-situation selection
+    rather than inside it, so a trip never displaces a direct train sharing its situation, and keyed
+    by the source-independent departure key, on which a direct alert wins (AE7). A trip KTD20 does
+    not admit is added only while `standing` says this definition holds an alert on it -- the pass
+    passes it, from the push ledger and the webhook subjects; the request paths have none, and show
+    admitted trips only. A failure here costs this definition its trips and nothing else.
     """
     if now is None:
         now = datetime.now(UTC)
@@ -2297,15 +2473,42 @@ def match_journey(
     ]
     # Every lookup this pass completed, keyed by the TRAIN it was about. See the back-fill below.
     by_train: dict[tuple[str | None, str], AlternativeOutcome] = {}
+    # The plan rides on ONE call per window (multi-leg U5): the one naming the journey's own pair.
+    # The judge reads `to_stop` with every ref `place_refs` gives it for KTD3's "is the first train
+    # itself direct?", and a child ref expands only to its alias group -- so the call has to name
+    # the place itself. For ordinary refs that is the first pair; a parent to-ref is named by no
+    # pair, and gets a call of its own whose direct half is empty (a parent carries no calls).
+    trip_pair = (canonical_stop(journey["from_stop"]), canonical_stop(journey["to_stop"]))
+    trip_alerts: dict[tuple, tuple[TripSubject, Alert]] = {}
+    trips_on = trips.enabled() and _trip_plans is not None
     for window_start, window_end in journey_windows(journey, now):
-        for pair_index, (from_ref, to_ref) in enumerate(ref_pairs):
+        plan = None
+        if trips_on:
+            # The Oslo date the window BEGINS on, `trip_plans.fetch_ranges`' key for it.
+            plan = _trip_plans(*trip_pair, window_start.astimezone(_OSLO).date())
+        calls = ref_pairs
+        if plan is not None and trip_pair not in ref_pairs:
+            calls = [*ref_pairs, trip_pair]
+        for pair_index, (from_ref, to_ref) in enumerate(calls):
+            rides_plan = plan is not None and (from_ref, to_ref) == trip_pair
             impact = _impact(
                 journey, window_start, window_end, catchable_after=now,
-                with_alternative=with_alternative and pair_index == 0,
+                # The trips' lookups run on the call their plan rides (U6), which for a parent ref
+                # is the call of its own, not the first pair.
+                with_alternative=with_alternative and (pair_index == 0 or rides_plan),
                 from_stop=from_ref, to_stop=to_ref, path=path,
+                plans=plan if rides_plan else None,
             )
             if impact is None:
                 continue
+            subjects = getattr(impact, "trip_subjects", None)
+            if subjects:
+                try:
+                    _collect_trip_alerts(impact, subjects, trip_alerts, now=now)
+                except Exception as exc:  # noqa: BLE001 - fail open, logged in `_trip_merge_failed`
+                    _trip_merge_failed(exc)
+                    trips_on = False
+                    trip_alerts.clear()
             for sit in impact.situations or []:
                 # getattr, like every other read off the impact response in this module: it is
                 # duck-typed, and a synthetic provider need not carry the newest fields.
@@ -2357,8 +2560,184 @@ def match_journey(
                 }
             )
 
-    alerts = sorted(worst_by_situation.values(), key=_alert_rank, reverse=True)
-    return alerts
+    alerts = list(worst_by_situation.values())
+    if trip_alerts:
+        try:
+            alerts += _merge_trip_alerts(trip_pair, alerts, trip_alerts, standing)
+        except Exception as exc:  # noqa: BLE001 - fail open, logged in `_trip_merge_failed`
+            _trip_merge_failed(exc)
+    return sorted(alerts, key=_alert_rank, reverse=True)
+
+
+def _trip_merge_failed(exc: Exception) -> None:
+    """Decision 7 of U5: one definition's broken trip evaluation costs it its trips this cycle and
+    nothing else. The class name only, as `impact._judge_trips` logs: a message could quote a stop
+    (R17), and a traceback would carry that message all the same."""
+    logger.warning(
+        "Could not merge the trips with a change for one definition (%s); serving its direct "
+        "trains alone",
+        type(exc).__name__,
+        extra={"fields": {"event": "trip_merge_error", "error": type(exc).__name__}},
+    )
+
+
+def _collect_trip_alerts(
+    impact: ImpactResponse,
+    subjects: Iterable[TripSubject],
+    trip_alerts: dict[tuple, tuple[TripSubject, Alert]],
+    *,
+    now: datetime,
+) -> None:
+    """Fold one response's departures with a change into the per-departure accumulator, worst
+    reading per KTD3 key, as :func:`_collect_alerts` keeps the worst per situation."""
+    observation_by_line = {line.line: line.latest_observation for line in (impact.lines or [])}
+    for subject in subjects:
+        alert = _trip_alert(subject, impact, observation=observation_by_line.get(subject.line), now=now)
+        existing = trip_alerts.get(subject.key)
+        if existing is None or _alert_severity(alert) > _alert_severity(existing[1]):
+            trip_alerts[subject.key] = (subject, alert)
+
+
+def _trip_alert(
+    subject: TripSubject,
+    impact: ImpactResponse,
+    *,
+    observation: LatestObservation | None,
+    now: datetime,
+) -> Alert:
+    """A departure with a change as an :class:`Alert`, in today's envelope fields (KTD5).
+
+    The identity is the first leg's boarding call as the plan pins it, and the figures are that
+    call's own -- `impact_probability` and `alert_threshold` keep their meaning -- while the gate's
+    verdict and the pair it was taken on ride beside them (KTD6): `alertworthy` is the subject's,
+    never a re-gate of the boarding figure. An unscored first leg has no figure of ours, so none is
+    made up, except that a confirmed one carries the destination-cancelled overwrite (1.0, 1.0,
+    null delays), the schema's `confirmed` rule, which a scored one already has from `impact`.
+    A first train that never leaves (`TripSubject.first_cancelled`) is `cancelled`, scored or not,
+    so every surface words it «er innstilt» as it does a direct train, never as a missed change.
+
+    `alert_threshold` is the boarding call's bar at the subject's own `has_situation`, the closest
+    this can say: the subject carries the situation of the reason it attaches to, not the boarding
+    row's. `ponytail:` it is exact whenever the boarding call is that reason; upgrade path: carry
+    the boarding row's `has_situation` on `impact.TripSubject`.
+
+    The response copy it carries holds only the subject's own situation: `build_message_input`
+    falls back to EVERY situation of a response when the alert's own is not in it, and a trip's
+    usually is not in the direct, `to_stop`-narrowed answer. Its alternative is the subject's own
+    lookup (multi-leg U6, `impact._best_trip_journey`), on the Alert and projected onto that copy as
+    `_collect_alerts` projects a situation's, since that copy is what the decision log, the caches
+    and the wording key read it off.
+    """
+    dep = subject.departure_prediction
+    if dep is not None:
+        figures = {
+            "cancelled": dep.cancelled or subject.first_cancelled,
+            "cancel_probability": dep.cancel_probability,
+            "delay_p50_min": _typ_delay(dep),
+            "delay_p90_min": dep.delay_p90_min,
+            "ge10_probability": dep.ge10_probability,
+            "impact_probability": dep.impact_probability,
+        }
+    else:
+        certain = 1.0 if subject.confirmed else None
+        figures = {
+            "cancelled": subject.first_cancelled, "cancel_probability": certain, "delay_p50_min": None,
+            "delay_p90_min": None, "ge10_probability": None, "impact_probability": certain,
+        }
+    return Alert(
+        situation_number=subject.situation_number,
+        summary=subject.summary,
+        description=subject.description,
+        operator=subject.operator,
+        has_situation=subject.has_situation,
+        report_type=subject.report_type,
+        mode=mode_label(subject.operator, subject.line),
+        line=subject.line,
+        destination=journey_status.destination(subject.operator, subject.jkey),
+        departure_time=subject.departure_time,
+        jkey=subject.jkey,
+        stop_place=subject.stop_place,
+        stop_order=subject.stop_order,
+        decided_at=now,
+        **figures,
+        alert_threshold=threshold_for(subject.operator, has_situation=subject.has_situation),
+        alertworthy=subject.alertworthy,
+        latest_observation=observation,
+        alternative_journey=subject.alternative_journey,
+        trip=subject.trip,
+        deciding_probability=subject.deciding_probability,
+        deciding_threshold=subject.deciding_threshold,
+        trip_confirmed=subject.confirmed,
+        trip_legs_snapshot=subject.legs_snapshot,
+        trip_p_miss=subject.p_miss,
+        impact=impact.model_copy(
+            update={
+                "situations": [
+                    sit for sit in impact.situations or []
+                    if sit.situation_number == subject.situation_number
+                ],
+                "alternative_journey": subject.alternative_journey,
+                "original_is_best": subject.original_is_best,
+                "alternative_subject": subject.alternative_subject,
+                "answered": subject.answered,
+            }
+        ),
+    )
+
+
+#: What each departure with a change last alerted on, per (place pair, KTD3 key): its reason kind
+#: and leg or transfer index (KTD13). KTD8: an unknown leg holds the withdrawal only of a subject
+#: whose standing reason sits on that leg or its transfer, and nothing durable records which reason
+#: a subject stood on, so this pod remembers it. Losing it (a restart, a new leader) is the safe
+#: direction: with nothing remembered, a reading an unknown leg could change holds the withdrawal.
+#: Written by the pass only, pruned with the trains in `check_and_notify`'s sweep, and in
+#: `test_varsel_api._reset_state`; a request path reads it.
+_trip_reasons: dict[tuple, tuple[str, int]] = {}
+
+
+def _merge_trip_alerts(
+    pair: tuple[str, str],
+    direct: list[Alert],
+    trip_alerts: dict[tuple, tuple[TripSubject, Alert]],
+    standing: Callable[[Alert], bool] | None,
+) -> list[Alert]:
+    """KTD3's merge: the departures with a change this definition keeps, beside `direct`.
+
+    * A direct alert on the same departure key wins (AE7): the traveller can stay on board, and the
+      direct verdict decides that departure.
+    * A subject KTD20 does not admit is kept only while `standing` says this definition holds an
+      alert on it, so a lifted cancellation never leaves that alert without a subject to withdraw it.
+    * KTD8's hold: under the bar, incomplete, and standing on a reason that sits on a leg now
+      unknown -- or on nothing this pod remembers -- the reading is kept (the card and the decision
+      log see it) but is no observation for a withdrawal (`Alert._hold_withdrawal`).
+    """
+    direct_keys = {(alert.operator, alert.jkey, alert.departure_time) for alert in direct}
+    kept = [
+        (key, subject, alert)
+        for key, (subject, alert) in trip_alerts.items()
+        if key not in direct_keys
+        # Asked lazily and outside the lock: it reads the push ledger and the subject mirror.
+        and (subject.admitted or (standing is not None and standing(alert)))
+    ]
+    with _state_lock:
+        for key, subject, alert in kept:
+            memo = (pair, key)
+            if subject.alertworthy and subject.trip.problem is not None:
+                # Written by the pass alone (`standing` is its argument), which is what prunes it:
+                # a request path on a follower would grow it for the life of the pod.
+                if standing is not None:
+                    _trip_reasons[memo] = (subject.trip.problem.kind, subject.trip.problem.index)
+            elif not subject.complete:
+                reason = _trip_reasons.get(memo)
+                alert._hold_withdrawal = reason is None or not _legs_of(*reason).isdisjoint(
+                    subject.unknown_legs
+                )
+    return [alert for _key, _subject, alert in kept]
+
+
+def _legs_of(kind: str, index: int) -> set[int]:
+    """The legs a reason sits on (KTD13's numbering): transfer `i` is between legs `i` and `i + 1`."""
+    return {index, index + 1} if kind == "missed_connection" else {index}
 
 
 def _collect_alerts(
@@ -2439,7 +2818,14 @@ def _alert_severity(alert: Alert) -> tuple[float, int, float]:
     comment is what let the two orders drift apart in the first place (main's was cancellation-first
     while this one was impact-first), and `Alert` carries the same three field names as
     `StopPrediction`, so the one function serves both.
+
+    A departure with a change ranks on its DECIDING figure (KTD6), in the same three-part shape:
+    its boarding figure can be a calm 0.1 beside a missed change at 0.8, and ranked on that the
+    broken trip would sort below calm trains in `one_alert_per_train` and every worst-first list.
+    `cancel_probability` is null on an unscored first leg, and None does not compare.
     """
+    if alert.deciding_probability is not None:
+        return (alert.deciding_probability, alert.delay_p90_min or 0, alert.cancel_probability or 0.0)
     return severity_key(alert)
 
 
@@ -2547,6 +2933,59 @@ def _webhook_pending(recipient: WebhookRecipient, alert: Alert) -> bool:
         departure_time=alert.departure_time,
     )
     return train_id is not None and train_id not in recipient.delivered
+
+
+def _holds_alert_on(
+    jids: Sequence[str], recipients: Sequence[WebhookRecipient], now: datetime
+) -> Callable[[Alert], bool]:
+    """KTD20's question for one definition: does a registration on it hold an alert on this train?
+
+    Answered from state the pass already keeps and that survives a leader change, so none is
+    written for it. The browser side: the train's push tag in the registration's push ledger
+    (`PushLedger.pushed_trains`; under the store backend a field of the journey document, which the
+    mirror seeds on taking the lease). The webhook side: a standing subject for the train in
+    `notification_store.SubjectMirror`, which is seeded on taking the lease and kept by the emit
+    pass's own commits, read the way that pass reads it -- and while it is not seeded, the
+    subscription's delivered marks, which can lag but never name a train never sent.
+
+    Asked only about a departure KTD20 no longer admits (`_merge_trip_alerts`), so a cycle with no
+    such departure reads nothing. The standing set is asked once per closure, on the first
+    candidate that needs it, and not per candidate: `_standing` walks the mirror's whole open-run
+    set (its docstring), `now` is fixed, and one merge's candidates are asked back to back.
+    """
+    known: dict[str, Any] | None = None
+
+    def stands(alert: Alert) -> bool:
+        nonlocal known
+        for jid in jids:
+            tag = _notification_tag(jid, alert)
+            if tag is not None and tag in _registrations.push_ledger(jid).pushed_trains:
+                return True
+        if not recipients:
+            return False
+        if known is None:
+            known = notification_events._standing([r.recipient_id for r in recipients], now)
+        for recipient in recipients:
+            alert_id = notification_events.alert_id_for(
+                recipient.recipient_id,
+                operator=alert.operator,
+                line=alert.line,
+                journey_ref=alert.jkey,
+                stop_place=alert.stop_place,
+                stop_order=alert.stop_order,
+                departure_time=alert.departure_time,
+            )
+            if alert_id is None:
+                continue
+            subjects = known.get(recipient.recipient_id)
+            if subjects is not None and subjects.complete:
+                if subjects.phases.get(alert_id) not in (None, notification_store.PHASE_WITHDRAWN):
+                    return True
+            elif alert_id in recipient.delivered:
+                return True
+        return False
+
+    return stands
 
 
 def one_alert_per_train(alerts: list[Alert]) -> list[Alert]:
@@ -2786,21 +3225,32 @@ class _Digest:
     brand: str
     replaces: bool
     tag: str
-    trains: tuple[journey_status.TrainStatus, ...]
+    trains: tuple[journey_status.RemovedTrain, ...]
 
     @property
     def situations(self) -> tuple[str, ...]:
         return tuple(notification_wording.plan_removed_situation(t.jkey) for t in self.trains)
 
 
-def _removed_trains(journey: dict, now: datetime) -> list[journey_status.TrainStatus]:
+def _removed_trains(journey: dict, now: datetime) -> list[journey_status.RemovedTrain]:
     """The strip's removed trains in today's window still to depart, soonest first (KTD5): the
     digest's set is the strip's by construction, and the day's rather than the prediction cache's,
-    which at 05:00 reaches only to ~17:00."""
+    which at 05:00 reaches only to ~17:00.
+
+    Since multi-leg U9 a departure with a change counts too, when a ridden leg's train is out of the
+    plan (AE13): the digest names THAT train, its own line and departure at the change, under the
+    relay's dated situation (`journey_status.removed_train`), never the first leg, which runs. Still
+    to depart is the row's own departure, the first leg's (R10). One train is named once, however
+    many rows ride it."""
     status = journey_status.status_for(journey, now)
     if status is None:
         return []
-    return [t for t in status.trains if t.removed_from_plan and t.departure_time > now]
+    found: dict[str, journey_status.RemovedTrain] = {}
+    for row in status.trains:
+        removed = journey_status.removed_train(row)
+        if removed is not None and row.departure_time > now:
+            found.setdefault(removed.jkey, removed)
+    return sorted(found.values(), key=lambda train: train.departure_time)
 
 
 def _digest_text(digest: _Digest, *, now: datetime) -> tuple[str, str]:
@@ -3076,7 +3526,7 @@ def _remember_message_meta(
             try:
                 import llm_message
 
-                meta["prompt_version"] = llm_message.PROMPT_VERSION
+                meta["prompt_version"] = llm_message.prompt_version_for(message_input)
             except (ImportError, AttributeError):
                 logger.debug("Prompt version unavailable for feedback context", exc_info=True)
 
@@ -3342,7 +3792,8 @@ def _message_input_from_alert(alert: Alert) -> dict:
     The message input now backs the push itself and not just the prompt and the log, so "could not
     build it" may no longer mean "no wording". This restates the handful of keys
     :func:`_deterministic_body` reads, straight off the Alert, using nothing from
-    :mod:`llm_message` — which is the module that has just failed when this is reached.
+    :mod:`llm_message` — which is the module that has just failed when this is reached — but a
+    guarded `trip_quotes_figures` for a departure with a change.
 
     Never recorded and never prompted with: it was not what any writer was shown, and a decision row
     claiming otherwise would be worse than one with a NULL input.
@@ -3407,8 +3858,22 @@ def _message_input_from_alert(alert: Alert) -> dict:
     if alert.destination_cancelled:
         body["kommer_ikke_fram"] = True
         return body
+    if alert.trip is not None:
+        # A departure with a change quotes the first train's figures only where the template does
+        # (`llm_message.trip_quotes_figures`): a confirmed trip's are the certainty, which would read
+        # «100 % sjanse for innstilling» about a train that runs. Asked of a trip alone, so a direct
+        # train's fallback still needs nothing from that module; none quoted if even this fails.
+        try:
+            import llm_message
+
+            quotes = llm_message.trip_quotes_figures(alert)
+        except Exception:  # noqa: BLE001 - the safe side: no figure rather than a wrong one
+            quotes = False
+        if not quotes:
+            return body
     body["forsinkelse_min"] = {"typisk": alert.delay_p50_min, "verstefall": alert.delay_p90_min}
-    if alert.cancel_probability >= _CANCEL_LIKELY:
+    # `or 0.0`: null on a departure with a change whose first leg we do not score (KTD6).
+    if (alert.cancel_probability or 0.0) >= _CANCEL_LIKELY:
         body["innstilling_prosent"] = round(alert.cancel_probability * 100)
     return body
 
@@ -3435,18 +3900,37 @@ def _message_input_json(message_input: dict | None) -> str | None:
         return None
 
 
+def _gated_figure(alert: Alert) -> float | None:
+    """The figure a decision row records as `impact_probability`: a departure with a change's
+    deciding figure, else the boarding call's (`decisions._gated_figure`, restated because that
+    module is imported lazily here). The thinning ledger's `max_impact` tracks the same number, or
+    `new_max` would miss the peak `max_impact_probability` reads off the rows. Keep the two in
+    step."""
+    return alert.deciding_probability if alert.deciding_probability is not None else alert.impact_probability
+
+
+def _trip_reason(alert: Alert) -> tuple[str, int] | None:
+    """The reason kind and leg or transfer index a decision row records (`trip.problem`); None on a
+    direct train and below the bar, where the flip is already a `transition`."""
+    problem = alert.trip.problem if alert.trip is not None else None
+    return (problem.kind, problem.index) if problem is not None else None
+
+
 def _thinning_reason(
     entry: dict[str, Any] | None, alert: Alert, *, pushed: bool, now: datetime
 ) -> str | None:
     """Why this observation has to be written down, or None to let the ledger carry it (KTD15).
 
-    Five triggers, and each one is the reason a figure `varsel_decision_groups` computes cannot be
+    Six triggers, and each one is the reason a figure `varsel_decision_groups` computes cannot be
     recovered from any other row:
 
     * ``first_seen`` — `first_decided_at` is MIN(decided_at) and nothing else can supply it.
     * ``transition`` — `first_alert_at` is MIN over the ALERTING rows and `ever_alerted` a
       LOGICAL_OR, so the cycle a subject crosses the gate in either direction is load-bearing; so is
       the `et_cancelled` pick, which reads the first alerting row.
+    * ``trip_reason`` — a departure with a change whose reason kind or leg/transfer index moved
+      (multi-leg KTD11): the row's `trip_reason_*` columns are its only record, and the groups view
+      reads them off the first alerting row.
     * ``new_max`` — `max_impact_probability` is a MAX, i.e. it is only ever as high as the highest
       row written. This is the trigger that keeps a threshold tunable.
     * ``pushed`` — `pushed_any` is a LOGICAL_OR and the quoted wording comes off the FIRST pushed
@@ -3472,7 +3956,9 @@ def _thinning_reason(
         return "pushed"
     if bool(alert.alertworthy) != bool(entry.get("alertworthy")):
         return "transition"
-    impact_p = alert.impact_probability
+    if _trip_reason(alert) != entry.get("trip_reason"):
+        return "trip_reason"
+    impact_p = _gated_figure(alert)
     if impact_p is not None and impact_p > entry.get("max_impact", float("-inf")):
         return "new_max"
     written_at = entry.get("written_at")
@@ -3642,10 +4128,9 @@ def _record_decisions(
                     }
                     entry["written"] = False
                     entry["alertworthy"] = bool(alert.alertworthy)
-                    if alert.impact_probability is not None:
-                        entry["max_impact"] = max(
-                            entry.get("max_impact", float("-inf")), alert.impact_probability
-                        )
+                    figure = _gated_figure(alert)
+                    if figure is not None:
+                        entry["max_impact"] = max(entry.get("max_impact", float("-inf")), figure)
                     continue
                 # Read RAW, deliberately not through `_deliverable_message`: this is the half of the
                 # pair recorded as `message_llm`, which is what was WRITTEN whether or not it was
@@ -3780,9 +4265,10 @@ def _record_decisions(
                     llm_provider=meta.get("provider"),
                     llm_model=meta.get("model"),
                     message_status=status,
-                    prompt_version=llm_message.PROMPT_VERSION,
+                    prompt_version=llm_message.prompt_version_for(message_input),
                 )
                 rows.append(row)
+                figure = _gated_figure(alert)
                 wrote.append(
                     (
                         decision_key,
@@ -3791,11 +4277,12 @@ def _record_decisions(
                             "written": True,
                             "written_at": cycle_now,
                             "alertworthy": bool(alert.alertworthy),
+                            # Committed only with the write, like the two beside it, so a lost
+                            # write leaves the old reason here and the trigger fires again.
+                            "trip_reason": _trip_reason(alert),
                             "max_impact": max(
                                 (entry or {}).get("max_impact", float("-inf")),
-                                alert.impact_probability
-                                if alert.impact_probability is not None
-                                else float("-inf"),
+                                figure if figure is not None else float("-inf"),
                             ),
                         },
                     )
@@ -4234,6 +4721,28 @@ def _webhook_situations(alerts: list[Alert]) -> list[dict]:
     return out
 
 
+def _effect(alert: Alert) -> str | None:
+    """The event's `effect`: a three-value vocabulary derived from what we actually know, `null` when
+    none is established. Wire vocabulary, so the typed client and the published contract's enum
+    have to match these literals rather than invent their own.
+
+    `trip_cancelled`, so a departure that never reaches the traveller's destination reads
+    "cancelled" with `arrival` saying which end failed -- the same as `phase`.
+    `missed_connection` (multi-leg KTD13): a departure with a change whose planned ride breaks AT a
+    change -- a missed connection, or a later leg cancelled while a cushion is only predicted to
+    fail -- whatever the first train's own delay, which may be none. `TRANSFER_PROBLEMS` is the
+    title verb's («kan miste overgangen»), so the two cannot disagree.
+    """
+    if alert.trip_cancelled:
+        return "cancelled"
+    reason = _trip_reason(alert)
+    if reason is not None and reason[0] in notification_wording.TRANSFER_PROBLEMS:
+        return "missed_connection"
+    if alert.delay_p50_min or alert.delay_p90_min:
+        return "delayed"
+    return None
+
+
 def _webhook_payload(
     alert: Alert,
     contributing: list[Alert],
@@ -4276,7 +4785,7 @@ def _webhook_payload(
             logger.debug("Could not serialize an alternative journey for a notification event", exc_info=True)
     situations = _webhook_situations(contributing)
     situations_text = notification_wording.situations_text(situations)
-    return {
+    payload = {
         "notification": {"title": title, "body": body, "action": None},
         "call": {
             "stop_place": alert.stop_place,
@@ -4319,18 +4828,7 @@ def _webhook_payload(
                 ),
             }
         ),
-        # A two-value vocabulary derived from what we actually know, `null` when neither is
-        # established. New wire vocabulary, so U7's typed client and U8's published contract have to
-        # match these two literals rather than invent their own.
-        # `trip_cancelled`, so a departure that never reaches the traveller's destination reads
-        # "cancelled" with `arrival` saying which end failed -- the same as `phase` below.
-        "effect": (
-            "cancelled"
-            if alert.trip_cancelled
-            else "delayed"
-            if (alert.delay_p50_min or alert.delay_p90_min)
-            else None
-        ),
+        "effect": _effect(alert),
         # Where the train terminates, the value the title names it with («R14 Drammen 14:59»);
         # null while the journey-status spine is unloaded and for every train it does not hold.
         "destination": alert.destination,
@@ -4351,6 +4849,15 @@ def _webhook_payload(
         "summary_en": summary[1],
         "summary_nn": summary[2],
     }
+    # A departure with a change (multi-leg KTD13): the one trip model, dumped -- its legs, its
+    # changes, the expected arrival and the problem with the figure and bar the gate decided on.
+    # The KEY is absent on a direct train, and so on every alert with TRIP_PLANS_ENABLED off
+    # (AE6): an absent key is additive for a receiver that never heard of it, a `null` one is a
+    # value it must type. `probabilities` and `delay` above stay the boarding call's, and `arrival`
+    # is null, because no one vehicle journey reaches the destination.
+    if alert.trip is not None:
+        payload["trip"] = alert.trip.model_dump(mode="json")
+    return payload
 
 
 def definition_summary(
@@ -4527,6 +5034,11 @@ def _observations_for_key(
             # `confirmed` events would spend a subscription's daily cap at 03:00 exactly as the
             # browser's would, and a digest event is a contract change nobody has asked for. The
             # public journey-alerts read still lists it. Never minted, so never withdrawn either.
+            continue
+        if winner._hold_withdrawal and not winner.alertworthy:
+            # KTD8: a departure with a change under the bar while a leg its standing reason sat on
+            # is unknown. No observation, so nothing counts toward a withdrawal; a reading taken
+            # once the leg is known again does (`_merge_trip_alerts`).
             continue
         train = _train_key(winner)
         if train is None:
@@ -5156,6 +5668,9 @@ def check_and_notify(
             _message_errors.pop(key, None)
         for key in [k for k in _message_meta if k[1] not in live]:
             _message_meta.pop(key, None)
+        # What each departure with a change last alerted on (KTD8), once its train has left.
+        for key in [k for k in _trip_reasons if k[1][2] < cycle_now - _WINDOW_CATCH_UP]:
+            _trip_reasons.pop(key, None)
         # NOTHING FOR THE WEBHOOK CHANNEL SWEEPS HERE, and that is a property worth stating rather
         # than an omission. The client snapshot loaded below is a pass-local list, and Firestore is
         # the only dedup ledger for that channel (KTD3), so this pass holds no notification state to go
@@ -5242,8 +5757,9 @@ def check_and_notify(
     # Same reasoning as loop 2's push fan-out, and the threads are equally nearly free -- each is
     # parked in a socket read.
     #
-    # Safe to run concurrently because `match_journey` mutates nothing global: it builds its own
-    # `worst_by_situation`/`by_train`, reads the stop-alias map and the prediction cache (both
+    # Safe to run concurrently because `match_journey` mutates nothing global but `_trip_reasons`,
+    # under `_state_lock` (multi-leg U5): it builds its own `worst_by_situation`/`by_train`,
+    # reads the stop-alias map and the prediction cache (both
     # rebuilt earlier on THIS thread, before check_and_notify is called), and reaches the outside
     # world only through `alternatives`, which has its own lock, its own single-flight and its own
     # fetch budget. What the fan-out did change there is that single-flight now has concurrent
@@ -5266,7 +5782,16 @@ def check_and_notify(
             # disagree by however long the pass takes, which at 100 000 subscriptions is seconds.
             # It is also what lets `impact`'s per-generation window memo be SHARED: a memo keyed on
             # a window each caller derived from its own clock is shared by nobody.
-            alerts = match_journey(journey, cycle_now, with_alternative=True)
+            #
+            # `standing` (multi-leg U5, KTD20) only with TRIP_PLANS_ENABLED on, so with it off the
+            # matcher is called with exactly the arguments it always was.
+            standing = (
+                {"standing": _holds_alert_on(
+                    jids_by_key.get(key, ()), webhook_by_key.get(key, ()), cycle_now
+                )}
+                if trips.enabled() else {}
+            )
+            alerts = match_journey(journey, cycle_now, with_alternative=True, **standing)
         except Exception:
             # One journey's failure must not stop the remaining journeys being scored or any push
             # going out. Empty alerts for this key; the next tick retries. Caught INSIDE the worker
@@ -5739,7 +6264,7 @@ def check_and_notify(
         # set is the strip's (`_removed_trains`), asked once per journey DEFINITION like the match
         # (it reads nothing a registration adds), and only for definitions whose from-place a
         # removed train calls at, so a day without a cut walks nobody.
-        removed_by_key: dict[str, list[journey_status.TrainStatus]] = {}
+        removed_by_key: dict[str, list[journey_status.RemovedTrain]] = {}
         if push_on and removed_stops and _digest_due(cycle_now):
             for key, journey in by_journey_key.items():
                 try:
@@ -6263,6 +6788,23 @@ class Journey(BaseModel):
         "(plan 2026-09-22-001). NULL while the day's timetable is not loaded, or when grading this "
         "journey failed; the card then renders exactly as it did before the strip existed.",
     )
+    transfers: trips.TransferCoverage | None = Field(
+        default=None,
+        description="Whether today's trips with a change were judged over the strip's window "
+        "(`trips.transfer_coverage`, the public reads' `coverage.transfers`): `evaluated`, `none` or "
+        "`not_evaluated`, which the PWA words under the strip. NULL with TRIP_PLANS_ENABLED off -- "
+        "unlike the public reads, whose strict schema needs a value -- and on a day not travelled.",
+    )
+
+
+def _transfers_judged(rec: dict, now: datetime) -> trips.TransferCoverage | None:
+    """`Journey.transfers` (multi-leg U10): the strip's window, and the plan the matcher reads for
+    it. None with the flag off, so the PWA says nothing it did not say before (AE6)."""
+    window = journey_status.window_today(rec, now) if trips.enabled() else None
+    if window is None:
+        return None
+    plan = _trip_plans(*_pair(rec), window[0].astimezone(_OSLO).date()) if _trip_plans is not None else None
+    return trips.transfer_coverage([(plan, *window)])[0]
 
 
 class JourneysResponse(BaseModel):
@@ -6592,6 +7134,7 @@ def _journey_model(jid: str, rec: dict, *, alerts: list[Alert] | None = None) ->
         # ingen avganger mellom disse stoppene" is a claim about the timetable rather than about
         # today's disruptions.
         warning=None if matched else _service_warning(rec),
+        transfers=_transfers_judged(rec, datetime.now(UTC)),
     )
 
 
@@ -6601,6 +7144,8 @@ def _feedback_detail(alert: Alert) -> str:
     The card shows this line only under the operator's SUMMARY; beside a written message it said the
     same thing twice (design review 2026-09-01, finding 18), so `_journey_model` records None in that
     case. The train label gains « i morgen» exactly as the card's `trainLabel` does."""
+    import llm_message
+
     parts: list[str] = []
     if alert.departure_time:
         train = _train_label(
@@ -6612,11 +7157,19 @@ def _feedback_detail(alert: Alert) -> str:
         if _departs_tomorrow(alert.departure_time):
             train = f"{train} i morgen"
         parts.append(train)
+    trip = alert.trip
     if alert.cancelled:
         parts.append("Innstilt")
     elif alert.destination_cancelled:
         parts.append(notification_wording.DESTINATION_CANCELLED)
-    elif alert.cancel_probability >= _CANCEL_LIKELY:
+    elif trip is not None and (
+        (trip_line := _trip_detail(alert)) or not llm_message.trip_quotes_figures(alert)
+    ):
+        # A departure with a change names the leg or change at fault (`tripModel.alertDriver`), and
+        # quotes the first train's figures only where the template does (multi-leg U10).
+        if trip_line:
+            parts.append(trip_line)
+    elif (alert.cancel_probability or 0.0) >= _CANCEL_LIKELY:
         # JavaScript Math.round (used by the card) rounds non-negative .5 values upward; Python's
         # round uses ties-to-even and would make the persisted "exact" text disagree at 50.5 %.
         parts.append(f"{int(alert.cancel_probability * 100 + 0.5)} % sjanse for innstilling")
@@ -6630,6 +7183,18 @@ def _feedback_detail(alert: Alert) -> str:
     ):
         parts.append(delay)
     return " · ".join(parts)
+
+
+def _trip_detail(alert: Alert) -> str | None:
+    """The template's line for the leg or change at fault (`notification_wording._trip_detail`), off
+    the same trip block the wording is written from. None where the Vertex dependencies are absent:
+    a snapshot is not worth an import failure."""
+    try:
+        import llm_message
+    except ImportError:
+        return None
+    block = llm_message._trip_block(alert.trip, confirmed=alert.trip_confirmed)
+    return notification_wording._trip_detail({llm_message.TRIP_KEY: block})
 
 
 def _feedback_observation(obs: LatestObservation | None) -> str | None:

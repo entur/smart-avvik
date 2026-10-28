@@ -349,11 +349,12 @@ class Segment(BaseModel):
     """One slice of the window, split on where the decision's information came from.
 
     Same four verdicts, same arithmetic, over a subset of the same rows — so a caller can put the
-    slices side by side and see what the blended figure is actually made of. There are four:
+    slices side by side and see what the blended figure is actually made of. There are five:
     `predicted` (an SX message existed and the models forecast the outcome), `relayed` (ET had
     already declared it), `no_sx` (nobody had published anything; the models read real-time data
-    alone) and `removed` (the train is missing from the day's plan and no cancellation was
-    published). Every labelled verdict lands in exactly one, or in `n_unsegmented`.
+    alone), `removed` (the train is missing from the day's plan and no cancellation was
+    published) and `transfer` («med bytte»: a departure with a change, judged end to end). Every
+    labelled verdict lands in exactly one, or in `n_unsegmented`.
     """
 
     n_hit: int = Field(description="Alerted, and trouble came.")
@@ -483,6 +484,16 @@ class Summary(BaseModel):
         "a cancellation (situationNumber `KIX:PlanRemoved:`, since 2026-09-23). Served at 1.0 like "
         "a relayed cancellation, but ET declared nothing: the certainty is our own reading of the "
         "plan. Resolved ahead of `relayed`, since these rows carry et_cancelled = TRUE.",
+    )
+    transfer: Segment = Field(
+        default_factory=lambda: Segment(
+            n_hit=0, n_false_alarm=0, n_miss=0, n_correct_reject=0,
+            precision=None, recall=None, median_lead_min_on_hits=None,
+        ),
+        description="«Med bytte»: departures that reach the destination only with a change "
+        "(multi-leg, TRIP_PLANS_ENABLED), judged end to end and labelled on the arrival there -- "
+        "trouble is 10+ min late or no continuation getting there. Resolved ahead of every other "
+        "segment, whatever the first leg would read as.",
     )
     n_unsegmented: int = Field(
         description="Labelled decisions taken before the flag existed (2026-08-05), in no "
@@ -1034,6 +1045,7 @@ def summary(
         relayed=segment("relayed"),
         no_sx=segment("no_sx"),
         removed=segment("removed"),
+        transfer=segment("transfer"),
         n_unsegmented=row.get("n_unsegmented") or 0,
         daily=[
             DailyPoint(

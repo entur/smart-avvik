@@ -25,6 +25,7 @@ Run: uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigq
 
 import ast
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -445,6 +446,76 @@ def test_an_acquisition_forces_the_next_rebuild_past_the_stamp_and_the_spacing()
     assert calls.count("on_change") == 2, calls
 
 
+def test_a_follower_tick_refreshes_its_own_trip_realtime_and_a_failure_costs_nothing_else():
+    """Multi-leg U4: JP real-time is per pod, so a follower fetches its own on its tick, after the
+    follow (the snapshot it judges "scored" on). A raise is logged; the hydrate still runs."""
+    calls: list[str] = []
+    publics: list = []
+    saved = main.trip_plans.refresh_realtime, main.trip_plans.public_plans
+
+    def refresh_realtime(now, *, public=()):
+        calls.append("realtime")
+        publics.append(public)
+        if calls.count("realtime") == 1:
+            raise RuntimeError("journey planner down")
+
+    main.trip_plans.refresh_realtime = refresh_realtime
+    main.trip_plans.public_plans = lambda: ["a public read's plan"]
+    try:
+        with _loop(_ScriptedLease([False, False]), calls):
+            main.poll_for_changes(lambda ts: calls.append("on_change"), _Ticks(2))
+    finally:
+        main.trip_plans.refresh_realtime, main.trip_plans.public_plans = saved
+    assert calls == ["follow", "realtime", "hydrate", "follow", "realtime", "hydrate"], calls
+    # Multi-leg U8: the plans this pod fetched for public reads ride along, after the registered ones.
+    assert publics == [["a public read's plan"]] * 2, publics
+
+
+def test_a_leader_tick_that_does_not_rebuild_refreshes_trip_realtime_and_a_rebuild_tick_does_not_twice():
+    """Multi-leg U4: a leader whose cycle is held (a quiet ingestion stamp, the rebuild spacing)
+    still refreshes JP real-time on its tick, or its answers would age past REALTIME_MAX_AGE_S
+    while every follower's stay fresh. A tick that rebuilt refreshed in its `trip_realtime` phase
+    (the real call, from `on_change` here) and skips; with the flag off nothing is fetched at all.
+
+    The real `refresh_realtime` runs, so its own flag gate and stamp are what is pinned; its leg
+    selection is the probe. Ticks are 61 s apart on the stamp's clock."""
+    import trip_plans
+
+    clock = [0.0]
+
+    class _Spaced(_Ticks):
+        def wait(self, interval: float) -> bool:
+            clock[0] += 61
+            return super().wait(interval)
+
+    def on_change(ts):  # a rebuild, whose `trip_realtime` phase makes the same call
+        calls.append("on_change")
+        trip_plans.refresh_realtime(datetime.now(UTC))
+
+    saved = (trip_plans._realtime_refs, trip_plans.monotonic, trip_plans._refreshed_at,
+             os.environ.get("TRIP_PLANS_ENABLED"))
+    trip_plans._realtime_refs = lambda groups, now: calls.append("realtime") or []
+    trip_plans.monotonic = lambda: clock[0]
+    try:
+        for flag, expected in (
+            ("1", ["on_change", "realtime", *_LEADER_TICK]
+                  + ["realtime", *_LEADER_TICK] + ["realtime", *_LEADER_TICK]),
+            ("0", ["on_change", *_LEADER_TICK, *_LEADER_TICK, *_LEADER_TICK]),
+        ):
+            calls: list[str] = []
+            clock[0], trip_plans._refreshed_at = 0.0, None
+            os.environ["TRIP_PLANS_ENABLED"] = flag
+            # One rebuild (the first value), then two ticks the unchanged stamp holds.
+            with _loop(_ScriptedLease([True, True, True]), calls, values=("a", "a", "a")):
+                main.poll_for_changes(on_change, _Spaced(3))
+            assert calls == expected, (flag, calls)
+    finally:
+        (trip_plans._realtime_refs, trip_plans.monotonic, trip_plans._refreshed_at) = saved[:3]
+        os.environ.pop("TRIP_PLANS_ENABLED", None)
+        if saved[3] is not None:
+            os.environ["TRIP_PLANS_ENABLED"] = saved[3]
+
+
 def test_a_follower_tick_beats_so_health_stays_200():
     calls: list[str] = []
     with _loop(_ScriptedLease([False]), calls):
@@ -702,7 +773,8 @@ def test_the_alerting_pass_is_handed_the_lease():
     import inspect
 
     source = inspect.getsource(main._rebuild_all)
-    assert "varsel.check_and_notify(_varsel_snapshot(), should_continue=_still_leading)" in source
+    # `_varsel_live()` since multi-leg U5: the snapshot plus the held plans' `KIX:Trip:` situations.
+    assert "varsel.check_and_notify(_varsel_live(), should_continue=_still_leading)" in source
 
 
 # ---- main: acquisition, loss and shutdown --------------------------------------------------------

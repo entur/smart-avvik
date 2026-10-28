@@ -75,6 +75,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import metrics  # sibling leaf module (no main import): the wording-attempt counter (KTD11)
+from notification_wording import TRIP_KEY  # a leaf: it imports this one lazily
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +396,58 @@ _RESPONSE_SCHEMA = {
 # hand-bumped: a prompt edit is exactly the kind of change nobody remembers to version, and a
 # stored message whose prompt is unknown cannot be compared with one written under a later brief.
 PROMPT_VERSION = hashlib.sha256(_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
+
+# ---- The trip prompt (multi-leg KTD12) ---------------------------------------------------------
+# `TRIP_KEY` (imported from `notification_wording`, whose template reads it too) carries a departure
+# with a change and is present only on one. Its presence is what selects the trip prompt
+# (`prompt_version_for`, `_system_prompt_for`), so a direct train's document, prompt and version
+# are exactly what they were.
+_TRIP_RULES = """\
+- `reise_med_bytte` betyr at reisen har bytte underveis, og varselet gjelder HELE reisen fra \
+`reise.fra` til `reise.til`. Avgangen øverst i dataene er første etappe; `etapper` er alle \
+etappene i rekkefølge, med planlagte tider. Si om denne avgangen får den reisende fram, hvor \
+problemet er, og når den reisende ventes fram.
+- `problem` sier hva som er galt: `missed_connection` – den reisende kan miste overgangen i \
+`byttested`; `leg_cancelled` – etappen `etapper[indeks]` er innstilt; `leg_removed` – den er tatt ut \
+av rutetabellen; `leg_departure` – den kan bli forsinket eller innstilt; `departure` – første \
+avgang kan bli forsinket. Skriv aldri ordene i `problem`, og nevn aldri `indeks`.
+- Nevn `byttested` når det finnes. `planlagt_byttetid_min` er minuttene reiseplanen gir til byttet.
+- `missed_connection` er et ANSLAG: skriv «kan miste overgangen», aldri at det er sikkert. \
+`bekreftet: true` betyr at reisen ALLEREDE ikke går som planlagt – det er et faktum, skriv aldri \
+«kan» om det.
+- `ventet_framme_kl` er når den reisende ventes fram til `reise.til`. Mangler den, vet vi ikke når \
+den reisende kommer fram: si det, og finn aldri på et klokkeslett.
+"""
+# The trip brief is the direct one with these rules before its closing lines, so every rule above
+# binds a trip wording too and an edit to them moves both versions, as it should. The marker is
+# checked by the suite: if it moved, the rules would silently land nowhere.
+_TRIP_SYSTEM_PROMPT = _SYSTEM_PROMPT.replace(
+    "- Ingen innledning", _TRIP_RULES + "- Ingen innledning", 1
+)
+#: `PROMPT_VERSION`'s twin for the trip brief, derived the same way.
+TRIP_PROMPT_VERSION = hashlib.sha256(_TRIP_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:8]
+
+
+def is_trip_input(message_input: Any) -> bool:
+    """Does this message input describe a departure with a change (KTD12)?"""
+    return isinstance(message_input, dict) and bool(message_input.get(TRIP_KEY))
+
+
+def prompt_version_for(message_input: Any) -> str:
+    """The version of the prompt this input is (or was) worded under: `TRIP_PROMPT_VERSION` for a
+    trip input, `PROMPT_VERSION` otherwise. The one reader of either constant outside this module's
+    own definitions, so the wording keys, the decision row and `/meldinger`'s replay key and
+    comparison cannot disagree about which brief wrote a text. Read at call time, never bound."""
+    return TRIP_PROMPT_VERSION if is_trip_input(message_input) else PROMPT_VERSION
+
+
+def _system_prompt_for(input_json: str) -> str:
+    """The brief a backend is handed for this serialized input; the direct one when it cannot be read,
+    as `_attempt_models` stays on the configured model."""
+    try:
+        return _TRIP_SYSTEM_PROMPT if is_trip_input(json.loads(input_json)) else _SYSTEM_PROMPT
+    except ValueError:
+        return _SYSTEM_PROMPT
 
 
 def message_input_json(message_input: dict) -> str:
@@ -727,7 +780,7 @@ def _claude_write(input_json: str) -> str:
         response = _backend_client("claude", _claude_client).messages.create(
             model=_CLAUDE_MODEL,
             max_tokens=_MAX_TOKENS,
-            system=_SYSTEM_PROMPT,
+            system=_system_prompt_for(input_json),
             thinking={"type": "adaptive"},
             output_config={
                 "effort": "low",
@@ -832,7 +885,7 @@ def _gemini_write(input_json: str) -> str:
                 model=model,
                 contents=f"<reisedata>\n{input_json}\n</reisedata>",
                 config={
-                    "system_instruction": _SYSTEM_PROMPT,
+                    "system_instruction": _system_prompt_for(input_json),
                     "max_output_tokens": _MAX_TOKENS,
                     "thinking_config": {"thinking_level": _THINKING_LEVELS.get(model, "low")},
                     "response_mime_type": "application/json",
@@ -1124,6 +1177,72 @@ def _departs_tomorrow(departure: datetime | None, now: datetime | None = None) -
     return departure.astimezone(_OSLO).date() == now.astimezone(_OSLO).date() + timedelta(days=1)
 
 
+def _trip_block(trip: Any, *, confirmed: bool) -> dict:
+    """KTD12's trip facts for one departure with a change (`alternatives.TripFacts`, duck-typed):
+    the legs, the reason, the change at fault with its planned slack, and the expected arrival.
+
+    Every time is local HH:MM and every name bounded, like the rest of the document: `_is_grounded`
+    reads figures off the serialized JSON, so a raw timestamp would put a UTC hour among the
+    figures a reply may quote. Optional keys are absent rather than null, as everywhere here: an
+    unknown arrival is no `ventet_framme_kl`, never an invented one.
+    """
+    legs = []
+    for leg in list(getattr(trip, "legs", None) or [])[:_MAX_PAYLOAD_ITEMS]:
+        entry: dict[str, Any] = {
+            "transportmiddel": _bounded_text(leg.mode, _NAME_MAX_CHARS),
+            "linje": _bounded_text(leg.public_code or line_code(leg.line), _NAME_MAX_CHARS),
+            "fra": _canonical_stop_name(leg.board_stop_place) or _bounded_text(leg.from_name, _NAME_MAX_CHARS),
+            "til": _canonical_stop_name(leg.alight_stop_place) or _bounded_text(leg.to_name, _NAME_MAX_CHARS),
+            "avgang_kl": _hhmm(leg.aimed_departure),
+            "ankomst_kl": _hhmm(leg.aimed_arrival),
+        }
+        if destination := _bounded_text(getattr(leg, "destination", None), _NAME_MAX_CHARS):
+            entry["destinasjon"] = destination
+        if leg.cancelled:
+            entry["innstilt"] = True
+        legs.append({k: v for k, v in entry.items() if v is not None})
+    block: dict[str, Any] = {"etapper": legs}
+    problem = getattr(trip, "problem", None)
+    if problem is not None:
+        block["problem"] = problem.kind
+        block["indeks"] = problem.index
+        # The change at fault: transfer `i` for a missed connection, the change ONTO leg `i` for a
+        # later leg's reason; none for the first leg's own departure.
+        at = problem.index if problem.kind == "missed_connection" else problem.index - 1
+        transfers = list(getattr(trip, "transfers", None) or [])
+        if problem.kind != "departure" and 0 <= at < len(transfers):
+            transfer = transfers[at]
+            stop = _canonical_stop_name(transfer.stop_place) or _bounded_text(transfer.stop_name, _NAME_MAX_CHARS)
+            if stop:
+                block["byttested"] = stop
+            # Carried only when it is a time to change in: a negative slack is a plan already too
+            # tight, and «-1 min» is not a sentence.
+            if transfer.slack_min >= 0:
+                block["planlagt_byttetid_min"] = transfer.slack_min
+    if arrival := _hhmm(getattr(trip, "expected_arrival", None)):
+        block["ventet_framme_kl"] = arrival
+    if confirmed:
+        block["bekreftet"] = True
+    return block
+
+
+def trip_quotes_figures(alert: Any) -> bool:
+    """Does the wording quote the boarding call's figures? Always on a direct train. On a departure
+    with a change (multi-leg KTD12) only when its reason is the first train's own departure: else the
+    boarding figures describe a train that may be running fine, and a confirmed trip's are the 1.0
+    certainty, which the figures block would turn into «100 % sjanse for innstilling» -- the trip
+    block carries the reason instead. An unscored first leg has no figures at all, and a block of
+    nulls is a key set the template must guard. Duck-typed like :func:`build_message_input`, which
+    asks it below the `innstilt` and `kommer_ikke_fram` facts; `varsel._feedback_detail` asks it too,
+    so the card's detail line quotes the figures exactly where the template does."""
+    trip = getattr(alert, "trip", None)
+    return trip is None or not (
+        getattr(alert, "trip_confirmed", False)
+        or getattr(trip.problem, "kind", "departure") != "departure"
+        or getattr(alert, "impact_probability", None) is None
+    )
+
+
 def build_message_input(
     journey: dict, impact: Any, alert: Any, *, now: datetime | None = None
 ) -> dict:
@@ -1238,6 +1357,9 @@ def build_message_input(
     if not getattr(alert, "has_situation", True):
         payload["ingen_melding"] = True
         payload["situasjoner"] = []
+    trip = getattr(alert, "trip", None)
+    if trip is not None:
+        payload[TRIP_KEY] = _trip_block(trip, confirmed=bool(getattr(alert, "trip_confirmed", False)))
     if certain_cancelled:
         payload["innstilt"] = True
     elif getattr(alert, "destination_cancelled", False):
@@ -1245,7 +1367,8 @@ def build_message_input(
         # `innstilt`, and like it the figures beside it are certainties or "if it runs", so none
         # rides: a 100 % here would read as a forecast and a delay as a promise of arrival.
         payload["kommer_ikke_fram"] = True
-    else:
+    elif trip_quotes_figures(alert):
+        # Not on a departure with a change whose reason is elsewhere (`trip_quotes_figures`).
         # Carried for the RECORD, not for quoting: it is the figure the alert gate fired on, so a
         # decision row without it cannot be re-read against the threshold that produced it. Neither
         # wording says it any more (2026-08-20) — the template never did, and the prompt now forbids

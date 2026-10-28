@@ -44,6 +44,8 @@ import togvarsel  # sibling module: the rush-hour forecast, Togmeldingen (/rushv
 import togvarsel_notify  # sibling module: togvarsel rush forecasts as /varsel Web Pushes
 import togvarsel_outcomes  # sibling module: what the rush actually did (/rushhistorikk's fasit)
 import tracing_setup  # import side effect: OTel tracing when TRACING_ENABLED (fail-open, KTD3)
+import trip_plans  # sibling module: Journey Planner day plans for trips with a change (multi-leg)
+import trips  # sibling module: the trip records and TRIP_PLANS_ENABLED, the multi-leg flag
 import varsel  # sibling module: registered-journey push alerts (/varsel + /varsel-api)
 import varsel_state  # where a /varsel registration lives: the seam and its blob backend
 import webhook_delivery  # sibling module: one bounded webhook attempt per pending notification event
@@ -289,6 +291,11 @@ _POLLER_METADATA_TIMEOUT_S = 30
 # ~175-185 s) at the price of latency. A change is never LOST either way — a held tick leaves
 # `last_seen` untouched so the next tick sees it again. 0 disables the floor.
 _MIN_REBUILD_SPACING_S = int(os.environ.get("POLLER_MIN_REBUILD_SPACING_S", "120"))
+# The leader refreshes Journey Planner real-time on a tick whose cycle did not (multi-leg U4),
+# unless a refresh ran less than this ago: one tick, so a tick whose rebuild refreshed in its
+# `trip_realtime` phase moments before (~35-50 s: the phase sits early in a 50-63 s cycle) does not
+# fetch twice, and a held tick a minute later does.
+_TRIP_REALTIME_TICK_S = 60
 
 
 def _row_to_cached(r) -> _CachedDisruption:
@@ -789,6 +796,10 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         # boarding-only long-distance call from being offered as somebody's trip.
         boarding_allowed=getattr(r, "boarding_allowed", None) is not False,
         alighting_allowed=getattr(r, "alighting_allowed", None) is not False,
+        # Same getattr rule: a trip's connection reads the stacks' 5-minute points (multi-leg KTD7),
+        # and a missing column is a missing point, never a zero.
+        p_arr_ge5=getattr(r, "p_arr_ge5", None),
+        p_dep_ge5=getattr(r, "p_dep_ge5", None),
     )
 
 
@@ -886,6 +897,12 @@ def refresh_call_predictions_cache(
         _call_pred_by_stop_ref = by_stop_ref
         _call_pred_refreshed_at = built or datetime.now(UTC)
     try:
+        # The `KIX:Trip:` situations a trip reason judged from Journey Planner real-time attaches to
+        # (multi-leg U3) have no prediction row to carry their texts, so they are named here: one
+        # per leg of every plan this pod holds -- a public read's included (U8) -- each with the fixed
+        # texts in all three languages.
+        # Nothing with no plan held, which is every pod with TRIP_PLANS_ENABLED off.
+        texts.update(trips.situation_texts([*trip_plans.held(), *trip_plans.public_plans()]))
         situation_english.update(texts, translate=translate)
     except Exception:
         # A translation is an addition to the payload, never a reason to keep last cycle's predictions.
@@ -1173,9 +1190,9 @@ def follow_last_build() -> dict[str, str]:
     per-load isolation and the one `event="follow_last_build"` record are
     `poller_follow.follow_last_build`'s. The registries are read at call time (the suites swap them).
 
-    Then the leader's machine translations and `/varsel` card caches from the store
-    (`situation_english.follow`, `varsel.follow_card_caches`, neither of which raises): a seed the
-    first time, a watermark sync on every tick after.
+    Then the leader's machine translations, `/varsel` card caches and trip plans from the store
+    (`situation_english.follow`, `varsel.follow_card_caches`, `trip_plans.follow`, none of which
+    raises): a seed the first time, a watermark sync on every tick after.
     """
     outcomes = poller_follow.follow_last_build(
         _FOLLOWED_CACHES,
@@ -1187,6 +1204,7 @@ def follow_last_build() -> dict[str, str]:
     )
     situation_english.follow()
     varsel.follow_card_caches()
+    trip_plans.follow()
     return outcomes
 
 
@@ -1493,6 +1511,29 @@ def _varsel_snapshot() -> dict[str, list]:
         return _call_pred_by_situation
 
 
+def _varsel_live() -> dict[str, list]:
+    """What `varsel.check_and_notify` reads as the live situations: the snapshot, plus with
+    TRIP_PLANS_ENABLED on every `KIX:Trip:` situation of a plan this pod holds (multi-leg U5) --
+    a public read's included, since the pass matches through `trip_plans.read_plan`, which serves
+    those too (U8).
+
+    A trip reason judged from Journey Planner real-time attaches to one of those, and no prediction
+    row carries it. The pass sweeps every push mark, wording and decision subject whose situation
+    is not live, so without this a trip alert's wording would be dropped and re-written every cycle
+    and, under the blob backend, its push mark too -- with the per-train tag making each re-push a
+    cap-exempt replacement. Live while a plan names it: the plans are pruned by date. The same
+    plans as the cache refresh names texts for, so `trips.situation_texts`' one-call memo serves both.
+    """
+    snapshot = _varsel_snapshot()
+    if not trips.enabled():
+        return snapshot
+    held = {
+        situation: []
+        for situation in trips.situation_texts([*trip_plans.held(), *trip_plans.public_plans()])
+    }
+    return {**snapshot, **held} if held else snapshot
+
+
 def _impact_snapshot() -> tuple[dict[str, list[impact_engine.CallPred]], datetime | None]:
     """The per-call prediction snapshot, injected into the impact engine via configure().
 
@@ -1566,6 +1607,7 @@ def _varsel_impact(
     with_alternative: bool = False,
     min_impact: float = 0.0,
     path: alternatives.FetchPath = alternatives._POLLER_PATH,
+    plans: trips.DayPlan | None = None,
 ) -> impact_engine.ImpactResponse:
     """/impact for a registered journey's boarding window, injected into varsel via configure().
 
@@ -1581,6 +1623,10 @@ def _varsel_impact(
     alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
     order and same response shaping as the HTTP endpoint — that is the point of routing varsel
     through here instead of letting it keep its own matcher.
+
+    `plans` (multi-leg U5) is the pair's day plan, which `varsel.match_journey` reads through the
+    `trip_plans.read_plan` it is configured with and sends on one call per window; forwarded only
+    with TRIP_PLANS_ENABLED on, so with the flag off no trip is ever judged here.
     """
     return impact_engine.for_trip(
         from_stop=from_stop,
@@ -1599,6 +1645,7 @@ def _varsel_impact(
         # default still protects: an unauthenticated caller flooding /impact cannot starve the
         # push cycle it shares this module-global cache with.
         path=path,
+        plans=plans if trips.enabled() else None,
     )
 
 
@@ -1907,6 +1954,33 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             refresh_line_modes()
     except Exception:
         logger.exception("Line modes refresh failed; serving the previous map")
+    # The leader's Journey Planner day plans (multi-leg U2): every registered pair's trips with a
+    # change, for `varsel_notify` to judge. Above `varsel_stops` for that step's orphan-window
+    # reason below: it reads no prediction snapshot, and up to `_PHASE_DEADLINE_S` of JP inside
+    # the window would serve the deterministic wording that much longer. What that costs: under
+    # the store backend the definitions come from the mirror as LAST cycle synced it, so another
+    # pod's new registration is fetched one cycle (~2-3 min) later, reading as a miss until then.
+    # Behind TRIP_PLANS_ENABLED: off, the phase is never entered, so its key is absent from
+    # `poller_cycle.phases` and nothing is fetched (AE6). Its own guard: a JP or store failure
+    # keeps the plans held and leaves the ranges due.
+    if trips.enabled():
+        try:
+            with _phase("trip_plans", timings):
+                _refresh_trip_plans(datetime.now(UTC))
+        except Exception:
+            logger.exception("Trip plan refresh failed; serving the plans held")
+        # This pod's Journey Planner real-time for the unscored legs of trips boarding soon (U4,
+        # KTD8), right after the plans it reads. KTD8 puts it just before `varsel_notify`; it sits
+        # here instead, above `varsel_stops`, because its up to three 3 s requests between
+        # `call_predictions_cache` and the pass would widen the orphan window below by ~9 s. The
+        # cost: "scored this cycle" is judged on the previous cycle's prediction snapshot, and the
+        # pass reads an answer about one cycle old, well inside REALTIME_MAX_AGE_S (360 s). Its own
+        # guard, as the plans': a JP failure costs the real-time only.
+        try:
+            with _phase("trip_realtime", timings):
+                _refresh_trip_realtime()
+        except Exception:
+            logger.exception("Trip real-time refresh failed; serving the answers held")
     # Rail-stop picker list for the avviksvarsel PWA. Isolated so a failure never breaks the feed.
     #
     # ABOVE the per-call block, and that placement is load-bearing rather than tidy (2026-09-22).
@@ -2054,7 +2128,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         with _phase("varsel_notify", timings):
             # `should_continue` is the lease inside the fan-out (KTD4): asked before the delivery
             # and before every push, so a leader demoted mid-pass submits no new send.
-            outcome = varsel.check_and_notify(_varsel_snapshot(), should_continue=_still_leading)
+            outcome = varsel.check_and_notify(_varsel_live(), should_continue=_still_leading)
     except Exception:
         logger.exception("Avviksvarsel notify failed")
     # What the pass changed in the card caches, to the store for every other pod (translation store
@@ -2430,6 +2504,14 @@ async def lifespan(app: FastAPI):
         # pairs rather than with registrations.
         stop_ref_index=_impact_stop_ref_index,
     )
+    # The trip verdict (multi-leg U3, KTD4) reads the same journey index, and every ref of the
+    # to-place for KTD3's "is the first train itself direct?". Its Journey Planner real-time reader
+    # (U4, KTD8) reads this pod's own answers, which the leader's `trip_realtime` phase and a
+    # follower's tick fetch; with none held, every leg it would answer is unknown.
+    trips.configure(
+        call_lookup=_impact_journey_calls, realtime=trip_plans.realtime_for,
+        places=varsel.place_refs,
+    )
     # BEFORE `varsel.configure`, whose `registrations=` argument resolves the backend and, under
     # `VARSEL_STATE_BACKEND=store`, immediately reads this store: the `browser` account, and then
     # U14's cutover import. `notification_store.enabled()` is `a client was injected, or a database
@@ -2449,6 +2531,12 @@ async def lifespan(app: FastAPI):
     varsel.configure(
         impact_provider=_varsel_impact,
         stops_provider=_varsel_stops,
+        # The pair's day plan for trips with a change (multi-leg U5): the matcher sends it on one
+        # provider call per window and servability reads its transfer half off it. Injected
+        # because only this module imports `trip_plans` (KTD4); with TRIP_PLANS_ENABLED off varsel
+        # never reads it, and with no plan held it answers None. The leader's plans, then what this
+        # pod fetched for a public read that missed (U8, KTD1).
+        trip_plans=trip_plans.read_plan,
         # Where a `/varsel` registration lives (U13), from `VARSEL_STATE_BACKEND`. Unset is `gcs`,
         # which is the five dicts and the state blob `/varsel` has always had -- so an untouched
         # deployment is byte-for-byte what it was. `store` is U12's Firestore collections, and
@@ -2503,11 +2591,21 @@ async def lifespan(app: FastAPI):
     # The journey-keyed public read's one seam (2026-09-10): when the per-call prediction cache
     # was loaded, so it can answer 503 rather than "no disruptions" before the poller's first load.
     # Its stop cache and matcher come through `varsel`'s own providers, wired just above.
-    notification_pull.configure(refreshed_at=_varsel_refreshed_at)
+    notification_pull.configure(
+        refreshed_at=_varsel_refreshed_at,
+        # The read-miss trigger (multi-leg U8, KTD4): a background plan fetch on the `plans_pull`
+        # path into this pod's own cache, which `trip_plans.read_plan` above then serves. Injected
+        # because the read may not import `trip_plans`; inert with TRIP_PLANS_ENABLED off.
+        plan_fetch=functools.partial(trip_plans.fetch_for_read, places=varsel.place_refs),
+    )
     # The «I dag» strip's engine: the prediction stamp for `as_of`, and every ref of a place, which
-    # it may not import from `varsel` itself (it is a leaf both surfaces call).
+    # it may not import from `varsel` itself (it is a leaf both surfaces call). And the pair's day
+    # plan, the reader `varsel` matches with, for the departures with a change (multi-leg U9), with
+    # every held plan for the morning digest's pre-filter (AE13): memory only, so a request never
+    # fetches; with TRIP_PLANS_ENABLED off neither is read.
     journey_status.configure(
-        predictions_refreshed_at=_varsel_refreshed_at, place_refs=varsel.place_refs
+        predictions_refreshed_at=_varsel_refreshed_at, place_refs=varsel.place_refs,
+        trip_plans=trip_plans.read_plan, held_plans=trip_plans.held,
     )
     llm_message.configure(stop_name_provider=_varsel_stop_names)
     # The webhook channel's two Firestore-backed planes and the authenticated API over
@@ -2567,6 +2665,9 @@ async def lifespan(app: FastAPI):
     # The /varsel card caches on the same gate (U7, D2): the leader's wording and alternative reach
     # every pod, and a new leader starts from them. None in tst.
     varsel.configure_card_store(notification_store if _varsel_store is not None else None)
+    # The trip plans on the same gate (multi-leg U2, KTD2): the leader merges, every pod follows.
+    # None in tst, whose one pod keeps its plans in memory.
+    trip_plans.configure(store=notification_store if _varsel_store is not None else None)
     feedback_contexts.ensure_table()
     historikk.configure(bq_client=bq_client)
     rushhistorikk.configure(bq_client=bq_client)
@@ -3131,6 +3232,28 @@ _on_lease_lost = poller_handover.on_lease_lost
 _shutdown_poller = poller_handover.shutdown_poller
 
 
+def _refresh_trip_plans(now: datetime) -> None:
+    """The `trip_plans` phase's body: every registered definition's boarding windows, grouped by
+    canonical pair, handed to `trip_plans.refresh` with the from-place's refs (multi-leg U2).
+
+    Registered definitions on BOTH channels (`varsel.registered_definitions`), and nothing a public
+    read asked about: a pair only a reader wants is that pod's own fetch (KTD1, KTD18).
+    """
+    windows: dict[tuple[str, str], list[tuple[datetime, datetime]]] = {}
+    for journey in varsel.registered_definitions():
+        windows.setdefault((journey["from_stop"], journey["to_stop"]), []).extend(
+            varsel.journey_windows(journey, now)
+        )
+    trip_plans.refresh(windows, places=varsel.place_refs, now=now, beat=_beat)
+
+
+def _refresh_trip_realtime() -> None:
+    """This pod's Journey Planner real-time for the unscored legs (multi-leg U4, KTD8): the
+    leader's `trip_realtime` phase, its held tick and a follower's tick. The plans this pod fetched
+    for public reads ride along, asked after the registered pairs' (U8)."""
+    trip_plans.refresh_realtime(datetime.now(UTC), public=trip_plans.public_plans())
+
+
 def _mirrors_wanted(webhook_channel: bool) -> bool:
     """Does this deployment's cycle read the notification store's mirrors? (zero-downtime U5)
 
@@ -3169,6 +3292,9 @@ def _on_lease_acquired() -> None:
     # The card caches likewise (U7, R10): the first cycle of this tenure starts from the wordings and
     # alternatives the last leader held, and its reconcile drops what is stale.
     varsel.follow_card_caches(beat=_beat)
+    # And the trip plans (multi-leg U2): the first cycle merges into what the last leader stored
+    # rather than fetching every pair's day again.
+    trip_plans.follow(beat=_beat)
     _force_rebuild = True
     metrics.POLLER_LEADER.set(1)
 
@@ -3290,6 +3416,14 @@ def poll_for_changes(
             # A follower only loads what the leader built: no probe, no rebuild, no tick writer.
             # Each load stands alone and logs its own failure (`follow_last_build` never raises).
             follow_last_build()
+            # Except Journey Planner real-time (multi-leg U4, KTD8), which every pod fetches for
+            # itself: after the follow, so "scored" is judged on the snapshot just loaded. A no-op
+            # with TRIP_PLANS_ENABLED off. The leader's is its cycle's `trip_realtime` phase, and on
+            # a tick that did not rebuild, the same call below.
+            try:
+                _refresh_trip_realtime()
+            except Exception:
+                logger.exception("Trip real-time refresh failed this tick; retrying on next tick")
             try:
                 _rush_hydrate()
             except Exception:
@@ -3319,6 +3453,15 @@ def poll_for_changes(
                     on_change(current)
         except Exception:
             logger.exception("Ingestion poll failed; retrying on next tick")
+        # JP real-time on a tick that did not rebuild (multi-leg U4): a quiet ingestion stamp or the
+        # rebuild spacing holds the cycle, and without this the leader's answers would age past
+        # REALTIME_MAX_AGE_S while every follower's stay fresh. Per pod, so behind no lease check;
+        # a no-op with TRIP_PLANS_ENABLED off, as on a follower.
+        if not trip_plans.realtime_refreshed_within(_TRIP_REALTIME_TICK_S):
+            try:
+                _refresh_trip_realtime()
+            except Exception:
+                logger.exception("Trip real-time refresh failed this tick; retrying on next tick")
         _beat()
         # The tick writers are the leader's too (KTD2), each behind its own lease check: a leader
         # demoted between two of them runs none of the rest, logged once as a cut cycle is. The

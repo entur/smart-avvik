@@ -219,6 +219,73 @@ test("the sample test event parses as a conforming envelope, and carries the ope
   assert.match(sample.how_to_regenerate.producer, /_synthetic_event/);
 });
 
+test("a departure with a change adds payload.trip and leaves every pinned key set as it was", () => {
+  // Multi-leg journeys (KTD13). `trip` is OPTIONAL on the payload -- absent on a direct train -- so
+  // a receiver that never reads it is unaffected, and the envelope's own field lists above did not
+  // move. The sample is a test event, a direct train, so it carries no `trip`: that is what keeps
+  // the pinned `call` and `probabilities` key sets of the sample test above true of every event.
+  const payload = EVENT_SCHEMA.properties.payload;
+  assert.ok(payload.properties.trip, "payload.trip is published");
+  assert.ok(!payload.required.includes("trip"));
+  const trip = payload.properties.trip;
+  assert.equal(trip.type, "object", "a plain object: the generator handles no oneOf or $defs");
+  assert.deepEqual(Object.keys(trip.properties), [
+    "legs",
+    "transfers",
+    "expected_arrival",
+    "arrives_via",
+    "problem",
+  ]);
+  // What each leg was judged from, a closed vocabulary (U10's «mangler sanntid» reads `none`).
+  assert.deepEqual(trip.properties.legs.items.properties.data_source.enum, [
+    "prediction",
+    "jp_realtime",
+    "none",
+    null,
+  ]);
+  assert.deepEqual(trip.properties.problem.properties.kind.enum, [
+    "departure",
+    "leg_cancelled",
+    "leg_departure",
+    "missed_connection",
+    "leg_removed",
+  ]);
+  const sample = JSON.parse(readVendoredContract("test-event-sample.json"));
+  assert.equal("trip" in sample.event.payload, false);
+
+  // A receiver keeps working on an event that carries one: `parseEvent` checks the envelope and
+  // `payload.notification`, and the trip rides inside the open payload.
+  const event = makeEvent({
+    payload: {
+      notification: { title: "Tog R13 07:17 kan miste overgangen i Drammen", body: "Lier → Oslo S" },
+      effect: "missed_connection",
+      arrival: null,
+      trip: {
+        legs: [],
+        transfers: [],
+        expected_arrival: null,
+        arrives_via: null,
+        problem: { kind: "missed_connection", index: 0, probability: 0.8, threshold: 0.65 },
+      },
+    },
+  });
+  assert.equal(parseEvent(encode(event)).ok, true);
+});
+
+test("effect is a closed vocabulary, and the typed client carries it as a literal union", () => {
+  // The schema declared `effect` with no values until multi-leg journeys added
+  // `missed_connection`; enumerating them is what turns the generated type into a literal union
+  // a client can switch on exhaustively.
+  assert.deepEqual(EVENT_SCHEMA.properties.payload.properties.effect.enum, [
+    "cancelled",
+    "delayed",
+    "missed_connection",
+    null,
+  ]);
+  const generated = fs.readFileSync(path.join(PACKAGE_ROOT, "src", "contracts.generated.ts"), "utf8");
+  assert.match(generated, /effect\?: "cancelled" \| "delayed" \| "missed_connection" \| null;/);
+});
+
 // --- The published OpenAPI document, from the side that consumes it -----------------------------
 //
 // `openapi.json` is not vendored into this package -- nothing here reads it at runtime, and the

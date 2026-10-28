@@ -232,7 +232,8 @@ _REPLAY_WORKERS = 4
 _MAX_CONCURRENT_REPLAYS = 2
 
 # 4. The wording cache, separate from the BigQuery response cache above and keyed differently: the
-#    subject key INCLUDING the replayed decided_at, plus llm_message.PROMPT_VERSION. Both halves are
+#    subject key INCLUDING the replayed decided_at, plus the row's prompt version (`_prompt_version`:
+#    the trip brief's for a stored trip input, llm_message.PROMPT_VERSION otherwise). Both halves are
 #    load-bearing. The prompt version is what makes a prompt edit invalidate the page rather than
 #    show yesterday's answer under today's brief; the replayed timestamp is what makes narrowing the
 #    window — which picks a different cycle — correctly miss rather than serve the wider window's
@@ -433,9 +434,9 @@ class Decision(BaseModel):
     )
     prompt_version: str | None = Field(
         description="SHA-256[:8] of the system prompt in force when the replayed cycle was written. "
-        "Compare with llm_message.PROMPT_VERSION to see whether the row predates the current "
-        "prompt. It does NOT separate a prompt change from sampling variance: each wording is a "
-        "single draw from a non-deterministic decoder.",
+        "Compare with llm_message.prompt_version_for(the row's input) to see whether the row "
+        "predates the current prompt. It does NOT separate a prompt change from sampling "
+        "variance: each wording is a single draw from a non-deterministic decoder.",
     )
 
     actual_cancelled: bool | None = Field(description="ET declared the boarding call cancelled.")
@@ -677,11 +678,12 @@ class FilterOptions(WindowFields):
 class Segment(BaseModel):
     """One slice of the window, split on where the decision's information came from.
 
-    Same four verdicts, same arithmetic, over a subset of the same rows. There are four:
+    Same four verdicts, same arithmetic, over a subset of the same rows. There are five:
     `predicted` (an SX message existed and the models forecast the outcome), `relayed` (ET had
     already declared it), `no_sx` (nobody had published anything; the models read real-time data
-    alone) and `removed` (the train is missing from the day's plan and no cancellation was
-    published). Every labelled verdict lands in exactly one, or in `n_unsegmented`.
+    alone), `removed` (the train is missing from the day's plan and no cancellation was
+    published) and `transfer` («med bytte»: a departure with a change, judged end to end). Every
+    labelled verdict lands in exactly one, or in `n_unsegmented`.
     """
 
     n_hit: int = Field(description="Alerted, and trouble came.")
@@ -800,6 +802,15 @@ class Summary(WindowFields):
         "a cancellation (situationNumber `KIX:PlanRemoved:`, since 2026-09-23). Served at 1.0 like "
         "a relayed cancellation, but ET declared nothing: the certainty is our own reading of the "
         "plan. Resolved ahead of `relayed`, since these rows carry et_cancelled = TRUE.",
+    )
+    transfer: Segment = Field(
+        default_factory=lambda: Segment(
+            n_hit=0, n_false_alarm=0, n_miss=0, n_correct_reject=0,
+            precision=None, recall=None, median_lead_min_on_hits=None,
+        ),
+        description="«Med bytte»: departures that reach the destination only with a change "
+        "(multi-leg, TRIP_PLANS_ENABLED), judged end to end and labelled on the arrival there. "
+        "Resolved ahead of every other segment, whatever the first leg would read as.",
     )
     n_unsegmented: int = Field(
         description="Labelled decisions taken before the flag existed (2026-08-05), in no segment.",
@@ -1366,7 +1377,19 @@ def _replay_latch() -> Any:
         return _replay_state
 
 
-def _wording_key(row: dict) -> tuple:
+def _prompt_version(row: dict) -> str:
+    """The version of the prompt today's replay of this row is worded under (multi-leg KTD12): the
+    trip brief's for a stored trip input, the direct one otherwise -- including for a row with no
+    input or one that will not parse, which `_replay_one` reports without wording anything. Asked
+    once per row per request (`_replay`) and handed down, since each ask re-parses the input."""
+    try:
+        payload = json.loads(row.get("message_input") or "null")
+    except (TypeError, ValueError):
+        payload = None
+    return llm_message.prompt_version_for(payload)
+
+
+def _wording_key(row: dict, prompt_version: str) -> tuple:
     """What identifies a wording: the subject, the cycle replayed, and the prompt that wrote it.
 
     The subject key is the decision log's own grain and includes `journey_digest` — which is exactly
@@ -1382,7 +1405,7 @@ def _wording_key(row: dict) -> tuple:
         row.get("stop_order"),
         row.get("situation_number"),
         row.get("would_send_at"),
-        llm_message.PROMPT_VERSION,
+        prompt_version,
     )
 
 
@@ -1510,7 +1533,9 @@ def _deterministic(payload: dict) -> str | None:
         return None
 
 
-def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool) -> _Wording:
+def _replay_one(
+    row: dict, *, budget: _Budget, deadline: float, generating: bool, prompt_version: str
+) -> _Wording:
     """Regenerate one subject's wording, or say why it was not regenerated. Runs on the pool.
 
     The order of the guards is the contract. A subject with no stored input is R7's state and never
@@ -1595,7 +1620,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
         provider=result.provider,
         model=result.model,
     )
-    _remember_wording(_wording_key(row), wording)
+    _remember_wording(_wording_key(row, prompt_version), wording)
     # The join key, unhashed, on this surface's own event. Not event="llm_message": that record
     # already exists for this call, carries the provider and the `replay` marker, and is what
     # operators' existing queries count — emitting a second one under the same name would double
@@ -1603,7 +1628,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     logger.info(
         "Replayed %s under prompt %s: %s",
         row.get("situation_number"),
-        llm_message.PROMPT_VERSION,
+        prompt_version,
         result.status,
         extra={
             "fields": {
@@ -1614,7 +1639,7 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
                 "result": result.status,
                 "provider": result.provider,
                 "model": result.model,
-                "prompt_version": llm_message.PROMPT_VERSION,
+                "prompt_version": prompt_version,
                 "row_prompt_version": row.get("prompt_version"),
             }
         },
@@ -1622,9 +1647,19 @@ def _replay_one(row: dict, *, budget: _Budget, deadline: float, generating: bool
     return wording
 
 
-def _replay_one_cached(row: dict, *, budget: _Budget, deadline: float, generating: bool) -> _Wording:
-    """Generate one cache key once, even when both admitted requests miss concurrently."""
-    key = _wording_key(row)
+def _replay_one_cached(
+    row: dict,
+    *,
+    budget: _Budget,
+    deadline: float,
+    generating: bool,
+    prompt_version: str | None = None,
+) -> _Wording:
+    """Generate one cache key once, even when both admitted requests miss concurrently.
+    `prompt_version` is the row's `_prompt_version`, asked here when the caller has not."""
+    if prompt_version is None:
+        prompt_version = _prompt_version(row)
+    key = _wording_key(row, prompt_version)
     hit = _cached_wording(key)
     if hit is not None:
         return hit
@@ -1648,9 +1683,13 @@ def _replay_one_cached(row: dict, *, budget: _Budget, deadline: float, generatin
         hit = _cached_wording(key)
         if hit is not None:
             return hit
-        return _replay_one(row, budget=budget, deadline=deadline, generating=generating)
+        return _replay_one(
+            row, budget=budget, deadline=deadline, generating=generating, prompt_version=prompt_version
+        )
     try:
-        return _replay_one(row, budget=budget, deadline=deadline, generating=generating)
+        return _replay_one(
+            row, budget=budget, deadline=deadline, generating=generating, prompt_version=prompt_version
+        )
     finally:
         with _wording_lock:
             _wording_inflight.pop(key, None)
@@ -1704,7 +1743,7 @@ def _message_rows(
     return [dict(r) for r in _query(_MESSAGES_QUERY, params, key)]
 
 
-def _replayed_message(row: dict, wording: _Wording) -> ReplayedMessage:
+def _replayed_message(row: dict, wording: _Wording, prompt_version: str) -> ReplayedMessage:
     """One response entry: the row's identity, and what came of replaying it.
 
     Note what is NOT copied across from the row — `journey_digest`, and the `message_input` the
@@ -1723,7 +1762,7 @@ def _replayed_message(row: dict, wording: _Wording) -> ReplayedMessage:
         provider=wording.provider,
         model=wording.model,
         prompt_version=row.get("prompt_version"),
-        current_prompt_version=llm_message.PROMPT_VERSION,
+        current_prompt_version=prompt_version,
     )
 
 
@@ -1746,12 +1785,14 @@ async def _replay(
     generating = llm_message.generation_enabled(_replay_latch())
     budget = _Budget()
     out: list[_Wording | None] = [None] * len(rows)
+    versions: list[str] = []
     pending: list[int] = []
     for i, row in enumerate(rows):
+        versions.append(_prompt_version(row))
         if row.get("message_input") is None:
             out[i] = _Wording(None, None, "no_input", None, None, None)
             continue
-        hit = _cached_wording(_wording_key(row))
+        hit = _cached_wording(_wording_key(row, versions[i]))
         if hit is not None:
             out[i] = hit
             continue
@@ -1767,6 +1808,7 @@ async def _replay(
                     budget=budget,
                     deadline=deadline,
                     generating=generating,
+                    prompt_version=versions[i],
                 ),
             )
             for i in pending
@@ -1775,8 +1817,8 @@ async def _replay(
             out[i] = wording
 
     return [
-        _replayed_message(row, wording)
-        for row, wording in zip(rows, out, strict=True)
+        _replayed_message(row, wording, version)
+        for row, wording, version in zip(rows, out, versions, strict=True)
         if wording is not None
     ]
 
@@ -2091,6 +2133,7 @@ def summary(
         relayed=segment("relayed"),
         no_sx=segment("no_sx"),
         removed=segment("removed"),
+        transfer=segment("transfer"),
         n_unsegmented=row.get("n_unsegmented") or 0,
     )
 
