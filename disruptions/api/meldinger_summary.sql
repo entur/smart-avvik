@@ -13,8 +13,8 @@
 --    makes the two readable together. A row with no `departure_time` cannot be placed on this axis
 --    and drops out of both, exactly as it does there.
 --
--- 2. A SAME-DAY WINDOW IS ALMOST ENTIRELY UNLABELLED. Verdicts arrive from the 04:00 UTC labelling
---    job the following night, so on this page's default view precision, recall and lead are computed
+-- 2. A SAME-DAY WINDOW IS ALMOST ENTIRELY UNLABELLED. Verdicts arrive from the 05:30 Oslo labelling
+--    job the following morning, so on this page's default view precision, recall and lead are computed
 --    over a small labelled subset while `n_pending` holds nearly everything. /historikk avoids this
 --    by defaulting to 14 days on `call_date`; this page cannot, so it reports the split instead of
 --    showing confident-looking rates over a handful of rows. `n_subjects` and `n_labelled` are here

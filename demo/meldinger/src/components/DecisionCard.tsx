@@ -24,7 +24,7 @@ import {
  *  Never falls through to a verdict-looking chip when `verdict` is null: an unresolved decision
  *  that renders like a resolved one is the single most misleading thing this page could do — and on
  *  this page nearly every card is unresolved, because the default window is today and the verdict
- *  arrives from the 04:00 UTC job the night after. */
+ *  arrives from the 05:30 Oslo job the morning after. */
 function VerdictBadge({ decision }: { decision: Decision }) {
   if (decision.verdict) {
     return (

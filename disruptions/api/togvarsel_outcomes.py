@@ -59,10 +59,11 @@ _PROVISIONAL_DUE: tuple[tuple[float, tuple[str, ...]], ...] = (
     (18.0 + 20 / 60, ("pm",)),
 )
 
-# The authoritative pass reads last_recorded, whose one daily rewrite landed at ~03:04 UTC when it
-# was measured (2026-09-01). 04:00 UTC is varsel-label-daily's own slot, chosen the same way: far
-# enough after the batch to be complete, early enough that a morning verdict is there by the time
-# anybody looks.
+# The authoritative pass reads last_recorded, whose one daily rewrite lands at ~05:03 Oslo: ~03:04 UTC
+# in summer (measured 2026-09-01), ~04:03 UTC in winter (2026-10-29). 04:00 UTC was chosen in summer,
+# far enough after the batch to be complete, early enough that a morning verdict is there by the time
+# anybody looks; in winter it falls just BEFORE the batch. varsel-label-daily moved to 05:30 Oslo on
+# 2026-10-29 for that reason (label_varsel_decisions.sql); this gate has not.
 _SETTLED_DUE_UTC_HOUR = 4
 
 # Matching label_varsel_decisions.sql: an outcome still inside this window is being retried, past it

@@ -922,7 +922,7 @@ def test_summary_refuses_the_outcome_filters_and_accepts_the_population_ones():
 
 
 def test_summary_reports_the_labelled_split_alongside_the_rates():
-    """R20, and it is not a diagnostic. Verdicts arrive from the 04:00 UTC job the following night,
+    """R20, and it is not a diagnostic. Verdicts arrive from the 05:30 Oslo job the following morning,
     so on this page's default view — today, all day — the rates are computed over a handful of rows
     while everything else is still `venter`. Without the denominator a reader takes a precision of
     1.00 over three decisions for a claim about the day."""

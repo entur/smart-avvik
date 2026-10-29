@@ -1,7 +1,13 @@
 -- Label Avviksvarsel's alert decisions with what actually happened to the train.
 --
--- Registered as the bq scheduled query "varsel-label-daily" (every day 04:00 UTC, between
--- "demo-recent-daily" at 03:30 and "demo-copy-daily" at 04:30). Reads the append-only decision log
+-- Registered as the bq scheduled query "varsel-label-daily", schedule "every 1 hours from 03:30 to
+-- 04:45": 03:30 and 04:30 UTC. That is 05:30 Oslo in both seasons, because a scheduled query's clock
+-- is UTC and ignores daylight saving while the batch it reads does not: last_recorded's one daily
+-- rewrite lands at ~05:03 Oslo, 03:04 UTC in summer (2026-09-01) and 04:03 UTC in winter
+-- (2026-10-29). The single 04:00 UTC slot this replaced ran before the rewrite all winter, so from
+-- 2026-10-25 every day was labelled a night late. Of the two runs, the off-season one is a re-run
+-- (summer) or reads the day before's batch (winter): harmless either way, ~$0.016 a day.
+-- Reads the append-only decision log
 -- disruptions/api/create_varsel_decisions.sql writes, joins each decision to the realized call, and
 -- appends a verdict row. Safe to re-run: rows already labelled are skipped (NOT EXISTS), so a
 -- missed night backfills itself on the next run.
@@ -464,7 +470,7 @@ labelled_removed AS (
       WHEN b.trainno IS NOT NULL THEN b.call_cancelled OR b.dep_delay_min >= 10
       -- The line ran and this number did not: the removal held. Decided only once the operating
       -- date is two days old, because absence is a verdict the NOT EXISTS guard then freezes, while
-      -- a train Vy put back can have its ET rows land after the 04:00 UTC run (0-37 VYG rail rows a
+      -- a train Vy put back can have its ET rows land after the morning's run (0-37 VYG rail rows a
       -- day did on 2026-09-19..22). The first night therefore leaves it NULL, deleted and retried;
       -- the second decides. A boarding call seen is evidence already, so that arm does not wait.
       WHEN lr.line IS NOT NULL AND tr.trainno IS NULL

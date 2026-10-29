@@ -900,8 +900,8 @@ def record(rows: list[dict], *, beat: Callable[[], None] | None = None) -> int:
 # window, and the check must cost jobs on the scale of the scheduled query it watches, not on the
 # scale of the 60 s tick that hosts it.
 _FRESHNESS_CHECK_INTERVAL_S = 6 * 3600
-# The labelling job runs daily at 04:00 UTC, so a healthy MAX(labelled_at) is under ~24 h old plus
-# jitter; 48 h means at least one whole run has failed to land.
+# The labelling job runs every morning (05:30 Oslo, label_varsel_decisions.sql), so a healthy
+# MAX(labelled_at) is under ~24 h old plus jitter; 48 h means at least one whole run has failed to land.
 _LABELLING_STALE_AFTER_H = 48.0
 # Bounded like _ENSURE_TIMEOUT_S and for the same reason: this query runs on the sole poller
 # thread, which must never inherit "wait forever" from a new call site.

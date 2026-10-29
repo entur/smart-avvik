@@ -720,8 +720,8 @@ class Segment(BaseModel):
 class Summary(WindowFields):
     """Alerting performance over the window — coverage first, then counts, then rates.
 
-    **Coverage is first here, and it is not a diagnostic.** Verdicts arrive from the 04:00 UTC
-    labelling job the following night, so on this page's default view — today, all day — nearly every
+    **Coverage is first here, and it is not a diagnostic.** Verdicts arrive from the 05:30 Oslo
+    labelling job the following morning, so on this page's default view — today, all day — nearly every
     subject is still ``venter`` and the rates below are computed over a handful of rows.
     /historikk avoids this by defaulting to 14 days on ``call_date``; this page cannot, because the
     question it answers is about a stretch of a specific day. ``n_subjects`` and ``n_labelled`` are
@@ -2075,7 +2075,7 @@ def summary(
 
     `n_subjects`, `n_labelled`, `n_unknown` and `n_pending` are part of the contract, not
     diagnostics. On this page they carry more weight than on /historikk: the default window is
-    today, verdicts arrive from the 04:00 UTC job the following night, so nearly everything is
+    today, verdicts arrive from the 05:30 Oslo job the following morning, so nearly everything is
     `venter` and a precision computed over a handful of rows is a different claim from one computed
     over almost all of them. A caller cannot tell which it has without them.
 
