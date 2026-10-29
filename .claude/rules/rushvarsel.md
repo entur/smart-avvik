@@ -297,11 +297,12 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     row for good.
   - **The fasit is two passes, because no single source serves both timeliness and the models'
     semantics.** `last_recorded` is a once-daily batch (measured 2026-09-01: every partition shares
-    one `last_modified_time` of ~03:04 UTC, and the current day's held 115 k rows against 1.81 M for
+    one `last_modified_time` of ~03:04 UTC — the batch runs at ~05:03 OSLO, so ~04:03 UTC in winter —
+    and the current day's held 115 k rows against 1.81 M for
     the previous full day), so it cannot answer for the morning rush at 09:20 — and `01_calls.sql`
     codifies that by stopping at `CURRENT_DATE() - 1`. So: a **provisional** pass at 09:20 and 18:20
     Oslo from `rail_calls_today` + `rail_calls_planned_today` (3.4 MB, tables the poller already
-    builds), and an **authoritative** pass after 04:00 UTC from `last_recorded` (32.5 MB/day,
+    builds), and an **authoritative** pass after 05:30 Oslo, once `last_recorded` has been rewritten that day, from `last_recorded` (32.5 MB/day,
     ~$0.0002) that settles the row. Both ride the poller's wall-clock tick beside
     `togvarsel.refresh()` rather than a transfer config — four configs each holding its own COPY of
     the SQL, on a fixed UTC time that slides an hour against Oslo twice a year, none of which could
@@ -324,18 +325,21 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     rewritten**, so a rule change leaves history graded on the old rule until
     `data/queries/togvarsel/regrade_outcomes.py` re-opens a range and re-settles it through the
     module's own path — run per environment, after the code carrying the rule is what you want.
-  - **The authoritative pass's latch is keyed on the UTC DATE, and mixing the two calendars once
-    cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for was measured at
-    a UTC hour (~03:04, 2026-09-01; it is really ~05:03 Oslo, so ~04:03 UTC and after this gate in
-    winter), while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
-    rush is an Oslo-clock thing. Held as a boolean inside the Oslo-day state those two shared one
-    dict, and the failure was not a near miss: at Oslo midnight — 22:00 UTC in CEST, 23:00 in CET —
-    the Oslo rollover cleared the flag while `hour >= 4` was trivially true, so the pass ran about
-    five hours **before** the batch it depends on, found nothing, and settled every day as
-    `unresolvable` — permanently, and with nothing logged as an error. Two calendars now live in two
-    variables: `_settled_last_utc` sits outside `_state`, which is also why it needs resetting in the
-    suite's own `_reset` (a leaked latch makes half the suite pass by accident). Both offsets are
-    pinned, because a fix that handled only the summer one would look right for half the year.
+  - **The authoritative pass must never read `last_recorded` before that day's rewrite, and twice a
+    clock alone failed to promise it.** First the gate was a UTC hour (04:00) with "has it run?" held
+    as a boolean in the Oslo-day state: at Oslo midnight — 22:00 UTC in CEST, 23:00 in CET — the Oslo
+    rollover cleared the flag while `hour >= 4` was trivially true, so the pass ran about five hours
+    **before** the batch, found nothing, and settled every day as `unresolvable`. A UTC-dated latch
+    fixed that, but the gate itself was wrong: the batch runs on Oslo time (~05:03), so from
+    2026-10-25 a 04:00 UTC read came first. That read is NOT empty — the table holds yesterday only
+    as far as the previous rewrite, the label reads the unrun rest as cancelled — so every scope of
+    2026-10-26..28 settled at `trouble10 = 1.0` in dev and prd, permanently, with no error. Since
+    2026-10-29 the gate is 05:30 Oslo (`_SETTLED_DUE_H`) with the latch `_settled_last` on the Oslo
+    date, **and** `_batch_landed_today` requires the table's `modified` time on that Oslo day (one
+    unbilled metadata read per tick until it runs). `_settled_last` sits outside `_state`, which is
+    why the suite's own `_reset` clears it (a leaked latch makes half the suite pass by accident).
+    Both offsets stay pinned, because a fix that handled only the summer one would look right for
+    half the year.
   - **The settled work set has two reaches, and the SELECT is chunked** (2026-09-02). Inside the
     10-day retry window, any issued day not fully settled; beyond it, out to `_BACKFILL_DAYS` (60),
     only issued days with NO outcome row at all — the pre-feature backlog each environment has

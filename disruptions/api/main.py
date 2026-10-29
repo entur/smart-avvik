@@ -3493,7 +3493,7 @@ def poll_for_changes(
             _beat()
             # The rush outcome resolves on the same wall-clock tick, and for the same reason: a
             # rush ends at its hour whether or not SX moved. Both of its passes are due-gated
-            # internally (provisional 09:20/18:20 Oslo, authoritative after 04:00 UTC), so this is
+            # internally (provisional 09:20/18:20 Oslo, authoritative after 05:30 Oslo), so this is
             # a cheap no-op on all but a few ticks a day. Isolated like the two above: a fasit
             # failure costs /rushhistorikk a day of verdicts, never the feed, the forecast or the
             # notifications.

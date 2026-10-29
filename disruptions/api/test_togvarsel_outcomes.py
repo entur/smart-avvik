@@ -39,7 +39,9 @@ class _FakeBQ:
     """Dispatches on SQL text. Records every MERGE's parameters, which is the only way a wrong
     write is visible — the module logs and swallows, so an unrecorded failure passes silently."""
 
-    def __init__(self, provisional=(), settled=(), work_set=(), fail_on=None, issued_today=True):
+    def __init__(self, provisional=(), settled=(), work_set=(), fail_on=None, issued_today=True,
+                 batch_at=datetime(2100, 1, 1, tzinfo=UTC)):
+        self.batch_at = batch_at  # last_recorded's modified time; the default is always fresh
         self.provisional = list(provisional)
         self.issued_today = issued_today  # the forecast-day probe's answer for `today'
         self.settled = list(settled)
@@ -78,6 +80,10 @@ class _FakeBQ:
             return _FakeJob(self.settled)
         raise AssertionError(f"unexpected query: {sql[:80]}")
 
+    def get_table(self, table, timeout=None):
+        assert table == togvarsel_outcomes._LAST_RECORDED, table
+        return type("_Table", (), {"modified": self.batch_at})()
+
     def merge_for(self, scope: str, kind: str) -> dict:
         rows = [m for m in self.merges if m["scope"] == scope and m["kind"] == kind]
         assert len(rows) == 1, f"expected one {kind} merge for {scope}, got {len(rows)}"
@@ -101,7 +107,7 @@ def _reset(fake) -> None:
     togvarsel_outcomes._table_ready = False
     # Module state outside `_state` has to be reset here too, or a leaked latch makes half the suite
     # pass by accident — the shape varsel's own `_reset_state` lesson warns about.
-    togvarsel_outcomes._settled_last_utc = None
+    togvarsel_outcomes._settled_last = None
 
 
 # ---- The level mapping: the bars, the boundaries, and the identity it rests on ----------------
@@ -184,20 +190,24 @@ def test_a_scope_already_checked_today_is_not_due_again():
     assert togvarsel_outcomes.provisional_due(18.5, {"am", "amrest", "pm"}) == ()
 
 
-def test_the_authoritative_pass_is_due_after_0400_utc():
-    """last_recorded's one daily rewrite landed at ~03:04 UTC when it was measured; 04:00 is
-    varsel-label-daily's own slot, chosen the same way."""
+def test_the_authoritative_pass_is_due_after_0530_oslo_in_both_seasons():
+    """last_recorded's one daily rewrite runs at ~05:03 OSLO: ~03:04 UTC in summer, ~04:03 UTC in
+    winter. 05:30 Oslo is after it in both; the 04:00 UTC gate this replaced fired at 05:00 Oslo in
+    winter, before the batch, and settled every winter day a day late."""
     due = togvarsel_outcomes.settled_due
-    assert due(datetime(2026, 8, 31, 3, 30, tzinfo=UTC), None) is False
-    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), None) is True
-    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), date(2026, 8, 31)) is False
-    # A run recorded YESTERDAY does not satisfy today.
-    assert due(datetime(2026, 8, 31, 4, 5, tzinfo=UTC), date(2026, 8, 30)) is True
+    for d in (date(2026, 8, 31), date(2026, 12, 1)):  # CEST, CET
+        assert due(datetime(d.year, d.month, d.day, 5, 25, tzinfo=_OSLO), None) is False, d
+        assert due(datetime(d.year, d.month, d.day, 5, 30, tzinfo=_OSLO), None) is True, d
+        assert due(datetime(d.year, d.month, d.day, 5, 35, tzinfo=_OSLO), d) is False, d
+        # A run recorded YESTERDAY does not satisfy today.
+        assert due(datetime(d.year, d.month, d.day, 5, 35, tzinfo=_OSLO), d - timedelta(days=1)) is True
+    # The winter case the UTC gate got wrong: 04:05 UTC is 05:05 Oslo, too early.
+    assert due(datetime(2026, 12, 1, 4, 5, tzinfo=UTC), None) is False
 
 
 def test_the_authoritative_pass_does_not_fire_at_oslo_midnight():
-    """The gate is a UTC hour and the latch must be keyed on the UTC date, or the pass runs five
-    hours BEFORE the batch it waits for.
+    """The gate's clock and the latch's calendar must be the same, or the pass runs hours BEFORE the
+    batch it waits for. Both are Oslo now; this pins the rollover that bit the UTC gate.
 
     Oslo midnight is 22:00 UTC of the previous UTC day in CEST (23:00 in CET). While the latch was
     a boolean inside the module's Oslo-day state, the Oslo rollover cleared it at exactly the moment
@@ -212,10 +222,9 @@ def test_the_authoritative_pass_does_not_fire_at_oslo_midnight():
         (datetime(2026, 9, 2, 0, 5, tzinfo=_OSLO), date(2026, 9, 1)),  # CEST: 22:05 UTC on the 1st
         (datetime(2026, 12, 2, 0, 5, tzinfo=_OSLO), date(2026, 12, 1)),  # CET: 23:05 UTC on the 1st
     ):
-        assert oslo_midnight.astimezone(UTC).hour >= togvarsel_outcomes._SETTLED_DUE_UTC_HOUR
         assert due(oslo_midnight, ran_on) is False, oslo_midnight
-        # ... and it does become due once the UTC day turns and 04:00 UTC passes.
-        assert due(oslo_midnight.astimezone(UTC).replace(hour=4) + timedelta(days=1), ran_on) is True
+        # ... and it does become due at 05:30 Oslo that same Oslo day.
+        assert due(oslo_midnight.replace(hour=5, minute=30), ran_on) is True, oslo_midnight
 
 
 # ---- The provisional pass --------------------------------------------------------------------
@@ -523,6 +532,27 @@ def test_the_range_select_is_bounded_by_the_work_sets_own_min_and_max():
     assert sent, "no settled SELECT ran"
     params = sent[0][1]
     assert params["from_date"] == monday and params["to_date"] == thursday
+
+
+def test_the_settled_pass_waits_for_todays_last_recorded_batch():
+    """A read before the day's rewrite settles a whole day wrongly, for good (2026-10-26..28: every
+    scope trouble10 = 1.0), so past the clock gate the pass still waits for the batch, reads
+    nothing while it waits, and runs on the first tick after it lands."""
+    tuesday = MONDAY + timedelta(days=1)
+    fake = _FakeBQ(settled=[_row(s, 0.1) for s in togvarsel_outcomes.SCOPES], work_set=[MONDAY],
+                   batch_at=datetime(2026, 8, 31, 5, 3, tzinfo=_OSLO))  # Monday's batch
+    _reset(fake)
+    togvarsel_outcomes.refresh(now=_oslo(5, 35, d=tuesday))
+    assert not [q for q in fake.queries if "last_recorded" in q or "togvarsel_issued" in q]
+    assert fake.merges == [] and togvarsel_outcomes._settled_last is None
+    # Monday's batch running late past midnight dates Tuesday but holds the same partial snapshot.
+    fake.batch_at = datetime(2026, 9, 1, 0, 10, tzinfo=_OSLO)
+    togvarsel_outcomes.refresh(now=_oslo(5, 36, d=tuesday))
+    assert fake.merges == [] and togvarsel_outcomes._settled_last is None
+    fake.batch_at = datetime(2026, 9, 1, 5, 40, tzinfo=_OSLO)  # Tuesday's, late
+    togvarsel_outcomes.refresh(now=_oslo(5, 41, d=tuesday))
+    assert len([m for m in fake.merges if m["kind"] == "settled"]) == len(togvarsel_outcomes.SCOPES)
+    assert togvarsel_outcomes._settled_last == tuesday
 
 
 def test_a_day_the_range_returned_nothing_for_at_all_is_left_for_the_retry_window():
