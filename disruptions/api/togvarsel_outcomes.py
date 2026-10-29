@@ -6,7 +6,7 @@ semantics:
 * **Provisional**, due 09:20 and 18:20 Oslo, from ``rail_calls_planned_today`` +
   ``rail_calls_today`` — tables the poller already builds. Four known skews against the label
   (see ``togvarsel_outcomes_provisional.sql``), so the value is marked and never enters a rate.
-* **Authoritative**, due after 04:00 UTC, from ``realtime_siri_et_last_recorded``, reproducing each
+* **Authoritative**, due after 05:30 Oslo, from ``realtime_siri_et_last_recorded``, reproducing each
   scope's own label expression. This is the value that agrees with the models, and it settles the
   row.
 
@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -59,12 +59,14 @@ _PROVISIONAL_DUE: tuple[tuple[float, tuple[str, ...]], ...] = (
     (18.0 + 20 / 60, ("pm",)),
 )
 
-# The authoritative pass reads last_recorded, whose one daily rewrite lands at ~05:03 Oslo: ~03:04 UTC
-# in summer (measured 2026-09-01), ~04:03 UTC in winter (2026-10-29). 04:00 UTC was chosen in summer,
-# far enough after the batch to be complete, early enough that a morning verdict is there by the time
-# anybody looks; in winter it falls just BEFORE the batch. varsel-label-daily moved to 05:30 Oslo on
-# 2026-10-29 for that reason (label_varsel_decisions.sql); this gate has not.
-_SETTLED_DUE_UTC_HOUR = 4
+# The authoritative pass reads last_recorded, whose one daily rewrite runs on OSLO time, ~05:03: ~03:04
+# UTC in summer (measured 2026-09-01), ~04:03 UTC in winter (2026-10-29). So the gate is an Oslo time,
+# 05:30 like varsel-label-daily's (label_varsel_decisions.sql): after the batch in both seasons, and
+# early enough that the verdict is there before the morning rush. It was 04:00 UTC until 2026-10-29,
+# which fell just before the batch all winter; _batch_landed_today says what that wrote, and why the
+# clock is not trusted alone.
+_SETTLED_DUE_H = 5.5
+_LAST_RECORDED = "ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded"
 
 # Matching label_varsel_decisions.sql: an outcome still inside this window is being retried, past it
 # the attempts have given up and /rushhistorikk reports `ukjent`.
@@ -194,12 +196,9 @@ _table_ready = False
 # discipline as togvarsel's _state, so no lock.
 _state: dict[str, Any] = {}
 
-# The authoritative pass's once-per-day latch, and it lives OUT HERE on purpose: `_state` is scoped
-# to the Oslo day (a rush is an Oslo-clock thing) while this gate is a UTC hour (the batch it waits
-# for rewrites at ~03:04 UTC). Held as a boolean inside `_state`, the two calendars shared one dict
-# and the Oslo rollover re-armed the UTC gate at 22:00/23:00 UTC — five hours before the batch. Two
-# calendars, two variables.
-_settled_last_utc: date | None = None
+# The authoritative pass's once-per-day latch: the OSLO date it last ran, the same calendar as its
+# gate (see settled_due).
+_settled_last: date | None = None
 
 
 def configure(*, bq_client: Any) -> None:
@@ -248,26 +247,29 @@ def provisional_due(now_h: float, done: set[str]) -> tuple[str, ...]:
     return tuple(due)
 
 
-def settled_due(now: datetime, last_run_utc: date | None) -> bool:
-    """Whether the authoritative pass is due: at or after 04:00 UTC on a UTC day it has not run.
+def settled_due(now: datetime, last_run: date | None) -> bool:
+    """Whether the authoritative pass is due: at or after 05:30 Oslo on an Oslo day it has not run.
 
-    KEYED ON THE UTC DATE, and that is the whole point. The gate is a UTC hour because the batch it
-    waits for is (last_recorded rewrites at ~03:04 UTC), but the module's other state is scoped to
-    the OSLO day because a rush is an Oslo-clock thing. Holding "has it run?" as a boolean inside
-    the Oslo-day state put those two calendars in one dict, and the result was not a near miss:
-    at Oslo midnight — 22:00 UTC in CEST — the Oslo rollover cleared the flag while
-    `hour >= 4` was trivially true, so the pass ran about five hours BEFORE the batch it depends on
-    landed, found nothing, and settled every day as `unresolvable` — permanently, and with no error
-    anywhere. The two calendars now live in two variables instead of one.
+    THE GATE'S CLOCK AND THE LATCH'S CALENDAR ARE THE SAME, and that is the whole point. The gate
+    was once a UTC hour (04:00) with "has it run?" held as a boolean in the Oslo-day state, and the
+    result was not a near miss: at Oslo midnight — 22:00 UTC in CEST — the Oslo rollover cleared
+    the flag while `hour >= 4` was trivially true, so the pass ran about five hours BEFORE the batch
+    it depends on landed, found nothing, and settled every day as `unresolvable` — permanently, and
+    with no error anywhere. The fix then was a UTC-dated latch beside the UTC gate. Since 2026-10-29
+    both are Oslo, because the batch itself runs on Oslo time and a UTC gate missed it all winter.
     """
-    now_utc = now.astimezone(UTC)
-    return now_utc.hour >= _SETTLED_DUE_UTC_HOUR and last_run_utc != now_utc.date()
+    now_oslo = now.astimezone(_OSLO)
+    now_h = now_oslo.hour + now_oslo.minute / 60
+    return now_h >= _SETTLED_DUE_H and last_run != now_oslo.date()
 
 
 def _blank_state(d: date) -> dict[str, Any]:
-    """The Oslo-day-scoped state. Note what is NOT here: the authoritative pass's last-run date,
-    which is UTC-scoped and must survive the Oslo rollover (see settled_due)."""
-    return {"date": d, "provisional_done": set(), "backoff": {}, "forecast_day": False}
+    """The Oslo-day-scoped state. Note what is NOT here: the authoritative pass's last-run date
+    (`_settled_last`, see settled_due)."""
+    return {
+        "date": d, "provisional_done": set(), "backoff": {}, "forecast_day": False,
+        "batch_wait_logged": False,
+    }
 
 
 # Has a forecast been issued for today? One tiny lookup, and the provisional pass's population test:
@@ -307,6 +309,23 @@ def _forecast_day(today: date, now: datetime, scopes: tuple[str, ...]) -> bool:
         extra={"fields": {"event": "togvarsel_outcomes_skip", "day": str(today), "scopes": list(scopes)}},
     )
     return False
+
+
+def _batch_landed_today(today: date) -> bool:
+    """Whether last_recorded's daily rewrite has run this Oslo morning. The settled pass must never
+    read before it, and the clock gate alone cannot promise that. "This morning" is after 04:00
+    Oslo, not merely today: a YESTERDAY's batch running late past midnight would date today while
+    holding the same partial snapshot.
+
+    A read before the rewrite is not an empty read the retry window absorbs: the table then holds
+    yesterday only as far as the PREVIOUS rewrite reached (~05:03 that morning), with the rest of
+    each journey still estimated, and the label reads that silent tail as cancelled. Every scope
+    came back resolved with trouble10 = 1.0 and settled for good — what the 04:00 UTC gate wrote for
+    2026-10-26..28 in dev and prd once winter time put it before the batch. One metadata read, which
+    BigQuery does not bill, made only once the clock gate is open and until the pass has run.
+    """
+    modified = _bq_client.get_table(_LAST_RECORDED, timeout=30).modified
+    return modified is not None and modified >= datetime.combine(today, time(4), tzinfo=_OSLO)
 
 
 def _retryable(key: str, now: datetime) -> bool:
@@ -589,7 +608,7 @@ def refresh(now: datetime | None = None) -> None:
         _state.update(_blank_state(today))
     now_h = now.hour + now.minute / 60 + now.second / 3600
 
-    global _settled_last_utc
+    global _settled_last
     due = provisional_due(now_h, _state["provisional_done"])
     # Keyed on the WINDOW, not on the pass. One "provisional" budget meant a morning outage that
     # burned the eight-failure give-up silently forfeited the afternoon check too, on a day when
@@ -614,10 +633,17 @@ def refresh(now: datetime | None = None) -> None:
             logger.exception("togvarsel_outcomes: provisional pass failed; retrying after backoff")
             _note_failure(due_key, now)
 
-    if settled_due(now, _settled_last_utc) and _retryable("settled", now):
+    if settled_due(now, _settled_last) and _retryable("settled", now):
         try:
-            _run_settled(_work_set(today), now)
-            _settled_last_utc = now.astimezone(UTC).date()
+            if _batch_landed_today(today):
+                _run_settled(_work_set(today), now)
+                _settled_last = today
+            elif not _state["batch_wait_logged"]:
+                _state["batch_wait_logged"] = True
+                logger.info(
+                    "togvarsel_outcomes: last_recorded not rewritten yet today; settled pass waits",
+                    extra={"fields": {"event": "togvarsel_outcomes_wait", "day": str(today)}},
+                )
             _state["backoff"].pop("settled", None)
         except Exception:
             logger.exception("togvarsel_outcomes: settled pass failed; retrying after backoff")
