@@ -213,7 +213,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     otherwise. The view holds the grouping shared by the nightly job and the API, so the two cannot
     drift apart.
   - Outcomes come from `data/queries/label_varsel_decisions.sql` (scheduled query
-    `varsel-label-daily`, 04:00 UTC, ~$0.015/run measured (2.30 GB, 2026-09-23); **registered in both dev and prd** —
+    `varsel-label-daily`, 05:30 Oslo all year (03:30 + 04:30 UTC since 2026-10-29: the ET batch it
+    reads rewrites at ~05:03 Oslo, which in winter is after 04:00 UTC), ~$0.015/run measured
+    (2.30 GB, 2026-09-23); **registered in both dev and prd** —
     register it per environment with the `bq mk --transfer_config` recipe in
     `label_varsel_decisions.sh`, which needs `--service_account_name` or it blocks on an
     interactive OAuth prompt. Each config holds a **copy** of the SQL, so a schema change is one
@@ -249,7 +251,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     run (830 FALSE, 68 cancelled, 41 late, 6 NULL with no recorded departure). **One asymmetry the
     rule creates, and the guard that closes it:** an unmatched row in the old branch stays NULL and
     is retried for ten nights, but an "absent" TRUE is resolved and so frozen by the NOT EXISTS
-    guard, which would make a re-added train whose ET rows land after the 04:00 UTC run a permanent
+    guard, which would make a re-added train whose ET rows land after the morning's run a permanent
     hit (0-37 VYG rail rows a day arrived after that hour on 19-22 Sept, apparently tail calls of
     trains already present), so the absent arm decides only once the operating date is two days
     old: the first night leaves it NULL and retries it, the second decides. The

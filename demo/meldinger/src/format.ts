@@ -137,7 +137,7 @@ export const OUTCOME_STATE_LABEL: Record<OutcomeState, string> = {
 export const OUTCOME_STATE_HELP: Record<OutcomeState, string> = {
   avklart: 'Utfallet er hentet fra sanntidsdata.',
   venter:
-    'Fasit er ikke på plass ennå. Nattjobben kjører kl. 04:00 UTC og forsøker på nytt i ti dager, ' +
+    'Fasit er ikke på plass ennå. Nattjobben kjører kl. 05.30 og forsøker på nytt i ti dager, ' +
     'så nesten alt i et vindu fra i dag står her.',
   ukjent:
     'Vi fant ingen registrert avgang for dette toget, og forsøkene har gitt seg. Det telles ikke ' +

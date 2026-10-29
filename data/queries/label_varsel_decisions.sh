@@ -3,9 +3,9 @@
 # Label Avviksvarsel's alert decisions with realized outcomes, by hand.
 #
 # Normally unattended: the same SQL runs as the "varsel-label-daily" BigQuery scheduled query at
-# 04:00 UTC. Run this to backfill after the schedule has been down, to label a fresh environment
-# for the first time, or to see the verdicts immediately after a day of testing rather than
-# waiting for the night.
+# 05:30 Oslo (03:30 and 04:30 UTC; the .sql header says why). Run this to backfill after the
+# schedule has been down, to label a fresh environment for the first time, or to see the verdicts
+# immediately after a day of testing rather than waiting for the morning.
 #
 # Safe to re-run and safe to run twice in a row: the INSERT skips decision subjects that already
 # have a row, so nothing is duplicated. Idempotence is the reason the window is 10 days rather
@@ -42,11 +42,13 @@
 #     --location=EU \
 #     --data_source=scheduled_query \
 #     --display_name="varsel-label-daily" \
-#     --schedule="every day 04:00" \
+#     --schedule="every 1 hours from 03:30 to 04:45" \
 #     --service_account_name="application@ent-kixavvik-dev.iam.gserviceaccount.com" \
 #     --params="$(python3 -c 'import json;print(json.dumps({"query":open("data/queries/label_varsel_decisions.sql").read()}))')"
 #
-# Creating the config fires one run immediately, so a mistake surfaces at once rather than at 04:00.
+# Creating the config fires one run immediately, so a mistake surfaces at once rather than the next morning.
+# An existing config takes the same schedule with
+#   bq update --transfer_config --schedule="every 1 hours from 03:30 to 04:45" <config resource name>
 #
 # The config embeds a COPY of the SQL text, so editing the .sql in git changes nothing until the
 # config is updated. That is the trap worth knowing about: the file here and the job actually
@@ -71,7 +73,7 @@
 # And one clock. The window is 10 days, so a decision not labelled within 10 days of its operating
 # day is unknown forever. Registering late costs exactly the decisions that aged out meanwhile.
 #
-# Force a run without waiting for 04:00, and check it:
+# Force a run without waiting for the morning, and check it:
 #   bq mk --transfer_run --run_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" <config resource name>
 #   bq ls --transfer_run <config resource name>
 # ---------------------------------------------------------------------------------------------

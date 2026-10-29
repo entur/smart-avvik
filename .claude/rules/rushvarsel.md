@@ -325,8 +325,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `data/queries/togvarsel/regrade_outcomes.py` re-opens a range and re-settles it through the
     module's own path — run per environment, after the code carrying the rule is what you want.
   - **The authoritative pass's latch is keyed on the UTC DATE, and mixing the two calendars once
-    cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for rewrites at
-    a UTC hour, while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
+    cost the whole page.** Its gate is a UTC hour (04:00) because the batch it waits for was measured at
+    a UTC hour (~03:04, 2026-09-01; it is really ~05:03 Oslo, so ~04:03 UTC and after this gate in
+    winter), while everything else in `togvarsel_outcomes` is scoped to the **Oslo** day because a
     rush is an Oslo-clock thing. Held as a boolean inside the Oslo-day state those two shared one
     dict, and the failure was not a near miss: at Oslo midnight — 22:00 UTC in CEST, 23:00 in CET —
     the Oslo rollover cleared the flag while `hour >= 4` was trivially true, so the pass ran about

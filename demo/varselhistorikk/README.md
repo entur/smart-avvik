@@ -28,7 +28,7 @@ gikk glipp av.
 |---|---|
 | `disruptions.varsel_decisions` | Append-only. Skrives av poller-syklusen (`disruptions/api/decisions.py`). |
 | `disruptions.varsel_decision_groups` | View: én rad per avgjørelse, delt med nattjobben. |
-| `disruptions.varsel_decision_outcomes` | Fasit, satt av `data/queries/label_varsel_decisions.sql` kl. 04:00 UTC. |
+| `disruptions.varsel_decision_outcomes` | Fasit, satt av `data/queries/label_varsel_decisions.sql` hver morgen kl. 05.30 norsk tid. |
 
 Personvern: radene er nøklet på reise*definisjonen* (en digest) pluss et enhetsantall — ingen
 `device_id`, ingen `journey_id`, og verken tidsvindu eller ukedagsmønster lagres. Loggen er en

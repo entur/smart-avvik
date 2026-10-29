@@ -364,7 +364,7 @@ SELECT
   -- counting an unmatched join as "nothing went wrong" manufactures precision out of missing data.
   --
   -- A same-day window -- this page's default -- is almost entirely 'venter', because verdicts arrive
-  -- from the 04:00 UTC job the following night. /summary reports the split beside the rates for
+  -- from the 05:30 Oslo job the following morning. /summary reports the split beside the rates for
   -- exactly that reason.
   CASE
     WHEN o.actual_trouble IS NOT NULL THEN 'avklart'

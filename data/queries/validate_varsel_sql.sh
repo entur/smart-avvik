@@ -5,7 +5,8 @@
 #
 # No SQL in this repo is executed by any test: the suites are hermetic (the BigQuery client is
 # stubbed, CI has no GCP credentials), so a syntax or type error in a .sql file ships green and
-# only surfaces when the query first runs for real -- at 04:00 UTC, or on a user's page load.
+# only surfaces when the query first runs for real -- at the morning's labelling run, or on a
+# user's page load.
 # That is not hypothetical: review of this feature found `APPROX_QUANTILES(expr IGNORE NULLS, n)`
 # with the clause order reversed, which is a hard syntax error and would have made
 # /historikk-api/summary a permanent 503. A dry run catches that in a second.

@@ -306,8 +306,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `IFNULL(ARRAY_LENGTH(@refs), 0) = 0` rule dry-runs identically either way, and **both** date
     bounds above fail silently and *cheaply* — the derived `DATE(decided_at)` cover as well as the
     `call_date` one.
-  - **A same-day window is almost entirely `venter`**, because verdicts arrive from the 04:00 UTC
-    labelling job the following night and /historikk avoids this by defaulting to 14 days on
+  - **A same-day window is almost entirely `venter`**, because verdicts arrive from the 05:30 Oslo
+    labelling job the following morning and /historikk avoids this by defaulting to 14 days on
     `call_date` — which this page cannot do, since its question is about a stretch of a specific day.
     So precision, recall and lead on the default view describe a handful of rows, and `/summary`
     states that as counts (`n_subjects`, `n_labelled`, `n_pending`, `n_unknown`) *before* the rates
