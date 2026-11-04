@@ -34,7 +34,7 @@
     "@firebase/rules-unit-testing": "^6.0.0",
     "@types/express": "^5.0.6",
     "@types/node": "^24.10.1",
-    "firebase": "^13.0.0",
+    "firebase": "^13.1.0",
     "typescript": "^7.0.2"
   },
   "//": "overrides.@firebase/app: firebase 13.0.0 pins @firebase/app 0.16.3 while the other @firebase packages (0.x peer) dedupe to the 0.16.2 that firebase-admin pulls in through @firebase/database-compat, so the client SDK got two app registries and the emulator suite failed with 'Service firestore is not available'. Remove the override once `npm ls @firebase/app` shows a single version without it.",
