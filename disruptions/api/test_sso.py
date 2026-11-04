@@ -349,6 +349,10 @@ def test_callback_happy_path_sets_a_working_session():
         assert response.headers["location"] == "/historikk"
         cookie = response.cookies[sso._COOKIE_NAME]
         assert sso.session_email(cookie) == "somebody@entur.org"
+        # EAT ADR 2026-09-10 (tokens must not be accessible to JavaScript): the session cookie must
+        # be HttpOnly and Secure. "testserver" is not local, so Secure must be on.
+        attrs = {a.strip().lower() for a in response.headers["set-cookie"].split(";")}
+        assert {"httponly", "secure", "samesite=lax"} <= attrs, attrs
         # And the minted session actually opens the gate.
         follow = client.get("/historikk-api/summary", cookies={sso._COOKIE_NAME: cookie})
         assert follow.status_code == 200
