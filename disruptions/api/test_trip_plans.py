@@ -1111,24 +1111,41 @@ def test_the_write_hands_the_store_one_pure_merge_and_never_replaces_what_it_can
         raise AssertionError("an unreadable stored plan must fail the write, never be replaced")
 
 
+@contextmanager
+def _clock_at(at: datetime):
+    """trip_plans' wall clock pinned to `at`. `follow()` prunes on `datetime.now`, so a test on the
+    fixed DAY broke for good two days after DAY (2026-10-30) unless the clock is held there."""
+    class _Pinned(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return at.astimezone(tz)
+
+    trip_plans.datetime = _Pinned
+    try:
+        yield
+    finally:
+        trip_plans.datetime = datetime
+
+
 def test_a_follower_seeds_then_syncs_the_leaders_plans():
     store = _PlanStore()
     with _plans(store, _fetcher(_complete(_trip("07:17")))):
         _refresh({(LIER, OSLO_S): [_span("07:00", "08:00")]}, T0)
         leader = trip_plans.day_plan(LIER, OSLO_S, DAY)
-        # A follower: its own memory, the same store.
-        trip_plans._plans.clear()
-        trip_plans.configure(store=store)
-        trip_plans.follow()
-        assert store.reads == [None], "the first follow is a seed"
-        assert trip_plans.day_plan(LIER, OSLO_S, DAY) == leader
-        # The leader writes another pair; the follower's next tick syncs past its watermark.
-        store.merge_trip_plan(DRAMMEN, OSLO_S, DAY, lambda _stored: trips.DayPlan(
-            trips=(_trip("08:17"),)).model_dump_json())
-        trip_plans.follow()
-        assert store.reads == [None, 1]
-        assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY).trips == (_trip("08:17"),)
-        assert trip_plans.day_plan(LIER, OSLO_S, DAY) == leader
+        # A follower: its own memory, the same store, on the leader's evening.
+        with _clock_at(T0):
+            trip_plans._plans.clear()
+            trip_plans.configure(store=store)
+            trip_plans.follow()
+            assert store.reads == [None], "the first follow is a seed"
+            assert trip_plans.day_plan(LIER, OSLO_S, DAY) == leader
+            # The leader writes another pair; the follower's next tick syncs past its watermark.
+            store.merge_trip_plan(DRAMMEN, OSLO_S, DAY, lambda _stored: trips.DayPlan(
+                trips=(_trip("08:17"),)).model_dump_json())
+            trip_plans.follow()
+            assert store.reads == [None, 1]
+            assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY).trips == (_trip("08:17"),)
+            assert trip_plans.day_plan(LIER, OSLO_S, DAY) == leader
 
 
 def test_a_follower_forgets_plans_for_dates_before_yesterday():
@@ -1151,7 +1168,7 @@ def test_a_store_failure_on_follow_keeps_memory_and_never_raises():
     store.docs[(DRAMMEN, OSLO_S, DAY)] = ("not a plan", 2)
     handler = _capture_logs()
     try:
-        with _plans(store):
+        with _plans(store), _clock_at(T0):
             trip_plans.follow()
             assert trip_plans.day_plan(LIER, OSLO_S, DAY).trips == (_trip("07:17"),)
             assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY) is None, "an unreadable one is skipped"
@@ -1345,14 +1362,16 @@ def test_a_merged_read_is_built_once_while_both_plans_are_held_and_a_follow_keep
         assert again is not first and again == first, "a replaced plan is merged anew"
 
         store.docs[(DRAMMEN, OSLO_S, DAY)] = (stored.model_dump_json(), 1)
-        trip_plans.follow()
-        held = trip_plans.day_plan(DRAMMEN, OSLO_S, DAY)
-        trip_plans.configure(store=store)  # a seed again: the same document re-read
-        trip_plans.follow()
-        assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY) is held, "an unchanged document keeps it"
-        store.docs[(DRAMMEN, OSLO_S, DAY)] = (trips.DayPlan(trips=(_trip("08:17"),)).model_dump_json(), 2)
-        trip_plans.follow()
-        assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY).trips == (_trip("08:17"),)
+        with _clock_at(T0):
+            trip_plans.follow()
+            held = trip_plans.day_plan(DRAMMEN, OSLO_S, DAY)
+            trip_plans.configure(store=store)  # a seed again: the same document re-read
+            trip_plans.follow()
+            assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY) is held, "an unchanged document keeps it"
+            store.docs[(DRAMMEN, OSLO_S, DAY)] = (
+                trips.DayPlan(trips=(_trip("08:17"),)).model_dump_json(), 2)
+            trip_plans.follow()
+            assert trip_plans.day_plan(DRAMMEN, OSLO_S, DAY).trips == (_trip("08:17"),)
 
 
 def test_a_flight_that_raises_is_logged_by_class_and_frees_its_key():
