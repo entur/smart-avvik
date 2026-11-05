@@ -332,7 +332,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   re-seeds instead of syncing. The bound is measured from the last seed or COMPLETE sync, never from
   the watermark: the watermark is the newest document's stamp, so on a quiet collection it aged past
   6 h while every sync succeeded and the mirror re-seeded every cycle (dev, 2026-09-15; fixed
-  2026-10-13). `kix_mirror_last_sync_timestamp_seconds` is the series rule 2a selects on.
+  2026-10-13). `smart_avvik_mirror_last_sync_timestamp_seconds` is the series rule 2a selects on.
   Two Firestore traps recorded here because both are silent: an `order_by` **excludes documents that
   lack the field** exactly as an equality does, so the seed orders by `created_at` and never by the
   watermark — ordering by it would skip every document written before it existed, which on the deploy
@@ -802,16 +802,16 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   the drain formula's `× replicas` says. Like every module budget here it joins the suite's reset
   (`webhook_delivery.reset_destination_window`), or a leaked tally reads exactly like a real
   refusal.
-  Two new series: `kix_worker_last_tick_timestamp_seconds` (liveness, set on every round including
+  Two new series: `smart_avvik_worker_last_tick_timestamp_seconds` (liveness, set on every round including
   the empty ones, **absent from the API pods** — so an alert on it must count no data as firing, or
-  a worker scaled to zero reads as healthy) and `kix_delivery_backlog_age_seconds` (how long ago the
+  a worker scaled to zero reads as healthy) and `smart_avvik_delivery_backlog_age_seconds` (how long ago the
   oldest **deliverable** pending delivery was minted; a leased row, a backed-off row and a row past
   a destination's ceiling are all absent from it, so one unwell receiver cannot drive it). The age
   comes off `created_at`, which `_mint` already wrote and nothing read back; a delivery minted
   before U11 carries none and contributes nothing, so the gauge climbs from zero rather than
   reporting the whole backlog as infinitely old on the deploy that introduces it. The drain formula,
   the rollback and how to scale replicas are in the operations document's "The delivery worker"
-  section; scaling is `deployment.forceReplicas` **by hand**, because the `kix_*` series are in
+  section; scaling is `deployment.forceReplicas` **by hand**, because the `smart_avvik_*` series are in
   Thanos rather than in Google Managed Prometheus and common's HPA on custom metrics cannot see
   them.
   **Six never-queried fields are exempt from Firestore's automatic single-field indexes** — `payload`

@@ -152,7 +152,7 @@ def test_an_unconfigured_deployment_is_not_a_bad_credential():
         assert notification_auth.available() is False
         raised = False
         try:
-            notification_auth.authenticate("Bearer kixn_00000000000000000000.x")
+            notification_auth.authenticate("Bearer sman_00000000000000000000.x")
         except notification_auth.NotConfigured:
             raised = True
         assert raised, "an unusable pepper must raise NotConfigured, not AuthFailed"
@@ -184,14 +184,14 @@ def test_a_pepper_written_with_echo_is_stripped_and_reported_once():
         notification_auth.logger.addHandler(handler)
         try:
             assert notification_auth.pepper_ready() is True
-            first = notification_auth.secret_hash("kixn_0", "s")
-            second = notification_auth.secret_hash("kixn_0", "s")
+            first = notification_auth.secret_hash("sman_0", "s")
+            second = notification_auth.secret_hash("sman_0", "s")
         finally:
             notification_auth.logger.removeHandler(handler)
         assert first == second
         # The stripped value is what hashes, so the newline cannot change a single hash.
         os.environ[notification_auth.PEPPER_ENV] = PEPPER
-        assert notification_auth.secret_hash("kixn_0", "s") == first
+        assert notification_auth.secret_hash("sman_0", "s") == first
         warnings = [r for r in records if r.levelno >= logging.WARNING]
         assert len(warnings) == 1, "warned once per process, not per read"
     finally:
@@ -210,8 +210,8 @@ def test_the_hash_is_bound_to_its_key_id():
     _install()
     try:
         secret = "the-same-secret"
-        assert notification_auth.secret_hash("kixn_aaaaaaaaaaaaaaaaaaaa", secret) != (
-            notification_auth.secret_hash("kixn_bbbbbbbbbbbbbbbbbbbb", secret)
+        assert notification_auth.secret_hash("sman_aaaaaaaaaaaaaaaaaaaa", secret) != (
+            notification_auth.secret_hash("sman_bbbbbbbbbbbbbbbbbbbb", secret)
         )
     finally:
         _uninstall()
@@ -280,7 +280,7 @@ def test_a_repeated_unknown_key_id_costs_one_store_read():
     """
     store = _install()
     try:
-        header = "Bearer kixn_0123456789abcdef0123.whatever"
+        header = "Bearer sman_0123456789abcdef0123.whatever"
         for _ in range(20):
             try:
                 notification_auth.authenticate(header)
@@ -326,7 +326,7 @@ def test_an_anonymous_flood_cannot_spend_a_clients_own_budget():
     try:
         seen_rate_limit = False
         for n in range(notification_auth.GLOBAL_PRELOOKUP_PER_MIN + 5):
-            header = f"Bearer kixn_{n:020x}.nope"
+            header = f"Bearer sman_{n:020x}.nope"
             try:
                 notification_auth.authenticate(header)
             except notification_auth.RateLimited as exc:
@@ -758,7 +758,7 @@ def _run(args: list[str], *, authorizer, store: _MemoryDocs) -> tuple[int, str]:
     # project that is not `--environment`'s own (exit 2), and a developer reproducing prd behaviour
     # locally has `GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev` exported -- which would fail every
     # `--environment prd` case here for a reason about their shell. `test_varsel_api` pins
-    # `KIX_ENVIRONMENT` at import for the same class of leak.
+    # `SMART_AVVIK_ENVIRONMENT` at import for the same class of leak.
     saved = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
     try:
         code = tool.main(args, authorizer=authorizer, store=store, out=out)

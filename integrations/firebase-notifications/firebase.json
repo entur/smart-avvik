@@ -27,7 +27,7 @@
     "    port at start-up -- a race two simultaneous starts both win. Pinning it makes the separation",
     "    deterministic instead of probabilistic.",
     "",
-    "And the emulator runs under its OWN demo project id (`demo-kixclient`, in package.json's",
+    "And the emulator runs under its OWN demo project id (`demo-smartavvikclient`, in package.json's",
     "test:emulator script). The CLI keys its hub locator file on the project id and warns that two",
     "instances of one project `may result in unexpected behavior`; a distinct id answers that warning",
     "rather than tolerating it. The suites read the id from GCLOUD_PROJECT, which `emulators:exec",

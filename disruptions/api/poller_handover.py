@@ -33,7 +33,7 @@ def holder_id() -> str:
 def on_lease_lost() -> None:
     """`on_lose` (KTD14), on the poller thread at the tick after the loss.
 
-    Gauge first, so `sum(kix_poller_leader)` stops counting this pod at once. Then wait for the
+    Gauge first, so `sum(smart_avvik_poller_leader)` stops counting this pod at once. Then wait for the
     emit pass to drain -- its abandoned commits still apply to the subject mirror, which learns only
     from this process's own commits -- and only then reset both mirrors, so no straggler lands in a
     mirror this pod no longer owns. Bounded like the shutdown: past it the reset goes ahead, and the

@@ -63,10 +63,10 @@ def targets(expr, nodata):
     selector — the failure this dashboard is meant to surface.
 
     1. A labelled counter child does not exist until its first increment, so
-       `rate(kix_http_requests_total{status="5xx"}[5m])` is ABSENT rather than 0
+       `rate(smart_avvik_http_requests_total{status="5xx"}[5m])` is ABSENT rather than 0
        in an environment that has served no 5xx, and the ratio built on it is
        empty. Same for rule 6's ERROR level. The runbook records this as rule 6's
-       known gap; it applies to every `kix_*` counter.
+       known gap; it applies to every `smart_avvik_*` counter.
     2. Rules 7-9 carry a volume guard (`and on() ... > N`) that empties the whole
        expression whenever the guard is unsatisfied — dev's push volume makes
        that the normal state.
@@ -85,7 +85,7 @@ def targets(expr, nodata):
     # Rules 1a/1b: the gauge is exported by every pod (followers and the worker at 0), so the sum
     # is how many lead and the count how many export it. Drawn side by side, a sum of 0 beside a
     # count of 0 is "no pods", beside a count of 3 it is "pods, but nobody leads".
-    if expr.startswith("sum(kix_poller_leader"):
+    if expr.startswith("sum(smart_avvik_poller_leader"):
         out[0]["legendFormat"] = "leaders (sum)"
         out.append({"expr": "count" + expr[3:], "legendFormat": "pods exporting (count)", "refId": "B"})
     return out

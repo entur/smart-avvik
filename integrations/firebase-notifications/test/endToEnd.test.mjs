@@ -21,7 +21,7 @@
 //     vendored package exists to remove.
 //   * The "declared client runtime" half (KTD11: compiled CommonJS, `.d.ts`, Node >= 24) is already
 //     half-covered right here and fully covered next door. `test/helpers/adapters.mjs` imports
-//     `@entur/kix-notifications-client` through the npm `file:` link, whose `main` is
+//     `@entur/smart-avvik-notifications-client` through the npm `file:` link, whose `main` is
 //     `./dist/index.js` and which `pretest` builds -- so every client-side symbol this file touches
 //     (`signatureHeader`, `createMemoryStores`, `receive`, `process`) runs here as COMPILED
 //     CommonJS on Node 24, not as a `.ts` source. This package's own modules load as `.ts`; their
@@ -33,7 +33,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
 
-import { signatureHeader } from "@entur/kix-notifications-client";
+import { signatureHeader } from "@entur/smart-avvik-notifications-client";
 
 import { createInboxWorker, createNotificationReceiver } from "../src/receiver.ts";
 import { NOW, TEST_SECRET, encode, fakeResponse, memoryAdapters } from "./helpers/adapters.mjs";
@@ -54,14 +54,14 @@ import { NOW, TEST_SECRET, encode, fakeResponse, memoryAdapters } from "./helper
  * schema-VALID -- which makes this file, read by a client as the worked example of a real payload,
  * the last place a transcription belongs.
  *
- * Resolved through `@entur/kix-notifications-client` rather than through the repository, because
+ * Resolved through `@entur/smart-avvik-notifications-client` rather than through the repository, because
  * that dependency is present in a vendored copy of this package and the repository is not.
  */
 const SAMPLE = JSON.parse(
   fs.readFileSync(
     path.join(
       path.dirname(
-        createRequire(import.meta.url).resolve("@entur/kix-notifications-client/package.json"),
+        createRequire(import.meta.url).resolve("@entur/smart-avvik-notifications-client/package.json"),
       ),
       "contracts",
       "test-event-sample.json",

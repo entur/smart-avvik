@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 # Rushvarsel's master gate, pinned ON before togvarsel is imported: every /rushvarsel-api route
 # carries a router-level dependency on it and 404s while it is off (which is the default, and the
 # posture every deployment is in today). Set at import, the way test_varsel_api pins
-# KIX_ENVIRONMENT — each suite is its own process, deliberately (see the CI note), so this cannot
+# SMART_AVVIK_ENVIRONMENT — each suite is its own process, deliberately (see the CI note), so this cannot
 # leak into another. The 404 itself is checked by
 # test_the_whole_api_404s_while_the_master_gate_is_off below, which turns it back off.
 os.environ["SHOW_RUSHVARSEL"] = "true"

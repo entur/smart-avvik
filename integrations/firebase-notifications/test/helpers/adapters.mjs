@@ -7,7 +7,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createMemoryStores, receive, signatureHeader } from "@entur/kix-notifications-client";
+import { createMemoryStores, receive, signatureHeader } from "@entur/smart-avvik-notifications-client";
 
 export const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 export const REPO_ROOT = path.resolve(PACKAGE_ROOT, "..", "..");

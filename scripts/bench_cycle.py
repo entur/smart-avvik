@@ -20,9 +20,9 @@ field is ``jsonPayload.event``, not ``jsonPayload.fields.event``: the logging se
 ``fields`` dict to the top of the payload, and the nested form matches nothing while looking
 perfectly plausible.
 
-The same three figures are also Prometheus series — ``kix_poller_phase_duration_seconds``,
-``kix_poller_phase_cpu_seconds``, ``kix_poller_cycle_duration_seconds`` — and **this script cannot
-read them**. The ``kix_*`` series live in Thanos behind Grafana and are not in Google Managed
+The same three figures are also Prometheus series — ``smart_avvik_poller_phase_duration_seconds``,
+``smart_avvik_poller_phase_cpu_seconds``, ``smart_avvik_poller_cycle_duration_seconds`` — and **this script cannot
+read them**. The ``smart_avvik_*`` series live in Thanos behind Grafana and are not in Google Managed
 Prometheus (checked 2026-09-11), so there is no API to scrape them from here. Use them in Grafana
 for rates and alerts; use this script for a run's numbers. That is not a redundancy to remove: the
 histogram is what an alert rule can select on, the log record is what a benchmark row can quote.
@@ -273,7 +273,7 @@ def render(summary: dict, *, tags: dict[str, str], receiver: dict | None = None)
             lines.append(f"  {name:<24}records={step['records']}  {fields}")
     lines.append("")
     lines.append(
-        "kix_poller_phase_cpu_seconds and its duration twin are in THANOS behind Grafana, not in "
+        "smart_avvik_poller_phase_cpu_seconds and its duration twin are in THANOS behind Grafana, not in "
         "Google Managed Prometheus -- no script can scrape them. The sub-pass and Firestore spans "
         "(firestore_transaction.cpu_ms is KTD2's number) are in Cloud Trace, not in any log line."
     )
@@ -349,8 +349,8 @@ def run_profile(definitions: int, *, top: int = 5) -> dict:
     # before the fences went in, four TLS handshakes and 1 616 socket reads inside a run that is
     # supposed to be measuring the interpreter. It made the report wrong (most of the self time was
     # in `_ssl` and `BufferedReader`) and it sent a laptop's traffic to a live upstream.
-    os.environ.setdefault("KIX_ALLOW_JP_NETWORK", "0")
-    os.environ.setdefault("KIX_ALLOW_WEBHOOK_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_JP_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_WEBHOOK_NETWORK", "0")
     # Not a fence but the same intent: `off` is the kill switch, so no backend is even asked.
     os.environ["VARSEL_LLM_PROVIDER"] = "off"
 
