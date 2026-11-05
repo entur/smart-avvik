@@ -1398,7 +1398,7 @@ def _api_values_files() -> list[Path]:
     return files
 
 
-@deploy_files.needs("helm/smart-avvik/env")
+@deploy_files.needs("helm/smart-avvik/env", "helm/smart-avvik/values.yaml")
 def test_every_helm_environment_and_the_base_pin_gemini():
     root = Path(__file__).parents[2] / "helm/smart-avvik"
     for path in [root / "values.yaml", *_api_values_files()]:

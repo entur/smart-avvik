@@ -28,11 +28,17 @@ Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **
 node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/rushvarsel` and
 `/rushhistorikk` front-ends (from `demo/reisedemo` + `demo/avviksvarsel` +
 `demo/varselhistorikk` + `demo/meldinger` + `demo/togmelding` + `demo/rushhistorikk`, which is
-why the context is the repo root, not `disruptions/api`), and its python stage assembles the API. CI builds and deploys it via `.github/workflows/{ci,cd}.yml`:
+why the context is the repo root, not `disruptions/api`), and its python stage assembles the API. This repository is public and only builds it:
+`.github/workflows/build.yml` runs `ci.yml` (lint, tests, image build, scan) and keeps the image
+as the run's `smart-avvik` artifact. The Helm chart, the environment values, Terraform and the
+deploy live in the private `entur/smart-avvik-deployment-config`, whose `cd.yml` pushes that
+artifact to the registry and deploys it:
 
 ```sh
-git push origin main                         # builds the image (ci.yml) and deploys to dev (cd.yml)
-gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispatch-only)
+# A push to main builds the image and dispatches deployment-config's cd.yml for dev.
+# tst and prd are dispatched by hand there, with the image dev runs:
+gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
+  -f environment=prd -f image=smart-avvik:main.<date>-SHA<commit>
 ```
 
 - **One writer per environment, elected by a lease** (2026-10-13): every API pod serves every route
