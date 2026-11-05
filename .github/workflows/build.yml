@@ -1,0 +1,63 @@
+# Build Workflow
+#
+# Runs ci.yml (lint, tests, image build, scan) on every pull request and on push to main. On main
+# it then asks smart-avvik-deployment-config to deploy this run's image to dev. That repository
+# checks that the run is a successful push build of main in entur/smart-avvik, pushes the image
+# artifact to Entur's registry and deploys it. tst and prd are deployed from there, by hand.
+#
+# The dispatch needs DEPLOYMENT_CONFIG_DISPATCH_TOKEN: a fine-grained PAT that reaches only
+# entur/smart-avvik-deployment-config, with `Actions: write` and nothing else. It stands in until
+# CLOUD-4471 gives a platform mechanism. Pull requests never see it: they get no dispatch job, and
+# pull requests from forks get no secrets at all.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    # The union of what ci.yml's jobs ask for: the test job writes checks, gha-docker's build asks
+    # for id-token (unused here, since nothing trusts this repository's tokens), and gha-security's
+    # scan comments on the pull request and uploads SARIF. Pull requests from forks get a read-only
+    # token whatever this says.
+    permissions:
+      contents: write
+      checks: write
+      id-token: write
+      issues: write
+      pull-requests: write
+      security-events: write
+      actions: read
+    secrets: inherit
+
+  deploy-dev:
+    needs: [ci]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Ask smart-avvik-deployment-config to deploy this build to dev
+        env:
+          GH_TOKEN: ${{ secrets.DEPLOYMENT_CONFIG_DISPATCH_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::DEPLOYMENT_CONFIG_DISPATCH_TOKEN is not set, so nothing was deployed"
+            exit 1
+          fi
+          gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
+            -f environment=dev -f run_id="$RUN_ID"
+          echo "Dispatched cd.yml in entur/smart-avvik-deployment-config for run $RUN_ID"
