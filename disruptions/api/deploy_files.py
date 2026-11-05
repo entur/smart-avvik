@@ -1,6 +1,7 @@
 """Deployment files that live in smart-avvik-deployment-config, not in this repository.
 
-Helm env values, Terraform, the deploy workflows and the orchestrator manifest are private. The
+The Helm chart and its env values, Terraform, the deploy workflows and the orchestrator manifest
+are private. The
 checks that hold the code and the deployment to each other still live beside the code. They run
 when that repository's files are copied over this checkout at the same paths, and skip otherwise,
 with a count printed at exit so a skip is never silent.
