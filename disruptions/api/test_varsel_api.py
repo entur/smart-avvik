@@ -33,7 +33,7 @@ os.environ.update(
     # non-prod, so a developer with GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev exported -- routine in this
     # repo -- would otherwise fail the title assertions below. The tests that DO exercise labelling
     # set it themselves via _deployed_as.
-    KIX_ENVIRONMENT="prd",
+    SMART_AVVIK_ENVIRONMENT="prd",
     # Pin the DELIVERY switch on, for the same class of reason (llm_message reads it at import).
     # Since 2026-08-07 it decides which of the two written wordings the push and the card carry, so
     # a developer with VARSEL_LLM_ENABLED=false exported -- prd's own setting, and exactly what
@@ -343,8 +343,8 @@ def test_config_reports_the_red_only_rule_from_its_flag():
 @contextmanager
 def _deployed_as(project: str | None, override: str | None = None):
     """Run the body as if the app were deployed in `project` (ambient env, if any, restored after)."""
-    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
-    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("KIX_ENVIRONMENT", override)):
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "SMART_AVVIK_ENVIRONMENT")}
+    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("SMART_AVVIK_ENVIRONMENT", override)):
         if value is None:
             os.environ.pop(key, None)
         else:
@@ -371,7 +371,7 @@ def test_config_names_the_non_prod_environment():
     with _deployed_as("ent-smartavvik-tst"):
         assert _environment() == "tst"
     with _deployed_as("ent-smartavvik-prd", override="local"):
-        assert _environment() == "local"  # KIX_ENVIRONMENT wins, for local runs
+        assert _environment() == "local"  # SMART_AVVIK_ENVIRONMENT wins, for local runs
 
 
 def test_config_leaves_production_unlabelled():

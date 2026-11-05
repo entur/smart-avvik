@@ -64,7 +64,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(kix_poller_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_poller_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -109,12 +109,12 @@
       },
       "targets": [
         {
-          "expr": "sum(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "leaders (sum)",
           "refId": "A"
         },
         {
-          "expr": "count(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "pods exporting (count)",
           "refId": "B"
         }
@@ -159,12 +159,12 @@
       },
       "targets": [
         {
-          "expr": "sum(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "leaders (sum)",
           "refId": "A"
         },
         {
-          "expr": "count(kix_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "pods exporting (count)",
           "refId": "B"
         }
@@ -209,7 +209,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(kix_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -254,7 +254,7 @@
       },
       "targets": [
         {
-          "expr": "(max(kix_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) - max(kix_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})) and on() (max(kix_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) > 0)",
+          "expr": "(max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) - max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})) and on() (max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) > 0)",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -299,7 +299,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(kix_worker_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_worker_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -344,7 +344,7 @@
       },
       "targets": [
         {
-          "expr": "max(kix_delivery_backlog_age_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "max(smart_avvik_delivery_backlog_age_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -529,12 +529,12 @@
       },
       "targets": [
         {
-          "expr": "increase(kix_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m])",
+          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m])",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "increase(kix_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m]) or vector(0)",
+          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m]) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -566,7 +566,7 @@
     {
       "type": "timeseries",
       "title": "7 — Push failures",
-      "description": "warning · fires above 0.2 for 10m\n\nMore than 20 % of push attempts failed over 30 minutes, across at least 5 attempts. gone is not an error — that is a device that unsubscribed. Check kix_push_total by result and the varsel push logs.",
+      "description": "warning · fires above 0.2 for 10m\n\nMore than 20 % of push attempts failed over 30 minutes, across at least 5 attempts. gone is not an error — that is a device that unsubscribed. Check smart_avvik_push_total by result and the varsel push logs.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -579,12 +579,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(kix_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(kix_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -629,12 +629,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(kix_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -679,12 +679,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h]))",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h]))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(kix_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -729,12 +729,12 @@
       },
       "targets": [
         {
-          "expr": "(time() - max(kix_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))\nand on()\n(sum(increase(kix_decision_write_total{result=\"ok\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[48h])) > 0)",
+          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))\nand on()\n(sum(increase(smart_avvik_decision_write_total{result=\"ok\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[48h])) > 0)",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "(time() - max(kix_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))",
+          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -779,12 +779,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(kix_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(kix_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))",
+          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(kix_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(kix_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])) or vector(0)",
+          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -829,12 +829,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(kix_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }

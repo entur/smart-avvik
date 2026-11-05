@@ -25,14 +25,14 @@ def environment_label() -> str | None:
     Derived from ``GOOGLE_CLOUD_PROJECT`` (``ent-smartavvik-dev`` -> ``"dev"``) rather than from a
     variable of its own, because that one is already required in every deployment -- the SQL's
     unqualified ``disruptions.*`` refs resolve through it -- so it cannot be forgotten the way a
-    cosmetic setting would be. ``KIX_ENVIRONMENT`` overrides it for local runs.
+    cosmetic setting would be. ``SMART_AVVIK_ENVIRONMENT`` overrides it for local runs.
 
     Anything unrecognisable, including the variable being unset, reads as production and stays
     unlabelled: prd is the public, traveller-facing deployment, and a stray "(dev)" there is worse
     than a missing label on a deployment we control.
     """
     project = os.environ.get("GOOGLE_CLOUD_PROJECT") or ""
-    name = (os.environ.get("KIX_ENVIRONMENT") or project.rsplit("-", 1)[-1]).strip().lower()
+    name = (os.environ.get("SMART_AVVIK_ENVIRONMENT") or project.rsplit("-", 1)[-1]).strip().lower()
     return None if name in _PRODUCTION else name
 
 

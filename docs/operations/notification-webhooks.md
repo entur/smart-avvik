@@ -184,7 +184,7 @@ follower serves the leader's cached wording for a registered definition, as the 
 
 ### One more, and it must never appear in a chart
 
-`KIX_ALLOW_WEBHOOK_NETWORK` is the outbound test fence in `webhook_sender`. Unset means "allowed
+`SMART_AVVIK_ALLOW_WEBHOOK_NETWORK` is the outbound test fence in `webhook_sender`. Unset means "allowed
 outside a test process", which is what a deployment wants. Setting it to a falsy value in a
 deployment silently blocks every delivery.
 
@@ -784,7 +784,7 @@ healthy one.
 - **`poller_phase{phase="notification_webhooks"}` exceeds half the cycle period** (~148 s against
   the 2026-09-08 measurement), which is the wall-clock bound that still means something — past it a
   slow store makes every cycle the previous one's tail. The ceilings are pinned under it by test;
-- a **second leader** appears — `sum(kix_poller_leader)` above 1 past its one-minute pending window,
+- a **second leader** appears — `sum(smart_avvik_poller_leader)` above 1 past its one-minute pending window,
   alert rule 1b (the single-writer argument the emit path's exactness rests on is one poller thread,
   no route invoking the pass, and only the pod holding the poller lease running the cycle: one LEADER
   per leadership term, with the exactness claims holding per term — and note U9 already made the
@@ -944,7 +944,7 @@ contract document says so in its own words; this is the operating half of the sa
    are gone (there is no per-cycle read left to bound), the `truncated` flag with them, and the
    store read moved out of the pass into its own `notification_mirror` phase, so a slow store costs
    the mirror its freshness rather than costing the pass its cycle. What replaces the ceiling as the
-   thing to watch is `kix_mirror_last_sync_timestamp_seconds` (rule 2a) and the mirror's readiness.
+   thing to watch is `smart_avvik_mirror_last_sync_timestamp_seconds` (rule 2a) and the mirror's readiness.
 3. **Emit and delivery as their own Deployment — emit widened in place and delivery moved out,
    both 2026-09-13 (U9, U11).** Both ran on the poller thread one transaction at a time, bounded at
    `_MAX_EMITS_PER_CYCLE` (120) and `MAX_DELIVERY_ATTEMPTS_PER_CYCLE` (200) so a bad morning could
@@ -1278,7 +1278,7 @@ contract document says so in its own words; this is the operating half of the sa
    shape**: most of the ~19 KB an entry costs is the winner's `impact`, which the message input
    reads, and the uncollapsed `contributing` alerts beside it are nearly free — measured over 540
    entries, 539 had a `contributing` that IS the winner object, one situation per train being the
-   ordinary case. Watch `kix_` memory against entries, not against registrations.
+   ordinary case. Watch `smart_avvik_` memory against entries, not against registrations.
 
    **What is still owed is the run against a real process**: 50 rps against dev during pass 1a in
    the evening shape, reporting p95 for complete reads and the figures-cache hit rate. The numbers
@@ -1431,15 +1431,15 @@ is **per process**, so N replicas are N times the rate, which is the same thing 
 `× replicas` says.
 
 **Scaling is `deployment.forceReplicas` in `helm/smart-avvik/env/worker-values-kub-ent-<env>.yaml`.**
-By hand and not by HPA: the `kix_*` series live in Thanos rather than in Google Managed Prometheus,
-so common's HPA on custom metrics cannot see `kix_delivery_backlog_age_seconds`, and `forceReplicas`
+By hand and not by HPA: the `smart_avvik_*` series live in Thanos rather than in Google Managed Prometheus,
+so common's HPA on custom metrics cannot see `smart_avvik_delivery_backlog_age_seconds`, and `forceReplicas`
 disables the HPA regardless. N replicas are safe — that is what the lease was taken for — and what
 they cost is N readers of the same pending page, each claiming what the others did not.
 
-**What to watch.** `kix_worker_last_tick_timestamp_seconds` is liveness: it moves on every round,
+**What to watch.** `smart_avvik_worker_last_tick_timestamp_seconds` is liveness: it moves on every round,
 including the ones that deliver nothing, so `time() - value` staying small is the whole check, and
 it is ABSENT from the API pods — an alert on it must count no data as firing, or a worker scaled to
-zero reads as healthy. `kix_delivery_backlog_age_seconds` is whether the queue is draining; read it
+zero reads as healthy. `smart_avvik_delivery_backlog_age_seconds` is whether the queue is draining; read it
 beside `webhook_delivery_round`'s `throttled` and `truncated`, which are what say a single
 destination is unwell. The worker's own `/health` (port 8081, not 8080) answers 503 when no round
 has finished inside `HEALTH_STALE_AFTER_S` — the API's variable, one number for both workloads.
@@ -1520,12 +1520,12 @@ the range between them, so a run at one ratio has measured half the question.
 **Wall and CPU answer different questions and only one of them is about capacity.** The poller and
 the request path share one CPython interpreter, so a phase bound by bytecode gets nothing from a
 wider pool or a second core, and a phase bound by a socket gets a lot from the first.
-`poller_phase.cpu_ms` (and `kix_poller_phase_cpu_seconds{phase}`) is what separates them.
+`poller_phase.cpu_ms` (and `smart_avvik_poller_phase_cpu_seconds{phase}`) is what separates them.
 
 **What is where.** The per-phase figures are in Cloud Logging in the **cluster** project
 (`ent-kub-dev`, namespace `smart-avvik`) — a read against `ent-smartavvik-dev` returns nothing, silently.
 The five sub-pass spans under `varsel_notify` and the per-Firestore-call spans, including
-`firestore_transaction`'s `cpu_ms`, are in **Cloud Trace** and in no log line. The `kix_*`
+`firestore_transaction`'s `cpu_ms`, are in **Cloud Trace** and in no log line. The `smart_avvik_*`
 Prometheus series are in **Thanos behind Grafana** and not in Google Managed Prometheus, so no
 script can scrape them; they are for rules and dashboards, and the log records are for these rows.
 

@@ -13,7 +13,7 @@
 import { FieldValue } from "firebase-admin/firestore";
 import type { Firestore } from "firebase-admin/firestore";
 
-import type { InboxOutcome, InboxRecord, InboxStore, SuppressionLog, SuppressionRecord } from "@entur/kix-notifications-client";
+import type { InboxOutcome, InboxRecord, InboxStore, SuppressionLog, SuppressionRecord } from "@entur/smart-avvik-notifications-client";
 
 import { COLLECTIONS, encodeDocumentId } from "./collections.ts";
 

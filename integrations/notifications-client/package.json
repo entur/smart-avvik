@@ -1,5 +1,5 @@
 {
-  "name": "@entur/kix-notifications-client",
+  "name": "@entur/smart-avvik-notifications-client",
   "version": "0.1.0",
   "private": true,
   "description": "Typed client, signature verifier, idempotent inbox contract and suppression policy for Entur's journey notification webhooks. No Firebase dependency.",

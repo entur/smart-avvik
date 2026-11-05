@@ -100,7 +100,7 @@ SIGNING_ROOT_ENV = "WEBHOOK_SIGNING_ROOT"
 #: choice; refusing it is the only moment anybody can notice.
 MIN_ROOT_BYTES = 32
 
-_PURPOSE = b"kix.webhook.signing.v1"
+_PURPOSE = b"smart-avvik.webhook.signing.v1"
 
 _WHITESPACE_REPORTED: set[str] = set()
 
@@ -150,7 +150,7 @@ def _env(name: str) -> str:
 #: example gets pasted. Restated here rather than read from the contract at runtime, because
 #: `contracts/` is not in the image; `test_webhook_signing` reads the literal OUT of the JSON and
 #: compares, so the two cannot drift.
-_PUBLISHED_TEST_ROOT = b"kix-test-signing-root-not-used-in-any-deployment"
+_PUBLISHED_TEST_ROOT = b"smart-avvik-test-signing-root-not-used-in-any-deployment"
 
 
 def configured() -> bool:

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Build the sibling client package, installing its dependencies first if they are missing.
 //
-// This package consumes `@entur/kix-notifications-client` through an npm `file:` link, which
+// This package consumes `@entur/smart-avvik-notifications-client` through an npm `file:` link, which
 // SYMLINKS the sibling directory and installs nothing inside it. So the sibling's own `tsc` and
 // `@types/node` are not here, and `npm ci` in this package does not put them there: building the
 // sibling needs the sibling's own `npm ci` to have run.

@@ -13,7 +13,7 @@ answers at once or blocks on an `Event` the test releases, a task is joined thro
 map (`_join`) rather than slept on, and no read ever waits the default `MAX_WAIT_S` -- `_get`
 defaults `wait` to two seconds and the parked-task tests pass `wait=0`.
 
-Run: KIX_ENVIRONMENT=prd uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigquery \
+Run: SMART_AVVIK_ENVIRONMENT=prd uv run --with fastapi --with httpx --with pydantic --with google-cloud-bigquery \
   --with google-cloud-storage --with pywebpush --with google-cloud-firestore python test_notification_pull.py
 """
 

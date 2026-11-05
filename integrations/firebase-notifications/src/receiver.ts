@@ -24,7 +24,7 @@ import {
   receive,
   type InboxRecord,
   type ProcessAdapters,
-} from "@entur/kix-notifications-client";
+} from "@entur/smart-avvik-notifications-client";
 
 import { COLLECTIONS } from "./collections.ts";
 

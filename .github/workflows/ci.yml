@@ -159,7 +159,7 @@ jobs:
         run: |
           set -euo pipefail
           npm install -g firebase-tools@15
-          firebase emulators:exec --project demo-kix --only firestore \
+          firebase emulators:exec --project demo-smartavvik --only firestore \
             --config ../../firebase.json \
             'uv run --with fastapi --with httpx --with pydantic \
                     --with google-cloud-bigquery --with google-cloud-storage \

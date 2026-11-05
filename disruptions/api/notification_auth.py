@@ -91,17 +91,17 @@ MAX_DESTINATIONS_PER_CLIENT = 4
 # ---- Credential shape -------------------------------------------------------------------------
 
 #: The `key-id` prefix. Greppable on purpose, exactly as PostHog's `phc_` is in `feedback.py`: a
-#: value that turns up in a log, a ticket or a config file should be identifiable as a kix client
+#: value that turns up in a log, a ticket or a config file should be identifiable as a smart-avvik client
 #: key id at a glance, and the prefix is also what lets `_parse_bearer` refuse a malformed header
 #: before spending a store read on it.
-KEY_ID_PREFIX = "kixn_"
+KEY_ID_PREFIX = "sman_"
 _KEY_ID_BYTES = 10
-KEY_ID_RE = re.compile(r"^kixn_[0-9a-f]{20}$")
+KEY_ID_RE = re.compile(r"^sman_[0-9a-f]{20}$")
 #: 32 bytes, urlsafe-base64 without padding: 43 characters, 256 bits. The number KTD8's argument
 #: against bcrypt rests on -- against this much entropy a work factor buys nothing.
 _SECRET_BYTES = 32
 #: The credential a client sends, as one string: `<key-id>.<secret>`. One token to copy, and the
-#: separator cannot occur in either half (the id is `kixn_` plus hex, the secret is base64url).
+#: separator cannot occur in either half (the id is `sman_` plus hex, the secret is base64url).
 _BEARER_SEPARATOR = "."
 
 PEPPER_ENV = "NOTIFICATION_KEY_PEPPER"

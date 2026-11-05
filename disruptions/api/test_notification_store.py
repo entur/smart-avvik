@@ -7,7 +7,7 @@ logic, the quota arithmetic, the expiry predicates, the tenant checks and the st
 and configuration guards are checked on every CI run.
 
 **The emulator-backed half runs only when `FIRESTORE_EMULATOR_HOST` is set**, from ci.yml's second
-step (`firebase emulators:exec --project demo-kix --only firestore`). When it is unset this file
+step (`firebase emulators:exec --project demo-smartavvik --only firestore`). When it is unset this file
 prints a conspicuous SKIPPED line naming the count and the variable and exits 0. It is deliberately
 loud: a suite in a directory no CI loop enters, or a runner placed mid-file, is this repo's most
 expensive recurring bug -- it prints a passing count while running nothing -- so
@@ -77,7 +77,7 @@ def _uncommented(text: str, marker: str = "#") -> str:
 FIRESTORE_TF_CODE = _uncommented(FIRESTORE_TF)
 
 EMULATOR_HOST = os.environ.get("FIRESTORE_EMULATOR_HOST")
-EMULATOR_PROJECT = "demo-kix"
+EMULATOR_PROJECT = "demo-smartavvik"
 
 NOW = datetime(2026, 9, 8, 6, 30, tzinfo=UTC)
 SID = "sub-1"
@@ -7706,7 +7706,7 @@ def _run() -> None:
             f"!! SKIPPED {len(emulator)} EMULATOR-BACKED CHECKS: FIRESTORE_EMULATOR_HOST is unset."
         )
         print("!! They run in ci.yml's own step, via:")
-        print("!!   firebase emulators:exec --project demo-kix --only firestore \\")
+        print("!!   firebase emulators:exec --project demo-smartavvik --only firestore \\")
         print("!!     --config ../../firebase.json '<this suite>'")
         print("!! Run them locally the same way (needs Java 21+ and firebase-tools).")
         print("!" * 78)

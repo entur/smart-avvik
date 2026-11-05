@@ -66,7 +66,7 @@ def _quiet(module):
         module.logger = before
 
 
-# ---- kix_push_total: one increment per _send_push call, on every return path -------------------
+# ---- smart_avvik_push_total: one increment per _send_push call, on every return path -------------------
 
 
 def _push(webpush_stub) -> str:
@@ -87,7 +87,7 @@ def _push(webpush_stub) -> str:
 
 
 def _push_totals() -> dict[str, float]:
-    return {r: _sample("kix_push_total", {"result": r}) for r in ("sent", "gone", "error")}
+    return {r: _sample("smart_avvik_push_total", {"result": r}) for r in ("sent", "gone", "error")}
 
 
 def _raiser(exc):
@@ -131,7 +131,7 @@ def test_push_counter_counts_sent_gone_and_error_exactly_once_per_call():
     assert after == {**before, "error": before["error"] + 1}
 
 
-# ---- kix_decision_write_total: ok / partial / error, and nothing when no write was attempted ----
+# ---- smart_avvik_decision_write_total: ok / partial / error, and nothing when no write was attempted ----
 
 
 class _InsertClient:
@@ -163,7 +163,7 @@ def _decisions_client(client):
 
 def _decision_totals() -> dict[str, float]:
     return {
-        r: _sample("kix_decision_write_total", {"result": r}) for r in ("ok", "partial", "error")
+        r: _sample("smart_avvik_decision_write_total", {"result": r}) for r in ("ok", "partial", "error")
     }
 
 
@@ -232,7 +232,7 @@ def test_a_failed_table_ensure_counts_an_error_rather_than_flatlining():
 def test_a_rebuild_cycle_sets_the_epoch_gauge_and_observes_the_duration():
     """The gauge must be EPOCH-plausible (> 1.7e9) — asserting a small monotonic-scale value here
     is exactly the two-clock confusion KTD1 exists to prevent."""
-    before_count = _sample("kix_poller_cycle_duration_seconds_count")
+    before_count = _sample("smart_avvik_poller_cycle_duration_seconds_count")
     before_main = (main._rebuild_all, main.logger)
     main._rebuild_all = lambda timings: None
     main.logger = _SilentLogger()
@@ -240,8 +240,8 @@ def test_a_rebuild_cycle_sets_the_epoch_gauge_and_observes_the_duration():
         main._on_ingestion_change(None)
     finally:
         main._rebuild_all, main.logger = before_main
-    assert _sample("kix_poller_cycle_duration_seconds_count") == before_count + 1
-    gauge = _sample("kix_poller_last_cycle_timestamp_seconds")
+    assert _sample("smart_avvik_poller_cycle_duration_seconds_count") == before_count + 1
+    gauge = _sample("smart_avvik_poller_last_cycle_timestamp_seconds")
     assert gauge > 1.7e9, "the cycle gauge must be epoch seconds, never a monotonic reading"
     assert abs(time.time() - gauge) < 60
 
@@ -260,7 +260,7 @@ def test_a_dying_rebuild_observes_its_duration_but_does_not_advance_the_freshnes
     def exploding_rebuild(timings):
         raise RuntimeError("rebuild died")
 
-    before_count = _sample("kix_poller_cycle_duration_seconds_count")
+    before_count = _sample("smart_avvik_poller_cycle_duration_seconds_count")
     before_main = (main._rebuild_all, main.logger)
     # A known, distinctly old value, so "did not move" is assertable rather than inferred from a
     # gauge some earlier test happened to set.
@@ -276,10 +276,10 @@ def test_a_dying_rebuild_observes_its_duration_but_does_not_advance_the_freshnes
             raise AssertionError("the rebuild failure must still propagate")
     finally:
         main._rebuild_all, main.logger = before_main
-    assert _sample("kix_poller_cycle_duration_seconds_count") == before_count + 1, (
+    assert _sample("smart_avvik_poller_cycle_duration_seconds_count") == before_count + 1, (
         "a failed cycle's duration is the reading worth having"
     )
-    assert _sample("kix_poller_last_cycle_timestamp_seconds") == 1_700_000_000.0, (
+    assert _sample("smart_avvik_poller_last_cycle_timestamp_seconds") == 1_700_000_000.0, (
         "a cycle that died must not report the caches as freshly rebuilt"
     )
 
@@ -289,13 +289,13 @@ def test_a_dying_rebuild_observes_its_duration_but_does_not_advance_the_freshnes
 
 def test_a_phase_observes_its_histogram_and_counts_ok():
     phase = {"phase": "metrics_test_step"}
-    before_hist = _sample("kix_poller_phase_duration_seconds_count", phase)
-    before_ok = _sample("kix_poller_phase_total", {**phase, "result": "ok"})
+    before_hist = _sample("smart_avvik_poller_phase_duration_seconds_count", phase)
+    before_ok = _sample("smart_avvik_poller_phase_total", {**phase, "result": "ok"})
     timings: dict[str, int] = {}
     with _quiet(main), main._phase("metrics_test_step", timings):
         pass
-    assert _sample("kix_poller_phase_duration_seconds_count", phase) == before_hist + 1
-    assert _sample("kix_poller_phase_total", {**phase, "result": "ok"}) == before_ok + 1
+    assert _sample("smart_avvik_poller_phase_duration_seconds_count", phase) == before_hist + 1
+    assert _sample("smart_avvik_poller_phase_total", {**phase, "result": "ok"}) == before_ok + 1
 
 
 def test_a_phase_observes_interpreter_cpu_and_never_a_negative_value():
@@ -303,7 +303,7 @@ def test_a_phase_observes_interpreter_cpu_and_never_a_negative_value():
 
     The phase timings say a step took 9 s; they cannot say whether those 9 s were one CPython
     thread executing bytecode (which a second core does not help and a wider pool does not help
-    either) or a socket wait (which both do). `kix_poller_phase_cpu_seconds{phase}` is the series
+    either) or a socket wait (which both do). `smart_avvik_poller_phase_cpu_seconds{phase}` is the series
     that separates them, and it is the one number every later unit's capacity claim is checked
     against.
 
@@ -313,20 +313,20 @@ def test_a_phase_observes_interpreter_cpu_and_never_a_negative_value():
     the sum and which no dashboard makes obvious.
     """
     phase = {"phase": "metrics_cpu_step"}
-    before = _sample("kix_poller_phase_cpu_seconds_count", phase)
-    before_sum = _sample("kix_poller_phase_cpu_seconds_sum", phase)
+    before = _sample("smart_avvik_poller_phase_cpu_seconds_count", phase)
+    before_sum = _sample("smart_avvik_poller_phase_cpu_seconds_sum", phase)
     timings: dict[str, int] = {}
     with _quiet(main), main._phase("metrics_cpu_step", timings):
         sum(i * i for i in range(200_000))  # real bytecode, so the delta cannot be exactly zero
-    assert _sample("kix_poller_phase_cpu_seconds_count", phase) == before + 1
-    observed = _sample("kix_poller_phase_cpu_seconds_sum", phase) - before_sum
+    assert _sample("smart_avvik_poller_phase_cpu_seconds_count", phase) == before + 1
+    observed = _sample("smart_avvik_poller_phase_cpu_seconds_sum", phase) - before_sum
     assert observed >= 0.0, f"a phase observed {observed} CPU seconds"
 
 
 def test_the_phase_record_carries_cpu_and_rss_beside_the_wall_clock():
     """The harness reads phases out of Cloud Logging, not out of Prometheus.
 
-    `kix_*` lives in Thanos behind Grafana and is not in Google Managed Prometheus (checked
+    `smart_avvik_*` lives in Thanos behind Grafana and is not in Google Managed Prometheus (checked
     2026-09-11), so `bench_cycle.py` cannot scrape the histogram above — it reads the
     `poller_phase` records. The three figures therefore have to be ON the record: `ms` was there,
     `cpu_ms` and `rss_delta_bytes` are what R16 adds.
@@ -374,15 +374,15 @@ def test_the_cycle_histogram_reaches_past_the_medians_period():
         float(b) for b in metrics.POLLER_CYCLE_DURATION._upper_bounds if b != float("inf")
     ]
     assert 600 in upper and 900 in upper, upper
-    before = _sample("kix_poller_cycle_duration_seconds_bucket", {"le": "600.0"})
+    before = _sample("smart_avvik_poller_cycle_duration_seconds_bucket", {"le": "600.0"})
     metrics.POLLER_CYCLE_DURATION.observe(500.0)
-    assert _sample("kix_poller_cycle_duration_seconds_bucket", {"le": "600.0"}) == before + 1
+    assert _sample("smart_avvik_poller_cycle_duration_seconds_bucket", {"le": "600.0"}) == before + 1
 
 
 def test_a_raising_phase_counts_error_and_still_observes_the_duration():
     phase = {"phase": "metrics_failing_step"}
-    before_hist = _sample("kix_poller_phase_duration_seconds_count", phase)
-    before_err = _sample("kix_poller_phase_total", {**phase, "result": "error"})
+    before_hist = _sample("smart_avvik_poller_phase_duration_seconds_count", phase)
+    before_err = _sample("smart_avvik_poller_phase_total", {**phase, "result": "error"})
     timings: dict[str, int] = {}
     try:
         with _quiet(main), main._phase("metrics_failing_step", timings):
@@ -391,11 +391,11 @@ def test_a_raising_phase_counts_error_and_still_observes_the_duration():
         pass  # _phase must re-raise — pinned by test_poller_refresh.py
     else:
         raise AssertionError("_phase must not swallow the step's exception")
-    assert _sample("kix_poller_phase_duration_seconds_count", phase) == before_hist + 1
-    assert _sample("kix_poller_phase_total", {**phase, "result": "error"}) == before_err + 1
+    assert _sample("smart_avvik_poller_phase_duration_seconds_count", phase) == before_hist + 1
+    assert _sample("smart_avvik_poller_phase_total", {**phase, "result": "error"}) == before_err + 1
 
 
-# ---- kix_llm_message_total: once per write_message_detailed call, at the return boundary --------
+# ---- smart_avvik_llm_message_total: once per write_message_detailed call, at the return boundary --------
 
 
 @contextmanager
@@ -438,47 +438,47 @@ def test_llm_counter_counts_one_representative_branch_per_class():
     wired to the log branches instead of the return boundary double-counts retries and misses the
     statuses that never log."""
     labels = {"provider": "claude", "result": "ok", "surface": "live"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=lambda body: _OK_REPLY):
         result = llm_message.write_message_detailed({"a": 1})
     assert result.status == "ok"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
     labels = {"provider": "claude", "result": "error", "surface": "live"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=_raiser(RuntimeError("vertex 429"))):
         result = llm_message.write_message_detailed({"a": 1})
     assert result.status == "error"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
     labels = {"provider": "claude", "result": "rejected", "surface": "live"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=lambda body: ""):
         result = llm_message.write_message_detailed({"a": 1})
     assert result.status == "rejected"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
 
 def test_llm_counter_tells_a_covered_error_apart():
     """An error the caller can cover with an earlier wording is `error_covered`, which the
     "LLM wording failures" rule does not select; the returned status stays `error`."""
     labels = {"provider": "claude", "result": "error_covered", "surface": "live"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=_raiser(RuntimeError("vertex 504"))):
         result = llm_message.write_message_detailed({"a": 1}, covered=True)
     assert result.status == "error"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
 
 def test_llm_counter_falls_back_to_a_bounded_provider_label():
     """`disabled` (and `unavailable`) carry no provider on the MessageResult; the label must be
     the bounded fallback "none", never an unlabelled series or a KeyError on the poller thread."""
     labels = {"provider": "none", "result": "disabled", "surface": "live"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(provider="off"):
         result = llm_message.write_message_detailed({"a": 1})
     assert result.status == "disabled"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
 
 def test_llm_surface_label_is_a_closed_vocabulary():
@@ -486,25 +486,25 @@ def test_llm_surface_label_is_a_closed_vocabulary():
     branch test above); any OTHER caller string collapses to "other" rather than minting a
     series from an unbounded value."""
     labels = {"provider": "claude", "result": "ok", "surface": "replay"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=lambda body: _OK_REPLY):
         result = llm_message.write_message_detailed({"a": 1}, replay=True)
     assert result.status == "ok"
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
     labels = {"provider": "claude", "result": "ok", "surface": "webhook"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=lambda body: _OK_REPLY):
         llm_message.write_message_detailed({"a": 1}, caller="webhook")
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
 
     labels = {"provider": "claude", "result": "ok", "surface": "other"}
-    before = _sample("kix_llm_message_total", labels)
+    before = _sample("smart_avvik_llm_message_total", labels)
     with _llm(backend=lambda body: _OK_REPLY):
         llm_message.write_message_detailed({"a": 1}, caller="some-novel-surface")
-    assert _sample("kix_llm_message_total", labels) == before + 1
+    assert _sample("smart_avvik_llm_message_total", labels) == before + 1
     # And the raw string never became a label value.
-    assert _sample("kix_llm_message_total",
+    assert _sample("smart_avvik_llm_message_total",
                    {"provider": "claude", "result": "ok", "surface": "some-novel-surface"}) == 0
 
 
@@ -541,7 +541,7 @@ def test_the_tick_gauge_is_epoch_while_the_heartbeat_stays_monotonic():
     main._poller_heartbeat_monotonic = None
     try:
         main.poll_for_changes(lambda ts: None, _Ticks(1))
-        gauge = _sample("kix_poller_last_tick_timestamp_seconds")
+        gauge = _sample("smart_avvik_poller_last_tick_timestamp_seconds")
         assert gauge > 1.7e9, "the tick gauge must be epoch seconds, never the monotonic value"
         assert abs(time.time() - gauge) < 60
         heartbeat = main._poller_heartbeat_monotonic

@@ -121,7 +121,7 @@ USER_AGENT = "smart-avvik-notifications/1"
 # Helm value silently costs every webhook delivery, forever, trading a loud test failure for a
 # silent production one. Detection covers both ways the suites run -- `python test_x.py` (CI) and
 # pytest (a developer).
-ALLOW_NETWORK_ENV = "KIX_ALLOW_WEBHOOK_NETWORK"
+ALLOW_NETWORK_ENV = "SMART_AVVIK_ALLOW_WEBHOOK_NETWORK"
 
 
 class UnsafeDestination(ValueError):

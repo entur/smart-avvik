@@ -1014,7 +1014,7 @@ def test_a_signed_request_survives_delivery_and_verifies_at_the_receiver():
     """
     import webhook_signing as ws
 
-    root = b"kix-test-signing-root-not-used-in-any-deployment"
+    root = b"smart-avvik-test-signing-root-not-used-in-any-deployment"
     # Norwegian, and therefore multibyte: a re-encode anywhere in the path would show up here and
     # nowhere else.
     body = (
@@ -1162,7 +1162,7 @@ def test_no_flag_or_environment_variable_bypasses_the_address_validation():
     README requires a public `https` : 443 hostname (a tunnel), and this check is what keeps the
     shortcut from being added later.
 
-    **The one environment variable this module reads is not it.** `KIX_ALLOW_WEBHOOK_NETWORK`
+    **The one environment variable this module reads is not it.** `SMART_AVVIK_ALLOW_WEBHOOK_NETWORK`
     decides whether a socket may be opened from a TEST process at all — it is a fence in front of
     the network, and it sits BEHIND the address checks rather than in front of them. Setting it,
     or anything plausibly named like a bypass, changes no verdict below.
@@ -1176,10 +1176,10 @@ def test_no_flag_or_environment_variable_bypasses_the_address_validation():
 
     candidates = (
         wc.ALLOW_NETWORK_ENV,
-        "KIX_ALLOW_LOCAL_WEBHOOK",
-        "KIX_WEBHOOK_ALLOW_INSECURE",
-        "KIX_LOADTEST",
-        "KIX_ALLOW_PRIVATE_DESTINATIONS",
+        "SMART_AVVIK_ALLOW_LOCAL_WEBHOOK",
+        "SMART_AVVIK_WEBHOOK_ALLOW_INSECURE",
+        "SMART_AVVIK_LOADTEST",
+        "SMART_AVVIK_ALLOW_PRIVATE_DESTINATIONS",
     )
     before = {name: os.environ.get(name) for name in candidates}
     for name in candidates:

@@ -93,7 +93,7 @@ PROTECTED_PREFIXES = (
     "/demo-api",
 )
 
-_COOKIE_NAME = "kix_sso"
+_COOKIE_NAME = "smart_avvik_sso"
 _SESSION_TTL_S = 12 * 3600  # a working day; renewal is a silent bounce while the Auth0 session lives
 _STATE_TTL_S = 600  # how long a login redirect may sit on the Entra screen before the state expires
 

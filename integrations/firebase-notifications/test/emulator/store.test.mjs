@@ -1,6 +1,6 @@
 // The Firestore-backed inbox and ledger, against the emulator.
 //
-// Run by `npm run test:emulator`, which wraps this in `firebase emulators:exec --project demo-kix`.
+// Run by `npm run test:emulator`, which wraps this in `firebase emulators:exec --project demo-smartavvik`.
 // A `demo-` project id is what makes it credential-free: the admin SDK picks up
 // FIRESTORE_EMULATOR_HOST and skips Application Default Credentials entirely, and a demo project can
 // reach no real GCP service.
@@ -30,7 +30,7 @@ import { COLLECTIONS } from "../../src/collections.ts";
 import { createFirestoreInbox, createFirestoreSuppressionLog } from "../../src/inbox.ts";
 import { createFirestoreLedger } from "../../src/ledger.ts";
 import { encodeDocumentId } from "../../src/collections.ts";
-import { process as processRecord, receive } from "@entur/kix-notifications-client";
+import { process as processRecord, receive } from "@entur/smart-avvik-notifications-client";
 
 import { NOW, TEST_SECRET, makeEvent, signedFunctionRequest } from "../helpers/adapters.mjs";
 

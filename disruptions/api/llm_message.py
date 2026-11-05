@@ -1588,7 +1588,7 @@ def write_message_detailed(
     """:func:`_write_message_detailed_inner`'s full contract, counted — this wrapper adds nothing
     to the behaviour, and the docstring below it is the one that documents it.
 
-    The `kix_llm_message_total` increment lives HERE, at the return boundary, and never at the
+    The `smart_avvik_llm_message_total` increment lives HERE, at the return boundary, and never at the
     inner function's log branches: those miss `truncated` and `unavailable` entirely (both fall
     out of the backend loop without a final log line) and fire once per retried backend, so
     counting there would both undercount statuses and double-count attempts. One call, one

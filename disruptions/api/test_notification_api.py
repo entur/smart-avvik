@@ -506,7 +506,7 @@ def test_a_missing_or_wrong_credential_reads_nothing():
             {},
             {"Authorization": "Bearer nonsense"},
             {"Authorization": f"Bearer {key_id}.wrong-secret"},
-            {"Authorization": f"Bearer kixn_{'0' * 20}.whatever"},
+            {"Authorization": f"Bearer sman_{'0' * 20}.whatever"},
         ):
             response = client.get("/notification-api/v1/subscriptions", headers=headers)
             assert response.status_code == 401, headers
@@ -514,7 +514,7 @@ def test_a_missing_or_wrong_credential_reads_nothing():
             assert response.headers.get("www-authenticate") == "Bearer"
         # A cookie is never an authenticator here: the app allows every CORS origin, so a cookie
         # would be sent from all of them.
-        client.cookies.set("kix_sso", "anything")
+        client.cookies.set("smart_avvik_sso", "anything")
         assert client.get("/notification-api/v1/subscriptions").status_code == 401
     finally:
         _uninstall()
@@ -1355,7 +1355,7 @@ def test_a_repeated_unknown_credential_costs_no_credential_lookup():
     _provision()
     try:
         client = _client()
-        headers = {"Authorization": f"Bearer kixn_{'a' * 20}.nope"}
+        headers = {"Authorization": f"Bearer sman_{'a' * 20}.nope"}
         before = _auth_docs.reads
         for _ in range(15):
             assert client.get(
@@ -1443,7 +1443,7 @@ def test_an_unconfigured_deployment_answers_503_on_every_route():
             ("delete", "/notification-api/v1/subscriptions/x"),
             ("get", "/notification-api/v1/destinations/current"),
         ):
-            response = getattr(client, method)(path, headers=_headers("kixn_x.y"))
+            response = getattr(client, method)(path, headers=_headers("sman_x.y"))
             assert response.status_code == 503, (method, path)
             assert response.json() == {"detail": "channel_not_configured"}
     finally:

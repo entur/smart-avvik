@@ -106,12 +106,12 @@ test("the emulator runs under its OWN demo project id, not the repo root's", () 
   // emulator runs in `--single_project_mode`, where a disagreement is a refusal, not a stray write.
   const manifest = JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, "package.json"), "utf8"));
   const mine = /--project (\S+)/.exec(manifest.scripts["test:emulator"])?.[1];
-  assert.equal(mine, "demo-kixclient");
+  assert.equal(mine, "demo-smartavvikclient");
 
   const workflow = fs.existsSync(WORKFLOW) ? fs.readFileSync(WORKFLOW, "utf8") : null;
   if (workflow) {
-    assert.match(workflow, /--project demo-kix\b/, "the root emulator step still uses demo-kix");
-    assert.notEqual(mine, "demo-kix");
+    assert.match(workflow, /--project demo-smartavvik\b/, "the root emulator step still uses demo-smartavvik");
+    assert.notEqual(mine, "demo-smartavvik");
   }
   for (const suite of ["store", "rules"]) {
     const text = fs.readFileSync(
@@ -119,7 +119,7 @@ test("the emulator runs under its OWN demo project id, not the repo root's", () 
       "utf8",
     );
     assert.match(text, /process\.env\.GCLOUD_PROJECT/, `${suite} hard-codes a project id`);
-    assert.doesNotMatch(text, /"demo-kix/, `${suite} hard-codes a project id`);
+    assert.doesNotMatch(text, /"demo-smartavvik/, `${suite} hard-codes a project id`);
   }
 });
 

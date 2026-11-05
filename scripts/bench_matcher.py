@@ -325,8 +325,8 @@ def run(
     # decide "is this a test process?" from `sys.argv[0]`, which here is `bench_matcher.py`. Without
     # them a profile of the interpreter opens real Journey Planner and Vertex connections — measured
     # on `bench_cycle` before its own fences went in.
-    os.environ.setdefault("KIX_ALLOW_JP_NETWORK", "0")
-    os.environ.setdefault("KIX_ALLOW_WEBHOOK_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_JP_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_WEBHOOK_NETWORK", "0")
     os.environ["VARSEL_LLM_PROVIDER"] = "off"  # the kill switch: no backend is even asked
 
     import alternatives
@@ -467,8 +467,8 @@ def run_pull_read(
     api = pathlib.Path(__file__).resolve().parents[1] / "disruptions" / "api"
     if str(api) not in sys.path:
         sys.path.insert(0, str(api))
-    os.environ.setdefault("KIX_ALLOW_JP_NETWORK", "0")
-    os.environ.setdefault("KIX_ALLOW_WEBHOOK_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_JP_NETWORK", "0")
+    os.environ.setdefault("SMART_AVVIK_ALLOW_WEBHOOK_NETWORK", "0")
     os.environ["VARSEL_LLM_PROVIDER"] = "off"
 
     import alternatives
