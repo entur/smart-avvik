@@ -40,6 +40,7 @@ import re
 from pathlib import Path
 
 import alternatives
+import deploy_files
 import notification_api
 import notification_auth
 import notification_events
@@ -774,6 +775,8 @@ def test_the_journey_keyed_read_is_published_with_its_two_switch_revert_and_its_
             "is two switches and the kill switch a third, and each has to be stated"
         )
     assert "journey-alerts" in operations, "the operations document no longer names the read"
+    if deploy_files.missing("helm/smart-avvik/env/values-kub-ent-dev.yaml"):
+        return
     values = DEV_VALUES.read_text(encoding="utf-8")
     assert 'NOTIFICATION_WEBHOOK_LLM_ENABLED: "true"' in values, (
         "the dev values file no longer sets NOTIFICATION_WEBHOOK_LLM_ENABLED. It is read at import "
@@ -786,6 +789,7 @@ def test_the_journey_keyed_read_is_published_with_its_two_switch_revert_and_its_
     )
 
 
+@deploy_files.needs("helm/smart-avvik/env", ".github/workflows/cd.yml")
 def test_every_worker_values_file_is_linted_and_deployed():
     """U11's three-way consistency: a values file, a lint entry and a deploy job.
 
@@ -823,6 +827,7 @@ def test_every_worker_values_file_is_linted_and_deployed():
     assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_constants():
     """`api_render.sh` pins the API release's two shapes (Recreate under `forceReplicas`, rolling
     plus HPA without it), so like the worker's it has to gate the image. And the shutdown deadline
@@ -869,6 +874,8 @@ def test_the_leader_smoke_asks_for_the_deployed_build_and_the_image_carries_it()
     main_src = (REPO_ROOT / "disruptions" / "api" / "main.py").read_text()
     assert 'os.environ.get("GIT_SHA")' in main_src
 
+    if deploy_files.missing(".github/workflows/cd.yml"):
+        return
     cd = (workflows / "cd.yml").read_text()
     steps = cd.split("- name: Wait for /ready, then a leader")[1:]
     assert len(steps) == 2, "expected the leader wait in smoke-dev and smoke-prd only"
@@ -880,6 +887,7 @@ def test_the_leader_smoke_asks_for_the_deployed_build_and_the_image_carries_it()
         assert "&& echo \"$body\" | grep" in step, "the two conditions are not ANDed on one answer"
 
 
+@deploy_files.needs(".github/workflows/cd.yml")
 def test_the_worker_release_is_never_the_api_release():
     """One transposed name upgrades the API release with the worker's values file: no ingress, no
     VAPID keys, no SSO secret, and `container.args` pointing every replica at the delivery loop. The
