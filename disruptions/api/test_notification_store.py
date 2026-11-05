@@ -54,7 +54,7 @@ INDEXES = json.loads((REPO / "firestore.indexes.json").read_text())
 FIRESTORE_TF = deploy_files.read("terraform/firestore.tf")
 CI_YML = (REPO / ".github" / "workflows" / "ci.yml").read_text()
 TERRAFORM_YML = deploy_files.read(".github/workflows/terraform.yml")
-HELM_VALUES = (REPO / "helm" / "smart-avvik" / "values.yaml").read_text()
+HELM_VALUES = deploy_files.read("helm/smart-avvik/values.yaml")
 TF_VARIABLES = deploy_files.read("terraform/variables.tf")
 VARSEL_SOURCE = (pathlib.Path(__file__).parent / "varsel.py").read_text()
 
@@ -3661,7 +3661,7 @@ def test_the_dependency_is_declared_in_all_three_places():
     assert 'name = "google-cloud-firestore"' in lock, "uv sync was not re-run"
 
 
-@deploy_files.needs("terraform/variables.tf", "terraform/firestore.tf")
+@deploy_files.needs("terraform/variables.tf", "terraform/firestore.tf", "helm/smart-avvik/values.yaml")
 def test_the_database_id_is_the_same_literal_in_terraform_and_helm():
     """The one thing Terraform and the runtime cannot share.
 
@@ -3717,6 +3717,7 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
         assert "VAPID_PRIVATE_KEY" in values or env == "tst", "tst alone has no keypair"
 
 
+@deploy_files.needs("helm/smart-avvik/values.yaml")
 def test_the_webhook_gate_is_off_where_an_operator_looks():
     assert 'NOTIFICATION_WEBHOOKS_ENABLED: "false"' in HELM_VALUES
     main_source = (pathlib.Path(__file__).parent / "main.py").read_text()
