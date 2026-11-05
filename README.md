@@ -17,11 +17,11 @@ an experiment by Entur's Team KI-eksperimentering, and keeps that history.
 | [`data/queries/`](data/queries/) | BigQuery SQL and scripts for training, calibration and evaluation. |
 | [`contracts/`](contracts/) | The notification API's OpenAPI document, event schemas and webhook signing vectors. |
 | [`integrations/`](integrations/) | TypeScript packages for a client that receives the webhooks. |
-| [`helm/smart-avvik/`](helm/smart-avvik/) | The Helm chart and its defaults. |
 | [`eval/`](eval/) | Model evaluation notebooks, rendered to `/eval`. |
 | [`docs/`](docs/) | Findings, plans, operations and integration guides. |
 
-The per-environment Helm values, Terraform and deploy workflows are in a private Entur repository.
+CI here builds and tests the image. The Helm chart, the environment values, Terraform and the
+deploy are in a private Entur repository, which deploys the image this repository builds.
 
 ## Running it
 

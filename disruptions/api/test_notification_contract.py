@@ -789,7 +789,7 @@ def test_the_journey_keyed_read_is_published_with_its_two_switch_revert_and_its_
     )
 
 
-@deploy_files.needs("helm/smart-avvik/env", ".github/workflows/cd.yml")
+@deploy_files.needs("helm/smart-avvik/env", ".github/workflows/cd.yml", ".github/workflows/checks.yml")
 def test_every_worker_values_file_is_linted_and_deployed():
     """U11's three-way consistency: a values file, a lint entry and a deploy job.
 
@@ -810,11 +810,11 @@ def test_every_worker_values_file_is_linted_and_deployed():
         "worker-values-kub-ent-prd.yaml",
         "worker-values-kub-ent-tst.yaml",
     ], files
-    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
+    checks = (REPO_ROOT / ".github" / "workflows" / "checks.yml").read_text()
     cd = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text()
     for name in files:
         env = name.removeprefix("worker-values-kub-ent-").removesuffix(".yaml")
-        assert f"values: {name}" in ci, f"{name} is not in ci.yml's helm-lint matrix"
+        assert f"values: {name}" in checks, f"{name} is not in checks.yml's helm-lint matrix"
         assert f"values: {name}" in cd, f"{name} is not deployed by cd.yml"
         assert f"deploy-{env}-worker:" in cd, f"cd.yml has no worker deploy job for {env}"
     assert cd.count("release_name: smart-avvik-worker") == len(files), (
@@ -822,12 +822,22 @@ def test_every_worker_values_file_is_linted_and_deployed():
         "repository name and the job would UPGRADE THE API RELEASE with the worker's values file"
     )
     # The render check is the one that sees a values file stop being a worker's, so it has to be a
-    # gate rather than an advisory job.
-    assert "bash helm/smart-avvik/test/worker_render.sh" in ci
-    assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
+    # gate rather than an advisory job: checks.yml runs it, and every deploy job waits for checks.
+    assert "bash helm/smart-avvik/test/worker_render.sh" in checks
+    assert _every_deploy_job_needs_checks(cd), "the render check does not gate the deploy"
 
 
-@deploy_files.needs("helm/smart-avvik/env")
+def _every_deploy_job_needs_checks(cd: str) -> bool:
+    heads = [block.split("\n\n", 1)[0] for block in cd.split("  deploy-")[1:]]
+    return bool(heads) and all("checks" in head.split("needs:", 1)[1].split("\n", 1)[0] for head in heads)
+
+
+@deploy_files.needs(
+    "helm/smart-avvik/env",
+    "helm/smart-avvik/values.yaml",
+    ".github/workflows/cd.yml",
+    ".github/workflows/checks.yml",
+)
 def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_constants():
     """`api_render.sh` pins the API release's two shapes (Recreate under `forceReplicas`, rolling
     plus HPA without it), so like the worker's it has to gate the image. And the shutdown deadline
@@ -837,10 +847,11 @@ def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_con
     """
     import poller_lease
 
-    ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
-    # Beside the worker script, in the job the worker test already holds to gating `docker`.
-    assert "bash helm/smart-avvik/test/api_render.sh" in ci
-    assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
+    checks = (REPO_ROOT / ".github" / "workflows" / "checks.yml").read_text()
+    cd = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text()
+    # Beside the worker script, in the job the worker test already holds to gating the deploy.
+    assert "bash helm/smart-avvik/test/api_render.sh" in checks
+    assert _every_deploy_job_needs_checks(cd), "the render check does not gate the deploy"
 
     helm = REPO_ROOT / "helm" / "smart-avvik"
     base = (helm / "values.yaml").read_text()
@@ -881,7 +892,7 @@ def test_the_leader_smoke_asks_for_the_deployed_build_and_the_image_carries_it()
     assert len(steps) == 2, "expected the leader wait in smoke-dev and smoke-prd only"
     for step in steps:
         step = step.split("- name:", 1)[0]
-        assert "IMAGE: ${{ inputs.image }}" in step, step
+        assert "IMAGE: ${{ needs.source.outputs.image }}" in step, step
         # Both greps must pass on the same body (the version one is double-quoted to expand $want).
         assert "grep -qE '\"role\"" in step and 'grep -qE "\\"version\\"' in step, step
         assert "&& echo \"$body\" | grep" in step, "the two conditions are not ANDed on one answer"
