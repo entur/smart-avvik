@@ -1,0 +1,15 @@
+# Test-only secrets. The signing vectors are derived from the `test_root` published in the same
+# file, and the other files copy secrets from them. None is used in any deployment. Same paths as
+# .github/secret_scanning.yml, plus the test files.
+[extend]
+useDefault = true
+
+[allowlist]
+paths = [
+  '''^contracts/notifications/v1/signing-vectors\.json$''',
+  '''^integrations/notifications-client/contracts/signing-vectors\.json$''',
+  '''^integrations/notifications-client/test/helpers/events\.mjs$''',
+  '''^integrations/notifications-client/test/dist/packagedArtifact\.test\.mjs$''',
+  '''^integrations/firebase-notifications/test/helpers/adapters\.mjs$''',
+  '''^disruptions/api/test_sso\.py$''',
+]
