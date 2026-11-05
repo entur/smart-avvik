@@ -141,25 +141,29 @@ def test_the_published_test_root_is_refused_by_name():
     ).headers[ws.HEADER_SIGNATURE]
 
 
+#: kix-avvik's example root, spelled out here rather than read from `ws._RETIRED_TEST_ROOTS`, so
+#: that dropping it from that tuple fails this test instead of emptying it.
+KIX_AVVIK_EXAMPLE_ROOT = "kix-test-signing-root-not-used-in-any-deployment"
+
 
 def test_an_earlier_published_root_is_refused_too():
     """The vectors used to publish kix-avvik's example root. The current file no longer carries it,
     but this repository's public history does, with every secret it derives, so it must be refused
     as firmly as the current one rather than slip back in as an ordinary 48-byte root."""
     _reset()
-    for retired in ws._RETIRED_TEST_ROOTS:
-        assert len(retired) >= ws.MIN_ROOT_BYTES, "the length test alone would admit it"
-        os.environ[ws.SIGNING_ROOT_ENV] = retired.decode()
+    assert len(KIX_AVVIK_EXAMPLE_ROOT) >= ws.MIN_ROOT_BYTES, "the length test alone would admit it"
+    os.environ[ws.SIGNING_ROOT_ENV] = KIX_AVVIK_EXAMPLE_ROOT
+    try:
+        assert ws.configured() is False
         try:
-            assert ws.configured() is False
-            try:
-                ws.signing_root()
-            except ws.SigningNotConfigured as exc:
-                assert "signing-vectors" in str(exc), str(exc)
-            else:
-                raise AssertionError(f"{retired!r} must raise")
-        finally:
-            _reset()
+            ws.signing_root()
+        except ws.SigningNotConfigured as exc:
+            assert "signing-vectors" in str(exc), str(exc)
+        else:
+            raise AssertionError("kix-avvik's example root must raise")
+    finally:
+        _reset()
+
 
 def test_surrounding_whitespace_is_stripped_and_warned_about_once(caplog=None):
     # The chart's own note: a payload written with `echo` rather than `printf '%s'` carries a
