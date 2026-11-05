@@ -8,7 +8,7 @@
 -- recomputes it (no stored bin edges). Built on TRAIN only (is_eval = FALSE). Serving:
 --   point model -> predicted_log -> ROUND(.,1) -> look up p90_min in this table
 --   (clamp the bucket to [MIN,MAX] per side for predictions beyond the trained range).
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.delay_p90_calib` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.delay_p90_calib` AS
 WITH dep AS (
   SELECT 'dep' AS side, ROUND(predicted_dep_log, 1) AS plog_bucket, dep_delay_pos AS actual
   FROM ML.PREDICT(MODEL `disruptions.dep_delay_reg`,

@@ -6,8 +6,8 @@
 -- inert: the change ships the machinery and never produces the answer.
 --
 -- Run it per environment (each records its own decisions; the tables are not copied dev->prd):
---   bq --project_id=ent-kixavvik-dev query --use_legacy_sql=false < message_wording_comparison.sql
---   bq --project_id=ent-kixavvik-prd query --use_legacy_sql=false < message_wording_comparison.sql
+--   bq --project_id=ent-smartavvik-dev query --use_legacy_sql=false < message_wording_comparison.sql
+--   bq --project_id=ent-smartavvik-prd query --use_legacy_sql=false < message_wording_comparison.sql
 -- A few MB over a 30-day window, i.e. free. Dry-run each statement SEPARATELY when editing --
 -- BigQuery validates a script lazily (`numChildJobs: 1`) and a whole-file dry run checks only the
 -- first, which is how a broken second query ships green (the rule `validate_varsel_sql.sh` exists

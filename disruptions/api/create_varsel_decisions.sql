@@ -611,10 +611,10 @@ SELECT * FROM `disruptions.varsel_decision_groups_between`(DATE '2020-01-01', DA
 -- PRUNED TWICE: eight statements on 2026-09-12 (U4 step 5) and four more on 2026-09-13 (U16).
 --
 -- Verified rather than assumed both times, which is what the paragraph above asks for. The second
--- prune compared each statement's text against `bq show --schema` in BOTH ent-kixavvik-dev and
--- ent-kixavvik-prd programmatically, byte for byte: varsel_decisions' alt_status, decided_at and
+-- prune compared each statement's text against `bq show --schema` in BOTH ent-smartavvik-dev and
+-- ent-smartavvik-prd programmatically, byte for byte: varsel_decisions' alt_status, decided_at and
 -- pushed and varsel_decision_outcomes' n_decisions were identical in both projects, so all four
--- were carrying text that had already arrived. ent-kixavvik-tst holds no such table at all, so a
+-- were carrying text that had already arrived. ent-smartavvik-tst holds no such table at all, so a
 -- statement here can only ever serve dev and prd. The first prune's eight were varsel_decisions'
 -- message_status, message_source, et_cancelled, impact_probability, cancel_probability,
 -- has_alternative and alt_minutes_saved plus varsel_decision_outcomes' message.

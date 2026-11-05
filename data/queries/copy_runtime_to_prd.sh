@@ -3,7 +3,7 @@
 # Copy the disruptions API's runtime BigQuery objects dev -> prd.
 #
 # The API's SQL uses unqualified `disruptions.*` refs resolved via
-# GOOGLE_CLOUD_PROJECT, so prd serves from ent-kixavvik-prd:disruptions. All
+# GOOGLE_CLOUD_PROJECT, so prd serves from ent-smartavvik-prd:disruptions. All
 # models are trained and all lookup tables are built in dev; prd never trains
 # or scans SIRI history itself — it only receives copies. Both datasets are in
 # the EU multi-region, so every copy job below is free (0 bytes billed).
@@ -37,8 +37,8 @@
 # logs its own issued forecasts; togvarsel.py creates the table on first use).
 set -euo pipefail
 
-SRC_PROJECT="ent-kixavvik-dev"
-DST_PROJECT="ent-kixavvik-prd"
+SRC_PROJECT="ent-smartavvik-dev"
+DST_PROJECT="ent-smartavvik-prd"
 DATASET="disruptions"
 
 MODELS=(

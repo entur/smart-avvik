@@ -37,7 +37,7 @@
 -- goes 0.530 (old model, SX columns NULLed) -> 0.913, and the flagged side is unmoved. The
 -- population does NOT want a lower threshold than 0.65 once it is encoded and calibrated
 -- honestly -- see the has_situation notes in create_training_calls.sql.
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt`
 OPTIONS(
   model_type       = 'LOGISTIC_REG',
   input_label_cols = ['call_cancelled'],
@@ -59,7 +59,7 @@ FROM (
 -- has_situation = FALSE and the documented fillers in the SX columns, so this is a fit of the
 -- realized outcome on what the model says about a call NOBODY published about -- which is a
 -- different question from the one above, and gets its own answer.
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_nosx`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_nosx`
 OPTIONS(
   model_type       = 'LOGISTIC_REG',
   input_label_cols = ['call_cancelled'],

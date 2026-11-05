@@ -109,7 +109,7 @@ ALLOWED_SCHEME = "https"
 #: client's public endpoint, and R18's blast radius is worth more than that flexibility.
 ALLOWED_PORT = 443
 
-USER_AGENT = "kix-avvik-notifications/1"
+USER_AGENT = "smart-avvik-notifications/1"
 
 # ---- The test-network fence --------------------------------------------------------------------
 #

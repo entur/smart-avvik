@@ -61,7 +61,7 @@ VARSEL_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "index.html"
 PERSONVERN_INDEX_HTML = _REPO / "demo" / "avviksvarsel" / "personvern" / "index.html"
 MAIN_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "main.tsx"
 PERSONVERN_PAGE_TSX = _REPO / "demo" / "avviksvarsel" / "src" / "personvern-page.tsx"
-HELM_ENV_DIR = _REPO / "helm" / "kix-avvik" / "env"
+HELM_ENV_DIR = _REPO / "helm" / "smart-avvik" / "env"
 
 # The constants /rushvarsel duplicates. Named here so a rename on either side fails loudly
 # instead of dropping a text out of the guard.

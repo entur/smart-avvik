@@ -15,14 +15,14 @@ import os
 
 from fastapi import HTTPException
 
-# prd carries no token in its hostname either (kix-avvik.entur.io), which is the same convention.
+# prd carries no token in its hostname either (smart-avvik.entur.io), which is the same convention.
 _PRODUCTION = ("", "prd", "prod", "production")
 
 
 def environment_label() -> str | None:
     """The environment name to show in the UI, or None in production.
 
-    Derived from ``GOOGLE_CLOUD_PROJECT`` (``ent-kixavvik-dev`` -> ``"dev"``) rather than from a
+    Derived from ``GOOGLE_CLOUD_PROJECT`` (``ent-smartavvik-dev`` -> ``"dev"``) rather than from a
     variable of its own, because that one is already required in every deployment -- the SQL's
     unqualified ``disruptions.*`` refs resolve through it -- so it cannot be forgotten the way a
     cosmetic setting would be. ``KIX_ENVIRONMENT`` overrides it for local runs.

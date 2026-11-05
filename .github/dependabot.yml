@@ -87,7 +87,7 @@ updates:
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
   - package-ecosystem: helm
-    directory: "/helm/kix-avvik"
+    directory: "/helm/smart-avvik"
     schedule:
       interval: weekly
     groups:

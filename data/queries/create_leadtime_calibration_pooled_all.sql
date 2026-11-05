@@ -36,54 +36,54 @@
 -- Run EACH statement as its own bq job (file + --nosynchronous_mode + bq wait). Re-run after any
 -- _pooled_all head retrain (serving reads ML.WEIGHTS live; a stale fit silently mis-calibrates).
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all` AS
 WITH inp AS (
-  SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_eval_pooled_all`
+  SELECT * FROM `ent-smartavvik-dev.disruptions.leadtime_eval_pooled_all`
 ),
 clf AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_cancel_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM inp))
 ),
 a5 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge5_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge5_clf_pooled_all`, (SELECT * FROM inp))
 ),
 a10 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled_all`, (SELECT * FROM inp))
 ),
 a20 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge20_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge20_clf_pooled_all`, (SELECT * FROM inp))
 ),
 a40 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge40_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge40_clf_pooled_all`, (SELECT * FROM inp))
 ),
 d5 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge5_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge5_clf_pooled_all`, (SELECT * FROM inp))
 ),
 d10 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM inp))
 ),
 d20 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge20_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge20_clf_pooled_all`, (SELECT * FROM inp))
 ),
 d40 AS (
   SELECT operator, situationNumber, jkey, stop_order, lead_min,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge40_clf_pooled_all`, (SELECT * FROM inp))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge40_clf_pooled_all`, (SELECT * FROM inp))
 )
 SELECT
   e.operator, e.situationNumber, e.jkey, e.stop_order, e.lead_min,
@@ -107,314 +107,314 @@ JOIN d40       USING (operator, situationNumber, jkey, stop_order, lead_min);
 
 -- Cancellation head ---------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['call_cancelled'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, call_cancelled
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['call_cancelled'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, call_cancelled
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['call_cancelled'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, call_cancelled
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['call_cancelled'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_cancel_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, call_cancelled
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1;
 
 
 -- arr ge5 head --------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND arr_delay_pos IS NOT NULL;
 
 
 -- arr ge10 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND arr_delay_pos IS NOT NULL;
 
 
 -- arr ge20 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND arr_delay_pos IS NOT NULL;
 
 
 -- arr ge40 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_arr40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, arr_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND arr_delay_pos IS NOT NULL;
 
 
 -- dep ge5 head --------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep5_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 5 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND dep_delay_pos IS NOT NULL;
 
 
 -- dep ge10 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep10_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 10 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND dep_delay_pos IS NOT NULL;
 
 
 -- dep ge20 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep20_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 20 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND dep_delay_pos IS NOT NULL;
 
 
 -- dep ge40 head -------------------------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_lead60_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_lead60_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 60 AND min_from_onset >= 60 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_lead120_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_lead120_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 120 AND min_from_onset >= 120 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_lead240_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_lead240_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = 240 AND min_from_onset >= 240 AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_plan_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_plan_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p_dep40_raw, 1 - 1e-6), 1e-6))) AS raw_logit,
   operator, dep_delay_pos >= 40 AS y
-FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
 WHERE lead_min = -1 AND dep_delay_pos IS NOT NULL;

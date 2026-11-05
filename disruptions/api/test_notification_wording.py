@@ -25,7 +25,7 @@ import os
 import pathlib
 from datetime import UTC, datetime, timedelta
 
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-smartavvik-test")
 
 import llm_message
 import notification_wording as nw
@@ -40,7 +40,7 @@ def _reset(*, provider="claude", webhook_delivery=True):
     llm_message._stop_name_provider = None
     llm_message._PROVIDER = provider
     llm_message._ENABLED = True
-    llm_message._PROJECT = "ent-kixavvik-test"
+    llm_message._PROJECT = "ent-smartavvik-test"
     llm_message._STATE = llm_message._LatchState()
     nw.reset_state()
     nw._WEBHOOK_DELIVERY_ENABLED = webhook_delivery
@@ -581,7 +581,7 @@ def _llm_log_fields(call):
 def test_a_webhook_wording_writes_no_prompt_record_even_with_prompt_logging_on():
     """Scenario 6, end to end through `write_wording` rather than through `llm_message` directly.
 
-    `VARSEL_LLM_LOG_PROMPTS` is "true" in dev (`helm/kix-avvik/env/values-kub-ent-dev.yaml`), which
+    `VARSEL_LLM_LOG_PROMPTS` is "true" in dev (`helm/smart-avvik/env/values-kub-ent-dev.yaml`), which
     is exactly the environment this rollout starts in, and `/varsel` message debugging needs it left
     on — so the suppression cannot be an environment variable and is in code, keyed on the
     `caller` marker this surface's policy carries. The record it suppresses is the whole

@@ -22,7 +22,7 @@
 --   HAVING date >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR) AND date < CURRENT_DATE();
 --
 --   bq load --replace --source_format=CSV --skip_leading_rows=1 \
---     ent-kixavvik-dev:disruptions.hh_weather_blindern blindern.csv \
+--     ent-smartavvik-dev:disruptions.hh_weather_blindern blindern.csv \
 --     date:DATE,tmin_c:FLOAT,tmax_c:FLOAT,prcp_mm:FLOAT,snwd_mm:FLOAT
 --
 -- GHCN-D is daily and has NO humidity element — testing the actual RH/kondens
@@ -52,7 +52,7 @@ WITH banded AS (
          ELSE                  '4: tmin > 5C' END AS temp_band,
     IF(prcp_mm > 0, 'wet', 'dry')             AS wet,
     IF(snwd_mm > 0, 'snow_on_ground', 'bare') AS snow
-  FROM `ent-kixavvik-dev.disruptions.hh_weather_blindern`
+  FROM `ent-smartavvik-dev.disruptions.hh_weather_blindern`
   WHERE tmin_c IS NOT NULL
 ),
 oslo_stops AS (
@@ -64,8 +64,8 @@ inc AS (
   SELECT d.situationNumber,
          DATE(d.onset_ts, 'Europe/Oslo') AS date,
          c.category, d.reopen_minutes
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
-  LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
+  FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS d
+  LEFT JOIN `ent-smartavvik-dev.disruptions.categories` AS c
     ON  IFNULL(c.summary, '')     = IFNULL(d.summary, '')
     AND IFNULL(c.description, '') = IFNULL(d.description, '')
   WHERE ARRAY_LENGTH(d.affected_stops) <= 3

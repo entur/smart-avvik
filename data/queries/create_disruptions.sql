@@ -15,7 +15,7 @@
 -- onset, which is a stronger predictor of cancellation/delay than the cause taxonomy
 -- (leak-free eta2_cancel ~0.32 vs ~0.23). Both onset fields are computed in the SAME scan via
 -- FIRST_VALUE -- no second ET/SX pass.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.disruptions` AS
 WITH
   -- 0. Per-snapshot scalars: the first Norwegian summary/description of each snapshot, plus an
   --    onset clock (event_ts). Computed once so both the latest- and first-version picks reuse

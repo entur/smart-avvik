@@ -1,4 +1,4 @@
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.prediction_model`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.prediction_model`
 OPTIONS (
   MODEL_TYPE = 'BOOSTED_TREE_REGRESSOR',
   INPUT_LABEL_COLS = ['duration_minutes'],
@@ -6,4 +6,4 @@ OPTIONS (
   HPARAM_TUNING_ALGORITHM = 'VIZIER_DEFAULT',
   HPARAM_TUNING_OBJECTIVES = ['R2_SCORE']
 ) AS
-SELECT * FROM `ent-kixavvik-dev.disruptions.training`
+SELECT * FROM `ent-smartavvik-dev.disruptions.training`

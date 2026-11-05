@@ -25,7 +25,7 @@
 # and remember §14f: a holdout that lands in winter reads lower than one in summer).
 set -euo pipefail
 
-PROJECT="${PROJECT:-ent-kixavvik-dev}"
+PROJECT="${PROJECT:-ent-smartavvik-dev}"
 DIR="$(dirname "$0")"
 
 run() {

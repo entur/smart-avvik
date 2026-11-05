@@ -1441,7 +1441,7 @@ def test_no_log_record_from_this_module_carries_a_raw_stop_ref():
 
 # ---- Recorded Journey Planner reply -----------------------------------------------------------
 # Captured verbatim with curl 2026-08-06 against
-# https://api.entur.io/journey-planner/v3/graphql (ET-Client-Name: entur-kixavvik), using the exact
+# https://api.entur.io/journey-planner/v3/graphql (ET-Client-Name: entur-smartavvik), using the exact
 # `alternatives._TRIP_QUERY` document: Oslo S (NSR:StopPlace:337) -> Drøbak torg
 # (NSR:StopPlace:5576), dateTime 2026-08-06T11:00:00+02:00, arriveBy false. Truncated to the first
 # 4 of 7 tripPatterns; nothing inside a pattern was edited.

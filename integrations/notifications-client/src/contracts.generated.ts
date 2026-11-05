@@ -1,7 +1,7 @@
 // GENERATED FILE -- do not edit by hand.
 //
 // Produced by `npm run generate` from the vendored JSON Schemas in `contracts/`, which are
-// byte-identical copies of `contracts/notifications/v1/` in the kix-avvik repository. Run
+// byte-identical copies of `contracts/notifications/v1/` in the smart-avvik repository. Run
 // `npm run generate:check` to prove this file is in step with them; the test suite does.
 
 /**

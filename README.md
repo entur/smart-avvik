@@ -1,4 +1,4 @@
-# kix-avvik
+# smart-avvik
 Agent for proaktiv avvikshåndtering, fra Team KI-eksperimentering
 
 ## Documentation

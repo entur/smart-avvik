@@ -282,7 +282,7 @@ def setup(exporter_factory=None) -> None:
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-        attributes = {"service.name": "kix-avvik"}
+        attributes = {"service.name": "smart-avvik"}
         project = os.environ.get("GOOGLE_CLOUD_PROJECT", "").strip()
         if project:
             attributes["gcp.project_id"] = project

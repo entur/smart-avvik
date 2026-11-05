@@ -43,7 +43,7 @@ pred AS (
     (SELECT prob FROM UNNEST(p.predicted_outcome_probs) WHERE label = 'CANCELLED') AS p_cancelled,
     p.call_cancelled,
     p.jkey, p.aimed_dep
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.trip_outcome_clf`, (SELECT * FROM cand)) AS p
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.trip_outcome_clf`, (SELECT * FROM cand)) AS p
 )
 SELECT
   ROUND(p_cancelled, 1) AS p_bucket,

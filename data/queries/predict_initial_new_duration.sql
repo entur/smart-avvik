@@ -277,7 +277,7 @@ SELECT
   a.actual_impact_min,                                                       -- forward-only (onset -> onset+12h)
   b.actual_impact_min_lb,                                                    -- incl. 60-min pre-onset look-back
   p.summary
-FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
+FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dur_init_reopen`,
                 (SELECT * FROM feat)) AS p
 -- per-category calibrated offsets, with the global '__ALL__' row as fallback for
 -- sparse / UNKNOWN / unseen categories (see create_quantiles.sql)

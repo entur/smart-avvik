@@ -25,7 +25,7 @@
 -- to ~30 min AFTER the nominal ask time, and realized delays stand in for live ET
 -- estimates, so quality at each lead reads slightly optimistic. Consistent across leads.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.leadtime_eval_pooled_all` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.leadtime_eval_pooled_all` AS
 WITH all_calls AS (
   SELECT 'NSB' AS operator, CAST(NULL AS DATE) AS operating_date, * FROM `disruptions.rail_calls`
   UNION ALL

@@ -39,7 +39,7 @@ WITH s AS (
          (call_cancelled OR COALESCE(dep_delay_pos, 0) >= 10) AS label_dep,
          IF(lead_min = -1, 'plan', CAST(lead_min AS STRING)) AS lead_bucket,
          p_cancel_raw, p_dep10_raw
-  FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+  FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
   WHERE NOT is_terminal
     AND (call_cancelled OR dep_delay_pos IS NOT NULL)
     AND (lead_min = -1 OR min_from_onset >= lead_min)
@@ -53,9 +53,9 @@ FROM (
          1 / (1 + EXP(-(wd.b + wd.a * LN(GREATEST(LEAST(s.p_dep10_raw, 1 - 1e-6), 1e-6)
                 / (1 - GREATEST(LEAST(s.p_dep10_raw, 1 - 1e-6), 1e-6))) + IFNULL(wd.w, 0)))) AS pd
   FROM s
-  JOIN `ent-kixavvik-dev.disruptions.pooled_all_platt_weights` AS wc
+  JOIN `ent-smartavvik-dev.disruptions.pooled_all_platt_weights` AS wc
     ON wc.head = 'cancel' AND wc.lead_bucket = s.lead_bucket AND wc.operator = s.operator
-  JOIN `ent-kixavvik-dev.disruptions.pooled_all_platt_weights` AS wd
+  JOIN `ent-smartavvik-dev.disruptions.pooled_all_platt_weights` AS wd
     ON wd.head = 'dep_ge10' AND wd.lead_bucket = s.lead_bucket AND wd.operator = s.operator
 ) AS s
 """
@@ -71,7 +71,7 @@ def prec_rec(y: np.ndarray, p: np.ndarray, thr: float) -> tuple[float, float, in
 
 
 def main() -> None:
-    df = bigquery.Client(project="ent-kixavvik-dev").query(QUERY).to_dataframe()
+    df = bigquery.Client(project="ent-smartavvik-dev").query(QUERY).to_dataframe()
     df["y"] = df.label_dep.astype(bool)
     df["p"] = df.p_impact_dep.astype(float)
     print(f"{len(df):,} ask-variant rows, {df.operator.nunique()} operators\n")
