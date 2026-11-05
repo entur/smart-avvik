@@ -45,16 +45,17 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Self
 from zoneinfo import ZoneInfo
 
+import deploy_files
 import notification_store
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 MODULE_SOURCE = pathlib.Path(notification_store.__file__).read_text()
 INDEXES = json.loads((REPO / "firestore.indexes.json").read_text())
-FIRESTORE_TF = (REPO / "terraform" / "firestore.tf").read_text()
+FIRESTORE_TF = deploy_files.read("terraform/firestore.tf")
 CI_YML = (REPO / ".github" / "workflows" / "ci.yml").read_text()
-TERRAFORM_YML = (REPO / ".github" / "workflows" / "terraform.yml").read_text()
+TERRAFORM_YML = deploy_files.read(".github/workflows/terraform.yml")
 HELM_VALUES = (REPO / "helm" / "smart-avvik" / "values.yaml").read_text()
-TF_VARIABLES = (REPO / "terraform" / "variables.tf").read_text()
+TF_VARIABLES = deploy_files.read("terraform/variables.tf")
 VARSEL_SOURCE = (pathlib.Path(__file__).parent / "varsel.py").read_text()
 
 
@@ -1942,6 +1943,7 @@ def test_every_checked_in_index_belongs_to_a_query_and_a_collection_the_module_u
         assert key in needed, f"{key} is declared but no query in the module needs it"
 
 
+@deploy_files.needs("terraform/firestore.tf", ".github/workflows/terraform.yml")
 def test_every_checked_in_index_is_materialised_by_terraform():
     assert 'jsondecode(file("${path.module}/../firestore.indexes.json")).indexes' in FIRESTORE_TF
     assert 'resource "google_firestore_index" "notification"' in FIRESTORE_TF
@@ -1968,6 +1970,7 @@ def test_every_index_entry_has_the_fields_the_for_each_reads():
             assert spec_field["fieldPath"] != "__name__"
 
 
+@deploy_files.needs("terraform/firestore.tf")
 def test_every_collection_group_has_exactly_one_ttl_field():
     ttl_block = FIRESTORE_TF.split("firestore_ttl_collections = [", 1)[1].split("]", 1)[0]
     # COMMENTS STRIPPED, because the block explains itself: the reason `migrations` is absent is
@@ -2016,6 +2019,7 @@ def test_every_collection_group_has_exactly_one_ttl_field():
     assert FIRESTORE_TF_CODE.count("index_config {}") == 1  # the exemption resource, for_each
 
 
+@deploy_files.needs("terraform/firestore.tf")
 def test_every_exempted_field_is_named_by_no_query_and_declared_in_both_places():
     """U9 step 4. An exemption is silent in both directions, so it is pinned in both.
 
@@ -3657,6 +3661,7 @@ def test_the_dependency_is_declared_in_all_three_places():
     assert 'name = "google-cloud-firestore"' in lock, "uv sync was not re-run"
 
 
+@deploy_files.needs("terraform/variables.tf", "terraform/firestore.tf")
 def test_the_database_id_is_the_same_literal_in_terraform_and_helm():
     """The one thing Terraform and the runtime cannot share.
 
@@ -3673,6 +3678,7 @@ def test_the_database_id_is_the_same_literal_in_terraform_and_helm():
     assert 'name        = var.notification_firestore_database' in FIRESTORE_TF
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
     """Never appended to `varsel`: an ExternalSecret is all-or-nothing under LatestOrFail and the
     chart's envFrom secretRef is not optional, so one unresolvable name deletes the group's Secret
@@ -3719,8 +3725,9 @@ def test_the_webhook_gate_is_off_where_an_operator_looks():
     )
 
 
+@deploy_files.needs(".entur/app-smart-avvik.yml", "terraform")
 def test_the_iam_grant_is_in_the_manifest_and_not_in_terraform():
-    manifest = (REPO / ".entur" / "application.yaml").read_text()
+    manifest = (REPO / ".entur" / "app-smart-avvik.yml").read_text()
     assert "roles/datastore.user" in manifest
     for tf in (REPO / "terraform").glob("*.tf"):
         assert "roles/datastore" not in _uncommented(tf.read_text()), (
@@ -3731,6 +3738,7 @@ def test_the_iam_grant_is_in_the_manifest_and_not_in_terraform():
     assert "google_bigquery_dataset_iam_member" not in FIRESTORE_TF_CODE
 
 
+@deploy_files.needs("terraform/firestore.tf")
 def test_the_database_is_named_and_abandoned_on_destroy():
     assert 'deletion_policy         = "ABANDON"' in FIRESTORE_TF, (
         "a destroy must not take the subscriptions with it -- nothing can rebuild them"
@@ -3758,6 +3766,7 @@ def test_the_deny_all_rules_file_exists_and_denies():
     assert firebase["firestore"]["indexes"] == "firestore.indexes.json"
 
 
+@deploy_files.needs("terraform/firestore.tf", ".github/workflows/terraform.yml")
 def test_the_deny_all_rules_are_deliberately_not_released_by_terraform():
     """The rules file is the emulator's and the tests' statement, NOT a Terraform-managed release --
     and that is a decision with a date, not an omission. For one day (2026-09-09/10) it was

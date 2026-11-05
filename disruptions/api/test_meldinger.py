@@ -43,6 +43,7 @@ from google.cloud import bigquery as _bq
 
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
+import deploy_files
 import llm_message
 import meldinger
 from fastapi import FastAPI
@@ -1397,12 +1398,14 @@ def _api_values_files() -> list[Path]:
     return files
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_every_helm_environment_and_the_base_pin_gemini():
     root = Path(__file__).parents[2] / "helm/smart-avvik"
     for path in [root / "values.yaml", *_api_values_files()]:
         assert "VARSEL_LLM_PROVIDER: gemini" in path.read_text(), path
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_every_helm_environment_extends_the_replay_deadline():
     for path in _api_values_files():
         assert 'MELDINGER_REQUEST_DEADLINE_S: "60"' in path.read_text(), path
