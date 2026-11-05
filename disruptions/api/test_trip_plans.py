@@ -1831,7 +1831,7 @@ def _run():
 
 # ---- Recorded Journey Planner replies --------------------------------------------------------
 # Captured verbatim with curl 2026-10-27 against https://api.entur.io/journey-planner/v3/graphql
-# (ET-Client-Name: entur-kixavvik) with `ignoreRealtimeUpdates: true` and the verification
+# (ET-Client-Name: entur-smartavvik) with `ignoreRealtimeUpdates: true` and the verification
 # document, which selected everything `trip_plans._PLAN_QUERY` does plus `realtime`, the expected
 # times, `authority`, `operatingDay`, `searchWindowUsed` and the place names. The extra fields are
 # unread here; nothing inside a pattern was edited.

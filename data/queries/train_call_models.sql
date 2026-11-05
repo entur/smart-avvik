@@ -69,7 +69,7 @@
 -- the 2026-07-03 promotion run took 5.4 h (training itself ~22 min; billed only ~$0.46, the
 -- explain phase is slot-invisible). Plan retrains overnight, or drop the option if attribution
 -- inspection isn't needed.
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['call_cancelled'],
@@ -94,7 +94,7 @@ WHERE is_eval = FALSE;
 -- Pruned feature set (11 features, validated 2026-07-02): planned, num_lines, is_terminal,
 -- is_origin, stop_place had ~0 global-explain attribution. Contract frozen; the 2026-07-02
 -- feature columns are excepted for the same reason as the classifier.
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_delay_reg`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_delay_reg`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_REGRESSOR',
   input_label_cols  = ['dep_log'],
@@ -112,7 +112,7 @@ FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
 -- 3. Arrival-delay regressor (destination side; non-cancelled calls with an arrival) -------
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_delay_reg`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_delay_reg`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_REGRESSOR',
   input_label_cols  = ['arr_log'],
@@ -143,7 +143,7 @@ WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 -- Population mirrors arr_delay_reg: non-cancelled calls with an arrival. Cancellation is handled
 -- by call_cancel_clf; these are P(>= t | train runs).
 -- All four MUST share one feature contract so serving computes the feature block once.
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -157,7 +157,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -171,7 +171,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -185,7 +185,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -204,7 +204,7 @@ WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 -- feature contract, same thresholds (dep base rates track arr almost exactly: holdout >=10 is
 -- 9.9% vs arr 9.7%; >=40 is 0.61% -- thin, tail is extrapolation territory on both sides).
 -- Population mirrors dep_delay_reg: non-cancelled calls with a departure (terminals excluded).
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -218,7 +218,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -232,7 +232,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -246,7 +246,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_clf`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_clf`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],

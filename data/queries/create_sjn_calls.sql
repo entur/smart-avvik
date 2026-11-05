@@ -15,7 +15,7 @@
 --
 -- WINDOW: training_calls' window, 2024-06-01 .. 2026-10-11 (Oslo call_date).
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.sjn_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.sjn_calls`
 PARTITION BY call_date
 CLUSTER BY lineRef, stop_place
 AS

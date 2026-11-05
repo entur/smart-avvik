@@ -38,12 +38,12 @@
 # by the same SA.
 #
 #   bq mk --transfer_config \
-#     --project_id=ent-kixavvik-dev \
+#     --project_id=ent-smartavvik-dev \
 #     --location=EU \
 #     --data_source=scheduled_query \
 #     --display_name="varsel-label-daily" \
 #     --schedule="every 1 hours from 03:30 to 04:45" \
-#     --service_account_name="application@ent-kixavvik-dev.iam.gserviceaccount.com" \
+#     --service_account_name="application@ent-smartavvik-dev.iam.gserviceaccount.com" \
 #     --params="$(python3 -c 'import json;print(json.dumps({"query":open("data/queries/label_varsel_decisions.sql").read()}))')"
 #
 # Creating the config fires one run immediately, so a mistake surfaces at once rather than the next morning.
@@ -79,7 +79,7 @@
 # ---------------------------------------------------------------------------------------------
 set -euo pipefail
 
-PROJECT="${1:-ent-kixavvik-dev}"
+PROJECT="${1:-ent-smartavvik-dev}"
 
 job=$(bq query --nouse_legacy_sql --nosynchronous_mode --project_id="$PROJECT" \
   < "$(dirname "$0")/label_varsel_decisions.sql" | sed -n 's/^Successfully started query //p')

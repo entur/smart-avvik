@@ -16,11 +16,11 @@
 -- suggestive, not conclusive. Not wired into production.
 
 -- Training tables: weather only, and ET+weather.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_initial_wx` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_initial_wx` AS
 SELECT t.*, w.* EXCEPT(situationNumber)
 FROM `disruptions.training_initial` t JOIN `disruptions.weather_features` w USING (situationNumber);
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_initial_etwx` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_initial_etwx` AS
 SELECT t.*, w.* EXCEPT(situationNumber)
 FROM `disruptions.training_initial_et` t JOIN `disruptions.weather_features` w USING (situationNumber);
 

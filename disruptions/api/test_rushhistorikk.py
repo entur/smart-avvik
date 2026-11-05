@@ -479,9 +479,9 @@ def test_the_query_file_is_registered_in_the_validator_with_its_parameters():
 
 def test_config_labels_non_prod_and_stays_quiet_in_prd():
     for project, expected in (
-        ("ent-kixavvik-dev", "dev"),
-        ("ent-kixavvik-tst", "tst"),
-        ("ent-kixavvik-prd", None),
+        ("ent-smartavvik-dev", "dev"),
+        ("ent-smartavvik-tst", "tst"),
+        ("ent-smartavvik-prd", None),
     ):
         with _deployed_as(project):
             assert client.get("/rushhistorikk-api/config").json()["environment"] == expected

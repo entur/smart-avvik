@@ -40,7 +40,7 @@
 -- several situations is counted under each (category, situation); categories are
 -- AI.CLASSIFY-derived from Norwegian summary+description. Scope: participantRef='NSB'.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.category_line_hour_impact` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.category_line_hour_impact` AS
 WITH
   aff AS (
     SELECT

@@ -8,5 +8,5 @@ download.log
 points.ndjson
 
 # Downloaded volumes (regenerable via download_volumes.py; loaded into
-# ent-kixavvik-dev.disruptions.svv_hourly_volumes). Mirrors data/frost/.gitignore.
+# ent-smartavvik-dev.disruptions.svv_hourly_volumes). Mirrors data/frost/.gitignore.
 volumes/

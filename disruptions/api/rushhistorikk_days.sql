@@ -25,7 +25,7 @@
 --
 -- No partition-pruning predicate to get right: all three tables are tiny (four issue rows per
 -- weekday, three outcome rows per day), so a 365-day window is bytes, not kilobytes. Measured 305 bytes by dry run
--- against ent-kixavvik-dev on 2026-09-01. The response is cached anyway, on a four-value window
+-- against ent-smartavvik-dev on 2026-09-01. The response is cached anyway, on a four-value window
 -- allow-list, so the reachable key space is four.
 WITH outcomes AS (
   -- One row per day, the three scopes pivoted. Each scope carries its own level because each

@@ -159,7 +159,7 @@ function render() {
   out.push("// GENERATED FILE -- do not edit by hand.");
   out.push("//");
   out.push("// Produced by `npm run generate` from the vendored JSON Schemas in `contracts/`, which are");
-  out.push("// byte-identical copies of `contracts/notifications/v1/` in the kix-avvik repository. Run");
+  out.push("// byte-identical copies of `contracts/notifications/v1/` in the smart-avvik repository. Run");
   out.push("// `npm run generate:check` to prove this file is in step with them; the test suite does.");
   out.push("");
   const event = schemas.get("event.schema.json");

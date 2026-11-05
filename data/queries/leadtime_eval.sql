@@ -31,18 +31,18 @@
 -- ~30 min AFTER the nominal ask time, and realized delays stand in for live ET estimates,
 -- so quality at each lead reads slightly optimistic. Consistent across leads.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.leadtime_eval_calls` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.leadtime_eval_calls` AS
 WITH
 -- recover the exact call timestamps for the holdout rows (training_calls drops call_ts)
 callts AS (
   SELECT jkey, stop_order, call_date, COALESCE(aimed_dep, aimed_arr) AS call_ts
-  FROM `ent-kixavvik-dev.disruptions.rail_calls`
+  FROM `ent-smartavvik-dev.disruptions.rail_calls`
   WHERE (aimed_dep IS NOT NULL OR aimed_arr IS NOT NULL)
     AND (COALESCE(call_cancelled, FALSE) OR dep_delay_min IS NOT NULL OR arr_delay_min IS NOT NULL)
 ),
 joined AS (
   SELECT t.*, c.call_ts
-  FROM `ent-kixavvik-dev.disruptions.training_calls` AS t
+  FROM `ent-smartavvik-dev.disruptions.training_calls` AS t
   JOIN callts AS c USING (jkey, stop_order, call_date)
   WHERE t.is_eval
 ),
@@ -55,7 +55,7 @@ linehour AS (
          COUNT(*) AS n,
          ROUND(AVG(GREATEST(dep_delay_min, 0)), 2) AS d,
          ROUND(AVG(CAST(COALESCE(call_cancelled, FALSE) AS INT64)), 3) AS c
-  FROM `ent-kixavvik-dev.disruptions.rail_calls`
+  FROM `ent-smartavvik-dev.disruptions.rail_calls`
   WHERE aimed_dep IS NOT NULL
   GROUP BY 1, 2
 ),
@@ -63,7 +63,7 @@ own AS (
   SELECT e.jkey, e.stop_order, e.call_date, e.lead_min,
          ARRAY_AGG(GREATEST(r2.dep_delay_min, 0) ORDER BY r2.stop_order DESC LIMIT 1)[OFFSET(0)] AS own_prev
   FROM (SELECT DISTINCT jkey, stop_order, call_ts, call_date, lead_min FROM expanded) AS e
-  JOIN `ent-kixavvik-dev.disruptions.rail_calls` AS r2
+  JOIN `ent-smartavvik-dev.disruptions.rail_calls` AS r2
     ON r2.jkey = e.jkey
    AND r2.call_date BETWEEN DATE_SUB(e.call_date, INTERVAL 1 DAY) AND e.call_date
    AND r2.stop_order < e.stop_order

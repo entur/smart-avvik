@@ -5,8 +5,8 @@
 -- rate in production stays at zero. This is the measurement that would notice.
 --
 -- Run it per environment (each records its own decisions; the tables are not copied):
---   bq --project_id=ent-kixavvik-dev query --use_legacy_sql=false < alternative_offer_rate.sql
---   bq --project_id=ent-kixavvik-prd query --use_legacy_sql=false < alternative_offer_rate.sql
+--   bq --project_id=ent-smartavvik-dev query --use_legacy_sql=false < alternative_offer_rate.sql
+--   bq --project_id=ent-smartavvik-prd query --use_legacy_sql=false < alternative_offer_rate.sql
 -- ~30 KB scanned over a 30-day window, i.e. free.
 --
 -- THE DENOMINATOR IS SUBJECTS, NOT ROWS. `varsel_decisions` holds one row per

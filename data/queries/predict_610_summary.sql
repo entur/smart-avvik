@@ -47,7 +47,7 @@ pred AS (
       WHEN p.dep_delay_min >= 10 THEN 'DELAYED'
       ELSE 'GO'
     END AS actual
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.trip_outcome_clf`, (SELECT * FROM cand)) AS p
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.trip_outcome_clf`, (SELECT * FROM cand)) AS p
 )
 SELECT predicted, actual, COUNT(*) AS n, ROUND(AVG(p_cancelled), 3) AS avg_p_cancelled
 FROM pred

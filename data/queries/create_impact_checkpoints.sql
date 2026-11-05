@@ -17,7 +17,7 @@
 
 DECLARE checkpoints ARRAY<INT64> DEFAULT [10,20,30,45,60,90,120,180,240,300,360];
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.impact_checkpoints` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.impact_checkpoints` AS
 WITH sit AS (
   SELECT situationNumber, onset_ts, reopen_minutes, impact_minutes, affected_stops
   FROM `disruptions.disruptions_initial`

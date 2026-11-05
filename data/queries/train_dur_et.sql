@@ -3,7 +3,7 @@
 -- add over the pure SX-onset feature set. is_eval is the SAME FARM_FINGERPRINT
 -- split, so eval rows are identical -> a fair head-to-head vs dur_init_*.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_initial_et` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_initial_et` AS
 SELECT t.*, f.* EXCEPT(situationNumber)
 FROM `disruptions.training_initial` AS t
 JOIN `disruptions.preonset_features` AS f USING (situationNumber);

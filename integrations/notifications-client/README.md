@@ -113,7 +113,7 @@ value kinds. The types in `src/contracts.generated.ts` are generated from
 changing either, and `npm run generate:check` fails on drift.
 
 Those two schemas plus `contracts/signing-vectors.json` are byte-identical copies of the authored
-files in the kix-avvik repository, so the package is self-contained when vendored; a test asserts the
+files in the smart-avvik repository, so the package is self-contained when vendored; a test asserts the
 copies have not drifted when the repository is present.
 
 The unknown-field refusal matters in both directions. Entur's store legitimately holds three fields

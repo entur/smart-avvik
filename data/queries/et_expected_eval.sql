@@ -52,12 +52,12 @@
 
 -- 1. One row per (holdout call x lead), with T and the leak-free ask-time features ---------------
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.exp_etcmp_asks` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.exp_etcmp_asks` AS
 WITH rc AS (
   SELECT jkey, stop_order, call_date, lineRef, aimed_dep, aimed_arr, actual_dep, actual_arr,
          dep_delay_min, arr_delay_min, call_cancelled,
          COALESCE(aimed_dep, aimed_arr) AS call_ts
-  FROM `ent-kixavvik-dev.disruptions.rail_calls`
+  FROM `ent-smartavvik-dev.disruptions.rail_calls`
   WHERE call_date BETWEEN '2026-08-30' AND '2026-09-13'
 ),
 asks AS (
@@ -66,7 +66,7 @@ asks AS (
   SELECT e.*, IFNULL(e.situationNumber, '') AS sid,
          r.call_ts, r.aimed_arr, r.actual_arr,
          TIMESTAMP_SUB(r.call_ts, INTERVAL e.lead_min MINUTE) AS ask_ts
-  FROM `ent-kixavvik-dev.disruptions.leadtime_eval_calls` AS e
+  FROM `ent-smartavvik-dev.disruptions.leadtime_eval_calls` AS e
   JOIN rc AS r USING (jkey, stop_order, call_date)
   WHERE e.call_date BETWEEN '2026-08-31' AND '2026-09-13'
     AND e.lead_min IN (30, 60, 120, 240)
@@ -112,16 +112,16 @@ LEFT JOIN line_fair AS lf USING (sid, jkey, stop_order, call_date, lead_min);
 -- 2. The four arrival heads on the leak-free features ------------------------------------------
 -- ML.PREDICT ignores the columns a model does not know, so the *_built twins ride along harmlessly.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.exp_etcmp_fair_scored` AS
-WITH inp AS (SELECT * FROM `ent-kixavvik-dev.disruptions.exp_etcmp_asks`),
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.exp_etcmp_fair_scored` AS
+WITH inp AS (SELECT * FROM `ent-smartavvik-dev.disruptions.exp_etcmp_asks`),
 a5 AS (SELECT sid, jkey, stop_order, call_date, lead_min, (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
-       FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge5_clf`, (SELECT * FROM inp))),
+       FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge5_clf`, (SELECT * FROM inp))),
 a10 AS (SELECT sid, jkey, stop_order, call_date, lead_min, (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
-       FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM inp))),
+       FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM inp))),
 a20 AS (SELECT sid, jkey, stop_order, call_date, lead_min, (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
-       FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge20_clf`, (SELECT * FROM inp))),
+       FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge20_clf`, (SELECT * FROM inp))),
 a40 AS (SELECT sid, jkey, stop_order, call_date, lead_min, (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p
-       FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge40_clf`, (SELECT * FROM inp)))
+       FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge40_clf`, (SELECT * FROM inp)))
 SELECT sid, jkey, stop_order, call_date, lead_min,
        a5.p AS f_arr5_raw, a10.p AS f_arr10_raw, a20.p AS f_arr20_raw, a40.p AS f_arr40_raw
 FROM a5 JOIN a10 USING (sid, jkey, stop_order, call_date, lead_min)
@@ -130,10 +130,10 @@ FROM a5 JOIN a10 USING (sid, jkey, stop_order, call_date, lead_min)
 
 -- 3. What ET said about each ask's call at T ----------------------------------------------------
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.exp_etcmp_et_asof` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.exp_etcmp_et_asof` AS
 WITH asks AS (
   SELECT sid, jkey, stop_order, call_date, lead_min, ask_ts
-  FROM `ent-kixavvik-dev.disruptions.exp_etcmp_asks`
+  FROM `ent-smartavvik-dev.disruptions.exp_etcmp_asks`
 ),
 need AS (SELECT DISTINCT jkey, stop_order FROM asks),
 snaps AS (

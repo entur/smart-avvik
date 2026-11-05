@@ -46,14 +46,14 @@ def _deployed_as(project: str | None):
 def test_config_names_the_non_prod_environment():
     """The page shows this behind its heading. /demo is shown to partners, and dev serves the same
     page from the same image as prd — the environment is the one thing the page cannot infer."""
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         r = client.get("/demo-api/config")
     assert r.status_code == 200, r.text
     assert r.json()["environment"] == "dev"
 
 
 def test_config_leaves_production_unlabelled():
-    with _deployed_as("ent-kixavvik-prd"):
+    with _deployed_as("ent-smartavvik-prd"):
         assert client.get("/demo-api/config").json()["environment"] is None
     with _deployed_as(None):
         assert client.get("/demo-api/config").json()["environment"] is None
@@ -64,7 +64,7 @@ def test_config_needs_no_demo_dataset():
     here at all, which is the fresh-environment case where meta cannot answer and the masthead
     still renders."""
     assert main.bq_client is None
-    with _deployed_as("ent-kixavvik-tst"):
+    with _deployed_as("ent-smartavvik-tst"):
         assert client.get("/demo-api/config").json()["environment"] == "tst"
 
 

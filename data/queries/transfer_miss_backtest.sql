@@ -22,12 +22,12 @@
 --
 --   bq query --use_legacy_sql=false < data/queries/transfer_miss_backtest.sql
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.exp_transfer_pairs` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.exp_transfer_pairs` AS
 WITH journey AS (
   SELECT *,
          LAG(stop_place) OVER w AS prev_place,
          LEAD(stop_place) OVER w AS next_place
-  FROM `ent-kixavvik-dev.disruptions.rail_calls`
+  FROM `ent-smartavvik-dev.disruptions.rail_calls`
   WHERE call_date BETWEEN '2026-04-01' AND '2026-10-12'
   WINDOW w AS (PARTITION BY jkey ORDER BY stop_order)
 ),

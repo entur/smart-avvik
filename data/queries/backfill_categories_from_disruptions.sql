@@ -16,17 +16,17 @@
 
 DECLARE cat_array STRING DEFAULT (
   SELECT STRING_AGG(FORMAT('(%T, %T)', category, description), ',\n      ' ORDER BY sort_order)
-  FROM `ent-kixavvik-dev.disruptions.category_taxonomy`
+  FROM `ent-smartavvik-dev.disruptions.category_taxonomy`
 );
 
 EXECUTE IMMEDIATE FORMAT(r"""
-INSERT INTO `ent-kixavvik-dev.disruptions.categories` (summary, description, category)
+INSERT INTO `ent-smartavvik-dev.disruptions.categories` (summary, description, category)
 WITH missing AS (
   SELECT DISTINCT d.summary, d.description
-  FROM `ent-kixavvik-dev.disruptions.disruptions` AS d
+  FROM `ent-smartavvik-dev.disruptions.disruptions` AS d
   WHERE (d.summary IS NOT NULL OR d.description IS NOT NULL)
     AND NOT EXISTS (
-      SELECT 1 FROM `ent-kixavvik-dev.disruptions.categories` AS c
+      SELECT 1 FROM `ent-smartavvik-dev.disruptions.categories` AS c
       WHERE IFNULL(c.summary,     '__NULL__') = IFNULL(d.summary,     '__NULL__')
         AND IFNULL(c.description, '__NULL__') = IFNULL(d.description, '__NULL__')
     )

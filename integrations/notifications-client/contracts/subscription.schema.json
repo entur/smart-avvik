@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://kix-avvik.entur.io/contracts/notifications/v1/subscription.schema.json",
+  "$id": "https://smart-avvik.entur.io/contracts/notifications/v1/subscription.schema.json",
   "title": "Webhook notification subscription",
   "description": "A client registration: one commuter's recurring journey plus a callback destination. It is /varsel's own registration shape (origin place, destination place, weekdays, a daily boarding window in Europe/Oslo) so that a webhook subscription and a browser registration with the same definition see the same trains and cost one match and one wording between them. Authored here and rendered as OpenAPI by the notification API rather than redefined there. The recipient behind a subscription is a commuter on a monthly pass, not a ticket-holder for one departure, which is why the grain is a recurring window and why the daily cap is per subscription.",
   "type": "object",

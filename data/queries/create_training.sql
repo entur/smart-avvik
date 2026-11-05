@@ -58,7 +58,7 @@ SET od_cols = (
 );
 
 EXECUTE IMMEDIATE FORMAT(r"""
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training` AS
 WITH base AS (
   SELECT
     d.*,

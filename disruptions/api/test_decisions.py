@@ -11,7 +11,7 @@ import os
 import re
 from datetime import UTC, datetime, timedelta
 
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-smartavvik-test")
 
 import decisions
 

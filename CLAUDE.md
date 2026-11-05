@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`kix-avvik` is an experiment from Entur's Team KI-eksperimentering aimed at proactive disruption handling (Norwegian: "proaktiv avvikshåndtering"). It predicts the duration of public-transport disruptions from SIRI-SX situation messages using BigQuery ML.
+`smart-avvik` is owned by Team Ruter & Reiseplanlegger (team-ror). It started as kix-avvik, an experiment from Entur's Team KI-eksperimentering, aimed at proactive disruption handling (Norwegian: "proaktiv avvikshåndtering"). It predicts the duration of public-transport disruptions from SIRI-SX situation messages using BigQuery ML.
 
 ## Tooling
 
@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Deployment
 
 The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
-path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
+path; hosts `smart-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
 node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/rushvarsel` and
 `/rushhistorikk` front-ends (from `demo/reisedemo` + `demo/avviksvarsel` +
@@ -112,13 +112,13 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
-  `ent-gcs-tfa-kixavvik`). Add the group to `disruptions_readers` in `terraform/env/<env>.tfvars`;
+  `ent-gcs-tfa-smartavvik`). Add the group to `disruptions_readers` in `terraform/env/<env>.tfvars`;
   `.github/workflows/terraform.yml` plans on the PR and applies to dev on merge (tst/prd are
   dispatch-only, as in `cd.yml`). Grant to a **group**, never a person — reading a group's
   membership needs permissions an ordinary developer does not have, so a per-person list rots
   silently. Two traps, both spelled out in `terraform/bigquery_iam.tf`: the resource must stay
   `google_bigquery_dataset_iam_member` (the `_iam_binding`/`_iam_policy` forms are authoritative and
-  would silently drop `application@ent-kixavvik-prd`, which `copy_runtime_to_prd.sh` reads through),
+  would silently drop `application@ent-smartavvik-prd`, which `copy_runtime_to_prd.sh` reads through),
   and the dataset itself is **not** a Terraform resource — the app creates it at startup and CTASes
   into it, so `dataset_id` stays a literal string.
 - **The internal surfaces are behind Entur SSO** (`disruptions/api/sso.py`; `/historikk`,

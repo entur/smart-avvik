@@ -46,8 +46,8 @@ Operational recipe, per environment (the application is a dashboard resource the
 create by hand — a Slack request per the Golden Path, not a PR; ours was posted 2026-09-09):
 
 1. Ask for a **Regular Web Application** in the partner tenant of that environment, callback
-   ``https://<host>/auth/callback`` (kix-avvik.dev.entur.io / kix-avvik.staging.entur.io /
-   kix-avvik.entur.io; ``http://localhost:8000/auth/callback`` on dev for local runs — 8000 is the
+   ``https://<host>/auth/callback`` (smart-avvik.dev.entur.io / smart-avvik.staging.entur.io /
+   smart-avvik.entur.io; ``http://localhost:8000/auth/callback`` on dev for local runs — 8000 is the
    local port, 8080 is the container's), logout URL ``https://<host>/``, only the ``entur-waad``
    connection enabled, no API/audience.
 2. Wire the env: ``SSO_AUTH0_DOMAIN`` and ``SSO_AUTH0_CLIENT_ID`` (configmap — neither is a

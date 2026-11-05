@@ -27,7 +27,7 @@
 --   * interval (stack path): monotonicity-enforced survival curve (GREATEST cascade), then
 --     linear interpolation of the q=0.5 (p50) and q=0.1 (p90) crossings; tail extrapolated
 --     as 40*SQRT(s40/q), capped at 90 min.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.call_predictions` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.call_predictions` AS
 WITH
 cat AS (
   SELECT summary, description, ANY_VALUE(category) AS category

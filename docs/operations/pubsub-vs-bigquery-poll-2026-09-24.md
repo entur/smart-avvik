@@ -124,8 +124,8 @@ its subscription API is open to a team outside ROR is not documented anywhere I 
 **Access precedent.** Ukur and dumuzid create their subscription in their own project against
 `projects/ent-anshar-prd/topics/...`; that needs `pubsub.topics.attachSubscription` on the topic,
 which ROR grants as `roles/pubsub.subscriber`. `anshar-deployment-config/terraform/main.tf` already
-carries `google_bigquery_dataset_iam_member` entries for `application@ent-kixavvik-dev` and
-`application@ent-kixavvik-prd`, so the ask is one `google_pubsub_topic_iam_member` per SA in the
+carries `google_bigquery_dataset_iam_member` entries for `application@ent-smartavvik-dev` and
+`application@ent-smartavvik-prd`, so the ask is one `google_pubsub_topic_iam_member` per SA in the
 same file, and a `google_pubsub_subscription` in our own `terraform/`. Dev would attach to the prd
 topic: dev SIRI is not usable, as Team Inntektsmodell's Confluence pages note for their own dev
 setup. Kompass's `list_pubsub_subscriptions` is denied to us on `ent-anshar-*`, so the live
@@ -249,7 +249,7 @@ SELECT
        ELSE CONCAT('table: ', REGEXP_REPLACE(destination_table.table_id, r'_[0-9a-f]{8,}$', '')) END AS what,
   COUNT(*) AS jobs,
   ROUND(SUM(total_bytes_billed)/POW(1024,4)*6.25/7, 2) AS usd_per_day
-FROM `ent-kixavvik-prd`.`region-eu`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
+FROM `ent-smartavvik-prd`.`region-eu`.INFORMATION_SCHEMA.JOBS_BY_PROJECT
 WHERE creation_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
   AND job_type = 'QUERY' AND state = 'DONE' AND error_result IS NULL
   AND user_email LIKE 'application@%'

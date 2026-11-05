@@ -271,7 +271,7 @@ def _reset(rows=None, error=None, filter_rows=None, registry=None, message_rows=
     # runs it (VARSEL_LLM_PROVIDER, GOOGLE_CLOUD_PROJECT), and the module-global latch is what the
     # isolation checks assert has NOT moved.
     llm_message._PROVIDER = "auto"
-    llm_message._PROJECT = "ent-kixavvik-test"
+    llm_message._PROJECT = "ent-smartavvik-test"
     llm_message._ENABLED = True
     llm_message._STATE = llm_message._LatchState()
 
@@ -1171,7 +1171,7 @@ def test_config_survives_an_unreadable_decision_log():
     """Why it is its own endpoint and not a field on /summary: when the log cannot be read, knowing
     which environment you are on is what tells a broken deployment from a fresh one."""
     _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         assert client.get("/meldinger-api/summary").status_code == 503
         queries_so_far = len(fake.calls)
         r = client.get("/meldinger-api/config")
@@ -1179,7 +1179,7 @@ def test_config_survives_an_unreadable_decision_log():
     assert r.json()["environment"] == "dev"
     assert len(fake.calls) == queries_so_far, "/config must not query BigQuery"
 
-    with _deployed_as("ent-kixavvik-prd"):
+    with _deployed_as("ent-smartavvik-prd"):
         assert client.get("/meldinger-api/config").json()["environment"] is None
 
 
@@ -1384,21 +1384,21 @@ def test_rolling_budgets_release_calls_at_each_window_boundary():
     assert meldinger._Budget(_BUDGET_PATH).reserve(1, now + meldinger._DAY_WINDOW_S) is None
 
 
-#: The API release's values files, and NOT the worker's (U11). `helm/kix-avvik/env/` holds two
+#: The API release's values files, and NOT the worker's (U11). `helm/smart-avvik/env/` holds two
 #: releases' files since the delivery worker got its own — the chart renders one Deployment per
 #: release, so a second workload is a second release — and the worker asks no model and serves no
 #: replay, so demanding these two values of it would be demanding configuration for surfaces that
 #: are not in that process at all. A prefix filter rather than a name list: a fourth environment
 #: must still be caught by both tests below, which is the whole point of globbing.
 def _api_values_files() -> list[Path]:
-    env = Path(__file__).parents[2] / "helm/kix-avvik/env"
+    env = Path(__file__).parents[2] / "helm/smart-avvik/env"
     files = [p for p in sorted(env.glob("values-kub-ent-*.yaml"))]
     assert len(files) >= 3, f"the API values glob matched only {files}; it has stopped matching"
     return files
 
 
 def test_every_helm_environment_and_the_base_pin_gemini():
-    root = Path(__file__).parents[2] / "helm/kix-avvik"
+    root = Path(__file__).parents[2] / "helm/smart-avvik"
     for path in [root / "values.yaml", *_api_values_files()]:
         assert "VARSEL_LLM_PROVIDER: gemini" in path.read_text(), path
 
@@ -2195,7 +2195,7 @@ def _meldinger_static_present():
 def _probe() -> dict:
     """Import main in a child interpreter and report what it registered."""
     env = dict(os.environ)
-    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-test"
     result = subprocess.run(
         [sys.executable, "-c", _SERVED_PROBE],
         cwd=_API_DIR,
