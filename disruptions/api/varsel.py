@@ -5876,7 +5876,7 @@ def check_and_notify(
             # registration on this pair needs this train". A train no browser registration
             # contributed must go through `notification_wording.WEBHOOK`, because the browser
             # policy's prompt audit record carries the traveller's origin, destination and
-            # departure time at DEBUG wherever VARSEL_LLM_LOG_PROMPTS is on -- which dev is -- and
+            # departure time at DEBUG wherever VARSEL_LLM_LOG_PROMPTS is on, and
             # R16 forbids that for client data. WEBHOOK suppresses that record in CODE rather than
             # by an environment variable, drops `message` from the INFO record, and latches against
             # its own holder. Its FIRST bound is the webhook delivery switch, so with client prose
