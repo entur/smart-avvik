@@ -2,7 +2,7 @@
 
 A Firestore-backed inbox, alert ledger, Cloud Functions receiver, security rules and recovery sweep
 for Entur's client journey-notification channel. It builds on
-[`@entur/kix-notifications-client`](../notifications-client/README.md), which holds the typed
+[`@entur/smart-avvik-notifications-client`](../notifications-client/README.md), which holds the typed
 envelope, the signature verifier and the suppression policy and has no Firebase dependency.
 
 Integration should be **configuring an adapter, not implementing a protocol**. Signature
@@ -256,7 +256,7 @@ smart-avvik repository's root config:
 | `hub.port` | 4400 | **4401** | the root file does not name it at all; 4400 is the CLI default |
 | `firestore.websocketPort` | 9150 | **9151** | named in neither. The CLI allocates it separately from `firestore.port`, defaults it to 9150 for every project, and shifts it only by probing for a free port at start-up — a race |
 
-The emulator also runs under its **own demo project id** (`demo-kixclient`). The CLI keys its hub
+The emulator also runs under its **own demo project id** (`demo-smartavvikclient`). The CLI keys its hub
 locator file on the project id and warns that two instances of one project "may result in unexpected
 behavior"; a distinct id answers that warning rather than tolerating it.
 
@@ -287,6 +287,6 @@ Two related properties this suite relies on, both learned the hard way:
   is unavailable, with `connect ECONNREFUSED` out of `before()` and every rules assertion marked
   failed for a reason having nothing to do with rules.
 
-The emulator suite runs against the project id `demo-kixclient`. A `demo-` prefix is what makes it
+The emulator suite runs against the project id `demo-smartavvikclient`. A `demo-` prefix is what makes it
 credential-free: the SDKs skip Application Default Credentials entirely and the project can reach no
 real GCP service. Never point it at a real project id.

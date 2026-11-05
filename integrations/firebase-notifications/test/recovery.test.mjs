@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { DEFAULT_PROCESSING_CUTOFF_MS } from "@entur/kix-notifications-client";
+import { DEFAULT_PROCESSING_CUTOFF_MS } from "@entur/smart-avvik-notifications-client";
 
 import {
   DEFAULT_SWEEP_LIMIT,

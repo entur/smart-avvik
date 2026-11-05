@@ -133,9 +133,9 @@ def _reset(rows=None, error=None) -> None:
 
 @contextmanager
 def _deployed_as(project: str | None):
-    saved_env = os.environ.get("KIX_ENVIRONMENT")
+    saved_env = os.environ.get("SMART_AVVIK_ENVIRONMENT")
     saved_proj = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    os.environ.pop("KIX_ENVIRONMENT", None)
+    os.environ.pop("SMART_AVVIK_ENVIRONMENT", None)
     if project is None:
         os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
     else:
@@ -143,7 +143,7 @@ def _deployed_as(project: str | None):
     try:
         yield
     finally:
-        for key, value in (("KIX_ENVIRONMENT", saved_env), ("GOOGLE_CLOUD_PROJECT", saved_proj)):
+        for key, value in (("SMART_AVVIK_ENVIRONMENT", saved_env), ("GOOGLE_CLOUD_PROJECT", saved_proj)):
             if value is None:
                 os.environ.pop(key, None)
             else:

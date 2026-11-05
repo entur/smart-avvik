@@ -816,8 +816,8 @@ def test_missing_tables_report_unavailable_not_a_traceback():
 @contextmanager
 def _deployed_as(project: str | None):
     """Run the body as if the app were deployed in `project` (ambient env restored afterwards)."""
-    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
-    os.environ.pop("KIX_ENVIRONMENT", None)  # a local override would mask the project
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "SMART_AVVIK_ENVIRONMENT")}
+    os.environ.pop("SMART_AVVIK_ENVIRONMENT", None)  # a local override would mask the project
     if project is None:
         os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
     else:

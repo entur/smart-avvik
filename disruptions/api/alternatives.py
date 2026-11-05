@@ -1075,14 +1075,14 @@ _response = threading.local()
 # disarmed it. This guard does not depend on anyone remembering to stub anything.
 #
 # Opt-in, because "allowed" is the state that has to be asserted rather than assumed:
-#   * KIX_ALLOW_JP_NETWORK truthy  -> always allowed (a deliberate live check against the real JP)
-#   * KIX_ALLOW_JP_NETWORK falsy   -> always blocked
+#   * SMART_AVVIK_ALLOW_JP_NETWORK truthy  -> always allowed (a deliberate live check against the real JP)
+#   * SMART_AVVIK_ALLOW_JP_NETWORK falsy   -> always blocked
 #   * unset -> allowed only outside a test process.
 # The last line is what keeps the deployment safe: requiring the flag in prd would mean a forgotten
 # Helm value silently costs every alternative, fail-open, forever — trading a loud test failure for
 # a silent production one, which is the wrong direction. Detection covers both ways the suites run:
 # `pytest` (CI runs each suite standalone, but a developer does not) and `python test_x.py`.
-_ALLOW_NETWORK_ENV = "KIX_ALLOW_JP_NETWORK"
+_ALLOW_NETWORK_ENV = "SMART_AVVIK_ALLOW_JP_NETWORK"
 
 
 def _in_a_test_process() -> bool:

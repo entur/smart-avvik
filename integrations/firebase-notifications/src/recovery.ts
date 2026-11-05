@@ -21,7 +21,7 @@
 import {
   process as processRecord,
   type ProcessAdapters,
-} from "@entur/kix-notifications-client";
+} from "@entur/smart-avvik-notifications-client";
 
 // There is deliberately NO "how far back does a sweep look" constant. A pending record of any age
 // is work nobody finished, and `process()` already settles one past its cutoff as `expired` on the

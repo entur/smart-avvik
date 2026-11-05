@@ -32,32 +32,32 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 # --- Domain metrics (declared here, incremented by later units) -----------------------------------
 
 POLLER_LAST_TICK = Gauge(
-    "kix_poller_last_tick_timestamp_seconds",
+    "smart_avvik_poller_last_tick_timestamp_seconds",
     "Epoch seconds of the poller loop's most recent tick, set on every iteration whether or not "
     "SIRI-SX moved. This is the LIVENESS series: alert on `time() - value`, which must stay small "
     "even on a quiet night.",
 )
 POLLER_LAST_CYCLE = Gauge(
-    "kix_poller_last_cycle_timestamp_seconds",
+    "smart_avvik_poller_last_cycle_timestamp_seconds",
     "Epoch seconds when a full rebuild cycle (main._rebuild_all) last RAN TO THE END. Moves only "
     "when the upstream SIRI-SX ingestion timestamp moves (~3 min p50), so it measures cache "
     "freshness, never liveness — an age alert on it would page on every quiet night. A cycle that "
     "died in one of the steps that propagate does not move it; a step with its own try/except "
     "failing every cycle DOES leave it moving, so pair it with "
-    "kix_poller_phase_total{result=\"error\"} rather than reading it as 'every cache is fresh'.",
+    "smart_avvik_poller_phase_total{result=\"error\"} rather than reading it as 'every cache is fresh'.",
 )
 POLLER_LEADER = Gauge(
-    "kix_poller_leader",
+    "smart_avvik_poller_leader",
     "1 while this pod holds the poller lease and runs the cycle, 0 otherwise (zero-downtime U2). "
     "Set after on_acquire succeeds and cleared on loss, on a failed acquisition and at shutdown, so "
     "sum() across pods is the number of leaders: above 1 past a one-minute pending window is two "
     "writers, 0 for minutes is nobody pushing. Reads 0, not absent, without the lease backend (tst, "
     "local runs) and on the worker pod: the gauge exports from import and nothing sets it there. "
-    "kix_poller_last_cycle_timestamp_seconds stays leader-only by construction: only the leader "
+    "smart_avvik_poller_last_cycle_timestamp_seconds stays leader-only by construction: only the leader "
     "runs a cycle.",
 )
 POLLER_CYCLE_DURATION = Histogram(
-    "kix_poller_cycle_duration_seconds",
+    "smart_avvik_poller_cycle_duration_seconds",
     "Wall-clock duration of one full rebuild cycle (the event=\"poller_cycle\" total, in "
     "seconds). Buckets are tuned for the measured 10-180 s range (prd baseline 2026-08-21: "
     "50-63 s against a ~177 s cycle period), with 600 and 900 added for the load harness: past "
@@ -66,14 +66,14 @@ POLLER_CYCLE_DURATION = Histogram(
     buckets=(10, 20, 30, 45, 60, 90, 120, 180, 300, 600, 900),
 )
 POLLER_PHASE_DURATION = Histogram(
-    "kix_poller_phase_duration_seconds",
+    "smart_avvik_poller_phase_duration_seconds",
     "Wall-clock duration of one step of the rebuild cycle (the event=\"poller_phase\" ms, in "
     "seconds). `phase` is the step name main._phase was given — a small fixed vocabulary.",
     ["phase"],
     buckets=(0.5, 1, 2, 5, 10, 20, 40, 60, 120),
 )
 POLLER_PHASE_CPU = Histogram(
-    "kix_poller_phase_cpu_seconds",
+    "smart_avvik_poller_phase_cpu_seconds",
     "PROCESS CPU seconds burned during one step of the rebuild cycle (the event=\"poller_phase\" "
     "`cpu_ms`, in seconds). The twin of the duration histogram above and the only one that "
     "answers the question capacity work actually asks: a step that takes 9 s of wall clock is "
@@ -87,21 +87,21 @@ POLLER_PHASE_CPU = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20, 40, 60, 120),
 )
 POLLER_PHASE_TOTAL = Counter(
-    "kix_poller_phase_total",
+    "smart_avvik_poller_phase_total",
     "Rebuild-cycle steps by outcome (`result` = ok/error). A failing step is isolated by the "
     "rebuild's per-step try/except, so `error` here means a degraded cache being served, not a "
     "dead poller — the liveness gauge above answers that.",
     ["phase", "result"],
 )
 PUSH_TOTAL = Counter(
-    "kix_push_total",
+    "smart_avvik_push_total",
     "Web Push delivery attempts by outcome (`result` = sent/gone/error), across every push kind "
     "— varsel alerts, togvarsel rounds, test pushes. The kind stays in the structured logs, not "
     "in a label, to keep the series count fixed.",
     ["result"],
 )
 LLM_MESSAGE_TOTAL = Counter(
-    "kix_llm_message_total",
+    "smart_avvik_llm_message_total",
     "LLM wording attempts by backend (`provider`), outcome (`result` = the MessageResult status "
     "vocabulary, plus `error_covered` for an error the caller covered with an earlier wording) "
     "and calling surface (`surface` = live/replay/...). Alert rules should select "
@@ -109,36 +109,36 @@ LLM_MESSAGE_TOTAL = Counter(
     ["provider", "result", "surface"],
 )
 DECISION_WRITE_TOTAL = Counter(
-    "kix_decision_write_total",
+    "smart_avvik_decision_write_total",
     "Appends to the disruptions.varsel_decisions log by outcome (`result` = ok/partial/error). "
     "The write fails open — a BigQuery problem never blocks a push — which is exactly why "
     "failures need a counter: the decision log going quiet is otherwise invisible.",
     ["result"],
 )
 MIRROR_LAST_SYNC = Gauge(
-    "kix_mirror_last_sync_timestamp_seconds",
+    "smart_avvik_mirror_last_sync_timestamp_seconds",
     "Epoch seconds when the subscription mirror last completed a seed or a sync that drained the "
     "collection (U6, KTD5). The pass reads the mirror rather than the collection, so a mirror that "
     "stops syncing keeps alerting a revoked recipient and misses a new one while every cycle looks "
     "healthy. The sync runs inside the rebuild, so on a quiet night it pauses with the cycle: alert "
-    "on `kix_poller_last_cycle_timestamp_seconds - value`, which grows only while cycles finish and "
-    "the mirror does not (runbook rule 2a). Replaces kix_mirror_age_seconds, which measured the "
+    "on `smart_avvik_poller_last_cycle_timestamp_seconds - value`, which grows only while cycles finish and "
+    "the mirror does not (runbook rule 2a). Replaces smart_avvik_mirror_age_seconds, which measured the "
     "watermark — the newest document's stamp — and so grew without bound on a quiet, healthy "
     "collection (dev, 2026-09-15). The CORRECTNESS bound is notification_store.MIRROR_MAX_AGE_S "
     "(6 h), past which the store re-seeds: a revocation arrives as a tombstone whose own TTL "
     "deletes it after about a day. Absent until the first sync completes.",
 )
 WORKER_LAST_TICK = Gauge(
-    "kix_worker_last_tick_timestamp_seconds",
+    "smart_avvik_worker_last_tick_timestamp_seconds",
     "Epoch seconds of the webhook delivery worker's most recent round, set on EVERY iteration "
     "including the ones that found nothing to deliver (U11). This is the worker's liveness series "
-    "and the counterpart to kix_poller_last_tick_timestamp_seconds: alert on `time() - value`, "
+    "and the counterpart to smart_avvik_poller_last_tick_timestamp_seconds: alert on `time() - value`, "
     "which must stay small on a quiet night too. Absent from the API pods entirely -- the series "
     "exists only where the worker runs -- so an alert must count NO DATA as firing, or a worker "
     "whose Deployment was scaled to zero reads as healthy.",
 )
 DELIVERY_BACKLOG_AGE = Gauge(
-    "kix_delivery_backlog_age_seconds",
+    "smart_avvik_delivery_backlog_age_seconds",
     "Seconds since the oldest DELIVERABLE pending webhook delivery was minted, as of the worker's "
     "last round (U11). Deliverable is the operative word: rows a lease holds, rows inside U7's "
     "durable backoff, and rows past a destination's per-cycle ceiling or the scan bound are not in "
@@ -148,13 +148,13 @@ DELIVERY_BACKLOG_AGE = Gauge(
     "backlog is expiring undelivered rather than merely lagging.",
 )
 LABELLING_LAST_SUCCESS = Gauge(
-    "kix_labelling_last_success_timestamp_seconds",
+    "smart_avvik_labelling_last_success_timestamp_seconds",
     "Epoch seconds when the varsel-label-daily outcome labelling was last observed fresh (set by "
     "the labelling-freshness detector). Absence or a large age means verdicts are not arriving; "
     "past the labelling job's 10-day retry window the loss is permanent.",
 )
 LOG_RECORDS_TOTAL = Counter(
-    "kix_log_records_total",
+    "smart_avvik_log_records_total",
     "Log records reaching the root logger, by level — counted by the handler configure() "
     "installs, so an ERROR-rate alert needs no log pipeline. Non-standard level names collapse "
     "to OTHER to keep the label bounded.",
@@ -164,7 +164,7 @@ LOG_RECORDS_TOTAL = Counter(
 # --- HTTP metrics ---------------------------------------------------------------------------------
 
 HTTP_REQUEST_DURATION = Histogram(
-    "kix_http_request_duration_seconds",
+    "smart_avvik_http_request_duration_seconds",
     "Wall-clock duration of requests on the public app port, by method and first path segment "
     "(allowlisted below, else `other`). `long_poll` is `true` for a request whose handler waits "
     "as long as the caller asked (journey-alerts with `wait` > 0), so latency alerting can leave "
@@ -172,7 +172,7 @@ HTTP_REQUEST_DURATION = Histogram(
     ["method", "path", "long_poll"],
 )
 HTTP_REQUESTS_TOTAL = Counter(
-    "kix_http_requests_total",
+    "smart_avvik_http_requests_total",
     "Requests on the public app port, by method, first path segment (allowlisted below, else "
     "`other`) and status class (`2xx`..`5xx`; a request that died before any response started "
     "counts as `5xx`, which is what the server answers for it).",
@@ -281,7 +281,7 @@ _STANDARD_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
 class _CountingHandler(logging.Handler):
-    """Counts records by level into ``kix_log_records_total``. Never formats the record — the
+    """Counts records by level into ``smart_avvik_log_records_total``. Never formats the record — the
     message and args are not touched, so a record whose %-formatting would fail still counts —
     and never raises: a logging call is the last thing that runs on many failure paths, and an
     exception from a handler would surface exactly there.

@@ -347,7 +347,7 @@ def test_only_health_answers_and_probe_requests_are_not_logged():
     """Two things a probe endpoint gets wrong by default. Any other path must 404, or a probe
     misconfigured onto `/` reports a wedged worker as Ready; and `BaseHTTPRequestHandler` logs every
     request to stderr, which at three probes every five seconds is ~50 000 lines a day counted by
-    `kix_log_records_total` as well.
+    `smart_avvik_log_records_total` as well.
     """
     _reset()
     server = webhook_worker.start_health_server(0)

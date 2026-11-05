@@ -211,7 +211,7 @@ def test_fresh_labelling_sets_the_gauge_and_logs_nothing():
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         assert recorder.records == [], recorder.records
-    value = REGISTRY.get_sample_value("kix_labelling_last_success_timestamp_seconds")
+    value = REGISTRY.get_sample_value("smart_avvik_labelling_last_success_timestamp_seconds")
     assert value == latest.timestamp(), "the gauge is the labelled_at epoch, never time.time()"
 
 
@@ -238,7 +238,7 @@ def test_a_fresh_environment_with_only_unlabellable_decisions_stays_quiet():
 def test_the_gauge_is_set_even_when_labelling_is_stale():
     """R8: the gauge must exist whenever a labelled row does, or the age rule cannot age it.
 
-    Set only on the healthy path, `kix_labelling_last_success_timestamp_seconds` disappeared
+    Set only on the healthy path, `smart_avvik_labelling_last_success_timestamp_seconds` disappeared
     exactly when labelling stopped — so the runbook's `time() - value` rule saw no-data precisely
     in the failure it exists to catch, and had to alert on no-data to compensate, which then
     paged on every quiet environment instead.
@@ -248,7 +248,7 @@ def test_the_gauge_is_set_even_when_labelling_is_stale():
     with _freshness(client) as recorder:
         decisions.check_labelling_freshness()
         assert len(recorder.by_level("ERROR")) == 1, "stale with work waiting is still the alert"
-    value = REGISTRY.get_sample_value("kix_labelling_last_success_timestamp_seconds")
+    value = REGISTRY.get_sample_value("smart_avvik_labelling_last_success_timestamp_seconds")
     assert value == stale.timestamp(), (
         "the gauge reports the last labelling that DID happen, however long ago — its age is the "
         "alert, and an absent series has no age"

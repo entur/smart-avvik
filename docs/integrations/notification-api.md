@@ -70,7 +70,7 @@ nobody registered. `../operations/notification-webhooks.md` states the five limi
 
    ```http
    POST /notification-api/v1/subscriptions
-   Authorization: Bearer kixn_0123456789abcdef0123.<secret>
+   Authorization: Bearer sman_0123456789abcdef0123.<secret>
    Content-Type: application/json
 
    {"subscription_id": "smoke-1", "destination_id": "acme-prod",
@@ -93,7 +93,7 @@ nobody registered. `../operations/notification-webhooks.md` states the five limi
 Authorization: Bearer <key-id>.<secret>
 ```
 
-- `key-id` is `kixn_` + 20 hex characters (`^kixn_[0-9a-f]{20}$`, 25 characters).
+- `key-id` is `sman_` + 20 hex characters (`^sman_[0-9a-f]{20}$`, 25 characters).
 - `secret` is 256 bits, url-safe base64 without padding (43 characters). It is shown **once**, at
   issue, and stored only as an HMAC-SHA256 hash under a per-environment pepper.
 - The separator is `.`, which occurs in neither half.
