@@ -192,7 +192,7 @@ PostHog outages or context-write failures must never be worked around by logging
 ### Step 3, verified (2026-08-28) — with three deviations from what the step claims
 
 Read out of the live IAM, not out of the plan. The **principle holds**: nothing here is granted to a
-person-shaped list, access arrives through `sg-dig-team-ki-eksperimentering@entur.no` bound at the
+person-shaped list, access arrives through `sg-dig-team-ror@entur.no` bound at the
 `team-ki-eksperimentering` folder and inherited by both projects. But three specifics are wider than
 this file said, and a reviewer comparing the two would rightly not trust either until it is written
 down.
