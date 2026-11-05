@@ -4,7 +4,7 @@
 -- list lives in exactly one place. Edit here to add/rename/redescribe a category, then
 -- re-run those scripts. sort_order only fixes a stable presentation order.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.category_taxonomy` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.category_taxonomy` AS
 SELECT sort_order, category, description
 FROM UNNEST([
   STRUCT(1  AS sort_order, 'infrastruktur/signal'     AS category, 'signalfeil, signalstans'    AS description),

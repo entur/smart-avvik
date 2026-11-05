@@ -25,7 +25,7 @@
 -- category joins the shared disruptions.categories text table -- verified 99.7% GOA
 -- coverage (2026-07-03), no operator gap.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_calls_pooled`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_calls_pooled`
 PARTITION BY call_date
 CLUSTER BY situationNumber AS
 WITH cat AS (

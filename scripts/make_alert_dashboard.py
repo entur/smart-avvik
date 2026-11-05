@@ -120,9 +120,9 @@ def panel(i, rule):
 def dashboard(text):
     panels = [panel(i, r) for i, r in enumerate(rules(text))]
     return {
-        "title": "kix-avvik — alert rules",
-        "uid": "kix-avvik-alerts",
-        "tags": ["kix-avvik", "alerts"],
+        "title": "smart-avvik — alert rules",
+        "uid": "smart-avvik-alerts",
+        "tags": ["smart-avvik", "alerts"],
         "timezone": "browser",
         "time": {"from": "now-6h", "to": "now"},
         "refresh": "1m",

@@ -102,7 +102,7 @@ _TRUTHY = ("true", "1", "yes", "on")
 _ENABLED = os.environ.get("VARSEL_LLM_ENABLED", "true").strip().lower() in _TRUTHY
 _PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
 # Location defaults to "global", NOT to the region the rest of the stack runs in: measured
-# 2026-07-29 and re-measured 2026-08-07 against ent-kixavvik-dev, gemini-3.5-flash serves at
+# 2026-07-29 and re-measured 2026-08-07 against ent-smartavvik-dev, gemini-3.5-flash serves at
 # `global` and 404s at europe-west1, europe-north1 and europe-west4 alike, so a SINGLE-REGION
 # default silently breaks the backend. Per-backend overrides exist because availability differs per
 # model — Anthropic models, when enabled, are served from a narrower set of regions than Gemini.
@@ -127,7 +127,7 @@ _CLAUDE_LOCATION = os.environ.get("VERTEX_CLAUDE_LOCATION") or _LOCATION
 # warn that PGA breaks multi-region endpoints.
 _GEMINI_LOCATION = os.environ.get("VERTEX_GEMINI_LOCATION") or _LOCATION_ENV or "eu"
 _CLAUDE_MODEL = os.environ.get("VERTEX_CLAUDE_MODEL", "claude-sonnet-5")
-# Verified live in ent-kixavvik-dev and ent-kixavvik-prd 2026-08-20 (location=eu). Availability is
+# Verified live in ent-smartavvik-dev and ent-smartavvik-prd 2026-08-20 (location=eu). Availability is
 # per MODEL, not per family: gemini-3.7-flash 404s at europe-west1 and europe-north1 exactly as
 # gemini-3.5-flash did, so the EU multi-region above remains the only endpoint that both serves it
 # and confines processing. Re-check that when moving this value, not only that the model answers.
@@ -1650,7 +1650,7 @@ def _write_message_detailed_inner(
 
     ``caller`` names a non-browser surface (``"webhook"``, ``"pull"``) and does three things, all of them
     required by R16 and none of them left to an environment variable —
-    ``helm/kix-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
+    ``helm/smart-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
     the environment this rollout starts in, and `/varsel` message debugging needs it left on:
 
     * the prompt/reply DEBUG record is suppressed **in code**, regardless of that variable;

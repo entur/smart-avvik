@@ -8,7 +8,7 @@
 -- Bucket key = ROUND(predicted_log, 1): deterministic from the point prediction, so serving just
 -- recomputes it. Built on TRAIN only (is_eval = FALSE). `operator` is a model feature, so it is
 -- present in the ML.PREDICT output and can be grouped on directly.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.delay_p90_calib_pooled_all` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.delay_p90_calib_pooled_all` AS
 WITH dep AS (
   SELECT 'dep' AS side, operator, ROUND(predicted_dep_log, 1) AS plog_bucket, dep_delay_pos AS actual
   FROM ML.PREDICT(MODEL `disruptions.dep_delay_reg_pooled_all`,

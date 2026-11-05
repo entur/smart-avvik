@@ -24,7 +24,7 @@ import os
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-smartavvik-test")
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq

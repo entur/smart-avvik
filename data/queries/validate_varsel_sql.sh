@@ -24,10 +24,10 @@
 #
 # Run this after editing any of these files, and before re-registering the scheduled query.
 #
-# Usage: data/queries/validate_varsel_sql.sh [project]      (default ent-kixavvik-dev)
+# Usage: data/queries/validate_varsel_sql.sh [project]      (default ent-smartavvik-dev)
 set -euo pipefail
 
-PROJECT="${1:-ent-kixavvik-dev}"
+PROJECT="${1:-ent-smartavvik-dev}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"          # data/
 API="$(cd "$ROOT/../disruptions/api" && pwd)"
 fail=0
@@ -208,7 +208,7 @@ check "meldinger_filters.sql"       "$API/meldinger_filters.sql" "${MELDINGER_PA
 # checks report FAILED and the files go UNVALIDATED, which is the exact failure this script exists
 # to prevent.
 #
-# Measured 2026-09-01 against ent-kixavvik-dev: settled 32.5 MB for one day, provisional 3.4 MB,
+# Measured 2026-09-01 against ent-smartavvik-dev: settled 32.5 MB for one day, provisional 3.4 MB,
 # the day query 305 bytes. Since 2026-09-21 both carry the planned-trains term from GTFS
 # (docs/rushvarsel/04-cuts): settled 2.36 GB for a 14-day span, provisional ~0.4 GB. The usual caveat applies harder than the byte counts suggest -- a too-narrow
 # date bound drops rows SILENTLY and shows up here as a CHEAPER query, i.e. as success.
@@ -233,7 +233,7 @@ check "rushhistorikk_days.sql"      "$API/rushhistorikk_days.sql" \
 # in JSON form (verified 2026-09-13). Note the usual caveat with extra force here: a dry run does
 # NOT evaluate parameters, so it proves the SHAPE and the column types and nothing about the join.
 # The equivalence that matters -- that a batch of one answers exactly what the single-pair query
-# answered -- was measured against ent-kixavvik-dev over six pairs on 2026-09-13 and is recorded in
+# answered -- was measured against ent-smartavvik-dev over six pairs on 2026-09-13 and is recorded in
 # the U10 pull request.
 check "varsel_connectivity.sql"     "$API/varsel_connectivity.sql" \
   '--parameter=pairs:ARRAY<STRUCT<pair_id INT64, from_refs ARRAY<STRING>, to_refs ARRAY<STRING>>>:[{"pair_id":0,"from_refs":["NSR:StopPlace:337"],"to_refs":["NSR:StopPlace:548"]}]'

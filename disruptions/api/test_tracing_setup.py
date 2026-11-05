@@ -136,7 +136,7 @@ def test_cycle_and_phase_spans_nest_as_parent_and_child():
 
 def test_the_resource_names_the_service_project_and_environment():
     _reset_tracing()
-    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-dev"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-dev"
     try:
         exporter = _enable_with_memory_exporter()
         with tracing_setup.span("x"):
@@ -144,8 +144,8 @@ def test_the_resource_names_the_service_project_and_environment():
         _flush()
         (span,) = exporter.get_finished_spans()
         attrs = dict(span.resource.attributes)
-        assert attrs["service.name"] == "kix-avvik"
-        assert attrs["gcp.project_id"] == "ent-kixavvik-dev"
+        assert attrs["service.name"] == "smart-avvik"
+        assert attrs["gcp.project_id"] == "ent-smartavvik-dev"
         # Derived from the project suffix, NOT deployment.environment_label(): that helper
         # returns None in prd by design, and a trace resource must never carry a null.
         assert attrs["environment"] == "dev"
@@ -303,7 +303,7 @@ def test_formatter_emits_the_three_correlation_keys_inside_a_sampled_span():
     key in Cloud Logging's `projects/<proj>/traces/<32-hex>` form."""
     from opentelemetry.sdk.trace import TracerProvider
 
-    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-dev"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-dev"
     try:
         # A LOCAL provider, never set globally: start_as_current_span attaches to the context
         # regardless, which is what lets this test leave the set-once global alone entirely.
@@ -314,7 +314,7 @@ def test_formatter_emits_the_three_correlation_keys_inside_a_sampled_span():
             entry = json.loads(formatter.format(record))
             ctx = span.get_span_context()
         assert entry["logging.googleapis.com/trace"] == (
-            f"projects/ent-kixavvik-dev/traces/{trace.format_trace_id(ctx.trace_id)}"
+            f"projects/ent-smartavvik-dev/traces/{trace.format_trace_id(ctx.trace_id)}"
         )
         assert entry["logging.googleapis.com/spanId"] == trace.format_span_id(ctx.span_id)
         assert entry["logging.googleapis.com/trace_sampled"] is True

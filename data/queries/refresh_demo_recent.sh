@@ -17,7 +17,7 @@
 # The API picks up the new window within ~30 min (meta cache TTL) — no redeploy needed.
 set -euo pipefail
 
-PROJECT="ent-kixavvik-dev"
+PROJECT="ent-smartavvik-dev"
 
 for sql in extend_demo_recent_daily.sql extend_demo_recent.sql; do
   job=$(bq query --nouse_legacy_sql --nosynchronous_mode --project_id="$PROJECT" \
@@ -33,6 +33,6 @@ done
 bq query --nouse_legacy_sql --project_id="$PROJECT" --format=pretty '
 SELECT operator, MAX(call_date) AS newest_call, COUNT(DISTINCT situationNumber) AS situations,
        COUNT(*) AS prediction_rows
-FROM `ent-kixavvik-dev.disruptions.demo_predictions`
+FROM `ent-smartavvik-dev.disruptions.demo_predictions`
 WHERE call_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
 GROUP BY operator ORDER BY prediction_rows DESC'

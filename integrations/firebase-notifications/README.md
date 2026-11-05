@@ -248,7 +248,7 @@ exercises.
 ### Emulator ports, and what separating them does and does not buy
 
 This package's `firebase.json` pins **three** ports, and two of them are invisible in the
-kix-avvik repository's root config:
+smart-avvik repository's root config:
 
 | | root | here | why it is easy to miss |
 |---|---|---|---|

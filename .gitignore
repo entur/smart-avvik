@@ -63,7 +63,7 @@ disruptions/api/varsel_state.json
 # Helm dependency archives (re-fetched by `helm dependency update`; Chart.lock is committed)
 helm/**/charts/
 
-# Terraform working files. State lives in gs://ent-gcs-tfa-kixavvik, never here.
+# Terraform working files. State lives in gs://ent-gcs-tfa-smartavvik, never here.
 # .terraform.lock.hcl is deliberately NOT ignored: it is committed so CI resolves
 # the same provider versions a developer did.
 terraform/.terraform/

@@ -41,7 +41,7 @@ def imports():
 
 @app.cell
 def bq_client(bigquery):
-    client = bigquery.Client(project="ent-kixavvik-dev")
+    client = bigquery.Client(project="ent-smartavvik-dev")
     return (client,)
 
 
@@ -49,37 +49,37 @@ def bq_client(bigquery):
 def score_holdout(client):
     _q = """
     WITH ev AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls` WHERE is_eval
+      SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls` WHERE is_eval
     ),
     clf AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM ev))
     ),
     a10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM ev))
     ),
     d10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM ev))
     ),
     wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
     ),
     wa AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt`)
     ),
     wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
     ),
     cal AS (
       SELECT c.situationNumber, c.jkey, c.stop_order,
@@ -383,27 +383,27 @@ def lead_header(mo):
 def lead_scoring(client):
     _lq = """
     WITH inp AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_eval_calls`
+      SELECT * FROM `ent-smartavvik-dev.disruptions.leadtime_eval_calls`
     ),
     clf AS (
       SELECT situationNumber, jkey, stop_order, lead_min,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM inp))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM inp))
     ),
     d10 AS (
       SELECT situationNumber, jkey, stop_order, lead_min,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM inp))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM inp))
     ),
     wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
     ),
     wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
     )
     SELECT
       e.lead_min, e.min_from_onset,
@@ -640,17 +640,17 @@ def platt_header(mo):
 def platt_scoring(client, pd):
     _pq = """
     WITH s AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_scored`
+      SELECT * FROM `ent-smartavvik-dev.disruptions.leadtime_scored`
     ),
     wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
     ),
     wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
     )
     SELECT s.lead_min, s.onset_date, s.min_from_onset,
            s.call_cancelled, s.dep_delay_pos, s.is_terminal,

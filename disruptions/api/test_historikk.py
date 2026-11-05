@@ -835,9 +835,9 @@ def _deployed_as(project: str | None):
 def test_config_names_the_non_prod_environment():
     """The page shows this behind its title: dev and prd serve the same page on near-identical
     hosts, so nothing else says which environment's numbers you are reading."""
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         assert client.get("/historikk-api/config").json()["environment"] == "dev"
-    with _deployed_as("ent-kixavvik-prd"):
+    with _deployed_as("ent-smartavvik-prd"):
         assert client.get("/historikk-api/config").json()["environment"] is None
 
 
@@ -845,7 +845,7 @@ def test_config_survives_an_unreadable_decision_log():
     """Why it is its own endpoint and not a field on /summary: when the log cannot be read, knowing
     which environment you are on is what tells a broken deployment from a fresh one."""
     _reset([], error=RuntimeError("404 Not found: Table disruptions.varsel_decisions"))
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         assert client.get("/historikk-api/summary").status_code == 503
         queries_so_far = len(fake.calls)
         r = client.get("/historikk-api/config")

@@ -423,7 +423,7 @@ _HHMM_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 # local runs and un-provisioned deploys degrade to "list only" instead of erroring.
 _VAPID_PRIVATE_KEY = os.environ.get("VAPID_PRIVATE_KEY")
 _VAPID_PUBLIC_KEY = os.environ.get("VAPID_PUBLIC_KEY")
-_VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:kixavvik@entur.org")
+_VAPID_SUBJECT = os.environ.get("VAPID_SUBJECT", "mailto:teamror@entur.org")
 
 _vapid: Any | None = None
 if _VAPID_PRIVATE_KEY:

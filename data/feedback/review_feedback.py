@@ -70,9 +70,9 @@ def imports():
     # and is separated from it by the `environment` event property alone, so the pair
     # is encoded here rather than left to whoever is typing --posthog-project-id at 16:55.
     TARGETS = {
-        "dev": ("ent-kixavvik-dev", None),
-        "tst": ("ent-kixavvik-tst", None),
-        "prd": ("ent-kixavvik-prd", None),
+        "dev": ("ent-smartavvik-dev", None),
+        "tst": ("ent-smartavvik-tst", None),
+        "prd": ("ent-smartavvik-prd", None),
     }
     return (
         Path,

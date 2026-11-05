@@ -14,13 +14,13 @@
 # is proven before anyone deletes it. tst keeps forceReplicas permanently (no store, no lease, no
 # tables).
 #
-# It runs in CI (ci.yml's `helm-render` job) and locally: `bash helm/kix-avvik/test/api_render.sh`.
+# It runs in CI (ci.yml's `helm-render` job) and locally: `bash helm/smart-avvik/test/api_render.sh`.
 # It FAILS rather than skips when helm is absent.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
-CHART=helm/kix-avvik
-RELEASE=kix-avvik  # gha-helm's default release name: the repository's
+CHART=helm/smart-avvik
+RELEASE=smart-avvik  # gha-helm's default release name: the repository's
 
 if ! command -v helm >/dev/null 2>&1; then
   echo "FAIL: helm is not on PATH; this check cannot be skipped into passing" >&2

@@ -14,8 +14,8 @@
 **Where the numbers come from, and where they do not.**
 
 The per-phase figures are read from the ``poller_phase`` and ``poller_cycle`` log records, in the
-**cluster** project (``ent-kub-dev``, namespace ``kix-avvik``) — never the app project, where
-``gcloud logging read --project=ent-kixavvik-dev`` returns nothing for them, silently. The filter
+**cluster** project (``ent-kub-dev``, namespace ``smart-avvik``) — never the app project, where
+``gcloud logging read --project=ent-smartavvik-dev`` returns nothing for them, silently. The filter
 field is ``jsonPayload.event``, not ``jsonPayload.fields.event``: the logging setup lifts the
 ``fields`` dict to the top of the payload, and the nested form matches nothing while looking
 perfectly plausible.
@@ -60,11 +60,11 @@ import subprocess
 import sys
 from collections.abc import Iterable, Sequence
 
-#: The GKE cluster project per environment. App logs are here, NOT in ent-kixavvik-*; a read
+#: The GKE cluster project per environment. App logs are here, NOT in ent-smartavvik-*; a read
 #: against the app project returns an empty result rather than an error, which is the whole reason
 #: this map is in the code instead of in somebody's shell history.
 CLUSTER_PROJECTS = {"dev": "ent-kub-dev", "tst": "ent-kub-dev", "prd": "ent-kub-prd"}
-NAMESPACE = "kix-avvik"
+NAMESPACE = "smart-avvik"
 
 #: `jsonPayload.event`, never `jsonPayload.fields.event`: logging_setup lifts `fields` onto the
 #: payload root, so the nested form matches nothing and reports it as "no cycles in the window".

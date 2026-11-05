@@ -11,7 +11,7 @@
 -- bounded; the 12h window is applied after. Derived entirely from rail_calls +
 -- disruptions (+ categories) -- no ET scan, so cheap to rebuild/retune.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.trip_outcomes_v2` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.trip_outcomes_v2` AS
 WITH sit AS (
   SELECT
     d.situationNumber,

@@ -30,7 +30,7 @@ DECLARE impact_delay_min   INT64 DEFAULT 15;   -- delay (min) that counts as imp
 DECLARE impact_gap_min     INT64 DEFAULT 60;   -- quiet gap (min) that ends an episode
 DECLARE impact_window_hour INT64 DEFAULT 12;   -- max hours after onset to look
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions_initial` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.disruptions_initial` AS
 WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,
@@ -135,7 +135,7 @@ base AS (
 impacted AS (
   SELECT b.situationNumber, r.aimed_dep AS ts
   FROM base AS b
-  JOIN `ent-kixavvik-dev.disruptions.rail_calls` AS r
+  JOIN `ent-smartavvik-dev.disruptions.rail_calls` AS r
     ON r.stop_place IN UNNEST(b.affected_stops)
    AND r.aimed_dep BETWEEN b.onset_ts AND TIMESTAMP_ADD(b.onset_ts, INTERVAL impact_window_hour HOUR)
    AND (r.call_cancelled OR r.dep_delay_min >= impact_delay_min)

@@ -11,8 +11,8 @@ paths:
   - "firestore.rules"
   - "firestore.indexes.json"
   - "terraform/firestore.tf"
-  - "helm/kix-avvik/env/worker-values-*"
-  - "helm/kix-avvik/test/worker_render.sh"
+  - "helm/smart-avvik/env/worker-values-*"
+  - "helm/smart-avvik/test/worker_render.sh"
   - "scripts/{manage_notification_client,loadgen_receiver,loadgen_subscriptions}.py"
 ---
 
@@ -748,8 +748,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   re-send).
   **The common chart renders exactly ONE Deployment per release** — `containers` is a list of
   containers in one POD, and the changelog's "multiple deployments" is the `releaseName` override —
-  so this is a second RELEASE, `kix-avvik-worker`, of the same chart and the same image, with
-  `helm/kix-avvik/env/worker-values-kub-ent-{dev,tst,prd}.yaml` and its own `cd.yml` job. Checked
+  so this is a second RELEASE, `smart-avvik-worker`, of the same chart and the same image, with
+  `helm/smart-avvik/env/worker-values-kub-ent-{dev,tst,prd}.yaml` and its own `cd.yml` job. Checked
   against the vendored chart before designing around it, and the same read answered two smaller
   questions: the chart creates **no ServiceAccount at all** (the platform provisions `application`
   in the namespace), so there is no second SA and `.entur/application.yaml` is untouched; and every
@@ -761,7 +761,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `WEBHOOK_SIGNING_ROOT` **alone**: delivery signs but never verifies a credential, so it gets no
   pepper, no VAPID keys and no SSO secret. `helm lint` cannot see any of that — every override that
   makes this file a worker's is NEGATIVE, and a negative that stops holding renders valid YAML —
-  so `helm/kix-avvik/test/worker_render.sh` renders all three environments, asserts both directions
+  so `helm/smart-avvik/test/worker_render.sh` renders all three environments, asserts both directions
   and gates the image build; it FAILS rather than skips when helm is absent.
   **Which process delivers is `NOTIFICATION_DELIVERY_WORKER_ENABLED`, read by `main` and in the
   OPPOSITE direction to every other flag here**: on means this process does less, so unset — the
@@ -1011,7 +1011,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   enumerable refs is a reversible pseudonym; a BATCH writes one summary record with counts and no
   digest at all. The fix was `/varsel`'s log line rather than this channel's, as the old paragraph
   predicted it would have to be. App logs live in the **cluster** project
-  (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project.
+  (`ent-kub-{dev,prd}`, namespace `smart-avvik`), not the app project.
   **`NOTIFICATION_WEBHOOK_LLM_ENABLED` is read at IMPORT** and therefore needs a restart, unlike the
   other three flags; it defaults off and is set in **dev and prd** (both since 2026-09-10, for the
   public read below, not for the channel — `NOTIFICATION_WEBHOOKS_ENABLED` went on in both later that day,

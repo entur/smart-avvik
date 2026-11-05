@@ -1,12 +1,12 @@
-# Base values for the kix-avvik deployment via the Entur common chart.
+# Base values for the smart-avvik deployment via the Entur common chart.
 # Environment-specific overrides live in env/values-kub-ent-{dev,tst,prd}.yaml.
 common:
-  app: kix-avvik
-  appId: kixavvik            # must match .entur/application.yaml metadata.id
+  app: smart-avvik
+  appId: smartavvik            # must match .entur/application.yaml metadata.id
   team: ki-eksperimentering  # team label without the "team-" prefix
 
   container:
-    image: kix-avvik  # replaced with image:tag by gha-helm deploy.yml
+    image: smart-avvik  # replaced with image:tag by gha-helm deploy.yml
     cpu: 0.5
     # Request AND limit since common 2.x, which has no separate limit knob (1.22.0 set the limit
     # to 6/5 of this, 1228Mi). 29-day peak on 2026-09-11: 446 MiB dev, 496 MiB prd (which sets 2048).
@@ -40,7 +40,7 @@ common:
   # with it the chart renders Recreate, a fixed replica count and no HPA. forceReplicas lives in
   # each environment file and never here, so dropping it is one environment at a time (KTD15) --
   # in this file it would flip prd on its next dispatch together with dev.
-  # helm/kix-avvik/test/api_render.sh pins both shapes.
+  # helm/smart-avvik/test/api_render.sh pins both shapes.
   deployment:
     # Effective HPA minimum as the PDB sees it: 1 keeps the PDB at minAvailable 0%.
     minReplicas: 1

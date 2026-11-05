@@ -26,7 +26,7 @@ def _b64url(raw: bytes) -> str:
 
 
 def main() -> None:
-    subject = sys.argv[1] if len(sys.argv) > 1 else "mailto:kixavvik@entur.org"
+    subject = sys.argv[1] if len(sys.argv) > 1 else "mailto:teamror@entur.org"
     vapid = Vapid02()
     vapid.generate_keys()
     private_b64 = _b64url(vapid.private_key.private_numbers().private_value.to_bytes(32, "big"))

@@ -411,7 +411,7 @@ def _llm(provider="claude", backend=None):
     )
     llm_message._PROVIDER = provider
     llm_message._ENABLED = True
-    llm_message._PROJECT = "ent-kixavvik-test"
+    llm_message._PROJECT = "ent-smartavvik-test"
     llm_message._STATE = llm_message._LatchState()
     if backend is not None:
         llm_message._BACKENDS["claude"] = backend

@@ -17,7 +17,7 @@
 -- landed in the last 2 days. The newest day is only as complete as ET has ingested so far
 -- (in-progress windows give partial actuals); re-run as ET fills in.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.rail_calls_new` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.rail_calls_new` AS
 WITH last_snap AS (
   SELECT
     REGEXP_REPLACE(datedVehicleJourneyRef, r'^[A-Za-z]+:', '') AS jkey,

@@ -19,10 +19,10 @@
 # Cost: ~0.3 GB per day for the build, plus one read of prd's varsel_decisions (~0.5 GB for two
 # weeks). Measured 2026-09-23.
 #
-# Usage: data/queries/replay_removed_trains.sh FIRST_DAY LAST_DAY [project]   (default ent-kixavvik-dev)
+# Usage: data/queries/replay_removed_trains.sh FIRST_DAY LAST_DAY [project]   (default ent-smartavvik-dev)
 set -euo pipefail
 
-FIRST="$1"; LAST="$2"; PROJECT="${3:-ent-kixavvik-dev}"
+FIRST="$1"; LAST="$2"; PROJECT="${3:-ent-smartavvik-dev}"
 API="$(cd "$(dirname "$0")/../../disruptions/api" && pwd)"
 
 replay_sql() {
@@ -67,7 +67,7 @@ WITH regs AS (
   SELECT call_date AS d, journey_digest, ANY_VALUE(from_stop) AS fs, ANY_VALUE(to_stop) AS ts,
          MIN(departure_time) AS w0, MAX(departure_time) AS w1,
          ARRAY_AGG(DISTINCT REGEXP_EXTRACT(jkey, r'ServiceJourney:(\d+)[-_]') IGNORE NULLS) AS seen
-  FROM `ent-kixavvik-prd.disruptions.varsel_decisions`
+  FROM `ent-smartavvik-prd.disruptions.varsel_decisions`
   WHERE call_date BETWEEN @first AND @last
     AND DATE(decided_at) BETWEEN DATE_SUB(@first, INTERVAL 1 DAY) AND DATE_ADD(@last, INTERVAL 1 DAY)
     AND operator = 'VYG'

@@ -1230,7 +1230,7 @@ def test_the_test_trigger_sends_the_synthetic_round_through_the_real_pipe(monkey
     # tag_title is varsel's REAL tagger here: the env prefix is part of what the trigger proves.
     store, fake = _configure_evaluate(issues=[], tag_title=varsel._tag_environment)
     with (
-        _deployed_as("ent-kixavvik-dev"),
+        _deployed_as("ent-smartavvik-dev"),
         _push_devices({"dev-trig-1": _dev("https://push.example.com/t", brand="entur")}),
     ):
         r = _trigger_client().post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
@@ -1255,10 +1255,10 @@ def test_the_test_trigger_is_refused_everywhere_but_dev(monkeypatch):
     _configure_evaluate(issues=[], tag_title=varsel._tag_environment)
     client = _trigger_client()
     scenarios = (
-        ("ent-kixavvik-tst", None),  # tst
-        ("ent-kixavvik-prd", None),  # prd: environment_label() is None
+        ("ent-smartavvik-tst", None),  # tst
+        ("ent-smartavvik-prd", None),  # prd: environment_label() is None
         (None, None),  # unset: reads as production (unlabelled), still refused
-        ("ent-kixavvik-prd", "staging"),  # an unrecognized label is not dev either
+        ("ent-smartavvik-prd", "staging"),  # an unrecognized label is not dev either
     )
     with _push_devices({"dev-trig-1": _dev("https://push.example.com/t")}):
         for project, override in scenarios:
@@ -1272,7 +1272,7 @@ def test_the_test_trigger_maps_delivery_outcomes_to_the_test_push_statuses(monke
     425 fresh-gone (kept for retry), 410 stale-gone (dropped), 502 send error — each read from
     the REAL delivery outcome, and no failure branch touches the round markers."""
     client = _trigger_client()
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         store, _ = _configure_evaluate(issues=[], push_ready=lambda: False)
         r = client.post("/rushvarsel-api/test-notify", json={"device_id": "dev-trig-1"})
         assert r.status_code == 503  # VAPID/push not configured
@@ -1541,7 +1541,7 @@ def test_both_routes_404_while_the_master_gate_is_off(monkeypatch):
     monkeypatch.setattr(togvarsel_notify, "rush_outlook", lambda device_id, now=None: [])
     app = FastAPI()
     app.include_router(togvarsel_notify.router)
-    with _deployed_as("ent-kixavvik-dev"), TestClient(app) as client:
+    with _deployed_as("ent-smartavvik-dev"), TestClient(app) as client:
         for value in ("false", "", "0", "off", "disabled"):
             os.environ["SHOW_RUSHVARSEL"] = value
             try:

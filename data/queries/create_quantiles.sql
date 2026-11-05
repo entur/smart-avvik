@@ -25,7 +25,7 @@
 
 DECLARE min_support INT64 DEFAULT 100;  -- min TRAIN residuals for a category to earn its own offsets
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.duration_quantiles` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.duration_quantiles` AS
 WITH resid AS (
   SELECT 'reopen' AS target, category, LN(reopen_minutes) - predicted_label AS e
   FROM ML.PREDICT(MODEL `disruptions.dur_init_reopen`,

@@ -24,7 +24,7 @@ on every cycle rather than latched at import.
 
 ### 1. `NOTIFICATION_FIRESTORE_DATABASE` — the named database
 
-`helm/kix-avvik/values.yaml`, uncommented, `notifications` in all three environments.
+`helm/smart-avvik/values.yaml`, uncommented, `notifications` in all three environments.
 Read once at startup by `main.lifespan` → `notification_store.configure(database=...)`.
 
 `notification_store._firestore_client()` **raises `NotConfigured` when it is empty and never falls back to
@@ -72,7 +72,7 @@ hashes cannot be re-derived. The signing root can, generation by generation.
 
 ### 3. `NOTIFICATION_WEBHOOKS_ENABLED` — the channel gate
 
-`helm/kix-avvik/values.yaml`, `"false"`; dev and prd override it to `"true"` since 2026-09-10 (with no client
+`helm/smart-avvik/values.yaml`, `"false"`; dev and prd override it to `"true"` since 2026-09-10 (with no client
 onboarded — the population is empty until the operator tool creates one, and the KTD12 checklist
 below still gates every client). Allow-list parse
 (`true/1/yes/on`), **unset = off**, **read at call time** — so it takes effect without a restart,
@@ -112,12 +112,12 @@ the webhook channel.** The public journey-keyed read (`GET /notification-api/v1/
 model's prose is `notification_wording.PULL`'s `deliver` gate, which is `webhook_delivery_enabled()`,
 the same function the event's wording reads. The flag is import-time and defaults off, so without
 the chart line the read would have shipped template-only in dev and defeated the decision behind its
-enrichment — hence `helm/kix-avvik/env/values-kub-ent-dev.yaml` sets it to `"true"`, with the comment
+enrichment — hence `helm/smart-avvik/env/values-kub-ent-dev.yaml` sets it to `"true"`, with the comment
 naming the read as the reason and `NOTIFICATION_WEBHOOKS_ENABLED` (off in dev) as what keeps it
 inert for events: no subscription is loaded and nothing is minted or delivered, so the only surface
 the value reaches in dev is the read. prd set it later the same day, on the product owner's call,
 for the same reason and with the same thing keeping it inert for events (`NOTIFICATION_WEBHOOKS_ENABLED`
-is off in prd too), so a read on `kix-avvik.entur.io` carries the model's prose under the read's own
+is off in prd too), so a read on `smart-avvik.entur.io` carries the model's prose under the read's own
 allowances. tst does not set it; there every entry the read serves reads `wording.status: disabled`
 with the template, which is correct and complete. When the webhook channel itself is enabled in an
 environment, this flag's value is the rollout order's second step below and a restart applies it.
@@ -293,7 +293,7 @@ need not be sequenced. **Verify the binding landed** — the platform's filter i
 that drops a non-matching role *silently*, with no error and no binding:
 
 ```sh
-gcloud projects get-iam-policy ent-kixavvik-dev \
+gcloud projects get-iam-policy ent-smartavvik-dev \
   --flatten='bindings[].members' \
   --filter='bindings.role:roles/datastore.user' --format='value(bindings.members)'
 ```
@@ -325,7 +325,7 @@ The first non-IAM resource this directory creates.
 | `google_firestore_index.notification` | `for_each` over `firestore.indexes.json`, **keyed on the index's own content**, never its array position — reordering the file would otherwise destroy and recreate every index |
 | `google_firestore_field.notification_ttl` | `expires_at` on all four notification collections. **No `index_config {}` block** — an empty one disables all indexes on the field, which is not what it looks like |
 | `google_firestore_backup_schedule.webhook_daily` | prd only, `daily_recurrence` with `retention = "3024000s"` — five weeks, a chosen value rather than a ceiling. Firestore allows up to 14 weeks for both daily and weekly recurrences (checked against Google's documentation, 2026-09-09). Five is what PITR does not already cover: PITR gives the last seven days at minute granularity, so the backup buys the month beyond it |
-| *(no Rules resources)* | `firestore.rules` is **deliberately not released by Terraform** since 2026-09-10. It was, for one day (`google_firebaserules_ruleset` + `_release`, `cloud.firestore/notifications`, added 2026-09-09), and the apply worked — but refreshing the ruleset on every later plan needs `firebaserules.rulesets.get`, which the pull-request plan identity (`gh-kix-avvik-f849-ci@`, `roles/viewer` + the org's `githubCiTerraformPlanReader`) lacks while the push-apply identity (`…-dev@`, `roles/firebase.admin`) holds it, so every Terraform PR after that apply failed its plan. Rules govern client-SDK access only, no Firebase app exists here, and a database with no release denies every client anyway. Two `removed { destroy = false }` blocks forget the pair (dev's live release stays deny-all, unmanaged); re-add them, with the Team Plattform ask for the plan-reader permission, the day a Firebase app is registered |
+| *(no Rules resources)* | `firestore.rules` is **deliberately not released by Terraform** since 2026-09-10. It was, for one day (`google_firebaserules_ruleset` + `_release`, `cloud.firestore/notifications`, added 2026-09-09), and the apply worked — but refreshing the ruleset on every later plan needs `firebaserules.rulesets.get`, which the pull-request plan identity (`gh-smart-avvik-f849-ci@`, `roles/viewer` + the org's `githubCiTerraformPlanReader`) lacks while the push-apply identity (`…-dev@`, `roles/firebase.admin`) holds it, so every Terraform PR after that apply failed its plan. Rules govern client-SDK access only, no Firebase app exists here, and a database with no release denies every client anyway. Two `removed { destroy = false }` blocks forget the pair (dev's live release stays deny-all, unmanaged); re-add them, with the Team Plattform ask for the plan-reader permission, the day a Firebase app is registered |
 
 **Do not add an IAM grant to this file.** `roles/datastore.user` lives in `.entur/application.yaml`
 because the two paths meet two different guards: a `google_project_iam_member` here runs under a
@@ -488,7 +488,7 @@ from ADC and never from an argument:
 
 **That is the team group, in every environment, and it is a pilot shortcut decided on 2026-09-10.**
 R22 asked for a dedicated least-privilege group with production as its own
-(`kix-avvik-notification-operators[-prd]`), and that remains the end state. It is not what ships
+(`smart-avvik-notification-operators[-prd]`), and that remains the end state. It is not what ships
 because a new group at Entur is not self-service: the `sg-dig-*` groups are Entra security groups
 that Team Plattform creates through `tf-azure-ad` and grants through `tf-gcp-iam` (ask in
 `#talk-utviklerplattform`), they are addressed `@entur.no` — never `@entur.org`, which the first
@@ -522,8 +522,8 @@ attempted and by whom it *claimed* to be, not that the claim was verified.
 
 ## What the logs say
 
-App logs live in the **cluster** project — `ent-kub-{dev,prd}`, namespace `kix-avvik` — not in
-`ent-kixavvik-*`. A `gcloud logging read --project=ent-kixavvik-prd` for any of these returns nothing,
+App logs live in the **cluster** project — `ent-kub-{dev,prd}`, namespace `smart-avvik` — not in
+`ent-smartavvik-*`. A `gcloud logging read --project=ent-smartavvik-prd` for any of these returns nothing,
 silently.
 
 | event | where | carries |
@@ -531,7 +531,7 @@ silently.
 | `varsel_webhook_load` | the pass's one read of notification state | `result` (`ok`/`error`/`skipped`/`flag_error`), `n`, `skipped`, `unroutable`, `truncated`, `ms` |
 | `notification_store_load` | the store side of the same read | `n`, `skipped`, `expired`, `truncated`; on the mirror's own records (`result` `mirror_sync`/`mirror_reseed`) also `mirror_size`, `synced`, `removed`, `pages`, `sync_age_s` (seconds since the last seed or complete sync; `watermark_age_s` before 2026-10-13, which measured the newest document instead) and — since U13 — **`overtaken`**: documents the read returned that this process had already superseded with its own commit. Its own number rather than folded into `synced`, because the two are different operator answers — `synced` is "the store told us something new", `overtaken` is "we were ahead of the read". Expect zeros on a webhook-only deployment and small numbers once `/varsel` registrations are in the store; a steady non-zero with no `/varsel` traffic at all would mean the local-apply ledger is not being pruned, which is the only way that mechanism can cost anything |
 | `notification_emit` | the emit step | `result` (`ok`, `timeout`, `overlap_refused`, `retryable`, `failed`, `ceiling_error`, `run_clear_error`, `subject_error`, `subjects_skipped`, `unroutable`, `build_error`), and on the one summary record per cycle: `created`, `withdrawn`, `unchanged`, `counting`, `obsolete`, `nothing_standing`, `unidentified`, `quota`, `capped`, `retryable`, `failed`, `abandoned`, `overlap_refused`, `run_cleared`, `run_stale`, `run_clear_capped`, `run_clear_error`, `n` (the (recipient, train) observations offered), `trains` (what the fan-out was over — `n` over `trains` is the corridor's sharing factor), `ms` |
-| `webhook_delivery_round` | the delivery step — **from the poller OR from the worker**, so read it beside the pod's `container_name`: `kix-avvik` is the poller's, `worker` is the delivery worker's (U11) | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `backlog_age_s`, `ms`. **`backlog_age_s`** is how long ago the OLDEST DELIVERABLE record was minted — deliverable being the operative word, since a leased row, a row inside U7's backoff and a row past a destination's ceiling are all absent from it, so one unwell endpoint cannot drive it. Approaching 3600 means the backlog is expiring undelivered rather than merely lagging. A delivery minted before U11 carries no `created_at` and contributes nothing, so it reads 0 rather than infinite on the deploy that introduces it. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
+| `webhook_delivery_round` | the delivery step — **from the poller OR from the worker**, so read it beside the pod's `container_name`: `smart-avvik` is the poller's, `worker` is the delivery worker's (U11) | `sent`, `retryable`, `expired`, `cancelled`, `capped`, `deadline`, `paused`, `backed_off`, `leased`, `lease_lost`, `skipped`, `skipped_destinations`, `store_errors`, `throttled`, `backlog_age_s`, `ms`. **`backlog_age_s`** is how long ago the OLDEST DELIVERABLE record was minted — deliverable being the operative word, since a leased row, a row inside U7's backoff and a row past a destination's ceiling are all absent from it, so one unwell endpoint cannot drive it. Approaching 3600 means the backlog is expiring undelivered rather than merely lagging. A delivery minted before U11 carries no `created_at` and contributes nothing, so it reads 0 rather than infinite on the deploy that introduces it. **`backed_off`** is attempts not made because the destination is inside U7's durable backoff, and it is deliberately not folded into `skipped`: `skipped` means "a sibling attempt in this pass took it out", while this means "we are waiting exactly as long as the receiver asked". A cycle that is all `backed_off` is the system behaving |
 | `webhook_delivery` | one delivery FAULT — never a per-attempt outcome, which is what `webhook_delivery_round` carries for the whole pass | `result` (`unsigned`, `pause_failed`, `store_error`, `error`, `expire_error`, `pending_error`, `expire_timeout`, `backoff_write_failed`, `backoff_clear_failed`), `destination_id`. The last two are **not** delivery outcomes: on a write failure the per-delivery `retry_not_before` and the pass-local skip both still hold and only the part that outlives the pass is lost, and on a clear failure the event went out and the stale backoff costs at most one cycle against a destination the next success clears. **`expire_timeout`** means the stale-expiry sweep hit its bounded wait — the store is demonstrably hung, so the delivery pool is not created at all on that cycle rather than leaking four more threads to reach the same answer |
 | `webhook_worker` | the delivery worker PROCESS, not its rounds — those stay `webhook_delivery_round` | `result`: `started` (with `health_port`), `stopping` (with the `signal`), `stopped` (with `rounds`), `unconfigured` (with `missing` — the worker exits non-zero, so this line is followed by a rolled-back release rather than by a running pod) and `error` (a round raised, which `deliver_pending` documents it never does; the loop continues) |
 | `notification_quota` | an R21 ceiling binding | `result` (`pending_events`, `alert_state`, `delivery_attempts`, `subscriptions`), the count; `delivery_attempts` also carries `throttled` (destination ids), `truncated` (the scan bound was hit before the collection was drained) and `scanned` (pending documents read) |
@@ -1376,7 +1376,7 @@ contract document says so in its own words; this is the operating half of the sa
 
 ### The delivery worker (U11)
 
-`webhook_worker` is a second Helm release of the same chart and the same image, `kix-avvik-worker`,
+`webhook_worker` is a second Helm release of the same chart and the same image, `smart-avvik-worker`,
 in the same namespace and under the same service account. The common chart renders exactly one
 Deployment per release — `containers` is a list of containers in one POD, not a list of workloads —
 so a second workload has to be a second release; there is no second service account, because the
@@ -1398,7 +1398,7 @@ chosen for that — unset means the poller delivers, so a deployment with no wor
 unchanged.
 
 **Rollback is the same two steps backwards**: flag to `"false"` and deploy, then scale the worker to
-zero (`kubectl -n kix-avvik scale deploy/kix-avvik-worker --replicas=0`) or leave it — with the flag
+zero (`kubectl -n smart-avvik scale deploy/smart-avvik-worker --replicas=0`) or leave it — with the flag
 off both would deliver, which is safe but pointless.
 
 **How long a backlog takes to drain.** One round claims up to `MAX_DELIVERY_ATTEMPTS_PER_CYCLE`
@@ -1430,7 +1430,7 @@ which is the safe direction: what it slows is the next read against a destinatio
 is **per process**, so N replicas are N times the rate, which is the same thing the drain formula's
 `× replicas` says.
 
-**Scaling is `deployment.forceReplicas` in `helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml`.**
+**Scaling is `deployment.forceReplicas` in `helm/smart-avvik/env/worker-values-kub-ent-<env>.yaml`.**
 By hand and not by HPA: the `kix_*` series live in Thanos rather than in Google Managed Prometheus,
 so common's HPA on custom metrics cannot see `kix_delivery_backlog_age_seconds`, and `forceReplicas`
 disables the HPA regardless. N replicas are safe — that is what the lease was taken for — and what
@@ -1523,7 +1523,7 @@ wider pool or a second core, and a phase bound by a socket gets a lot from the f
 `poller_phase.cpu_ms` (and `kix_poller_phase_cpu_seconds{phase}`) is what separates them.
 
 **What is where.** The per-phase figures are in Cloud Logging in the **cluster** project
-(`ent-kub-dev`, namespace `kix-avvik`) — a read against `ent-kixavvik-dev` returns nothing, silently.
+(`ent-kub-dev`, namespace `smart-avvik`) — a read against `ent-smartavvik-dev` returns nothing, silently.
 The five sub-pass spans under `varsel_notify` and the per-Firestore-call spans, including
 `firestore_transaction`'s `cpu_ms`, are in **Cloud Trace** and in no log line. The `kix_*`
 Prometheus series are in **Thanos behind Grafana** and not in Google Managed Prometheus, so no
@@ -1828,7 +1828,7 @@ the other's, so cleanup deliberately does not try.
   reach — the same residual window as `varsel`'s, in memory only, cleared by a redeploy.
 
 **2. Client and event identifiers in cluster logs.** They live in `ent-kub-{dev,prd}`, namespace
-`kix-avvik`, under that project's retention and access policy and not this repo's — nothing here
+`smart-avvik`, under that project's retention and access policy and not this repo's — nothing here
 configures a bucket or a sink. The exact fields are the table in [What the logs say](#what-the-logs-say);
 the three that matter are `subscription_id` (which embeds the client's own reference), a refused
 destination's hostname with its resolved addresses, and an operator's email address.
@@ -1969,8 +1969,8 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
 4. **The operator groups — DONE for the pilot by shortcut, 2026-09-10**, and still owed in the
    intended form. The tool gates every environment on the team group
    `sg-dig-team-ki-eksperimentering@entur.no` (see "The operator tool" above for why and what it
-   gives up). The end state is still two dedicated groups, `kix-avvik-notification-operators` for
-   dev and tst and `kix-avvik-notification-operators-prd` for prd, each holding
+   gives up). The end state is still two dedicated groups, `smart-avvik-notification-operators` for
+   dev and tst and `smart-avvik-notification-operators-prd` for prd, each holding
    `roles/datastore.user` in the projects it operates — a Team Plattform request
    (`tf-azure-ad` for the groups, `tf-gcp-iam` for the grants; `#talk-utviklerplattform`), since
    that grant exists nowhere in this repository: `terraform/` cannot make it and

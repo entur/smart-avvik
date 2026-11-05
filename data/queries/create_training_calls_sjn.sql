@@ -10,7 +10,7 @@
 -- All rows are no-SX on purpose. SJN's own SX (~25-30 a month) are per-departure notices that
 -- announce an outcome already decided ("SJ Nord kjører buss for tog"), and no other publisher
 -- names an SJN train; see docs/sjn/LEARNINGS.md.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_calls_sjn`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_calls_sjn`
 PARTITION BY call_date AS
 WITH nosx AS (
   SELECT

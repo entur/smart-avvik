@@ -57,7 +57,7 @@ DOCS = REPO_ROOT / "docs"
 OPERATIONS_DOC = DOCS / "operations" / "notification-webhooks.md"
 API_DOC = DOCS / "integrations" / "notification-api.md"
 BFF_DOC = DOCS / "integrations" / "firebase-bff.md"
-DEV_VALUES = REPO_ROOT / "helm" / "kix-avvik" / "env" / "values-kub-ent-dev.yaml"
+DEV_VALUES = REPO_ROOT / "helm" / "smart-avvik" / "env" / "values-kub-ent-dev.yaml"
 
 #: The modules the channel is made of. `notification_wording` is included even though it also serves
 #: the browser: it is the one module both surfaces write through, so a leak added there would reach
@@ -799,7 +799,7 @@ def test_every_worker_values_file_is_linted_and_deployed():
     Both directions, as always: the check that every file has a job, and the check that every job
     names a file that exists.
     """
-    env_dir = REPO_ROOT / "helm" / "kix-avvik" / "env"
+    env_dir = REPO_ROOT / "helm" / "smart-avvik" / "env"
     files = sorted(p.name for p in env_dir.glob("worker-values-kub-ent-*.yaml"))
     assert files == [
         "worker-values-kub-ent-dev.yaml",
@@ -813,13 +813,13 @@ def test_every_worker_values_file_is_linted_and_deployed():
         assert f"values: {name}" in ci, f"{name} is not in ci.yml's helm-lint matrix"
         assert f"values: {name}" in cd, f"{name} is not deployed by cd.yml"
         assert f"deploy-{env}-worker:" in cd, f"cd.yml has no worker deploy job for {env}"
-    assert cd.count("release_name: kix-avvik-worker") == len(files), (
+    assert cd.count("release_name: smart-avvik-worker") == len(files), (
         "every worker deploy job must name the worker release; without it gha-helm defaults to the "
         "repository name and the job would UPGRADE THE API RELEASE with the worker's values file"
     )
     # The render check is the one that sees a values file stop being a worker's, so it has to be a
     # gate rather than an advisory job.
-    assert "bash helm/kix-avvik/test/worker_render.sh" in ci
+    assert "bash helm/smart-avvik/test/worker_render.sh" in ci
     assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
 
 
@@ -834,10 +834,10 @@ def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_con
 
     ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text()
     # Beside the worker script, in the job the worker test already holds to gating `docker`.
-    assert "bash helm/kix-avvik/test/api_render.sh" in ci
+    assert "bash helm/smart-avvik/test/api_render.sh" in ci
     assert "helm-render" in ci[ci.index("  docker:") :], "the render check does not gate the image"
 
-    helm = REPO_ROOT / "helm" / "kix-avvik"
+    helm = REPO_ROOT / "helm" / "smart-avvik"
     base = (helm / "values.yaml").read_text()
     grace = re.findall(r"^    terminationGracePeriodSeconds: (\d+)$", base, re.MULTILINE)
     assert grace == [str(int(poller_lease.GRACE_S))], grace
@@ -890,7 +890,7 @@ def test_the_worker_release_is_never_the_api_release():
     for block in cd.split("  deploy-")[1:]:
         head = block.split("\n\n", 1)[0]
         is_worker_job = head.startswith(("dev-worker:", "tst-worker:", "prd-worker:"))
-        names_worker_release = "release_name: kix-avvik-worker" in head
+        names_worker_release = "release_name: smart-avvik-worker" in head
         names_worker_values = "values: worker-values-kub-ent-" in head
         assert is_worker_job == names_worker_release == names_worker_values, head.split("\n")[0]
 

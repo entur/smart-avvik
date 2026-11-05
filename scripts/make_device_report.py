@@ -50,7 +50,7 @@ DAY = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 # Each environment is its own project with its own runtime identity, which is what keeps a dev
 # credential from naming prd's data: the Firestore client takes its project from the ambient
 # environment and never from an argument.
-PROJECTS = {"prd": "ent-kixavvik-prd", "dev": "ent-kixavvik-dev"}
+PROJECTS = {"prd": "ent-smartavvik-prd", "dev": "ent-smartavvik-dev"}
 DATABASE = os.environ.get("NOTIFICATION_FIRESTORE_DATABASE") or "notifications"
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)

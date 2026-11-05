@@ -43,7 +43,7 @@ HEADS = [
 # (lead_bucket label, model-name suffix after the shared `_platt_nosx` stem). The 30-min bucket is
 # the training anchoring and its layer carries no suffix, exactly as on the flagged side.
 BUCKETS = [("30", ""), ("60", "_lead60"), ("120", "_lead120"), ("240", "_lead240"), ("plan", "_plan")]
-DS = "ent-kixavvik-dev.disruptions"
+DS = "ent-smartavvik-dev.disruptions"
 
 
 def main() -> None:

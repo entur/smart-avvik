@@ -13,4 +13,4 @@ from __future__ import annotations
 # Registered per Entur's client-name convention (`<organisation>-<application>`); the deployment is
 # not distinguished, because dev and prd calling in as one client is the intent — the traffic comes
 # from the same application.
-ET_CLIENT_NAME = "entur-kixavvik"
+ET_CLIENT_NAME = "entur-smartavvik"

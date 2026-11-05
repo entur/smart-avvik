@@ -756,7 +756,7 @@ def _run(args: list[str], *, authorizer, store: _MemoryDocs) -> tuple[int, str]:
     out = io.StringIO()
     # GOOGLE_CLOUD_PROJECT is POPPED for the run, and that is not tidiness. The tool refuses a
     # project that is not `--environment`'s own (exit 2), and a developer reproducing prd behaviour
-    # locally has `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported -- which would fail every
+    # locally has `GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev` exported -- which would fail every
     # `--environment prd` case here for a reason about their shell. `test_varsel_api` pins
     # `KIX_ENVIRONMENT` at import for the same class of leak.
     saved = os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
@@ -951,7 +951,7 @@ def test_the_actor_is_the_adc_users_email_and_never_the_os_user():
         assert "application-default login" in reason
     finally:
         tool._email_from_userinfo = original
-    sa = types.SimpleNamespace(service_account_email="ci@ent-kixavvik-dev.iam.gserviceaccount.com")
+    sa = types.SimpleNamespace(service_account_email="ci@ent-smartavvik-dev.iam.gserviceaccount.com")
     assert tool._actor_from(sa) == sa.service_account_email, "a service account needs no lookup"
     assert tool._unresolved_actor_reason("operator@entur.org") is None
     assert tool._email_from_userinfo(None) is None
@@ -987,7 +987,7 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
 
     `--environment` picks the group membership is checked against; `--project` picked which project
     was then read and written, with no comparison between the two. So `--environment dev --project
-    ent-kixavvik-prd` was authorized against the dev group and acted on prd -- `show-signing-secret`
+    ent-smartavvik-prd` was authorized against the dev group and acted on prd -- `show-signing-secret`
     printing a live prd receiver credential, `suspend-client` and `revoke-key` silencing a real
     client. The audit row lands in the project that was targeted, so the action IS recorded; it is
     recorded as authorized.
@@ -1006,7 +1006,7 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
                 "--environment",
                 "dev",
                 "--project",
-                "ent-kixavvik-prd",
+                "ent-smartavvik-prd",
                 "create-client",
                 "--client-id",
                 "acme",
@@ -1025,12 +1025,12 @@ def test_the_gate_and_the_target_cannot_be_chosen_separately():
     assert code == 2, code
     assert store.data == {}, "refused before anything was written, audit row included"
     # The message names both halves, because the operator has to know which one to change.
-    assert tool.OPERATOR_GROUPS["dev"] in message and "ent-kixavvik-dev" in message
-    assert "ent-kixavvik-prd" in message
+    assert tool.OPERATOR_GROUPS["dev"] in message and "ent-smartavvik-dev" in message
+    assert "ent-smartavvik-prd" in message
     # And a stale exported variable is refused the same way rather than silently redirecting the
     # run -- which is the failure `--project` was added for in the first place.
     saved = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-prd"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-prd"
     stderr, sys.stderr = sys.stderr, io.StringIO()
     try:
         code = tool.main(

@@ -7,9 +7,9 @@ ran count as cancelled -- leaves every already-settled day graded on the old rul
 This script re-opens a date range and runs the module's OWN settle path over it, so there is one
 definition of the rule and this file holds none of it.
 
-    uv run python data/queries/togvarsel/regrade_outcomes.py --project ent-kixavvik-dev \
+    uv run python data/queries/togvarsel/regrade_outcomes.py --project ent-smartavvik-dev \
         --from 2025-08-01 --to 2026-09-20            # dry run: prints what would change
-    uv run python data/queries/togvarsel/regrade_outcomes.py --project ent-kixavvik-dev \
+    uv run python data/queries/togvarsel/regrade_outcomes.py --project ent-smartavvik-dev \
         --from 2025-08-01 --to 2026-09-20 --apply    # un-settle the range, then re-settle it
 
 What it touches: `trouble10`, `level`, `n_*`, `eligible`, `unresolvable`, `resolved_at` on the

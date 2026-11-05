@@ -20,58 +20,58 @@
 WITH
 -- ====================== pooled_all family, pooled_all holdout ======================
 pooled_ev AS (
-  SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls_pooled_all` WHERE is_eval
+  SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls_pooled_all` WHERE is_eval
 ),
 pl_clf AS (
   SELECT operator, situationNumber, jkey, stop_order, call_cancelled,
          is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
          (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`,
                   (SELECT * FROM pooled_ev))
 ),
 pl_a10 AS (
   SELECT operator, situationNumber, jkey, stop_order,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled_all`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled_all`,
                   (SELECT * FROM pooled_ev))
 ),
 pl_d10 AS (
   SELECT operator, situationNumber, jkey, stop_order,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`,
                   (SELECT * FROM pooled_ev))
 ),
 -- operator-aware platt weights: scalar (b, a) + per-operator intercept shifts
 pl_wc AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`)
 ),
 pl_wc_op AS (
   SELECT cw.category AS operator, cw.weight AS w
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`),
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`),
        UNNEST(category_weights) AS cw
   WHERE processed_input = 'operator'
 ),
 pl_wa AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`)
 ),
 pl_wa_op AS (
   SELECT cw.category AS operator, cw.weight AS w
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
        UNNEST(category_weights) AS cw
   WHERE processed_input = 'operator'
 ),
 pl_wd AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
 ),
 pl_wd_op AS (
   SELECT cw.category AS operator, cw.weight AS w
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
        UNNEST(category_weights) AS cw
   WHERE processed_input = 'operator'
 ),
@@ -97,41 +97,41 @@ pooled_scored AS (
 ),
 -- ====================== prod family, prod holdout (NSB baseline) ======================
 prod_ev AS (
-  SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls` WHERE is_eval
+  SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls` WHERE is_eval
 ),
 pr_clf AS (
   SELECT situationNumber, jkey, stop_order, call_cancelled,
          is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
          (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`,
                   (SELECT * FROM prod_ev))
 ),
 pr_a10 AS (
   SELECT situationNumber, jkey, stop_order,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`,
                   (SELECT * FROM prod_ev))
 ),
 pr_d10 AS (
   SELECT situationNumber, jkey, stop_order,
          (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`,
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`,
                   (SELECT * FROM prod_ev))
 ),
 pr_wc AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
 ),
 pr_wa AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt`)
 ),
 pr_wd AS (
   SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
 ),
 prod_scored AS (
   SELECT

@@ -593,7 +593,7 @@ def test_the_summary_carries_no_environment_tag_even_where_the_titles_do():
     now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
     _reset(now=now)
     _use_snapshot({"S1": _train(now + timedelta(hours=1), p_cancel=0.3, p_impact_dep=0.9)})
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         body = _get(wait=0).json()
     title = body["alerts"][0]["payload"]["notification"]["title"]
     assert title.startswith("[dev] "), title

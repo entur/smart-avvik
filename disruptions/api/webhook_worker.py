@@ -11,7 +11,7 @@ partitions. This process does nothing else. It calls
 **The same image, a second Helm release.** The Entur common chart renders exactly ONE Deployment per
 release — `containers` is a list of containers in one POD, not a list of workloads — so a second
 workload is a second release of the same chart with `container.args` pointed here (KTD18). Nothing
-about the image changes: `helm/kix-avvik/env/worker-values-kub-ent-*.yaml` turns the Service and the
+about the image changes: `helm/smart-avvik/env/worker-values-kub-ent-*.yaml` turns the Service and the
 Ingress off, points the probes at this module's own health port, and names only the `notifications`
 secret group. There is deliberately no second service account: the chart does not create one (the
 platform provisions `application` in the namespace), so both releases run as the identity that

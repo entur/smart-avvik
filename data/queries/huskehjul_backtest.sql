@@ -30,12 +30,12 @@
 --     established baseline anyway (train_dual_models.sql).
 
 -- ===== Job 1: base table ========================================================
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.hh_backtest_base` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.hh_backtest_base` AS
 WITH sit AS (
   SELECT d.situationNumber, d.onset_ts, d.reopen_minutes, d.impact_minutes,
          c.category, d.affected_stops, ARRAY_LENGTH(d.affected_stops) AS n_stops
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
-  LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
+  FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS d
+  LEFT JOIN `ent-smartavvik-dev.disruptions.categories` AS c
     ON  IFNULL(c.summary, '')     = IFNULL(d.summary, '')
     AND IFNULL(c.description, '') = IFNULL(d.description, '')
 ),
@@ -66,12 +66,12 @@ JOIN prec_place AS pp ON pp.sn = l.situationNumber;
 
 -- ===== Job 2: metrics (run separately) ==========================================
 WITH split AS (
-  SELECT situationNumber, is_eval FROM `ent-kixavvik-dev.disruptions.training_initial`
+  SELECT situationNumber, is_eval FROM `ent-smartavvik-dev.disruptions.training_initial`
 ),
 sit AS (
   SELECT d.situationNumber, d.reopen_minutes, d.impact_minutes, c.category
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
-  LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
+  FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS d
+  LEFT JOIN `ent-smartavvik-dev.disruptions.categories` AS c
     ON  IFNULL(c.summary, '')     = IFNULL(d.summary, '')
     AND IFNULL(c.description, '') = IFNULL(d.description, '')
 ),
@@ -91,13 +91,13 @@ glob_median AS (
 ),
 mp_reopen AS (
   SELECT situationNumber, EXP(predicted_label) AS model_reopen
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
-                  (SELECT * FROM `ent-kixavvik-dev.disruptions.training_initial` WHERE is_eval))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dur_init_reopen`,
+                  (SELECT * FROM `ent-smartavvik-dev.disruptions.training_initial` WHERE is_eval))
 ),
 mp_impact AS (
   SELECT situationNumber, EXP(predicted_label) AS model_impact
-  FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_impact`,
-                  (SELECT * FROM `ent-kixavvik-dev.disruptions.training_initial` WHERE is_eval))
+  FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dur_init_impact`,
+                  (SELECT * FROM `ent-smartavvik-dev.disruptions.training_initial` WHERE is_eval))
 ),
 evalset AS (
   SELECT b.*, cm.cat_reopen, cm.cat_impact, gm.glob_reopen, gm.glob_impact,
@@ -107,7 +107,7 @@ evalset AS (
            WHEN b.category = 'materiell/teknisk' THEN 'materiell'
            ELSE 'annet'
          END AS family
-  FROM `ent-kixavvik-dev.disruptions.hh_backtest_base` AS b
+  FROM `ent-smartavvik-dev.disruptions.hh_backtest_base` AS b
   JOIN split ON split.situationNumber = b.situationNumber AND split.is_eval
   LEFT JOIN cat_median AS cm ON cm.category = IFNULL(b.category, '?')
   CROSS JOIN glob_median AS gm

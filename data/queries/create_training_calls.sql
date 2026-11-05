@@ -119,7 +119,7 @@
 -- refuses to change an existing table's clustering through CREATE OR REPLACE ("clustering(...)
 -- and existing spec is ..."), so this file would stop being runnable in place against every
 -- warehouse that already has the table.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_calls`
 PARTITION BY call_date
 CLUSTER BY situationNumber AS
 WITH cat AS (

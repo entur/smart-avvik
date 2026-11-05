@@ -267,8 +267,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     (`data/queries/backfill_togvarsel_rounds_from_log.sql`, 10 and 11 rows) — a copy of the app's
     own record, not a replay, and it agreed with the reconstruction on every round, so no verdict
     moved; only «Varsler sendt» did. Those events live in the GKE **cluster** project
-    (`ent-kub-{dev,prd}`, namespace `kix-avvik`), not the app project — `gcloud logging read
-    --project=ent-kixavvik-prd` returns nothing for them, silently — and expire after 30 days.
+    (`ent-kub-{dev,prd}`, namespace `smart-avvik`), not the app project — `gcloud logging read
+    --project=ent-smartavvik-prd` returns nothing for them, silently — and expire after 30 days.
   - **A recorded round is never re-derived, and a round nobody recorded is reconstructed and
     labelled** (the second half since 2026-09-02). `decide_issue` is a pure function of (level,
     marker state, clock), so replaying it looks like a substitute for the record and is not: it

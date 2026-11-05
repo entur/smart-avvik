@@ -42,7 +42,7 @@
 -- Refresh order for the API: rail_calls_planned_today.sql -> (disruptions refresh) -> this ->
 -- cache a slice. Situation window here is "recent" as a stand-in for an active-situations feed
 -- (e.g. active_disruptions.sql); narrow it to taste.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.call_predictions_today` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.call_predictions_today` AS
 WITH
 cat AS (
   SELECT summary, description, ANY_VALUE(category) AS category

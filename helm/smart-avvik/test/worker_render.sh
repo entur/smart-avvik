@@ -9,14 +9,14 @@
 # ingress: the chart's base values set `enabled: true` with `trafficType: public`, so a worker file
 # that forgot to turn it off publishes this workload on a public host.
 #
-# It runs in CI (ci.yml's `helm-render` job) and locally: `bash helm/kix-avvik/test/worker_render.sh`.
+# It runs in CI (ci.yml's `helm-render` job) and locally: `bash helm/smart-avvik/test/worker_render.sh`.
 # It FAILS rather than skips when helm is absent -- a check that quietly passes where the binary is
 # missing is a check that has never run anywhere it matters.
 set -euo pipefail
 
 cd "$(dirname "$0")/../../.."
-CHART=helm/kix-avvik
-RELEASE=kix-avvik-worker
+CHART=helm/smart-avvik
+RELEASE=smart-avvik-worker
 
 if ! command -v helm >/dev/null 2>&1; then
   echo "FAIL: helm is not on PATH; this check cannot be skipped into passing" >&2

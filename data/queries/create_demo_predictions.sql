@@ -68,14 +68,14 @@ CREATE TEMP FUNCTION stack_q(s5 FLOAT64, s10 FLOAT64, s20 FLOAT64, s40 FLOAT64, 
 
 -- ================================ NSB rail (prod family) =======================================
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_predictions`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.demo_predictions`
 PARTITION BY call_date
 CLUSTER BY stop_place AS
 WITH
 sc AS (
   SELECT *,
          CASE lead_min WHEN 30 THEN '30' WHEN 60 THEN '60' ELSE 'plan' END AS lead_bucket
-  FROM `ent-kixavvik-dev.disruptions.leadtime_scored`
+  FROM `ent-smartavvik-dev.disruptions.leadtime_scored`
   WHERE lead_min IN (-1, 30, 60)
 ),
 -- Per-ask-horizon platt weights, one row per bucket ('30' = the standard training-anchoring
@@ -84,145 +84,145 @@ wch AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_plan`)
 ),
 w5h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_plan`)
 ),
 w10h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_plan`)
 ),
 w20h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_plan`)
 ),
 w40h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_plan`)
 ),
 wd5h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_plan`)
 ),
 wd10h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_plan`)
 ),
 wd20h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_plan`)
 ),
 wd40h AS (
   SELECT '30' AS lead_bucket,
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt`)
   UNION ALL
   SELECT '60',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_lead60`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_lead60`)
   UNION ALL
   SELECT 'plan',
          MAX(IF(processed_input='__INTERCEPT__', weight, NULL)),
          MAX(IF(processed_input!='__INTERCEPT__', weight, NULL))
-  FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_plan`)
+  FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_plan`)
 ),
 -- Calibrate every head at its ask-horizon; enforce survival-curve monotonicity by cascading
 -- (GREATEST of the higher rungs), exactly as predict_calls.sql.
@@ -328,13 +328,13 @@ sit AS (
   SELECT situationNumber,
          MIN(SAFE.TIMESTAMP(creationTime)) AS onset_ts,
          ANY_VALUE(COALESCE(onset_summary, summary)) AS summary
-  FROM `ent-kixavvik-dev.disruptions.disruptions`
+  FROM `ent-smartavvik-dev.disruptions.disruptions`
   WHERE participantRef = 'NSB'
   GROUP BY situationNumber
 ),
 cat AS (
   SELECT situationNumber, ANY_VALUE(category) AS category
-  FROM `ent-kixavvik-dev.disruptions.leadtime_eval_calls`
+  FROM `ent-smartavvik-dev.disruptions.leadtime_eval_calls`
   GROUP BY situationNumber
 )
 SELECT
@@ -349,7 +349,7 @@ SELECT
   r.arr_delay_min AS act_arr_delay_min,
   p.* EXCEPT (situationNumber, jkey, stop_order, call_date, min_from_onset)
 FROM pivoted AS p
-JOIN `ent-kixavvik-dev.disruptions.rail_calls` AS r
+JOIN `ent-smartavvik-dev.disruptions.rail_calls` AS r
   ON r.jkey = p.jkey AND r.stop_order = p.stop_order
  AND r.call_date BETWEEN DATE '2026-03-31' AND DATE '2026-06-21'
 LEFT JOIN nsr AS n ON n.stop_place = r.stop_place
@@ -363,7 +363,7 @@ LEFT JOIN cat AS c USING (situationNumber);
 -- of the key because bus ServiceJourney jkeys repeat daily. NSB rows in the pooled holdout are
 -- excluded (they are served by the prod family above, same two-family split as live).
 
-INSERT INTO `ent-kixavvik-dev.disruptions.demo_predictions`
+INSERT INTO `ent-smartavvik-dev.disruptions.demo_predictions`
   (operator, situationNumber, jkey, stop_order, call_date, min_from_onset,
    lineRef, stop_place, stop_name, aimed_dep, aimed_arr,
    onset_ts, summary, category,
@@ -378,11 +378,11 @@ WITH
 sc AS (
   SELECT *,
          CASE lead_min WHEN 30 THEN '30' WHEN 60 THEN '60' ELSE 'plan' END AS lead_bucket
-  FROM `ent-kixavvik-dev.disruptions.leadtime_scored_pooled_all`
+  FROM `ent-smartavvik-dev.disruptions.leadtime_scored_pooled_all`
   WHERE lead_min IN (-1, 30, 60)
     AND operator != 'NSB'
 ),
-pwt AS (SELECT * FROM `ent-kixavvik-dev.disruptions.pooled_all_platt_weights`),
+pwt AS (SELECT * FROM `ent-smartavvik-dev.disruptions.pooled_all_platt_weights`),
 scored AS (
   SELECT
     sc.operator, sc.situationNumber, sc.jkey, sc.stop_order, sc.lead_min, sc.call_date,
@@ -474,10 +474,10 @@ pivoted AS (
 -- operating_date) + the goa_calls column order (same trick as leadtime_eval_pooled_all.sql).
 ac AS (
   SELECT 'GOA' AS operator, CAST(NULL AS DATE) AS operating_date, *
-  FROM `ent-kixavvik-dev.disruptions.goa_calls`
+  FROM `ent-smartavvik-dev.disruptions.goa_calls`
   WHERE call_date BETWEEN DATE '2026-03-31' AND DATE '2026-06-21'
   UNION ALL
-  SELECT * FROM `ent-kixavvik-dev.disruptions.bus_calls`
+  SELECT * FROM `ent-smartavvik-dev.disruptions.bus_calls`
   WHERE call_date BETWEEN DATE '2026-03-31' AND DATE '2026-06-21'
 ),
 nsr AS (
@@ -489,13 +489,13 @@ sit AS (
   SELECT situationNumber,
          MIN(SAFE.TIMESTAMP(creationTime)) AS onset_ts,
          ANY_VALUE(COALESCE(onset_summary, summary)) AS summary
-  FROM `ent-kixavvik-dev.disruptions.disruptions`
+  FROM `ent-smartavvik-dev.disruptions.disruptions`
   WHERE participantRef IN ('GOA', 'GCO', 'MOR', 'NOR', 'TRO', 'FIN', 'RUT')
   GROUP BY situationNumber
 ),
 cat AS (
   SELECT situationNumber, ANY_VALUE(category) AS category
-  FROM `ent-kixavvik-dev.disruptions.leadtime_eval_pooled_all`
+  FROM `ent-smartavvik-dev.disruptions.leadtime_eval_pooled_all`
   GROUP BY situationNumber
 )
 SELECT
@@ -528,7 +528,7 @@ LEFT JOIN cat AS c USING (situationNumber);
 -- instance pin -- bus ServiceJourney jkeys repeat every operating day, so demo_journeys.sql
 -- joins boarding/alighting calls on it (rail/GOA jkeys are date-scoped; theirs stays NULL).
 -- Clustered by stop_place for the from/to lookups.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.demo_calls`
 PARTITION BY call_date
 CLUSTER BY stop_place AS
 WITH nsr AS (
@@ -540,19 +540,19 @@ src AS (
   SELECT 'NSB' AS operator, CAST(NULL AS DATE) AS operating_date,
          jkey, lineRef, stop_place, stop_name, stop_order, call_date,
          aimed_dep, aimed_arr, call_cancelled, dep_delay_min, arr_delay_min
-  FROM `ent-kixavvik-dev.disruptions.rail_calls`
+  FROM `ent-smartavvik-dev.disruptions.rail_calls`
   WHERE call_date BETWEEN DATE '2026-04-01' AND DATE '2026-06-20'
   UNION ALL
   SELECT 'GOA', CAST(NULL AS DATE),
          jkey, lineRef, stop_place, stop_name, stop_order, call_date,
          aimed_dep, aimed_arr, call_cancelled, dep_delay_min, arr_delay_min
-  FROM `ent-kixavvik-dev.disruptions.goa_calls`
+  FROM `ent-smartavvik-dev.disruptions.goa_calls`
   WHERE call_date BETWEEN DATE '2026-04-01' AND DATE '2026-06-20'
   UNION ALL
   SELECT operator, operating_date,
          jkey, lineRef, stop_place, stop_name, stop_order, call_date,
          aimed_dep, aimed_arr, call_cancelled, dep_delay_min, arr_delay_min
-  FROM `ent-kixavvik-dev.disruptions.bus_calls`
+  FROM `ent-smartavvik-dev.disruptions.bus_calls`
   WHERE call_date BETWEEN DATE '2026-04-01' AND DATE '2026-06-20'
 )
 SELECT s.operator, s.operating_date, s.jkey, s.lineRef, s.stop_place,
@@ -569,7 +569,7 @@ LEFT JOIN nsr AS n ON n.id = s.stop_place;
 -- Tog/Buss facet for the searchable combobox (thousands of bus stops make a plain list useless).
 -- Some bus quays never resolve to an NSR StopPlace -- those calls are unsearchable and are
 -- dropped here (stop_place IS NOT NULL).
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_stops` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.demo_stops` AS
 SELECT stop_place,
        ANY_VALUE(stop_name) AS stop_name,
        COUNT(*) AS n_calls,
@@ -579,7 +579,7 @@ SELECT stop_place,
          WHEN LOGICAL_OR(operator IN ('NSB', 'GOA')) THEN 'Tog'
          ELSE 'Buss'
        END AS mode
-FROM `ent-kixavvik-dev.disruptions.demo_calls`
+FROM `ent-smartavvik-dev.disruptions.demo_calls`
 WHERE stop_place IS NOT NULL
 GROUP BY stop_place
 HAVING COUNT(*) >= 200;
@@ -589,7 +589,7 @@ HAVING COUNT(*) >= 200;
 -- from/to (first and last affected stop of the situation's worst-hit journey) and a time
 -- window bracketing its affected departures. Capped per operator so high-volume bus publishers
 -- (Ruter alone would fill the list) leave room for rail scenarios.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.demo_highlights` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.demo_highlights` AS
 WITH impact AS (
   SELECT situationNumber, operator, jkey,
          ANY_VALUE(summary)  AS summary,
@@ -600,7 +600,7 @@ WITH impact AS (
          COUNT(*) AS n_calls,
          MIN(aimed_dep) AS first_dep,
          MAX(aimed_dep) AS last_dep
-  FROM `ent-kixavvik-dev.disruptions.demo_predictions`
+  FROM `ent-smartavvik-dev.disruptions.demo_predictions`
   GROUP BY situationNumber, operator, jkey
 ),
 per_sit AS (
@@ -627,7 +627,7 @@ exemplar AS (
          ARRAY_AGG(d.stop_place ORDER BY d.stop_order DESC LIMIT 1)[OFFSET(0)] AS to_stop,
          ARRAY_AGG(d.stop_name  ORDER BY d.stop_order DESC LIMIT 1)[OFFSET(0)] AS to_name
   FROM per_sit AS s
-  JOIN `ent-kixavvik-dev.disruptions.demo_predictions` AS d
+  JOIN `ent-smartavvik-dev.disruptions.demo_predictions` AS d
     ON d.situationNumber = s.situationNumber
    AND d.operator = s.top.operator AND d.jkey = s.top.jkey
   GROUP BY s.situationNumber

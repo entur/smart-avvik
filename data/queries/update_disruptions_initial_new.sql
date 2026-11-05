@@ -41,12 +41,12 @@
 
 DECLARE last_update_date DATE DEFAULT (
   SELECT DATE(TIMESTAMP_MILLIS(last_modified_time))
-  FROM `ent-kixavvik-dev.disruptions.__TABLES__`
+  FROM `ent-smartavvik-dev.disruptions.__TABLES__`
   WHERE table_id = 'disruptions_initial'
 );
 
 EXECUTE IMMEDIATE FORMAT(r"""
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.disruptions_initial_new` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.disruptions_initial_new` AS
 WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,
@@ -148,7 +148,7 @@ base AS (
     -- only situations NOT already in the training build (the incremental slice)
     AND NOT EXISTS (
       SELECT 1
-      FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS di
+      FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS di
       WHERE di.participantRef = fv.participantRef
         AND di.situationNumber = fv.situationNumber
     )
@@ -159,7 +159,7 @@ base AS (
 impacted AS (
   SELECT b.situationNumber, r.aimed_dep AS ts
   FROM base AS b
-  JOIN `ent-kixavvik-dev.disruptions.rail_calls_new` AS r
+  JOIN `ent-smartavvik-dev.disruptions.rail_calls_new` AS r
     ON r.stop_place IN UNNEST(b.affected_stops)
    AND r.aimed_dep BETWEEN b.onset_ts AND TIMESTAMP_ADD(b.onset_ts, INTERVAL 12 HOUR)
    AND (r.call_cancelled OR r.dep_delay_min >= 15)

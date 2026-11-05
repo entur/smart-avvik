@@ -1,4 +1,4 @@
--- Schema documentation for `ent-kixavvik-dev.disruptions.svv_hourly_volumes`
+-- Schema documentation for `ent-smartavvik-dev.disruptions.svv_hourly_volumes`
 -- and `disruptions.svv_points` -- SVV (Statens vegvesen) hourly traffic volumes
 -- for the curated E18 Lier -> Oslo corridor registration points, used by the
 -- reisevalg-varsel feasibility analysis (road-congestion side of the
@@ -38,7 +38,7 @@
 --     if [ $first = 1 ]; then repl=--replace; first=0; else repl=--noreplace; fi
 --     bq load --source_format=NEWLINE_DELIMITED_JSON $repl \
 --       --time_partitioning_field=date_oslo --clustering_fields=point_id \
---       ent-kixavvik-dev:disruptions.svv_hourly_volumes "$f" \
+--       ent-smartavvik-dev:disruptions.svv_hourly_volumes "$f" \
 --       data/svv/svv_hourly_volumes_schema.json
 --   done
 --
@@ -47,10 +47,10 @@
 --     ensure_ascii=False)) for p in json.load(open('data/svv/points.json'))['points']]" \
 --     > data/svv/points.ndjson
 --   bq load --source_format=NEWLINE_DELIMITED_JSON --replace \
---     ent-kixavvik-dev:disruptions.svv_points data/svv/points.ndjson \
+--     ent-smartavvik-dev:disruptions.svv_points data/svv/points.ndjson \
 --     data/svv/svv_points_schema.json
 
-CREATE TABLE IF NOT EXISTS `ent-kixavvik-dev.disruptions.svv_hourly_volumes` (
+CREATE TABLE IF NOT EXISTS `ent-smartavvik-dev.disruptions.svv_hourly_volumes` (
   point_id        STRING    NOT NULL OPTIONS(description="SVV traffic registration point id, e.g. 33438V444232; joins svv_points.id"),
   hour_start_utc  TIMESTAMP NOT NULL OPTIONS(description="Start of the measured hour, UTC"),
   hour_start_oslo DATETIME  NOT NULL OPTIONS(description="Start of the measured hour, naive Europe/Oslo local time (as published by the API)"),
@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS `ent-kixavvik-dev.disruptions.svv_hourly_volumes` (
 PARTITION BY date_oslo
 CLUSTER BY point_id;
 
-CREATE TABLE IF NOT EXISTS `ent-kixavvik-dev.disruptions.svv_points` (
+CREATE TABLE IF NOT EXISTS `ent-smartavvik-dev.disruptions.svv_points` (
   id                  STRING  NOT NULL OPTIONS(description="SVV traffic registration point id"),
   name                STRING  NOT NULL OPTIONS(description="SVV point name, e.g. 'E18 Høvik'"),
   road_ref            STRING  NOT NULL OPTIONS(description="Road reference short form, e.g. 'EV18 S53D1 m3630'; ascending = Lier -> Oslo corridor order"),

@@ -33,7 +33,7 @@
 DECLARE win_start DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 2 YEAR);
 DECLARE win_end   DATE DEFAULT CURRENT_DATE();
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.trip_outcomes` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.trip_outcomes` AS
 WITH
   aff AS (
     SELECT

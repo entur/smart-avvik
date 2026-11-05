@@ -649,7 +649,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     through it. `KIX_ENVIRONMENT` overrides it locally. `prd` — and an unreadable project — stay
     unlabelled: a stray `(dev)` on the traveller-facing host is worse than none on a deployment we
     control. Note the `/varsel-api` tests pin `KIX_ENVIRONMENT=prd` at import, or a developer with
-    `GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev` exported fails the push-title assertions.
+    `GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev` exported fails the push-title assertions.
   - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` / `VERTEX_GEMINI_FALLBACK_MODEL` /
     `VERTEX_GEMINI_CANCELLATION_FALLBACK_MODEL` — the push text is written by an LLM on Vertex AI

@@ -17,7 +17,7 @@
 --
 -- Run EACH statement as its own bq job (cumulative --maximum_bytes_billed kills later ones).
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['call_cancelled'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -32,7 +32,7 @@ FROM (
      WHERE is_eval = TRUE))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -46,7 +46,7 @@ FROM (
      WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -60,7 +60,7 @@ FROM (
      WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -74,7 +74,7 @@ FROM (
      WHERE is_eval = TRUE AND arr_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -90,7 +90,7 @@ FROM (
 
 -- Departure side (boarding stop) ------------------------------------------------------------
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -104,7 +104,7 @@ FROM (
      WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -118,7 +118,7 @@ FROM (
      WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,
@@ -132,7 +132,7 @@ FROM (
      WHERE is_eval = TRUE AND dep_delay_pos IS NOT NULL))
 );
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_platt_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_platt_pooled_all`
 OPTIONS(model_type='LOGISTIC_REG', input_label_cols=['y'], data_split_method='NO_SPLIT') AS
 SELECT
   LN(GREATEST(LEAST(p, 1 - 1e-6), 1e-6) / (1 - GREATEST(LEAST(p, 1 - 1e-6), 1e-6))) AS raw_logit,

@@ -42,7 +42,7 @@ def imports():
 
 @app.cell
 def bq_client(bigquery):
-    client = bigquery.Client(project="ent-kixavvik-dev")
+    client = bigquery.Client(project="ent-smartavvik-dev")
     return (client,)
 
 
@@ -105,10 +105,10 @@ def score_holdout(client):
     # 3 prod-modeller blindt på GOA-radene (zeroshot). ~$0.1-klasse skann.
     _q = """
     WITH pooled_ev AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls_pooled` WHERE is_eval
+      SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls_pooled` WHERE is_eval
     ),
     prod_ev AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls` WHERE is_eval
+      SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls` WHERE is_eval
     ),
     zs_ev AS (
       SELECT * FROM pooled_ev WHERE operator = 'GOA'
@@ -117,79 +117,79 @@ def score_holdout(client):
       SELECT operator, situationNumber, jkey, stop_order, call_cancelled,
              is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled`, (SELECT * FROM pooled_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled`, (SELECT * FROM pooled_ev))
     ),
     pl_a10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled`, (SELECT * FROM pooled_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled`, (SELECT * FROM pooled_ev))
     ),
     pl_d10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled`, (SELECT * FROM pooled_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled`, (SELECT * FROM pooled_ev))
     ),
     pl_wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled`)
     ),
     pl_wa AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled`)
     ),
     pl_wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled`)
     ),
     pr_clf AS (
       SELECT situationNumber, jkey, stop_order, call_cancelled,
              is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM prod_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM prod_ev))
     ),
     pr_a10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM prod_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM prod_ev))
     ),
     pr_d10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM prod_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM prod_ev))
     ),
     pr_wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)
     ),
     pr_wa AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt`)
     ),
     pr_wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)
     ),
     zs_clf AS (
       SELECT situationNumber, jkey, stop_order, call_cancelled,
              is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM zs_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM zs_ev))
     ),
     zs_a10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM zs_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM zs_ev))
     ),
     zs_d10 AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM zs_ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM zs_ev))
     )
     SELECT 'pooled' AS family, c.operator, c.call_cancelled,
       (NOT c.is_origin   AND (c.call_cancelled OR c.arr_delay_pos IS NOT NULL)) AS eligible_arr,

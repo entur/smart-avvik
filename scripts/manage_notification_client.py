@@ -33,7 +33,7 @@ this table.
 
 **``--environment`` picks the target as well as the gate**, and until 2026-09-09 it picked only the
 gate: ``--project`` chose which project was read and written with no comparison between the two, so
-``--environment dev --project ent-kixavvik-prd`` was authorized against the dev group and then acted
+``--environment dev --project ent-smartavvik-prd`` was authorized against the dev group and then acted
 on prd -- ``show-signing-secret`` printing a live prd receiver credential, ``suspend-client``
 silencing a real client. What refused it was prd project IAM, not this tool, so R22's separate prd
 group held only while that group was the sole holder of ``roles/datastore.user`` there. The tool now
@@ -71,7 +71,7 @@ without it. No other subcommand touches it. Fetch it from Secret Manager into th
 command and drop it afterwards -- never paste it from a ticket, and never leave it exported:
 
     NOTIFICATION_KEY_PEPPER="$(gcloud secrets versions access latest \\
-        --secret=NOTIFICATION_KEY_PEPPER --project=ent-kixavvik-dev)" \\
+        --secret=NOTIFICATION_KEY_PEPPER --project=ent-smartavvik-dev)" \\
       uv run --with google-api-python-client python scripts/manage_notification_client.py \\
         --environment dev issue-key --client-id acme
 
@@ -146,14 +146,14 @@ OPERATOR_GROUPS = {
 #: WHICH PROJECT EACH ENVIRONMENT IS, so the gate and the target cannot be chosen separately.
 #: `--environment` picks the group membership is checked against and `--project` used to pick, with
 #: no comparison between them, which project was then read and written -- so `--environment dev
-#: --project ent-kixavvik-prd` was authorized against the dev group and acted on prd, including
+#: --project ent-smartavvik-prd` was authorized against the dev group and acted on prd, including
 #: `show-signing-secret` (prints a live prd receiver credential) and `suspend-client` (silences a
 #: real client). What stopped it was prd project IAM rather than this tool, while the module
 #: docstring claimed the stronger property; now the tool refuses first and IAM backs it.
 #:
-#: The naming assumption is `ent-kixavvik-<env>`, which is what `.entur/application.yaml`'s own
+#: The naming assumption is `ent-smartavvik-<env>`, which is what `.entur/application.yaml`'s own
 #: verification recipe uses. If a project is ever renamed this map is the one place to change.
-PROJECTS = {environment: f"ent-kixavvik-{environment}" for environment in ENVIRONMENTS}
+PROJECTS = {environment: f"ent-smartavvik-{environment}" for environment in ENVIRONMENTS}
 
 #: The named database `notification_store` and `notification_auth` open. The same literal lives in the Helm
 #: chart's `NOTIFICATION_FIRESTORE_DATABASE` and in `terraform/variables.tf`; it is read from the
@@ -644,7 +644,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--project",
         default=None,
-        help="GCP project to talk to. Must be --environment's own project (ent-kixavvik-<env>); "
+        help="GCP project to talk to. Must be --environment's own project (ent-smartavvik-<env>); "
         "anything else is refused with exit 2. Pass it to override an exported "
         "GOOGLE_CLOUD_PROJECT that names a different environment.",
     )

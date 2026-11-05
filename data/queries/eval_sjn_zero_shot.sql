@@ -4,7 +4,7 @@
 -- no-SX Platt layer at the training anchoring (lead_bucket '30'), then composes p_impact_dep the
 -- way predict_calls.sql does. Writes disruptions.sjn_zero_shot_scores; the summary is the SELECT in
 -- docs/sjn/LEARNINGS.md.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.sjn_zero_shot_scores` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.sjn_zero_shot_scores` AS
 WITH input AS (
   SELECT 'SJN' AS pop, * FROM `disruptions.training_calls_sjn` WHERE is_eval
   UNION ALL

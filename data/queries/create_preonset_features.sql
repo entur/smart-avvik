@@ -20,7 +20,7 @@
 
 DECLARE win_min INT64 DEFAULT 60;
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.preonset_features` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.preonset_features` AS
 WITH sit AS (
   SELECT
     situationNumber, onset_ts, affected_stops,

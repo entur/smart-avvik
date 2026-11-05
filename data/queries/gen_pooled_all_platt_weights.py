@@ -22,7 +22,7 @@ HEADS = [
 ]
 # (lead_bucket label, model-name infix)
 BUCKETS = [("30", ""), ("60", "_lead60"), ("120", "_lead120"), ("240", "_lead240"), ("plan", "_plan")]
-DS = "ent-kixavvik-dev.disruptions"
+DS = "ent-smartavvik-dev.disruptions"
 # The bus/GOA operators served live (matches predict_calls_bus.sql + bus_calls_planned_today.sql).
 # A row is emitted for EVERY served operator per (head, bucket) so the serving inner-join always
 # hits: a small operator with no rows at a far horizon simply gets w=0 (the shared scalar, no

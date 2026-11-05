@@ -24,7 +24,7 @@
 -- call_cancelled is TRUE, i.e. a perfect leak of the cancellation label.
 
 -- 1. Cancellation classifier (tuned 2026-07-02 hyperparameters, see train_call_models.sql) --
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['call_cancelled'],
@@ -42,7 +42,7 @@ FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE;
 
 -- 2. Departure-delay regressor (LN(1+delay) target; frozen 11-feature contract + operator) --
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_delay_reg_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_delay_reg_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_REGRESSOR',
   input_label_cols  = ['dep_log'],
@@ -60,7 +60,7 @@ FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
 -- 3. Arrival-delay regressor ----------------------------------------------------------------
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_delay_reg_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_delay_reg_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_REGRESSOR',
   input_label_cols  = ['arr_log'],
@@ -78,7 +78,7 @@ FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
 -- 4. Arrival-delay EXCEEDANCE stack: P(arr_delay >= t), t in {5, 10, 20, 40} -----------------
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge5_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge5_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -92,7 +92,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -106,7 +106,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge20_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge20_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -120,7 +120,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.arr_ge40_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.arr_ge40_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -135,7 +135,7 @@ FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND arr_delay_pos IS NOT NULL;
 
 -- 5. Departure-delay EXCEEDANCE stack: P(dep_delay >= t), t in {5, 10, 20, 40} ---------------
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge5_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge5_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -149,7 +149,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -163,7 +163,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge20_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge20_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],
@@ -177,7 +177,7 @@ SELECT * EXCEPT(situationNumber, jkey, call_date, call_cancelled, dep_delay_pos,
 FROM `disruptions.training_calls_pooled_all`
 WHERE is_eval = FALSE AND dep_delay_pos IS NOT NULL;
 
-CREATE OR REPLACE MODEL `ent-kixavvik-dev.disruptions.dep_ge40_clf_pooled_all`
+CREATE OR REPLACE MODEL `ent-smartavvik-dev.disruptions.dep_ge40_clf_pooled_all`
 OPTIONS(
   model_type        = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols  = ['y_ge'],

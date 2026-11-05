@@ -30,7 +30,7 @@
 --         disruptions.frost_stations data/frost/stations_with_distance.csv
 
 -- 1. StopPlace -> nearest <=3 stations within 25 km (areal weather sources).
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.stopplace_station` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.stopplace_station` AS
 WITH affected AS (
   SELECT DISTINCT st AS stop_place
   FROM `disruptions.disruptions_initial`, UNNEST(affected_stops) AS st
@@ -57,7 +57,7 @@ FROM ranked WHERE rk <= 3 AND dist_km <= 25;
 --    (e.g. temp at 2 m / 10 m) are averaged. Precip winsorized at 80 mm/h (one bad
 --    gauge reported 160); snow depth clamped >=0 (MET codes -1 = snow-free).
 --    ~9 GB scan of the 16 GB clustered table (~$0.05).
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.station_weather_hourly` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.station_weather_hourly` AS
 WITH raw AS (
   SELECT
     SPLIT(source_id, ':')[OFFSET(0)] AS station_id,
@@ -85,7 +85,7 @@ GROUP BY station_id, ts;
 --    station) window stats, then areally across the situation's nearby stations
 --    (worst-case MAX for precip/wind/snow, MIN/MAX for temp extremes, AVG for the
 --    "now" temperature). NULLs kept (BOOSTED_TREE handles missing natively) + has-flags.
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.weather_features` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.weather_features` AS
 WITH sit AS (
   SELECT situationNumber, onset_ts, affected_stops FROM `disruptions.disruptions_initial`
 ),

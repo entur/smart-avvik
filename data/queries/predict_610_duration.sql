@@ -210,7 +210,7 @@ SELECT
   s.actual_max_delay_min,
   a.actual_impact_min,                                                       -- realized vs pred_reopen_min
   p.summary
-FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dur_init_reopen`,
+FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dur_init_reopen`,
                 (SELECT * FROM feat)) AS p
 -- per-category calibrated offsets, with the global '__ALL__' row as fallback for
 -- sparse / UNKNOWN / unseen categories (see create_quantiles.sql)

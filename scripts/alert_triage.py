@@ -74,7 +74,7 @@ MCP = {
 }
 
 PROMPT = """\
-You are triaging a Grafana alert for kix-avvik that was just posted in the team's Slack channel
+You are triaging a Grafana alert for smart-avvik that was just posted in the team's Slack channel
 #alerts-kix. Find out what is happening and why, using read-only tools, and write a short reply
 for the alert's thread. You cannot change anything and must not try.
 
@@ -89,16 +89,16 @@ How to investigate:
   the rule title): what the rule measures and what its description says to check.
 - Logs are in the CLUSTER project, not the app project:
   gcloud logging read --project=ent-kub-<env> 'resource.type="k8s_container" AND
-  resource.labels.namespace_name="kix-avvik" AND timestamp>="<RFC 3339>" AND ...' --limit=<n>
+  resource.labels.namespace_name="smart-avvik" AND timestamp>="<RFC 3339>" AND ...' --limit=<n>
   Structured events are in jsonPayload.event (poller_cycle carries a phases breakdown in ms;
   poller_phase, push, ...). Start with the window around the alert.
 - BigQuery only through this command, with the SQL on one line:
   python3 scripts/alert_triage.py bq <env> '<one SELECT statement>'
-  Tables are in ent-kixavvik-<env>.disruptions. Aggregate; never select raw rows.
+  Tables are in ent-smartavvik-<env>.disruptions. Aggregate; never select raw rows.
 - The alert's own kix_* metrics are only in Thanos behind Grafana, which you cannot reach; do not
   look for them. Kompass read_metrics sees the kubernetes_io:* metrics (restarts, CPU, memory)
-  on ent-kub-<env>, with the label namespace_name="kix-avvik".
-- Kompass get_workflow_runs on entur/kix-avvik (workflow cd.yml) tells you whether a deploy ran
+  on ent-kub-<env>, with the label namespace_name="smart-avvik".
+- Kompass get_workflow_runs on entur/smart-avvik-deployment-config (workflow cd.yml) tells you whether a deploy ran
   just before the alert; get_workflow_run_jobs and get_workflow_job_logs tell you why one failed.
 - Stop after about 10 tool calls. "Uncertain" is an acceptable answer; a guess stated as fact
   is not.
@@ -277,10 +277,10 @@ def one_pass():
 
 
 def bq(env, sql):
-    """Run one SELECT against ent-kixavvik-<env>, refusing anything else. Exit code tells Claude."""
+    """Run one SELECT against ent-smartavvik-<env>, refusing anything else. Exit code tells Claude."""
     if env not in ("dev", "tst", "prd"):
         sys.exit(f"env must be dev, tst or prd, not {env!r}")
-    base = ["bq", f"--project_id=ent-kixavvik-{env}", "query", "--use_legacy_sql=false"]
+    base = ["bq", f"--project_id=ent-smartavvik-{env}", "query", "--use_legacy_sql=false"]
     dry = subprocess.run(
         [*base, "--dry_run", "--format=json", sql],
         capture_output=True,

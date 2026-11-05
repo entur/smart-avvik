@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://kix-avvik.entur.io/contracts/notifications/v1/event.schema.json",
+  "$id": "https://smart-avvik.entur.io/contracts/notifications/v1/event.schema.json",
   "title": "Webhook notification event",
   "description": "One revision of one alert about one train for one subscription. Delivery is at-least-once with no ordering guarantee, so a receiver MUST apply three suppression rules before it dispatches anything natively: drop a duplicate event_id; drop a revision not strictly newer than the highest applied for that alert_id; and never dispatch a `predicted` revision for a train already `confirmed`, whatever its revision. Duplicate suppression and revision ordering within our stream are supplied as a client policy, not left as homework.",
   "type": "object",

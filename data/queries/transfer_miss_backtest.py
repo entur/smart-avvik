@@ -42,7 +42,7 @@ from google.cloud import bigquery
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-DS = "ent-kixavvik-dev.disruptions"
+DS = "ent-smartavvik-dev.disruptions"
 LEADS = (30, 60, 120, 240)
 BAR = {True: 0.65, False: 0.85}  # alert_policy: Vy with an operator message, and without
 SPLIT = date(2026, 8, 16)  # the out-of-time check: fit before, test from
@@ -205,7 +205,7 @@ def fit(d):
 
 def main():
     check_against_trips(np.random.default_rng(7))
-    bq = bigquery.Client(project="ent-kixavvik-dev")
+    bq = bigquery.Client(project="ent-smartavvik-dev")
     w = bq.query(Q_WEIGHTS).to_dataframe()
     w["has_situation"] = w.has_situation.astype(bool)
     pairs = bq.query(Q_PAIRS).to_dataframe()

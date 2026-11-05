@@ -18,7 +18,7 @@
 -- off the log event (Logs Explorer, project ent-kub-{dev,prd}):
 --
 --   resource.type="k8s_container"
---   resource.labels.namespace_name="kix-avvik"
+--   resource.labels.namespace_name="smart-avvik"
 --   jsonPayload.event="togvarsel_notify_round"
 --
 -- Field mapping — `d` is the Oslo date of the event timestamp; `decided_at` is that timestamp
@@ -46,32 +46,32 @@ USING (
       project STRING, d DATE, issue STRING, level STRING, baseline_level STRING, sent BOOL,
       kind STRING, reason STRING, decided_at TIMESTAMP,
       matched_journeys INT64, matched_devices INT64, n_sent INT64, n_error INT64, n_gone INT64>>[
-    -- ent-kixavvik-prd ------------------------------------------------------------------------
-    ('ent-kixavvik-prd', DATE '2026-08-31', '0630', 'red',    NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 04:31:04.197 UTC', 21, 13,  9, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-08-31', '0700', 'red',    'red',    FALSE, NULL,        'no_change', TIMESTAMP '2026-08-31 05:01:28.982 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-prd', DATE '2026-08-31', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 10:00:44.288 UTC', 23, 14, 10, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-08-31', '1400', 'green',  'yellow', TRUE,  'all_clear', NULL,        TIMESTAMP '2026-08-31 12:01:27.397 UTC', 24, 15, 11, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-09-01', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 04:30:23.936 UTC', 38, 22, 13, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-09-01', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 05:01:21.796 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-prd', DATE '2026-09-01', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 10:01:42.859 UTC', 24, 15, 11, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-09-01', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 12:01:07.833 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-prd', DATE '2026-09-02', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 04:31:05.728 UTC', 39, 23, 14, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-09-02', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 05:00:53.184 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-prd', DATE '2026-09-02', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 10:02:33.021 UTC', 25, 15, 11, 0, 0),
-    ('ent-kixavvik-prd', DATE '2026-09-02', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 12:00:48.823 UTC', NULL, NULL, NULL, NULL, NULL),  -- already recorded by the app
-    -- ent-kixavvik-dev ------------------------------------------------------------------------
-    ('ent-kixavvik-dev', DATE '2026-08-31', '0630', 'red',    NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 04:30:40.362 UTC',  9,  4,  3, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-08-31', '0700', 'red',    'red',    FALSE, NULL,        'no_change', TIMESTAMP '2026-08-31 05:01:35.114 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-dev', DATE '2026-08-31', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 10:00:54.530 UTC',  9,  4,  4, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-08-31', '1400', 'green',  'yellow', TRUE,  'all_clear', NULL,        TIMESTAMP '2026-08-31 12:01:17.800 UTC',  9,  4,  4, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-09-01', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 04:31:05.098 UTC',  9,  4,  4, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-09-01', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 05:02:02.695 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-dev', DATE '2026-09-01', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 10:01:43.466 UTC',  9,  4,  4, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-09-01', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 12:00:50.103 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-dev', DATE '2026-09-02', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 04:30:36.266 UTC',  9,  4,  4, 0, 0),
-    ('ent-kixavvik-dev', DATE '2026-09-02', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 05:01:05.861 UTC', NULL, NULL, NULL, NULL, NULL),
-    ('ent-kixavvik-dev', DATE '2026-09-02', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 10:00:38.541 UTC',  9,  4,  4, 0, 0),  -- already recorded by the app
-    ('ent-kixavvik-dev', DATE '2026-09-02', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 12:01:01.237 UTC', NULL, NULL, NULL, NULL, NULL)   -- already recorded by the app
+    -- ent-smartavvik-prd ------------------------------------------------------------------------
+    ('ent-smartavvik-prd', DATE '2026-08-31', '0630', 'red',    NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 04:31:04.197 UTC', 21, 13,  9, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-08-31', '0700', 'red',    'red',    FALSE, NULL,        'no_change', TIMESTAMP '2026-08-31 05:01:28.982 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-prd', DATE '2026-08-31', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 10:00:44.288 UTC', 23, 14, 10, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-08-31', '1400', 'green',  'yellow', TRUE,  'all_clear', NULL,        TIMESTAMP '2026-08-31 12:01:27.397 UTC', 24, 15, 11, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-09-01', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 04:30:23.936 UTC', 38, 22, 13, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-09-01', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 05:01:21.796 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-prd', DATE '2026-09-01', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 10:01:42.859 UTC', 24, 15, 11, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-09-01', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 12:01:07.833 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-prd', DATE '2026-09-02', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 04:31:05.728 UTC', 39, 23, 14, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-09-02', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 05:00:53.184 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-prd', DATE '2026-09-02', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 10:02:33.021 UTC', 25, 15, 11, 0, 0),
+    ('ent-smartavvik-prd', DATE '2026-09-02', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 12:00:48.823 UTC', NULL, NULL, NULL, NULL, NULL),  -- already recorded by the app
+    -- ent-smartavvik-dev ------------------------------------------------------------------------
+    ('ent-smartavvik-dev', DATE '2026-08-31', '0630', 'red',    NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 04:30:40.362 UTC',  9,  4,  3, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-08-31', '0700', 'red',    'red',    FALSE, NULL,        'no_change', TIMESTAMP '2026-08-31 05:01:35.114 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-dev', DATE '2026-08-31', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-08-31 10:00:54.530 UTC',  9,  4,  4, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-08-31', '1400', 'green',  'yellow', TRUE,  'all_clear', NULL,        TIMESTAMP '2026-08-31 12:01:17.800 UTC',  9,  4,  4, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-09-01', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 04:31:05.098 UTC',  9,  4,  4, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-09-01', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 05:02:02.695 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-dev', DATE '2026-09-01', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-01 10:01:43.466 UTC',  9,  4,  4, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-09-01', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-01 12:00:50.103 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-dev', DATE '2026-09-02', '0630', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 04:30:36.266 UTC',  9,  4,  4, 0, 0),
+    ('ent-smartavvik-dev', DATE '2026-09-02', '0700', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 05:01:05.861 UTC', NULL, NULL, NULL, NULL, NULL),
+    ('ent-smartavvik-dev', DATE '2026-09-02', '1200', 'yellow', NULL,     TRUE,  'warning',   NULL,        TIMESTAMP '2026-09-02 10:00:38.541 UTC',  9,  4,  4, 0, 0),  -- already recorded by the app
+    ('ent-smartavvik-dev', DATE '2026-09-02', '1400', 'yellow', 'yellow', FALSE, NULL,        'no_change', TIMESTAMP '2026-09-02 12:01:01.237 UTC', NULL, NULL, NULL, NULL, NULL)   -- already recorded by the app
   ])
   WHERE project = @@project_id
 ) AS s

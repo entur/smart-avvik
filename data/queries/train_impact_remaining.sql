@@ -9,7 +9,7 @@
 --                            beyond just knowing elapsed time and the reopen event.
 -- raw reopen_minutes / impact_minutes are NOT carried as features (future knowledge).
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_checkpoints` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_checkpoints` AS
 SELECT
   ck.*,
   ti.* EXCEPT(situationNumber, reopen_minutes, impact_minutes, is_eval),

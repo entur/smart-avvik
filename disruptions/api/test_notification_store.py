@@ -53,7 +53,7 @@ INDEXES = json.loads((REPO / "firestore.indexes.json").read_text())
 FIRESTORE_TF = (REPO / "terraform" / "firestore.tf").read_text()
 CI_YML = (REPO / ".github" / "workflows" / "ci.yml").read_text()
 TERRAFORM_YML = (REPO / ".github" / "workflows" / "terraform.yml").read_text()
-HELM_VALUES = (REPO / "helm" / "kix-avvik" / "values.yaml").read_text()
+HELM_VALUES = (REPO / "helm" / "smart-avvik" / "values.yaml").read_text()
 TF_VARIABLES = (REPO / "terraform" / "variables.tf").read_text()
 VARSEL_SOURCE = (pathlib.Path(__file__).parent / "varsel.py").read_text()
 
@@ -1471,7 +1471,7 @@ def test_no_project_is_named_anywhere_in_the_module():
     So there is no code path that can name a project at all -- which is a stronger claim than any
     runtime test could make, and the only one an emulator with a `demo-` project could not check.
     """
-    assert "ent-kixavvik" not in MODULE_SOURCE
+    assert "ent-smartavvik" not in MODULE_SOURCE
     assert "firestore.Client(database=_database)" in MODULE_SOURCE
     assert not re.search(r"firestore\.Client\([^)]*project=", MODULE_SOURCE)
 
@@ -3686,7 +3686,7 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
     """
     live_secret_envs = {"dev", "prd"}
     for env in ("dev", "tst", "prd"):
-        values = (REPO / "helm" / "kix-avvik" / "env" / f"values-kub-ent-{env}.yaml").read_text()
+        values = (REPO / "helm" / "smart-avvik" / "env" / f"values-kub-ent-{env}.yaml").read_text()
         live = _uncommented(values)
         for name in ("WEBHOOK_SIGNING_ROOT", "NOTIFICATION_KEY_PEPPER"):
             assert name in values, f"{env} does not name {name} at all"

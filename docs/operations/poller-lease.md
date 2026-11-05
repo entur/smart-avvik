@@ -139,8 +139,8 @@ Three sources, and they should agree.
    whichever pod the load balancer picks; to see every pod, port-forward each one (the image is
    distroless — there is no shell or curl inside it):
    ```sh
-   kubectl -n kix-avvik get pods      # the API pods, not kix-avvik-worker-*
-   kubectl -n kix-avvik port-forward pod/<pod> 18080:8080   # then curl -s localhost:18080/ready
+   kubectl -n smart-avvik get pods      # the API pods, not smart-avvik-worker-*
+   kubectl -n smart-avvik port-forward pod/<pod> 18080:8080   # then curl -s localhost:18080/ready
    ```
    503 with `reason: predictions_not_loaded` or `plan_not_loaded` is a pod still loading, not a
    lease problem. `/ready` and `/health` are both muted from the access log (`logging_setup`), so
@@ -153,7 +153,7 @@ Three sources, and they should agree.
    an image built before the `version` field existed (a rollback past this change) fails this step
    by design; the deploy itself has already happened.
 2. **The `event="poller_lease"` records**, in the **cluster** project (`ent-kub-dev`/`ent-kub-prd`,
-   namespace `kix-avvik`), with `result` and `holder`:
+   namespace `smart-avvik`), with `result` and `holder`:
 
    | `result` | Meaning |
    |---|---|
@@ -175,7 +175,7 @@ Three sources, and they should agree.
 3. **`kix_poller_leader`**, 1 on the leader and 0 everywhere else — followers, the worker pod and
    every tst pod export it as 0 (an unset `prometheus_client` gauge is 0, not absent; the metric's
    HELP text says "absent" and is wrong in the same way `WORKER_LAST_TICK`'s was).
-   `sum(kix_poller_leader{kubernetes_namespace="kix-avvik", prometheus_group="kub-ent-<env>-001"})`
+   `sum(kix_poller_leader{kubernetes_namespace="smart-avvik", prometheus_group="kub-ent-<env>-001"})`
    is the number of leaders; the dashboard draws `count()` beside it, the number of pods exporting.
    `kix_poller_last_cycle_timestamp_seconds` is leader-only by construction.
 
@@ -184,7 +184,7 @@ shell with ADC; never write it by hand.
 
 ## Operations
 
-**Force a handoff: delete the leader pod.** `kubectl -n kix-avvik delete pod <leader>` sends SIGTERM,
+**Force a handoff: delete the leader pod.** `kubectl -n smart-avvik delete pod <leader>` sends SIGTERM,
 the pod releases at the end of its shutdown sequence, and a follower acquires at its next tick. At
 one replica (dev) the Deployment's replacement pod acquires once it is Ready, and nothing serves
 until then (~45 s measured). Use `--grace-period=1` only to rehearse a crash: the lease is then
@@ -317,7 +317,7 @@ verified live, and its shape differs per environment:
   pod buys out. The cost is a permanent follower: one more pod at prd's 1.0 CPU and 2 GiB, and its
   follower loads (step 5's measurement).
 
-`helm/kix-avvik/test/api_render.sh` (CI's `helm-render`, gating the image) renders each environment's
+`helm/smart-avvik/test/api_render.sh` (CI's `helm-render`, gating the image) renders each environment's
 step B by deleting the `forceReplicas` line and asserts its floor (`ROLLING_FLOOR`: dev `1 0%`, prd
 `2 50%`), so the shape is proven before anyone commits it — and a prd block that lost its floor
 fails that render on the nil pointer above.
@@ -329,10 +329,10 @@ a branch or tag at the step A commit.
 
 ### Pre-deploy audits (before each environment's step B)
 
-- **Live strategy and grace**: `kubectl -n kix-avvik get deploy kix-avvik -o
+- **Live strategy and grace**: `kubectl -n smart-avvik get deploy smart-avvik -o
   jsonpath='{.spec.strategy.type} {.spec.template.spec.terminationGracePeriodSeconds}'` reads
   `Recreate 270`. Anything else means step A is not what is running.
-- **Rendered manifests**: `bash helm/kix-avvik/test/api_render.sh` passes on the commit being
+- **Rendered manifests**: `bash helm/smart-avvik/test/api_render.sh` passes on the commit being
   deployed.
 - **The Firestore database and its TTL configs** exist for `feedback_contexts` (Terraform; prd's is
   dispatch-only — `gh workflow run terraform.yml -f environment=prd`, and confirm the apply, or prd's
@@ -372,7 +372,7 @@ a branch or tag at the step A commit.
 6. **Watch** `sum(kix_poller_leader)` in dev for a day.
 7. **prd**, in the same two steps, after rules 1a/1b exist and are proven in prd:
    `gh workflow run terraform.yml -f environment=prd` and confirm the apply; dispatch `cd.yml` with
-   the image in SHORT form (`kix-avvik:main.<date>-SHA<sha>`) and prd's `forceReplicas: 1` still in
+   the image in SHORT form (`smart-avvik:main.<date>-SHA<sha>`) and prd's `forceReplicas: 1` still in
    place; confirm `acquired` on the single pod; only then delete prd's `forceReplicas` line (the
    block and its 2-pod floor stay) and dispatch again. Expect the rollout to end with **two** pods,
    one `acquired` and one follower whose `/ready` answers `role: follower`, and

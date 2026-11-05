@@ -26,7 +26,7 @@ from google.cloud import bigquery
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 
-DS = "ent-kixavvik-dev.disruptions"
+DS = "ent-smartavvik-dev.disruptions"
 FIT_UNTIL = "2026-09-06"  # combination model: fit on the first week, test on the second
 
 PULL = f"""
@@ -153,7 +153,7 @@ def combination(ev):
 
 
 def main():
-    client = bigquery.Client(project="ent-kixavvik-dev")
+    client = bigquery.Client(project="ent-smartavvik-dev")
     df = prepare(client.query(PULL).to_dataframe(), client.query(WEIGHTS).to_dataframe())
     print(f"{len(df):,} asks")
 

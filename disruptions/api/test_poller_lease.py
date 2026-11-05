@@ -569,7 +569,7 @@ def test_the_holder_is_the_pod_name_with_a_per_process_suffix():
     import os
 
     saved = os.environ.get("HOSTNAME")
-    os.environ["HOSTNAME"] = "kix-avvik-7d9f-abcde"
+    os.environ["HOSTNAME"] = "smart-avvik-7d9f-abcde"
     try:
         first, second = main._poller_holder_id(), main._poller_holder_id()
     finally:
@@ -577,7 +577,7 @@ def test_the_holder_is_the_pod_name_with_a_per_process_suffix():
             os.environ.pop("HOSTNAME", None)
         else:
             os.environ["HOSTNAME"] = saved
-    assert first.startswith("kix-avvik-7d9f-abcde-") and second.startswith("kix-avvik-7d9f-abcde-")
+    assert first.startswith("smart-avvik-7d9f-abcde-") and second.startswith("smart-avvik-7d9f-abcde-")
     assert first != second, "two processes on one pod (a restart) are two holders"
 
 

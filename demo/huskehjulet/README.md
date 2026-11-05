@@ -37,8 +37,8 @@ inc AS (
   SELECT DISTINCT
     d.situationNumber, d.onset_ts, d.reopen_minutes, d.impact_minutes,
     d.summary, d.description
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
-  LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
+  FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS d
+  LEFT JOIN `ent-smartavvik-dev.disruptions.categories` AS c
     ON  IFNULL(c.summary, '')     = IFNULL(d.summary, '')
     AND IFNULL(c.description, '') = IFNULL(d.description, '')
   CROSS JOIN UNNEST(d.affected_stops) AS sr
@@ -48,7 +48,7 @@ inc AS (
 )
 SELECT i.*, w.tmin_c, w.snwd_mm
 FROM inc AS i
-LEFT JOIN `ent-kixavvik-dev.disruptions.hh_weather_blindern` AS w
+LEFT JOIN `ent-smartavvik-dev.disruptions.hh_weather_blindern` AS w
   ON w.date = DATE(i.onset_ts, 'Europe/Oslo')
 ORDER BY i.onset_ts;
 ```

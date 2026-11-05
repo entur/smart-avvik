@@ -12,11 +12,11 @@
 
 DECLARE cat_array STRING DEFAULT (
   SELECT STRING_AGG(FORMAT('(%T, %T)', category, description), ',\n      ' ORDER BY sort_order)
-  FROM `ent-kixavvik-dev.disruptions.category_taxonomy`
+  FROM `ent-smartavvik-dev.disruptions.category_taxonomy`
 );
 
 EXECUTE IMMEDIATE FORMAT(r"""
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.categories` AS
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.categories` AS
 WITH texts AS (
   SELECT DISTINCT
     (SELECT s.value

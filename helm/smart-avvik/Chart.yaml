@@ -1,5 +1,5 @@
 apiVersion: v2
-name: kix-avvik
+name: smart-avvik
 description: KIX Proaktivt avvik - Predict disruption duration from SIRI-SX messages
 type: application
 version: 0.1.0

@@ -31,7 +31,7 @@ jobs:
       dockerfile: Dockerfile
 
   # Helm charts are linted per environment to catch env-specific value errors.
-  # SIX combinations since U11, not three: `kix-avvik-worker` is a second RELEASE of this same chart
+  # SIX combinations since U11, not three: `smart-avvik-worker` is a second RELEASE of this same chart
   # (the common chart renders one Deployment per release, so a second workload cannot be a second
   # block in one values file), and a values file nothing lints is a values file that fails at deploy
   # time. `include` rather than a second matrix axis: the two sets are not a cross product.
@@ -53,7 +53,7 @@ jobs:
             values: worker-values-kub-ent-prd.yaml
     uses: entur/gha-helm/.github/workflows/lint.yml@v2
     with:
-      chart: helm/kix-avvik
+      chart: helm/smart-avvik
       environment: ${{ matrix.environment }}
       values: ${{ matrix.values }}
 
@@ -70,10 +70,10 @@ jobs:
       # No setup action: ubuntu-24.04 ships helm, and the script fails loudly rather than skipping
       # if it ever stops doing so. One fewer third-party action in the path of the image build.
       - uses: actions/checkout@v7
-      - run: bash helm/kix-avvik/test/worker_render.sh
+      - run: bash helm/smart-avvik/test/worker_render.sh
       # The API release's two shapes: Recreate while an environment file sets forceReplicas, and
       # RollingUpdate + HPA without it (proven for dev and prd before that line is deleted).
-      - run: bash helm/kix-avvik/test/api_render.sh
+      - run: bash helm/smart-avvik/test/api_render.sh
 
   # --- Build and Test ---
 

@@ -114,10 +114,10 @@ LEFT JOIN `ent-data-sharing-ext-prd.national_stop_registry.quays_last_version` A
 -- insert the fresh rows. No age-out -- the table grows from its fixed 2024-06-01 start.
 BEGIN TRANSACTION;
 
-DELETE FROM `ent-kixavvik-dev.disruptions.rail_calls`
+DELETE FROM `ent-smartavvik-dev.disruptions.rail_calls`
 WHERE jkey IN (SELECT jkey FROM fresh);
 
-INSERT INTO `ent-kixavvik-dev.disruptions.rail_calls`
+INSERT INTO `ent-smartavvik-dev.disruptions.rail_calls`
   (jkey, lineRef, quay, stop_place, stop_name, stop_order, aimed_dep, call_date,
    call_cancelled, dep_delay_min, call_source, aimed_arr, actual_dep, actual_arr, arr_delay_min)
 SELECT

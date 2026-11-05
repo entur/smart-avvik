@@ -23,7 +23,7 @@
 -- cancelled (either flag) or it has NON-estimated actual times; estimated "actuals" on
 -- cancelled rows are nulled. Dedup on latest recordedAtTime per (journey, date, seq).
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.bus_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.bus_calls`
 PARTITION BY call_date
 CLUSTER BY operator, lineRef, stop_place
 AS
