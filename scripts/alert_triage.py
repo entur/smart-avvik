@@ -49,7 +49,7 @@ CLAUDE_TIMEOUT_S = 900
 MAX_BYTES_BILLED = 10 * 10**9  # 10 GB, about $0.06 at on-demand rates
 STATE = Path.home() / ".local/state/kix-alert-triage"
 LOG = Path.home() / "Library/Logs/kix-alert-triage.log"
-LABEL = "no.entur.kix-alert-triage"
+LABEL = "no.entur.smart-avvik-alert-triage"
 PREFIX = (
     "🤖 *Automatisk analyse (Claude Code)* – kan ta feil, sjekk før du handler.\n\n"
 )
@@ -95,7 +95,7 @@ How to investigate:
 - BigQuery only through this command, with the SQL on one line:
   python3 scripts/alert_triage.py bq <env> '<one SELECT statement>'
   Tables are in ent-smartavvik-<env>.disruptions. Aggregate; never select raw rows.
-- The alert's own kix_* metrics are only in Thanos behind Grafana, which you cannot reach; do not
+- The alert's own smart_avvik_* metrics are only in Thanos behind Grafana, which you cannot reach; do not
   look for them. Kompass read_metrics sees the kubernetes_io:* metrics (restarts, CPU, memory)
   on ent-kub-<env>, with the label namespace_name="smart-avvik".
 - Kompass get_workflow_runs on entur/smart-avvik-deployment-config (workflow cd.yml) tells you whether a deploy ran

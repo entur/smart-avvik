@@ -97,7 +97,7 @@ prefix and one slot of the day's cap.
 
 **On acquisition**, on the poller thread, before the first cycle of a tenure: reset and seed both
 mirrors (beating between pages), reload the rush round markers, hydrate the rush state, force the
-next iteration to rebuild whatever the ingestion stamp says, then set `kix_poller_leader` to 1 and
+next iteration to rebuild whatever the ingestion stamp says, then set `smart_avvik_poller_leader` to 1 and
 log `acquired`. If any step raises, the lease is released, the gauge cleared, and the pod stays a
 follower for **5 ticks** before trying again (`acquire_failed`), so a partial store outage does not
 spin every pod through acquire and release each tick. **A failed rush hydrate does not count**:
@@ -172,12 +172,12 @@ Three sources, and they should agree.
    A healthy rolling deploy reads, in order: the old pod's `released`, then the new pod's
    `acquired` within one tick. A Recreate deploy from a lease-unaware binary shows `acquired` with no
    `released` before it, since the old binary had no lease.
-3. **`kix_poller_leader`**, 1 on the leader and 0 everywhere else — followers, the worker pod and
+3. **`smart_avvik_poller_leader`**, 1 on the leader and 0 everywhere else — followers, the worker pod and
    every tst pod export it as 0 (an unset `prometheus_client` gauge is 0, not absent; the metric's
    HELP text says "absent" and is wrong in the same way `WORKER_LAST_TICK`'s was).
-   `sum(kix_poller_leader{kubernetes_namespace="smart-avvik", prometheus_group="kub-ent-<env>-001"})`
+   `sum(smart_avvik_poller_leader{kubernetes_namespace="smart-avvik", prometheus_group="kub-ent-<env>-001"})`
    is the number of leaders; the dashboard draws `count()` beside it, the number of pods exporting.
-   `kix_poller_last_cycle_timestamp_seconds` is leader-only by construction.
+   `smart_avvik_poller_last_cycle_timestamp_seconds` is leader-only by construction.
 
 The document itself can be read with `notification_store.read_poller_lease()` from a developer
 shell with ADC; never write it by hand.
@@ -206,7 +206,7 @@ the outage cannot start at all (the store backend already fails the lifespan wit
 so do not delete pods to "fix" it. Recovery is automatic once the store answers: the next tick
 acquires. Before the lease this cost only the mirror sync; it is the price of having one writer.
 
-**Rule 1b firing (two leaders).** Find the stalled pod: its own `kix_poller_leader` series (per pod,
+**Rule 1b firing (two leaders).** Find the stalled pod: its own `smart_avvik_poller_leader` series (per pod,
 without the `sum()`) reads 1 while its `/ready` answers `role: follower` — `/ready` asks the lease's
 local deadline, which has passed, while the gauge is cleared only at that pod's next tick — and its
 last `poller_lease` record predates the other pod's `acquired`. Its thread is stuck mid-phase. Run the duplicate check over `event="push"` for the window (at most one `result="sent"` per journey
@@ -349,7 +349,7 @@ a branch or tag at the step A commit.
 
 1. **dev step A**: push to `main`. Confirm the single dev pod logs `poller_lease` `acquired` (no
    `released` before it — the old binary had no lease), `/ready` answers 200 with `role: leader`
-   through a port-forward, one `poller_cycle` per period, and `sum(kix_poller_leader)` is 1. Create
+   through a port-forward, one `poller_cycle` per period, and `sum(smart_avvik_poller_leader)` is 1. Create
    rules 1a/1b in dev and prove them (alert-rules checklist step 9).
 2. **dev step B**: delete dev's `deployment:` block, merge, and watch the first rolling deploy while
    polling the journey-alerts/journey-status route matrix at one request per second **in total**,
@@ -369,14 +369,14 @@ a branch or tag at the step A commit.
 5. **Follower cost**: read `INFORMATION_SCHEMA.JOBS_BY_PROJECT` for one day — bytes billed by
    follower SELECTs against the leader's own load bytes. A follower reading more than the leader
    loads is a defect to fix before prd.
-6. **Watch** `sum(kix_poller_leader)` in dev for a day.
+6. **Watch** `sum(smart_avvik_poller_leader)` in dev for a day.
 7. **prd**, in the same two steps, after rules 1a/1b exist and are proven in prd:
    `gh workflow run terraform.yml -f environment=prd` and confirm the apply; dispatch `cd.yml` with
    the image in SHORT form (`smart-avvik:main.<date>-SHA<sha>`) and prd's `forceReplicas: 1` still in
    place; confirm `acquired` on the single pod; only then delete prd's `forceReplicas` line (the
    block and its 2-pod floor stay) and dispatch again. Expect the rollout to end with **two** pods,
    one `acquired` and one follower whose `/ready` answers `role: follower`, and
-   `count(kix_poller_leader)` at 3 (two API pods plus the worker) beside `sum` at 1. Repeat steps 1,
+   `count(smart_avvik_poller_leader)` at 3 (two API pods plus the worker) beside `sum` at 1. Repeat steps 1,
    3 (graceful delete only: with a follower already Ready it should take one tick, with no serving
    gap) and 6 there.
 

@@ -50,12 +50,12 @@ test("the sibling client package is consumed as its BUILT artifact, not as sourc
   // The `file:` link resolves to the sibling's package.json `main`, which is its dist. So a client
   // vendoring both gets two compiled packages, and this package never depends on Node's type
   // stripping at runtime.
-  const link = path.join(PACKAGE_ROOT, "node_modules", "@entur", "kix-notifications-client");
+  const link = path.join(PACKAGE_ROOT, "node_modules", "@entur", "smart-avvik-notifications-client");
   const manifest = JSON.parse(fs.readFileSync(path.join(link, "package.json"), "utf8"));
   assert.equal(manifest.main, "./dist/index.js");
   assert.ok(fs.existsSync(path.join(link, manifest.main)));
   const emitted = fs.readFileSync(path.join(DIST, "receiver.js"), "utf8");
-  assert.match(emitted, /require\("@entur\/kix-notifications-client"\)/);
+  assert.match(emitted, /require\("@entur\/smart-avvik-notifications-client"\)/);
 });
 
 test("every source module has a declaration file beside it", () => {

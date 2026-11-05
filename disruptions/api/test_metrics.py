@@ -26,7 +26,7 @@ from google.cloud import bigquery as _bq
 _bq.Client = lambda *a, **k: None  # type: ignore[assignment]
 
 # The suite asserts what an SSO-less request counts as, so a developer's exported SSO_REQUIRED
-# must not leak in (the same reason the /varsel-api tests pin KIX_ENVIRONMENT at import). The one
+# must not leak in (the same reason the /varsel-api tests pin SMART_AVVIK_ENVIRONMENT at import). The one
 # test about SSO rejection sets it explicitly and restores the popped state.
 os.environ.pop("SSO_REQUIRED", None)
 
@@ -51,40 +51,40 @@ def test_request_is_counted_with_method_path_and_status_class():
     path collapsed to its first segment and the status to its class."""
     count_labels = {"method": "GET", "path": "demo-api", "status": "2xx"}
     duration_labels = {"method": "GET", "path": "demo-api", "long_poll": "false"}
-    count_before = _sample("kix_http_requests_total", count_labels)
-    duration_before = _sample("kix_http_request_duration_seconds_count", duration_labels)
+    count_before = _sample("smart_avvik_http_requests_total", count_labels)
+    duration_before = _sample("smart_avvik_http_request_duration_seconds_count", duration_labels)
     r = client.get("/demo-api/config")
     assert r.status_code == 200, r.text
-    assert _sample("kix_http_requests_total", count_labels) == count_before + 1
-    assert _sample("kix_http_request_duration_seconds_count", duration_labels) == duration_before + 1
+    assert _sample("smart_avvik_http_requests_total", count_labels) == count_before + 1
+    assert _sample("smart_avvik_http_request_duration_seconds_count", duration_labels) == duration_before + 1
 
 
 def test_unknown_path_labels_as_other_and_known_mounts_by_segment():
     """The path label is an allowlist, not the raw path: a scanner probing random URLs on the
     public port must collapse to one series, or every probe mints a time series held forever."""
     other = {"method": "GET", "path": "other", "status": "4xx"}
-    before = _sample("kix_http_requests_total", other)
+    before = _sample("smart_avvik_http_requests_total", other)
     r = client.get("/no-such-page-xyzzy/deep/path")
     assert r.status_code == 404
-    assert _sample("kix_http_requests_total", other) == before + 1
+    assert _sample("smart_avvik_http_requests_total", other) == before + 1
     # A known mount keeps its segment — /health answers 200 in a lifespan-less process.
     health = {"method": "GET", "path": "health", "status": "2xx"}
-    before = _sample("kix_http_requests_total", health)
+    before = _sample("smart_avvik_http_requests_total", health)
     assert client.get("/health").status_code == 200
-    assert _sample("kix_http_requests_total", health) == before + 1
+    assert _sample("smart_avvik_http_requests_total", health) == before + 1
 
 
 def test_log_records_are_counted_by_level_and_emit_never_raises():
     metrics.configure()
     logger = logging.getLogger("test-metrics")
-    before_error = _sample("kix_log_records_total", {"level": "ERROR"})
+    before_error = _sample("smart_avvik_log_records_total", {"level": "ERROR"})
     logger.error("counted")
-    assert _sample("kix_log_records_total", {"level": "ERROR"}) == before_error + 1
+    assert _sample("smart_avvik_log_records_total", {"level": "ERROR"}) == before_error + 1
     # Exotic records: an arbitrary object as arg, and a record whose %-formatting FAILS (too few
     # args) — the JSON stdout handler's format() raises internally and logging routes that to
     # handleError; the counting handler must still count and must never raise. raiseExceptions is
     # silenced so the expected handleError traceback does not spray the test output.
-    before_info = _sample("kix_log_records_total", {"level": "INFO"})
+    before_info = _sample("smart_avvik_log_records_total", {"level": "INFO"})
     raise_before = logging.raiseExceptions
     logging.raiseExceptions = False
     try:
@@ -92,7 +92,7 @@ def test_log_records_are_counted_by_level_and_emit_never_raises():
         logger.info("mismatched %s %s", "only-one-arg")  # noqa: PLE1206 - failing format is the point
     finally:
         logging.raiseExceptions = raise_before
-    assert _sample("kix_log_records_total", {"level": "INFO"}) == before_info + 2
+    assert _sample("smart_avvik_log_records_total", {"level": "INFO"}) == before_info + 2
 
 
 def test_setup_rerun_needs_reconfigure_and_installs_exactly_one_handler():
@@ -104,9 +104,9 @@ def test_setup_rerun_needs_reconfigure_and_installs_exactly_one_handler():
     metrics.configure()
     metrics.configure()
     assert sum(isinstance(h, metrics._CountingHandler) for h in root.handlers) == 1
-    before = _sample("kix_log_records_total", {"level": "ERROR"})
+    before = _sample("smart_avvik_log_records_total", {"level": "ERROR"})
     logging.getLogger("test-metrics").error("still counted after re-setup")
-    assert _sample("kix_log_records_total", {"level": "ERROR"}) == before + 1
+    assert _sample("smart_avvik_log_records_total", {"level": "ERROR"}) == before + 1
 
 
 def test_sso_rejected_request_is_still_counted():
@@ -119,11 +119,11 @@ def test_sso_rejected_request_is_still_counted():
     for key in keys[1:]:
         os.environ.pop(key, None)
     labels = {"method": "GET", "path": "historikk-api", "status": "5xx"}
-    before = _sample("kix_http_requests_total", labels)
+    before = _sample("smart_avvik_http_requests_total", labels)
     try:
         r = client.get("/historikk-api/config")
         assert r.status_code == 503, r.text
-        assert _sample("kix_http_requests_total", labels) == before + 1
+        assert _sample("smart_avvik_http_requests_total", labels) == before + 1
     finally:
         for key, value in before_env.items():
             if value is None:
@@ -143,8 +143,8 @@ def test_start_serves_text_exposition_on_its_own_ephemeral_port():
         assert port != 0
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=5) as response:
             body = response.read().decode()
-        assert "kix_http_requests_total" in body
-        assert "kix_poller_last_tick_timestamp_seconds" in body
+        assert "smart_avvik_http_requests_total" in body
+        assert "smart_avvik_poller_last_tick_timestamp_seconds" in body
     finally:
         server.shutdown()
         server.server_close()
@@ -176,38 +176,38 @@ def test_domain_metrics_are_declared_with_the_agreed_names_and_labels():
     """U3/U4 only import and increment (KTD11) — so every agreed name and labelset is exercised
     once here, and a rename or label change fails now rather than when those units land."""
     metrics.POLLER_LAST_TICK.set(1_234.5)
-    assert _sample("kix_poller_last_tick_timestamp_seconds") == 1_234.5
+    assert _sample("smart_avvik_poller_last_tick_timestamp_seconds") == 1_234.5
     metrics.POLLER_LAST_CYCLE.set(2_345.5)
-    assert _sample("kix_poller_last_cycle_timestamp_seconds") == 2_345.5
+    assert _sample("smart_avvik_poller_last_cycle_timestamp_seconds") == 2_345.5
     metrics.POLLER_LEADER.set(1)
-    assert _sample("kix_poller_leader") == 1
+    assert _sample("smart_avvik_poller_leader") == 1
     metrics.POLLER_LEADER.set(0)
-    assert _sample("kix_poller_leader") == 0
+    assert _sample("smart_avvik_poller_leader") == 0
     metrics.LABELLING_LAST_SUCCESS.set(3_456.5)
-    assert _sample("kix_labelling_last_success_timestamp_seconds") == 3_456.5
+    assert _sample("smart_avvik_labelling_last_success_timestamp_seconds") == 3_456.5
 
-    before = _sample("kix_poller_cycle_duration_seconds_count")
+    before = _sample("smart_avvik_poller_cycle_duration_seconds_count")
     metrics.POLLER_CYCLE_DURATION.observe(42.0)
-    assert _sample("kix_poller_cycle_duration_seconds_count") == before + 1
+    assert _sample("smart_avvik_poller_cycle_duration_seconds_count") == before + 1
 
     phase = {"phase": "test_phase"}
-    before = _sample("kix_poller_phase_duration_seconds_count", phase)
+    before = _sample("smart_avvik_poller_phase_duration_seconds_count", phase)
     metrics.POLLER_PHASE_DURATION.labels(**phase).observe(1.5)
-    assert _sample("kix_poller_phase_duration_seconds_count", phase) == before + 1
+    assert _sample("smart_avvik_poller_phase_duration_seconds_count", phase) == before + 1
 
-    before = _sample("kix_poller_phase_cpu_seconds_count", phase)
+    before = _sample("smart_avvik_poller_phase_cpu_seconds_count", phase)
     metrics.POLLER_PHASE_CPU.labels(**phase).observe(0.75)
-    assert _sample("kix_poller_phase_cpu_seconds_count", phase) == before + 1
+    assert _sample("smart_avvik_poller_phase_cpu_seconds_count", phase) == before + 1
 
     for counter, name, labels in (
-        (metrics.POLLER_PHASE_TOTAL, "kix_poller_phase_total", {"phase": "test_phase", "result": "ok"}),
-        (metrics.PUSH_TOTAL, "kix_push_total", {"result": "sent"}),
+        (metrics.POLLER_PHASE_TOTAL, "smart_avvik_poller_phase_total", {"phase": "test_phase", "result": "ok"}),
+        (metrics.PUSH_TOTAL, "smart_avvik_push_total", {"result": "sent"}),
         (
             metrics.LLM_MESSAGE_TOTAL,
-            "kix_llm_message_total",
+            "smart_avvik_llm_message_total",
             {"provider": "gemini", "result": "ok", "surface": "live"},
         ),
-        (metrics.DECISION_WRITE_TOTAL, "kix_decision_write_total", {"result": "ok"}),
+        (metrics.DECISION_WRITE_TOTAL, "smart_avvik_decision_write_total", {"result": "ok"}),
     ):
         before = _sample(name, labels)
         counter.labels(**labels).inc()
@@ -223,7 +223,7 @@ def test_journey_alerts_that_may_wait_are_timed_apart_as_long_polls():
 
     def count(long_poll: str) -> float:
         labels = {"method": "GET", "path": "notification-api", "long_poll": long_poll}
-        return _sample("kix_http_request_duration_seconds_count", labels)
+        return _sample("smart_avvik_http_request_duration_seconds_count", labels)
 
     for query, label in (("", "true"), ("&wait=5", "true"), ("&wait=0", "false")):
         marked, unmarked = count(label), count("false" if label == "true" else "true")

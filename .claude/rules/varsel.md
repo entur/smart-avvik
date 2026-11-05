@@ -646,9 +646,9 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `disruptions/api/deployment.py` (`environment_label()`), shared with `/historikk`: it reads the
     `GOOGLE_CLOUD_PROJECT` suffix, so no cosmetic per-environment variable has to be remembered —
     that one is already mandatory everywhere, since the unqualified `disruptions.*` refs resolve
-    through it. `KIX_ENVIRONMENT` overrides it locally. `prd` — and an unreadable project — stay
+    through it. `SMART_AVVIK_ENVIRONMENT` overrides it locally. `prd` — and an unreadable project — stay
     unlabelled: a stray `(dev)` on the traveller-facing host is worse than none on a deployment we
-    control. Note the `/varsel-api` tests pin `KIX_ENVIRONMENT=prd` at import, or a developer with
+    control. Note the `/varsel-api` tests pin `SMART_AVVIK_ENVIRONMENT=prd` at import, or a developer with
     `GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev` exported fails the push-title assertions.
   - `VARSEL_LLM_ENABLED` / `VARSEL_LLM_PROVIDER` / `VERTEX_LOCATION` /
     `VERTEX_CLAUDE_MODEL` / `VERTEX_GEMINI_MODEL` / `VERTEX_GEMINI_FALLBACK_MODEL` /

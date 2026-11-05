@@ -33,7 +33,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 VECTORS_PATH = REPO / "contracts" / "notifications" / "v1" / "signing-vectors.json"
 VECTORS = json.loads(VECTORS_PATH.read_text())
 
-ROOT = b"kix-test-signing-root-not-used-in-any-deployment"
+ROOT = b"smart-avvik-test-signing-root-not-used-in-any-deployment"
 OTHER_ROOT = b"a-completely-different-root-secret-for-comparison"
 DEST_A = "dst_client_a_prod"
 DEST_B = "dst_client_b_prod"
@@ -205,7 +205,7 @@ def test_the_derivation_material_is_length_framed_so_no_two_pairs_can_collide():
 def test_the_material_carries_a_purpose_tag_like_ssos_tokens():
     # One key, disjoint messages: a future second use of the same root cannot collide with this one.
     material = ws.derivation_material(DEST_A, 2)
-    assert material.startswith(b"kix.webhook.signing.v1|")
+    assert material.startswith(b"smart-avvik.webhook.signing.v1|")
     assert b"|17|dst_client_a_prod|2" in material
 
 

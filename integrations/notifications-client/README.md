@@ -5,7 +5,7 @@ rules for Entur's client journey-notification channel. **No Firebase dependency*
 Cloud Function, a container, or a `node:http` server, and the generic Node receiver in
 `src/nodeReceiver.ts` is a shipped reference rather than an example.
 
-On Firebase, add [`@entur/kix-firebase-notifications`](../firebase-notifications/README.md), which
+On Firebase, add [`@entur/smart-avvik-firebase-notifications`](../firebase-notifications/README.md), which
 supplies the Firestore-backed inbox and ledger, the Cloud Functions wiring and the security rules.
 
 ## Why the rules are supplied rather than left as homework
@@ -27,7 +27,7 @@ import {
   createMemoryStores,
   process as processEvent,
   receive,
-} from "@entur/kix-notifications-client";
+} from "@entur/smart-avvik-notifications-client";
 
 const stores = createMemoryStores();          // replace with your own persistence
 

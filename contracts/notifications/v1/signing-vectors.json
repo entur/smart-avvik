@@ -21,24 +21,24 @@
   "derivation": {
     "$comment": "How a destination's secret is produced, so no signing material is stored anywhere. A client never needs this -- they are handed the secret -- but an operator reproducing a signature does.",
     "algorithm": "HMAC-SHA256(root, material)",
-    "material": "'kix.webhook.signing.v1' + '|' + <byte length of destination_id in utf-8> + '|' + <destination_id> + '|' + <generation>",
+    "material": "'smart-avvik.webhook.signing.v1' + '|' + <byte length of destination_id in utf-8> + '|' + <destination_id> + '|' + <generation>",
     "material_encoding": "utf-8",
     "why_length_framed": "a destination id is an operator-supplied string, so ('a', 11) and ('a1', 1) must not share a preimage; a bare separator only holds while no id contains that separator",
     "secret_format": "'whsec_' + base64(the 32 raw HMAC bytes), standard alphabet, padded",
     "root_env_var": "WEBHOOK_SIGNING_ROOT",
-    "test_root": "kix-test-signing-root-not-used-in-any-deployment",
+    "test_root": "smart-avvik-test-signing-root-not-used-in-any-deployment",
     "examples": [
       {
         "destination_id": "dst_client_a_prod",
         "generation": 2,
-        "material": "kix.webhook.signing.v1|17|dst_client_a_prod|2",
-        "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU="
+        "material": "smart-avvik.webhook.signing.v1|17|dst_client_a_prod|2",
+        "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw="
       },
       {
         "destination_id": "dst_client_b_prod",
         "generation": 2,
-        "material": "kix.webhook.signing.v1|17|dst_client_b_prod|2",
-        "secret": "whsec_4+Xz+/xL5w4gEw90+h/EtKrxx18nHya9keAq20AySz4="
+        "material": "smart-avvik.webhook.signing.v1|17|dst_client_b_prod|2",
+        "secret": "whsec_zCvpqmGPLXaQ4o+JVnM7RdYxrQATfPTsw0Tb5ioENAw="
       }
     ]
   },
@@ -71,7 +71,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,WrZ6Y4MdLgU/2UenHJtx0NaDQQ5jzAlIty/MVyZveaE=",
+      "signature_header": "v1,hVJbEGTrlBf4/B5A9eJoYb3qUKe6Oy4tBhC9zSAZe48=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
@@ -79,15 +79,15 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,WrZ6Y4MdLgU/2UenHJtx0NaDQQ5jzAlIty/MVyZveaE=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,hVJbEGTrlBf4/B5A9eJoYb3qUKe6Oy4tBhC9zSAZe48=",
           "verifies": true
         },
         {
           "destination_id": "dst_client_a_prod",
           "generation": 1,
-          "secret": "whsec_cSAKKovoN4ANi5kMAoC5TSLCewviq/xzSDIlu9PyxNU=",
-          "signature": "v1,aSfuHZctxTMgxxEPZ6oUbQDmJ/k8sb2cEyp7ukqsJMw=",
+          "secret": "whsec_riiMs09TteSKum3JOo9jO3yyDpmfVxOtB+hii/MPp8o=",
+          "signature": "v1,9XIrXoLDAgc3ad/AYDCx0tcdCYP1G/zSJ2GaCS8M9yA=",
           "verifies": false
         }
       ]
@@ -103,7 +103,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,E6j0aII5zsr2JB8GRXeWOeoCUfkr5UJG68FFwuN5fn0=",
+      "signature_header": "v1,Ng1sKbWPSnfFxRh1QwcNu+JhFSfMy6viBELj5N2Fyt0=",
       "verify_at_unix_seconds": "1789197597",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
@@ -111,8 +111,8 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,E6j0aII5zsr2JB8GRXeWOeoCUfkr5UJG68FFwuN5fn0=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,Ng1sKbWPSnfFxRh1QwcNu+JhFSfMy6viBELj5N2Fyt0=",
           "verifies": true
         }
       ],
@@ -129,7 +129,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,GAR/qmAZLgxye+8VNiafZs3D7t+DKciv7TrXNbQevDQ= v1,jwHL7+lLIRtXOFay2hPJ/O/EzcM75HRukZqWo9LvxGA=",
+      "signature_header": "v1,y/Hz7CVrXKZvOrN8lLWLDAJN+klQDOLLgdJEyAhArM8= v1,68LfOKGXOZFg1tUZDkuup1Ut5Why8YN9FhIe1/6w39c=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
@@ -137,22 +137,22 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 3,
-          "secret": "whsec_6oWMkBdb7zwj7psLi7OlMG+VGeLlNLHlrvB9eL8ambs=",
-          "signature": "v1,GAR/qmAZLgxye+8VNiafZs3D7t+DKciv7TrXNbQevDQ=",
+          "secret": "whsec_ACDW8Qack8jpaIgutHUZVejP9NtYEX9HfrptJggRsLc=",
+          "signature": "v1,y/Hz7CVrXKZvOrN8lLWLDAJN+klQDOLLgdJEyAhArM8=",
           "verifies": true
         },
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,jwHL7+lLIRtXOFay2hPJ/O/EzcM75HRukZqWo9LvxGA=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,68LfOKGXOZFg1tUZDkuup1Ut5Why8YN9FhIe1/6w39c=",
           "verifies": true
         },
         {
           "destination_id": "dst_client_a_prod",
           "generation": 1,
-          "secret": "whsec_cSAKKovoN4ANi5kMAoC5TSLCewviq/xzSDIlu9PyxNU=",
-          "signature": "v1,clGnX4hLuvatyaSpByG2EgZ9LS9v1vtyZLVhIap7y7I=",
+          "secret": "whsec_riiMs09TteSKum3JOo9jO3yyDpmfVxOtB+hii/MPp8o=",
+          "signature": "v1,2CQ+IUMV3adR0EgJpH3JsokJSp0TUz/mutjDUPBpXks=",
           "verifies": false
         }
       ]
@@ -168,7 +168,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,RaoVmpPooUJdD4vNlBiMeHi8PrTxPAz6KXamM0GiQwA=",
+      "signature_header": "v1,j3llMjWE9a7eR4Bw/rB5uwRPLmGRbneC0g2kf38SFEc=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
@@ -176,15 +176,15 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,RaoVmpPooUJdD4vNlBiMeHi8PrTxPAz6KXamM0GiQwA=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,j3llMjWE9a7eR4Bw/rB5uwRPLmGRbneC0g2kf38SFEc=",
           "verifies": true
         },
         {
           "destination_id": "dst_client_b_prod",
           "generation": 2,
-          "secret": "whsec_4+Xz+/xL5w4gEw90+h/EtKrxx18nHya9keAq20AySz4=",
-          "signature": "v1,1HmUN8Q2XYVLHup/MyfZGBAVNmKlyCyVE+hMdmvDMSw=",
+          "secret": "whsec_zCvpqmGPLXaQ4o+JVnM7RdYxrQATfPTsw0Tb5ioENAw=",
+          "signature": "v1,DSzWu8eRPKqvybR+PCom8cjbOr3Ds4NYkUUkMd1vP8A=",
           "verifies": false
         }
       ]
@@ -200,7 +200,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "20fc156096909dbe35d38eb5859c46da3aa31569cd17c69d19f6dc6bb74de67d",
-      "signature_header": "v1,ZHkhsk9gLWTHU5NpFfdsssO5d736tt69mmScKl9Th4M=",
+      "signature_header": "v1,VvB/fa8uaqyEqSjX3DoOn82uQUNyTewV3OZFRPWV2M0=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": false,
@@ -208,8 +208,8 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,TTNtMey4xm1iupvJzJ18utiiyMGcsRxsLexyaGVvO4c=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,AwWYheojhsB/6MbILWhX0o3I+UkZxwOFTTC4TjqeoYM=",
           "verifies": false
         }
       ],
@@ -226,7 +226,7 @@
       "body_utf8_byte_length": 139,
       "body_utf16_code_unit_length": 139,
       "body_sha256_hex": "11e05bbf705ebc5130a83efa208e20e86828f348fb118c5cdcefd7f1a620079e",
-      "signature_header": "v1,YsEyBUg+A8/iMiWhdlXHVtvD27XQ76rGlwvTaUOHdUg=",
+      "signature_header": "v1,vD5TWzbgBwVidmJAjR9nRSusT0EI7DLTYrNl3TVK7cQ=",
       "verify_at_unix_seconds": "1767225901",
       "verify_at_note": "301 s past its own timestamp -- OUTSIDE the tolerance, which is what this vector tests. `mac_is_correct` is true: verify at `webhook_timestamp` itself and it passes, which is what isolates a replay-window refusal from a wrong-key refusal.",
       "mac_is_correct": true,
@@ -234,8 +234,8 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,YsEyBUg+A8/iMiWhdlXHVtvD27XQ76rGlwvTaUOHdUg=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,vD5TWzbgBwVidmJAjR9nRSusT0EI7DLTYrNl3TVK7cQ=",
           "verifies": false
         }
       ],
@@ -252,7 +252,7 @@
       "body_utf8_byte_length": 400,
       "body_utf16_code_unit_length": 386,
       "body_sha256_hex": "5ca1cbc553aecb711e6b8c3299e6260d79dba99daa4eccec77311450f6869b1d",
-      "signature_header": "v1,b8O4VmOo7xwnWH+tCuyuE55AHtZmlTYTpgE4UPl303s= v1,ePZS3PHMe+j1IaYzxNm2kg891Bqe3+tsLP+hOBYwl5E=",
+      "signature_header": "v1,E8G+kZavsNWJ4mQ/dUUgu+veq45IXd3rFAlCyG7AU1A= v1,f4N4MWbYrE5Octp80b44Qez3Ocbb7jYCP4gLANytaXI=",
       "verify_at_unix_seconds": "1789197300",
       "verify_at_note": "its own timestamp, which is inside the 300 s tolerance",
       "mac_is_correct": true,
@@ -260,15 +260,15 @@
         {
           "destination_id": "dst_client_a_prod",
           "generation": 3,
-          "secret": "whsec_6oWMkBdb7zwj7psLi7OlMG+VGeLlNLHlrvB9eL8ambs=",
-          "signature": "v1,b8O4VmOo7xwnWH+tCuyuE55AHtZmlTYTpgE4UPl303s=",
+          "secret": "whsec_ACDW8Qack8jpaIgutHUZVejP9NtYEX9HfrptJggRsLc=",
+          "signature": "v1,E8G+kZavsNWJ4mQ/dUUgu+veq45IXd3rFAlCyG7AU1A=",
           "verifies": true
         },
         {
           "destination_id": "dst_client_a_prod",
           "generation": 2,
-          "secret": "whsec_RclQaOc/t4M/cQuSgZa26XW4fXUX6hxVfT1jmG7VKYU=",
-          "signature": "v1,ePZS3PHMe+j1IaYzxNm2kg891Bqe3+tsLP+hOBYwl5E=",
+          "secret": "whsec_zbg+3UlpVjGLq+zNWjswxeJS0FZJXDdaecHYtu7kNMw=",
+          "signature": "v1,f4N4MWbYrE5Octp80b44Qez3Ocbb7jYCP4gLANytaXI=",
           "verifies": true
         }
       ]

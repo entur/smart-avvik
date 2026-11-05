@@ -471,7 +471,7 @@ def test_the_receiver_records_a_refusal_with_its_retry_after():
     """
     import urllib.error  # noqa: F401 - _post catches HTTPError
 
-    path = pathlib.Path("/tmp/kix_loadgen_receiver_test.json")
+    path = pathlib.Path("/tmp/smart_avvik_loadgen_receiver_test.json")
     server, record, _ = _serve(path, latency_s=0.0, refuse_every=3, refuse_status=429, retry_after=30)
     port = server.server_address[1]
     try:
@@ -501,7 +501,7 @@ def test_concurrent_posts_leave_a_record_file_that_parses():
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    path = pathlib.Path("/tmp/kix_loadgen_receiver_concurrent.json")
+    path = pathlib.Path("/tmp/smart_avvik_loadgen_receiver_concurrent.json")
     path.unlink(missing_ok=True)
     server, record, _ = _serve(path, latency_s=0.0)
     port = server.server_address[1]
@@ -538,7 +538,7 @@ def test_the_record_write_is_serialized_and_atomic_by_construction():
     assert "write_text(json.dumps" not in body, "a direct write bypasses the rename"
 
     # And the helper itself: no temp file left behind, and the content is the payload.
-    path = pathlib.Path("/tmp/kix_loadgen_atomic.json")
+    path = pathlib.Path("/tmp/smart_avvik_loadgen_atomic.json")
     path.unlink(missing_ok=True)
     loadgen_receiver._write_atomically(path, {"accepted": 3})
     loadgen_receiver._write_atomically(path, {"accepted": 4})
@@ -690,7 +690,7 @@ def test_the_benchmark_reads_the_cluster_project_and_never_the_app_one():
 
 
 def test_the_benchmark_says_the_prometheus_series_cannot_be_scraped():
-    """`kix_*` is in Thanos behind Grafana and not in Google Managed Prometheus (checked
+    """`smart_avvik_*` is in Thanos behind Grafana and not in Google Managed Prometheus (checked
     2026-09-11). Somebody will try; the output says so where they would look."""
     rendered = bench_cycle.render(bench_cycle.summarise([]), tags={})
     assert "THANOS" in rendered and "Cloud Trace" in rendered
@@ -744,12 +744,12 @@ def test_the_profile_mode_fences_the_network_before_it_imports_anything():
     source = pathlib.Path(bench_cycle.__file__).read_text()
     body = source[source.index("def run_profile") :]
     body = body[: body.index("\n# ---- CLI")]
-    for fence in ('"KIX_ALLOW_JP_NETWORK", "0"', '"KIX_ALLOW_WEBHOOK_NETWORK", "0"',
+    for fence in ('"SMART_AVVIK_ALLOW_JP_NETWORK", "0"', '"SMART_AVVIK_ALLOW_WEBHOOK_NETWORK", "0"',
                   '"VARSEL_LLM_PROVIDER"] = "off"'):
         assert fence in body, fence
     assert "_send_push" in body and "decisions.record" in body
     # Before the imports, or the module-level `_in_a_test_process()` reads have already happened.
-    assert body.index("KIX_ALLOW_JP_NETWORK") < body.index("import test_varsel_api")
+    assert body.index("SMART_AVVIK_ALLOW_JP_NETWORK") < body.index("import test_varsel_api")
 
 
 # ---- CI wiring ------------------------------------------------------------------------------------

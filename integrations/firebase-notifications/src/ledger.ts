@@ -21,7 +21,7 @@ import {
   type DisplayResolver,
   type NotificationEvent,
   type PolicyDecision,
-} from "@entur/kix-notifications-client";
+} from "@entur/smart-avvik-notifications-client";
 
 import { COLLECTIONS, encodeDocumentId } from "./collections.ts";
 

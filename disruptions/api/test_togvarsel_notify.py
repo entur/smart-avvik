@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 # Rushvarsel's master gate, pinned ON before the module is imported: both routes here carry a
 # router-level dependency on it and 404 while it is off (its default). Set at import, the way
-# test_varsel_api pins KIX_ENVIRONMENT — each suite is its own process. The policy core needs no
+# test_varsel_api pins SMART_AVVIK_ENVIRONMENT — each suite is its own process. The policy core needs no
 # such pin: `enabled` is an injected seam, and main.py is where the two flags are ANDed.
 os.environ["SHOW_RUSHVARSEL"] = "true"
 
@@ -1204,8 +1204,8 @@ def _deployed_as(project: str | None, override: str | None = None):
     """Run the body as if deployed in `project` (same shape as test_varsel_api's helper —
     deployment.environment_label reads the environment per call, so setting it around the
     request is enough)."""
-    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "KIX_ENVIRONMENT")}
-    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("KIX_ENVIRONMENT", override)):
+    before = {k: os.environ.get(k) for k in ("GOOGLE_CLOUD_PROJECT", "SMART_AVVIK_ENVIRONMENT")}
+    for key, value in (("GOOGLE_CLOUD_PROJECT", project), ("SMART_AVVIK_ENVIRONMENT", override)):
         if value is None:
             os.environ.pop(key, None)
         else:

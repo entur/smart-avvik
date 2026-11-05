@@ -1861,7 +1861,7 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
             # every cache goes hours stale while the runbook's staleness rule stays green forever.
             # What the gauge can still not see is a step that IS isolated (varsel_notify,
             # predict_calls_*, …) failing on every cycle: the rebuild returns normally and this
-            # runs. That is what `kix_poller_phase_total{result="error"}` is for, and the help
+            # runs. That is what `smart_avvik_poller_phase_total{result="error"}` is for, and the help
             # text says so rather than overclaiming.
             metrics.POLLER_LAST_CYCLE.set(time.time())
         finally:
