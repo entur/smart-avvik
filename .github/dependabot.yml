@@ -1,5 +1,5 @@
-# Minor and patch updates are grouped and auto-merged by
-# workflows/dependabot-automerge.yml once the required checks pass. Majors are merged by hand.
+# Minor and patch updates are grouped. Nothing merges them automatically until this repository
+# has CI and required checks.
 # The chore(deps) prefix makes the PR titles pass verify-pr in pr.yml.
 version: 2
 updates:
@@ -88,19 +88,6 @@ updates:
 
   - package-ecosystem: helm
     directory: "/helm/smart-avvik"
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: "chore(deps)"
-
-  - package-ecosystem: terraform
-    directory: "/terraform"
     schedule:
       interval: weekly
     groups:
