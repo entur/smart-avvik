@@ -1,26 +1,22 @@
 # Continuous Integration Workflow
 #
 # This is a reusable workflow (workflow_call) -- it is NOT triggered directly
-# by events. It is called by build.yml (on PRs) and cd.yml (on push to main,
-# or workflow_dispatch without a pre-built image).
+# by events. It is called by build.yml, on pull requests and on push to main.
 #
 # Pipeline:
-#   1. Lint (parallel)   -- Dockerfile (hadolint) and Helm chart per environment
-#   2. Test              -- ruff lint + the API test suites, in a uv-managed environment
-#   3. Docker build      -- build the image from disruptions/api
-#   4. Docker scan/push  -- scan for vulnerabilities and push to the registry (parallel)
+#   1. Lint         -- Dockerfile (hadolint)
+#   2. Test         -- ruff lint + the API test suites, in a uv-managed environment
+#   3. Docker build -- build the image and keep it as this run's `smart-avvik` artifact
+#   4. Docker scan  -- scan it for vulnerabilities
 #
-# The output `image_and_tag` is passed back to the caller (cd.yml) so it
-# knows which image to deploy.
+# Nothing here pushes or deploys. This repository is public and has no access to Entur's
+# registry or clusters: smart-avvik-deployment-config pulls the artifact from this run, pushes it
+# to the registry and deploys it. The Helm chart, its lint and its render checks live there too.
 
 name: CI
 
 on:
   workflow_call:
-    outputs:
-      image_and_tag:
-        description: Fully qualified image reference
-        value: ${{ jobs.docker-push.outputs.image_and_tag }}
 
 jobs:
   # --- Linting (runs in parallel with test) ---
@@ -30,55 +26,9 @@ jobs:
     with:
       dockerfile: Dockerfile
 
-  # Helm charts are linted per environment to catch env-specific value errors.
-  # SIX combinations since U11, not three: `smart-avvik-worker` is a second RELEASE of this same chart
-  # (the common chart renders one Deployment per release, so a second workload cannot be a second
-  # block in one values file), and a values file nothing lints is a values file that fails at deploy
-  # time. `include` rather than a second matrix axis: the two sets are not a cross product.
-  helm-lint:
-    strategy:
-      matrix:
-        include:
-          - environment: dev
-            values: values-kub-ent-dev.yaml
-          - environment: tst
-            values: values-kub-ent-tst.yaml
-          - environment: prd
-            values: values-kub-ent-prd.yaml
-          - environment: dev
-            values: worker-values-kub-ent-dev.yaml
-          - environment: tst
-            values: worker-values-kub-ent-tst.yaml
-          - environment: prd
-            values: worker-values-kub-ent-prd.yaml
-    uses: entur/gha-helm/.github/workflows/lint.yml@v2
-    with:
-      chart: helm/smart-avvik
-      environment: ${{ matrix.environment }}
-      values: ${{ matrix.values }}
-
-  # What `helm lint` cannot answer: does the worker release come out as a WORKER? Every override
-  # that makes it one is negative -- no Service, no Ingress, no VAPID keys, no SSO secret -- and a
-  # negative that stops holding renders perfectly valid YAML that lints clean. The script renders
-  # all three environments and asserts both directions; it fails rather than skips when helm is
-  # absent, because a check that passes where the binary is missing has never run.
-  helm-render:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-      # No setup action: ubuntu-24.04 ships helm, and the script fails loudly rather than skipping
-      # if it ever stops doing so. One fewer third-party action in the path of the image build.
-      - uses: actions/checkout@v7
-      - run: bash helm/smart-avvik/test/worker_render.sh
-      # The API release's two shapes: Recreate while an environment file sets forceReplicas, and
-      # RollingUpdate + HPA without it (proven for dev and prd before that line is deleted).
-      - run: bash helm/smart-avvik/test/api_render.sh
-
   # --- Build and Test ---
 
-  # Runs on Dependabot PRs too: test, docker and docker-scan are required checks on main,
-  # and a skipped required check counts as passed.
+  # Runs on Dependabot PRs too.
   test:
     runs-on: ubuntu-24.04
     permissions:
@@ -255,7 +205,7 @@ jobs:
   # Only runs after all lints and tests pass to avoid wasting resources on broken builds
 
   docker:
-    needs: [test, docker-lint, helm-lint, helm-render]
+    needs: [test, docker-lint]
     uses: entur/gha-docker/.github/workflows/build.yml@v1
     with:
       # Context is the repo root: the multi-stage Dockerfile builds the /demo,
@@ -268,21 +218,20 @@ jobs:
       # there is no separate front-end job.
       context: .
       dockerfile: Dockerfile
-      # The commit, baked into the image as GIT_SHA and published as /ready's `version`; cd.yml's
-      # leader smoke waits for an answer from THIS build. The push job tags the same commit
-      # (`<branch>.<date>-SHA<first 7>`), which is what the smoke derives its expectation from.
+      # The commit, baked into the image as GIT_SHA and published as /ready's `version`; the
+      # deployment's leader smoke waits for an answer from THIS build. deployment-config tags the
+      # pushed image with the same commit (`main.<date>-SHA<first 7>`), which is what the smoke
+      # derives its expectation from.
       build_args: GIT_SHA=${{ github.sha }}
+      # No GitHub Factory setup here: the repository is public and gets no cloud identity.
+      authenticate: false
 
-  # Scan and push run in parallel -- a vulnerability finding does not block the
-  # push, but the scan results are available for review on the PR
+  # A finding does not block anything; the results are on the PR. Not for pull requests from forks,
+  # which get no secrets, and the scan needs the organisation's allowlist key.
   docker-scan:
     needs: [docker]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: entur/gha-security/.github/workflows/docker-scan.yml@v2
     secrets: inherit
     with:
       image_artifact: ${{ needs.docker.outputs.image_artifact }}
-
-  docker-push:
-    needs: [docker]
-    uses: entur/gha-docker/.github/workflows/push.yml@v1
-    secrets: inherit
