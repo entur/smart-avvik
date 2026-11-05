@@ -484,7 +484,7 @@ from ADC and never from an argument:
 
 | environment | group |
 |---|---|
-| dev, tst, prd | `sg-dig-team-ki-eksperimentering@entur.no` |
+| dev, tst, prd | `sg-dig-team-ror@entur.no` |
 
 **That is the team group, in every environment, and it is a pilot shortcut decided on 2026-09-10.**
 R22 asked for a dedicated least-privilege group with production as its own
@@ -1968,7 +1968,7 @@ Nothing in this list is done. The channel cannot be enabled anywhere until the f
    is the one permission in KTD5's chain that was never measured.
 4. **The operator groups — DONE for the pilot by shortcut, 2026-09-10**, and still owed in the
    intended form. The tool gates every environment on the team group
-   `sg-dig-team-ki-eksperimentering@entur.no` (see "The operator tool" above for why and what it
+   `sg-dig-team-ror@entur.no` (see "The operator tool" above for why and what it
    gives up). The end state is still two dedicated groups, `smart-avvik-notification-operators` for
    dev and tst and `smart-avvik-notification-operators-prd` for prd, each holding
    `roles/datastore.user` in the projects it operates — a Team Plattform request

@@ -10,9 +10,9 @@ a client credential would let a client grant itself what an operator is supposed
 group, and for the pilot that group is the team's own in every environment:
 
 ============  =====================================================================
-``dev``       ``sg-dig-team-ki-eksperimentering@entur.no``
-``tst``       ``sg-dig-team-ki-eksperimentering@entur.no``
-``prd``       ``sg-dig-team-ki-eksperimentering@entur.no``
+``dev``       ``sg-dig-team-ror@entur.no``
+``tst``       ``sg-dig-team-ror@entur.no``
+``prd``       ``sg-dig-team-ror@entur.no``
 ============  =====================================================================
 
 R22 asked for a least-privilege group with production as its own, and that is still the intended
@@ -138,9 +138,9 @@ ENVIRONMENTS = ("dev", "tst", "prd")
 #: why R22's dedicated, prd-separate groups are the end state and not what ships. Entur groups are
 #: `@entur.no`, never `@entur.org`.
 OPERATOR_GROUPS = {
-    "dev": "sg-dig-team-ki-eksperimentering@entur.no",
-    "tst": "sg-dig-team-ki-eksperimentering@entur.no",
-    "prd": "sg-dig-team-ki-eksperimentering@entur.no",
+    "dev": "sg-dig-team-ror@entur.no",
+    "tst": "sg-dig-team-ror@entur.no",
+    "prd": "sg-dig-team-ror@entur.no",
 }
 
 #: WHICH PROJECT EACH ENVIRONMENT IS, so the gate and the target cannot be chosen separately.
