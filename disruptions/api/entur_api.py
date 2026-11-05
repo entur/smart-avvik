@@ -14,4 +14,4 @@ from __future__ import annotations
 # not distinguished, because dev and prd calling in as one client is the intent — the traffic comes
 # from the same application. Keep it in step with the Trafikkdata User-Agent in reisevalg.py, which
 # carries the same identity in the shape that API asks for.
-ET_CLIENT_NAME = "entur-kixavvik"
+ET_CLIENT_NAME = "entur-smartavvik"

@@ -30,7 +30,7 @@ os.environ.update(
     VAPID_SUBJECT="mailto:test@entur.org",
     VARSEL_STATE_PATH=_STATE_PATH,
     # Pin the environment label off (see deployment.environment_label): notification titles carry it on
-    # non-prod, so a developer with GOOGLE_CLOUD_PROJECT=ent-kixavvik-dev exported -- routine in this
+    # non-prod, so a developer with GOOGLE_CLOUD_PROJECT=ent-smartavvik-dev exported -- routine in this
     # repo -- would otherwise fail the title assertions below. The tests that DO exercise labelling
     # set it themselves via _deployed_as.
     KIX_ENVIRONMENT="prd",
@@ -48,7 +48,7 @@ os.environ.update(
     # test that stubs `_write_message` would silently never reach its stub and assert against a
     # deployment that cannot write at all. No client is ever constructed from this value here --
     # the backends are stubbed -- so a placeholder project is enough.
-    GOOGLE_CLOUD_PROJECT=os.environ.get("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test"),
+    GOOGLE_CLOUD_PROJECT=os.environ.get("GOOGLE_CLOUD_PROJECT", "ent-smartavvik-test"),
 )
 
 import copy
@@ -366,18 +366,18 @@ def _environment():
 def test_config_names_the_non_prod_environment():
     """The PWA shows this behind its title: dev and prd sit side by side on one phone and are
     otherwise identical, down to the home-screen name (one image, one manifest, every environment)."""
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         assert _environment() == "dev"
-    with _deployed_as("ent-kixavvik-tst"):
+    with _deployed_as("ent-smartavvik-tst"):
         assert _environment() == "tst"
-    with _deployed_as("ent-kixavvik-prd", override="local"):
+    with _deployed_as("ent-smartavvik-prd", override="local"):
         assert _environment() == "local"  # KIX_ENVIRONMENT wins, for local runs
 
 
 def test_config_leaves_production_unlabelled():
     """prd is the public, traveller-facing host, so it carries no environment token -- and neither
     does a deployment whose project we cannot read: guessing risks a stray label in prd."""
-    with _deployed_as("ent-kixavvik-prd"):
+    with _deployed_as("ent-smartavvik-prd"):
         assert _environment() is None
     with _deployed_as(None):
         assert _environment() is None
@@ -1224,7 +1224,7 @@ def test_push_titles_carry_the_environment_on_non_prod(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     _register_matching_journey()
-    with _deployed_as("ent-kixavvik-dev"):
+    with _deployed_as("ent-smartavvik-dev"):
         varsel.check_and_notify(SNAPSHOT)
         assert client.post("/varsel-api/test", json={"device_id": DEVICE}).status_code == 200
     assert [p["title"] for p in sent] == [
@@ -7475,7 +7475,7 @@ def test_the_digest_carries_the_environment_and_names_the_bus(monkeypatch):
     sent = []
     monkeypatch.setattr(varsel, "_send_push", lambda sub, payload: sent.append(payload) or "sent")
     _register(DEVICE)
-    with _spine(_removed_spine((7, 10), (7, 40), bus=(1,))), _deployed_as("ent-kixavvik-dev"):
+    with _spine(_removed_spine((7, 10), (7, 40), bus=(1,))), _deployed_as("ent-smartavvik-dev"):
         varsel.check_and_notify({}, now=_at(6, 0))
     (push,) = sent
     assert push["title"] == "[dev] 2 tog er tatt ut av rutetabellen i dag"

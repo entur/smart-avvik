@@ -101,10 +101,10 @@ logger = logging.getLogger("loadgen_subscriptions")
 #: half of the refusal: an operator cannot even spell the production environment here. The other
 #: half is :func:`resolve_target`, for the ways prd can arrive without being named.
 ENVIRONMENTS = ("dev", "tst")
-PROJECTS = {environment: f"ent-kixavvik-{environment}" for environment in ENVIRONMENTS}
+PROJECTS = {environment: f"ent-smartavvik-{environment}" for environment in ENVIRONMENTS}
 BASE_URLS = {
-    "dev": "https://kix-avvik.dev.entur.io",
-    "tst": "https://kix-avvik.staging.entur.io",
+    "dev": "https://smart-avvik.dev.entur.io",
+    "tst": "https://smart-avvik.staging.entur.io",
 }
 
 #: The client every synthetic subscription belongs to. One client id, so teardown is a query rather
@@ -593,7 +593,7 @@ def bind_store(target: Target) -> None:
     `resolve_target` refuses production four ways, and every one of them judges an ARGUMENT. None of
     them reaches the Firestore client: `notification_store.firestore_client()` builds
     `firestore.Client(database=...)` with no project, so the project comes from ambient ADC — which
-    means an exported `GOOGLE_CLOUD_PROJECT=ent-kixavvik-prd` would have this tool print that it is
+    means an exported `GOOGLE_CLOUD_PROJECT=ent-smartavvik-prd` would have this tool print that it is
     seeding dev while writing synthetic subscriptions into PRODUCTION, where they become real push
     notifications and real webhook deliveries to a real client's BFF.
 

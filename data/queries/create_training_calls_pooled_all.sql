@@ -30,7 +30,7 @@
 -- category still joins the shared disruptions.categories text table; bus texts that miss
 -- fall to 'UNKNOWN' and the trees can split on operator/status instead.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.training_calls_pooled_all`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.training_calls_pooled_all`
 PARTITION BY call_date
 CLUSTER BY situationNumber AS
 WITH cat AS (

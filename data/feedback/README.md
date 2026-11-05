@@ -16,7 +16,7 @@ anything older is gone from PostHog, and its BigQuery context expires at 45 days
 ```sh
 POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" \
 uv run python data/feedback/export_varsel_feedback.py \
-  --project ent-kixavvik-dev \
+  --project ent-smartavvik-dev \
   --environment dev \
   --from-date 2026-08-25 \
   --to-date 2026-08-27 \
@@ -41,7 +41,7 @@ case but is the trap if the recipe is ever wrapped in a helper function.
 
 `--posthog-project-id` is **259080** for `Kix - dev` — which serves the dev *and* tst environments, so
 `--environment` is what separates them — and **259077** for `Kix - prod`. `--project` is the GCP
-project holding the context table, so it always tracks `--environment`: `ent-kixavvik-{dev,tst,prd}`.
+project holding the context table, so it always tracks `--environment`: `ent-smartavvik-{dev,tst,prd}`.
 
 The tool talks only to `https://eu.posthog.com/api/projects/{project_id}/query/`, queries the
 `varsel_alert_feedback` and `rush_alert_feedback` events with server-built time/environment predicates, and refuses
@@ -160,7 +160,7 @@ one environment is not evidence for another, because the subjects differ:
    real address, which the project's own IP setting was measured not to prevent (see the IP entry
    under the measurements below). Check `person_mode`, which reads `propertyless` when no profile
    was created.
-3. Assign runtime write access only to the kix-avvik workload identity: BigQuery Job User plus the
+3. Assign runtime write access only to the smart-avvik workload identity: BigQuery Job User plus the
    minimum dataset/table append/create permissions needed for `varsel_feedback_contexts`. There is
    no public context-read route. The owning access group is `team-ki-eksperimentering`; developers
    and product managers receive BigQuery Data Viewer/Job User and PostHog project read access only
@@ -197,7 +197,7 @@ person-shaped list, access arrives through `sg-dig-team-ki-eksperimentering@entu
 this file said, and a reviewer comparing the two would rightly not trust either until it is written
 down.
 
-**Runtime write access.** `application@ent-kixavvik-{dev,prd}` holds `roles/bigquery.dataEditor` +
+**Runtime write access.** `application@ent-smartavvik-{dev,prd}` holds `roles/bigquery.dataEditor` +
 `roles/bigquery.jobUser` at *project* level, which reaches the dataset through its `projectWriters`
 ACL entry. That satisfies create + `insertAll` for `varsel_feedback_contexts`, and is proved in
 practice rather than on paper: the same SA already writes `varsel_decisions` through the identical
@@ -367,7 +367,7 @@ lands 7x under the bar. And the code's own timeouts (`insert_rows_json(timeout=5
   fix every context write failed invisibly, and only a real write proves it.
 - **No free text reaches the logs.** A canary in the comment returned **0 hits** in `ent-kub-dev`
   over the window, against a control query on the same resource that did return entries. The first
-  attempt searched `ent-kixavvik-dev`, which holds only BigQuery audit logs — its empty result meant
+  attempt searched `ent-smartavvik-dev`, which holds only BigQuery audit logs — its empty result meant
   nothing, and a log check whose control is not run is not a check. The only warnings in the window
   were unrelated: one transient Gemini fallback, a `google_genai` AFC notice, and the known
   `varsel_decisions` description-refresh warning.
@@ -413,13 +413,13 @@ one value, once the approval existed. What that leaves per environment:
 | `VARSEL_FEEDBACK_ENABLED` | `true` | `false` | `true` |
 
 **Order, and why it is not negotiable.** Every secret was created in its project *before* its name
-was added to Helm. Each namespace's `SecretStore` reads its own `ent-kixavvik-<env>` with
+was added to Helm. Each namespace's `SecretStore` reads its own `ent-smartavvik-<env>` with
 `secretVersionSelectionPolicy: LatestOrFail`, and the rendered `ExternalSecret` is all-or-nothing —
-one unresolvable name fails the whole object, and the container takes the resulting `kix-avvik-varsel`
+one unresolvable name fails the whole object, and the container takes the resulting `smart-avvik-varsel`
 Secret through a single `envFrom.secretRef`. In prd that would have taken `VAPID_PRIVATE_KEY` and
 `VAPID_PUBLIC_KEY` down with it, **silently disabling push for real travellers over a feature that is
 switched off**. `roles/secretmanager.secretAccessor` was already granted project-wide to
-`application@ent-kixavvik-<env>` in all three, so no per-secret IAM was needed.
+`application@ent-smartavvik-<env>` in all three, so no per-secret IAM was needed.
 
 **tst deliberately shares dev's PostHog project ("Kix - dev").** The token value is dev's byte for
 byte (verified by hash, never displayed). What separates the two inside that project is the
@@ -536,9 +536,9 @@ on 2026-08-31. **A check that normalises the input cannot detect a defect in the
 
 ```sh
 gcloud secrets versions access latest --secret=POSTHOG_PROJECT_TOKEN \
-  --project=ent-kixavvik-<env> | wc -c            # 48, not 49
+  --project=ent-smartavvik-<env> | wc -c            # 48, not 49
 gcloud secrets versions access latest --secret=POSTHOG_PROJECT_TOKEN \
-  --project=ent-kixavvik-<env> | tail -c1 | xxd -p  # not 0a
+  --project=ent-smartavvik-<env> | tail -c1 | xxd -p  # not 0a
 ```
 
 Write the value with `printf '%s'`, never `echo`, and never from a file. `feedback._env` now strips
@@ -550,8 +550,8 @@ pin it, including that padding cannot smuggle a short receipt key past the 32-by
 **Two operational traps found in the same hour, both of which cost a round trip.** A corrected secret
 reaches the process only after *both* of these:
 
-- the **ExternalSecret re-syncs** — `refreshInterval: 1h` on `kix-avvik-varsel`, so either wait or
-  `kubectl annotate externalsecret kix-avvik-varsel force-sync=$(date +%s) --overwrite`;
+- the **ExternalSecret re-syncs** — `refreshInterval: 1h` on `smart-avvik-varsel`, so either wait or
+  `kubectl annotate externalsecret smart-avvik-varsel force-sync=$(date +%s) --overwrite`;
 - the **pod restarts**, because the container takes the Secret through `envFrom` and reads its
   environment once at start. A pod whose Secret was fixed underneath it keeps serving the old value
   with nothing to show for it.
@@ -618,7 +618,7 @@ project-level BigQuery binding in any of the three), and it was verified by quer
 **One correction to a claim in CLAUDE.md.** Nothing in this repo creates the `disruptions` dataset —
 there is no `create_dataset` call and no `CREATE SCHEMA` statement; the startup CTASes create *tables*
 into a dataset that must already exist. tst had none, so `ensure_table()` would have failed there with
-"Dataset not found" and every submit would have returned `downstream`. `ent-kixavvik-tst:disruptions`
+"Dataset not found" and every submit would have returned `downstream`. `ent-smartavvik-tst:disruptions`
 was created in **EU**, matching dev and prd. It is empty and stays empty: tst has no models or runtime
 tables, so its poller produces no alerts and there is nothing there to rate. tst's wiring exists to
 make promotion a flag and to exercise the plumbing, not because tst can evaluate the feature.

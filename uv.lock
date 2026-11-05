@@ -1935,7 +1935,7 @@ wheels = [
 ]
 
 [[package]]
-name = "kix-avvik"
+name = "smart-avvik"
 version = "0.1.0"
 source = { virtual = "." }
 default-groups = ["api", "dev"]

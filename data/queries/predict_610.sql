@@ -72,7 +72,7 @@ SELECT
   p.summary,
   p.description
 FROM ML.PREDICT(
-  MODEL `ent-kixavvik-dev.disruptions.trip_outcome_clf`,
+  MODEL `ent-smartavvik-dev.disruptions.trip_outcome_clf`,
   (SELECT * FROM cand)
 ) AS p
 ORDER BY p.aimed_dep;

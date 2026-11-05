@@ -141,7 +141,7 @@ kjører `tsc -b` først, så en typefeil feiler image-bygget — det finnes inge
 Siden er bak Entur-SSO (`sso.py`, Auth0s partner-tenant med Entra-innlogging, kun for
 organisasjon Entur) på alle tre hostene siden 2026-09-10, som søsknene sine: `sso.PROTECTED_PREFIXES`
 har både `/rushhistorikk` og `/rushhistorikk-api`, og hver miljøfil setter `SSO_REQUIRED: "true"` med
-sin egen Auth0-klient. Fram til da var siden åpent lesbar (`"false"` i `helm/kix-avvik/values.yaml`,
+sin egen Auth0-klient. Fram til da var siden åpent lesbar (`"false"` i `helm/smart-avvik/values.yaml`,
 ikke overstyrt). Å skru porten av igjen er én verdi per miljø, ikke en kodeendring.
 
 [Entur Linje]: https://linje.entur.no/

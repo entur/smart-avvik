@@ -22,8 +22,8 @@ WITH situations AS (
   SELECT
     d.situationNumber, d.onset_ts, d.reopen_minutes, d.impact_minutes,
     d.summary, d.description, c.category, stop_ref
-  FROM `ent-kixavvik-dev.disruptions.disruptions_initial` AS d
-  LEFT JOIN `ent-kixavvik-dev.disruptions.categories` AS c
+  FROM `ent-smartavvik-dev.disruptions.disruptions_initial` AS d
+  LEFT JOIN `ent-smartavvik-dev.disruptions.categories` AS c
     -- IFNULL-sentinel equality: NULL-safe AND hash-joinable (IS NOT DISTINCT FROM blew the
     -- on-demand CPU limit -- see huskehjul_backtest.sql).
     ON  IFNULL(c.summary, '__NULL__')     = IFNULL(d.summary, '__NULL__')

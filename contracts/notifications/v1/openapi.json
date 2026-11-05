@@ -11,15 +11,15 @@
   },
   "servers": [
     {
-      "url": "https://kix-avvik.entur.io/notification-api/v1",
+      "url": "https://smart-avvik.entur.io/notification-api/v1",
       "description": "Production."
     },
     {
-      "url": "https://kix-avvik.staging.entur.io/notification-api/v1",
+      "url": "https://smart-avvik.staging.entur.io/notification-api/v1",
       "description": "Test (tst). Records and credentials are per environment; a production credential is not valid here."
     },
     {
-      "url": "https://kix-avvik.dev.entur.io/notification-api/v1",
+      "url": "https://smart-avvik.dev.entur.io/notification-api/v1",
       "description": "Development."
     }
   ],

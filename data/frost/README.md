@@ -50,7 +50,7 @@ value. Use `SAFE_CAST(value AS FLOAT64)` for numeric elements.
 
 ## In BigQuery
 
-Loaded into **`ent-kixavvik-dev.disruptions.frost_weather`** (EU): 155,274,639 rows,
+Loaded into **`ent-smartavvik-dev.disruptions.frost_weather`** (EU): 155,274,639 rows,
 1,357 stations, 253 elements, ~16 GB. Partitioned by `DATE(reference_time)` (DAY) and
 clustered by `source_id, element_id, time_resolution`, so filtering by station/element
 and a time range is cheap. Column types match `frost_weather_schema.json` (note `value`
@@ -59,9 +59,9 @@ is STRING — see above).
 Reload (from a GCS staging bucket co-located with the EU dataset):
 
 ```sh
-gcloud storage buckets create gs://<staging-bucket> --location=EU --project=ent-kixavvik-dev
-gcloud storage cp 'observations/*.csv.gz' gs://<staging-bucket>/observations/ --project=ent-kixavvik-dev
-bq load --project_id=ent-kixavvik-dev --location=EU --replace \
+gcloud storage buckets create gs://<staging-bucket> --location=EU --project=ent-smartavvik-dev
+gcloud storage cp 'observations/*.csv.gz' gs://<staging-bucket>/observations/ --project=ent-smartavvik-dev
+bq load --project_id=ent-smartavvik-dev --location=EU --replace \
   --source_format=CSV --skip_leading_rows=1 --max_bad_records=0 \
   --time_partitioning_field=reference_time --time_partitioning_type=DAY \
   --clustering_fields=source_id,element_id,time_resolution \

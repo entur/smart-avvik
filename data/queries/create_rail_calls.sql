@@ -29,7 +29,7 @@
 -- by Oslo-local call_date. Bounds are literals (not scripting variables) so
 -- BigQuery prunes partitions.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.rail_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.rail_calls`
 PARTITION BY call_date
 CLUSTER BY lineRef, stop_place
 AS

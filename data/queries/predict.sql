@@ -3,7 +3,7 @@ AS
 SELECT *
 FROM
   ML.PREDICT(
-    MODEL `ent-kixavvik-dev.disruptions.prediction_model`,
+    MODEL `ent-smartavvik-dev.disruptions.prediction_model`,
     (
       SELECT
         category,

@@ -190,10 +190,10 @@ def test_a_production_project_is_refused_before_any_request():
     """
     for kwargs in (
         {"environment": "prd"},
-        {"environment": "dev", "project": "ent-kixavvik-prd"},
-        {"environment": "dev", "env_project": "ent-kixavvik-prd"},
-        {"environment": "dev", "base_url": "https://kix-avvik.entur.io"},
-        {"environment": "dev", "base_url": "https://kix-avvik.staging.entur.io"},
+        {"environment": "dev", "project": "ent-smartavvik-prd"},
+        {"environment": "dev", "env_project": "ent-smartavvik-prd"},
+        {"environment": "dev", "base_url": "https://smart-avvik.entur.io"},
+        {"environment": "dev", "base_url": "https://smart-avvik.staging.entur.io"},
     ):
         try:
             gen.resolve_target(**kwargs)
@@ -211,7 +211,7 @@ def test_the_cli_exits_non_zero_on_a_refusal_and_sends_nothing():
     gen.fetch_stops = lambda base_url, **_: fetched.append(base_url) or []  # type: ignore[assignment]
     stderr, sys.stderr = sys.stderr, io.StringIO()
     try:
-        code = gen.main(["--environment", "dev", "--project", "ent-kixavvik-prd",
+        code = gen.main(["--environment", "dev", "--project", "ent-smartavvik-prd",
                          "plan", "--count", "10"])
         message = sys.stderr.getvalue()
     finally:
@@ -223,9 +223,9 @@ def test_the_cli_exits_non_zero_on_a_refusal_and_sends_nothing():
 
 
 def test_a_healthy_dev_target_resolves():
-    target = gen.resolve_target("dev", env_project="ent-kixavvik-dev")
-    assert target.project == "ent-kixavvik-dev"
-    assert target.base_url == "https://kix-avvik.dev.entur.io"
+    target = gen.resolve_target("dev", env_project="ent-smartavvik-dev")
+    assert target.project == "ent-smartavvik-dev"
+    assert target.base_url == "https://smart-avvik.dev.entur.io"
     assert target.database == "notifications"
 
 
@@ -676,17 +676,17 @@ def test_the_log_filter_names_the_event_field_the_logger_actually_writes():
     for event in bench_cycle.BENCH_EVENTS:
         assert f'jsonPayload.event="{event}"' in clause, event
     assert "jsonPayload.fields" not in clause
-    assert 'resource.labels.namespace_name="kix-avvik"' in clause
+    assert 'resource.labels.namespace_name="smart-avvik"' in clause
 
 
 def test_the_benchmark_reads_the_cluster_project_and_never_the_app_one():
-    """App logs live in ent-kub-{dev,prd}, namespace kix-avvik. `gcloud logging read
-    --project=ent-kixavvik-dev` returns NOTHING for them, silently, which is why the map is in the
+    """App logs live in ent-kub-{dev,prd}, namespace smart-avvik. `gcloud logging read
+    --project=ent-smartavvik-dev` returns NOTHING for them, silently, which is why the map is in the
     code rather than in somebody's shell history."""
     assert bench_cycle.CLUSTER_PROJECTS["dev"] == "ent-kub-dev"
     assert bench_cycle.CLUSTER_PROJECTS["prd"] == "ent-kub-prd"
     for project in bench_cycle.CLUSTER_PROJECTS.values():
-        assert not project.startswith("ent-kixavvik-")
+        assert not project.startswith("ent-smartavvik-")
 
 
 def test_the_benchmark_says_the_prometheus_series_cannot_be_scraped():
@@ -773,7 +773,7 @@ def test_the_store_is_bound_to_the_resolved_project_not_to_ambient_credentials()
 
     `notification_store.firestore_client()` builds `firestore.Client(database=...)` with no project,
     so without this binding the project comes from ambient ADC. A developer with
-    GOOGLE_CLOUD_PROJECT=ent-kixavvik-prd exported -- which this repo's own test suites show is a
+    GOOGLE_CLOUD_PROJECT=ent-smartavvik-prd exported -- which this repo's own test suites show is a
     normal thing to have exported -- would see "Seeding in dev" on stderr while synthetic
     subscriptions landed in PRODUCTION, where the poller turns them into real push notifications and
     real webhook deliveries. The refusals would all have passed.
@@ -786,7 +786,7 @@ def test_the_store_is_bound_to_the_resolved_project_not_to_ambient_credentials()
     target = lg.resolve_target("dev", env_project=None)
     built: dict = {}
     before = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-prd"  # the stale shell variable
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-prd"  # the stale shell variable
 
     class _FakeClient:
         def __init__(self, project=None, database=None):

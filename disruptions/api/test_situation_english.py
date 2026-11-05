@@ -155,7 +155,7 @@ def test_one_update_submits_at_most_its_ceiling():
 
 def test_a_test_process_never_translates_even_with_a_project_and_a_provider():
     saved = (llm_message._PROJECT, llm_message._PROVIDER)
-    llm_message._PROJECT, llm_message._PROVIDER = "ent-kixavvik-test", "gemini"
+    llm_message._PROJECT, llm_message._PROVIDER = "ent-smartavvik-test", "gemini"
     try:
         assert se._translation_enabled() is False
     finally:

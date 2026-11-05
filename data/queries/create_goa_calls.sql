@@ -26,7 +26,7 @@
 -- vehicleMode = 'rail' excludes GOA replacement buses (extraJourney bus rows).
 -- ~0.02% duplicate (journey, date, sequenceNr) keys -> dedup on latest recordedAtTime.
 
-CREATE OR REPLACE TABLE `ent-kixavvik-dev.disruptions.goa_calls`
+CREATE OR REPLACE TABLE `ent-smartavvik-dev.disruptions.goa_calls`
 PARTITION BY call_date
 CLUSTER BY lineRef, stop_place
 AS

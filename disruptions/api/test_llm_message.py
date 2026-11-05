@@ -18,7 +18,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
-os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-kixavvik-test")
+os.environ.setdefault("GOOGLE_CLOUD_PROJECT", "ent-smartavvik-test")
 
 _API_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -108,7 +108,7 @@ def _reset(provider="auto", enabled=True):
     llm_message._stop_name_provider = None
     llm_message._PROVIDER = provider
     llm_message._ENABLED = enabled
-    llm_message._PROJECT = "ent-kixavvik-test"
+    llm_message._PROJECT = "ent-smartavvik-test"
     # The latch is a HOLDER now (2026-08-21), not four module globals. Rebinding
     # `llm_message._active` / `._latched_off` here would leave `_candidates` reading the holder and
     # every latch assertion below pointed at a name nothing consults — a suite that passes while the
@@ -162,7 +162,7 @@ def test_delivery_is_on_when_the_flag_is_unset():
     wording" — the default only exists in the env expression at module scope.
     """
     env = {k: v for k, v in os.environ.items() if k != "VARSEL_LLM_ENABLED"}
-    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-test"
     result = subprocess.run(
         [sys.executable, "-c", "import llm_message; print(llm_message.delivery_enabled())"],
         cwd=_API_DIR,
@@ -182,7 +182,7 @@ def _location_in_fresh_interpreter(**overrides: str | None) -> tuple[str, str]:
     assigning to them — that would test the assignment, not the default.
     """
     env = {k: v for k, v in os.environ.items() if k not in ("VERTEX_LOCATION", "VERTEX_GEMINI_LOCATION")}
-    env["GOOGLE_CLOUD_PROJECT"] = "ent-kixavvik-test"
+    env["GOOGLE_CLOUD_PROJECT"] = "ent-smartavvik-test"
     for key, value in overrides.items():
         if value is not None:
             env[key] = value

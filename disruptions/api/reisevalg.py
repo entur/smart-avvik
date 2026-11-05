@@ -157,7 +157,7 @@ _TRAFIKKDATA_URL = "https://trafikkdata-api.atlas.vegvesen.no/"
 # half. A team alias, deliberately, not whoever wrote this: an address that stops being read when
 # one person moves on leaves SVV with no way to reach us, which is the whole point of sending it.
 # `data/svv/download_volumes.py` carries its own copy for the offline backfill; change both together.
-_TRAFIKKDATA_USER_AGENT = "entur-kixavvik Team-KI-eksperimentering@entur.org"
+_TRAFIKKDATA_USER_AGENT = "entur-smartavvik teamror@entur.org"
 
 # Journey Planner departure-board query — verified live with curl 2026-07-11. The board (not
 # `trip`) is deliberate: estimatedCalls carries cancellation state for cancelled and running

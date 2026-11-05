@@ -38,7 +38,7 @@ def imports():
 
 @app.cell
 def bq_client(bigquery):
-    client = bigquery.Client(project="ent-kixavvik-dev")
+    client = bigquery.Client(project="ent-smartavvik-dev")
     return (client,)
 
 
@@ -48,57 +48,57 @@ def score_holdout(client, mo):
     # eval_pooled_all_models.sql, men returnerer rader i stedet for aggregater).
     _q = """
     WITH ev AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls_pooled_all` WHERE is_eval
+      SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls_pooled_all` WHERE is_eval
     ),
     clf AS (
       SELECT operator, situationNumber, jkey, stop_order, call_cancelled,
              is_origin, is_terminal, dep_delay_pos, arr_delay_pos,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`,
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`,
                       (SELECT * FROM ev))
     ),
     a10 AS (
       SELECT operator, situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled_all`,
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled_all`,
                       (SELECT * FROM ev))
     ),
     d10 AS (
       SELECT operator, situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`,
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`,
                       (SELECT * FROM ev))
     ),
     wc AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`)
     ),
     wc_op AS (
       SELECT cw.category AS operator, cw.weight AS w
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`),
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`),
            UNNEST(category_weights) AS cw
       WHERE processed_input = 'operator'
     ),
     wa AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`)
     ),
     wa_op AS (
       SELECT cw.category AS operator, cw.weight AS w
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
            UNNEST(category_weights) AS cw
       WHERE processed_input = 'operator'
     ),
     wd AS (
       SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input='raw_logit', weight, NULL))     AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
     ),
     wd_op AS (
       SELECT cw.category AS operator, cw.weight AS w
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
            UNNEST(category_weights) AS cw
       WHERE processed_input = 'operator'
     )
@@ -400,7 +400,7 @@ def _(client):
     # NSB-holdout skåret av begge familier + slicing-kolonner. ~6 ML.PREDICTs over 262k rader.
     _q = """
     WITH ev AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.training_calls` WHERE is_eval
+      SELECT * FROM `ent-smartavvik-dev.disruptions.training_calls` WHERE is_eval
     ),
     ev_all AS (
       SELECT 'NSB' AS operator, * FROM ev
@@ -409,63 +409,63 @@ def _(client):
       SELECT situationNumber, jkey, stop_order, call_cancelled, is_origin, is_terminal,
              dep_delay_pos, arr_delay_pos, category, status, planned, min_from_onset,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf`, (SELECT * FROM ev))
     ),
     pr_a AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf`, (SELECT * FROM ev))
     ),
     pr_d AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM ev))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf`, (SELECT * FROM ev))
     ),
     pa_c AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM ev_all))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM ev_all))
     ),
     pa_a AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_clf_pooled_all`, (SELECT * FROM ev_all))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_clf_pooled_all`, (SELECT * FROM ev_all))
     ),
     pa_d AS (
       SELECT situationNumber, jkey, stop_order,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM ev_all))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM ev_all))
     ),
     w_pr_c AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt`)),
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt`)),
     w_pr_a AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt`)),
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt`)),
     w_pr_d AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input!='__INTERCEPT__', weight, NULL)) AS a
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt`)),
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt`)),
     w_pa_c AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input='raw_logit', weight, NULL))     AS a,
                       (SELECT cw.weight
-                       FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`),
+                       FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`),
                             UNNEST(category_weights) AS cw
                        WHERE processed_input='operator' AND cw.category='NSB') AS w_op
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`)),
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`)),
     w_pa_a AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input='raw_logit', weight, NULL))     AS a,
                       (SELECT cw.weight
-                       FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
+                       FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`),
                             UNNEST(category_weights) AS cw
                        WHERE processed_input='operator' AND cw.category='NSB') AS w_op
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.arr_ge10_platt_pooled_all`)),
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.arr_ge10_platt_pooled_all`)),
     w_pa_d AS (SELECT MAX(IF(processed_input='__INTERCEPT__', weight, NULL)) AS b,
                       MAX(IF(processed_input='raw_logit', weight, NULL))     AS a,
                       (SELECT cw.weight
-                       FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
+                       FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
                             UNNEST(category_weights) AS cw
                        WHERE processed_input='operator' AND cw.category='NSB') AS w_op
-               FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`))
+               FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`))
     SELECT
       c.category, c.status, c.planned, c.min_from_onset,
       c.call_cancelled,
@@ -634,37 +634,37 @@ def _(client):
     # platt-lag (lukket form), kombinert til p_impact_dep. ~3,1M rader (629k avganger x 5).
     _lq = """
     WITH inp AS (
-      SELECT * FROM `ent-kixavvik-dev.disruptions.leadtime_eval_pooled_all`
+      SELECT * FROM `ent-smartavvik-dev.disruptions.leadtime_eval_pooled_all`
     ),
     clf AS (
       SELECT situationNumber, operator, jkey, stop_order, lead_min,
              (SELECT prob FROM UNNEST(predicted_call_cancelled_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM inp))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.call_cancel_clf_pooled_all`, (SELECT * FROM inp))
     ),
     d10 AS (
       SELECT situationNumber, operator, jkey, stop_order, lead_min,
              (SELECT prob FROM UNNEST(predicted_y_ge_probs) WHERE label) AS p_raw
-      FROM ML.PREDICT(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM inp))
+      FROM ML.PREDICT(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_clf_pooled_all`, (SELECT * FROM inp))
     ),
     wc AS (
       SELECT MAX(IF(processed_input = '__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input = 'raw_logit', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`)
     ),
     wc_op AS (
       SELECT cw.category AS operator, cw.weight AS w
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.cancel_platt_pooled_all`),
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.cancel_platt_pooled_all`),
            UNNEST(category_weights) AS cw
       WHERE processed_input = 'operator'
     ),
     wd AS (
       SELECT MAX(IF(processed_input = '__INTERCEPT__', weight, NULL)) AS b,
              MAX(IF(processed_input = 'raw_logit', weight, NULL)) AS a
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`)
     ),
     wd_op AS (
       SELECT cw.category AS operator, cw.weight AS w
-      FROM ML.WEIGHTS(MODEL `ent-kixavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
+      FROM ML.WEIGHTS(MODEL `ent-smartavvik-dev.disruptions.dep_ge10_platt_pooled_all`),
            UNNEST(category_weights) AS cw
       WHERE processed_input = 'operator'
     ),
