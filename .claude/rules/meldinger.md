@@ -222,7 +222,7 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     marked with a `replay` **field** on the existing `event="llm_message"` record rather than a new
     event name — a new name would quietly drop it out of every query that already exists, including
     the ones that would notice a burst — and it suppresses the prompt/reply DEBUG record regardless
-    of `VARSEL_LLM_LOG_PROMPTS`, which dev has on and which would otherwise write a traveller's
+    of `VARSEL_LLM_LOG_PROMPTS`, which would otherwise write a traveller's
     origin, destination and departure time to Cloud Logging at page-load volume. A second record,
     `event="meldinger_replay"`, carries the unhashed `journey_digest` so a replay joins both the
     decision row and the live trail. And the `/messages` route is **`async def`**, which is not a

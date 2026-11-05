@@ -4860,7 +4860,7 @@ def _capture_writes(monkeypatch, text="Toget er innstilt. Ta neste tog."):
     `varsel._write_message` (the browser wording policy) and a **webhook-only** definition goes
     through `notification_wording.write_wording` under `notification_wording.WEBHOOK`, whose prompt
     audit record is suppressed in code — R16 forbids the browser policy's record for client data,
-    and dev runs `VARSEL_LLM_LOG_PROMPTS=true`.
+    which `VARSEL_LLM_LOG_PROMPTS=true` would write.
 
     Stubbing only one of the two would make every webhook-only assertion here read "nothing was
     written for it", which is exactly the shape of the failure these tests exist to catch. Both
@@ -5972,7 +5972,7 @@ def test_a_webhook_only_definition_is_written_for_through_the_webhook_policy(mon
     """The R16 exposure U2 left open, and the half of it U6 closes.
 
     A `journey_key` reaching `varsel._write_message` reaches `llm_message.write_message_detailed`,
-    which emits `event="llm_message"` — and under `VARSEL_LLM_LOG_PROMPTS=true`, which dev runs, the
+    which emits `event="llm_message"` — and under `VARSEL_LLM_LOG_PROMPTS=true` the
     full prompt at DEBUG, carrying the traveller's origin, destination and departure time. R16
     forbids that for client data, so a definition NO browser registration holds is routed through
     `notification_wording.WEBHOOK`, which suppresses that record in code rather than by an
@@ -6842,8 +6842,8 @@ def test_a_webhook_only_pair_is_worded_once_under_the_webhook_policy(monkeypatch
     """Two client subscriptions on one pair cost one wording, and it is NOT the browser's.
 
     R16. The new key names no definition, so a shared call could put a client route's origin and
-    destination into the browser policy's prompt/reply DEBUG record — which dev writes
-    (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK` suppresses that record in code,
+    destination into the browser policy's prompt/reply DEBUG record, written
+    under `VARSEL_LLM_LOG_PROMPTS=true`. `notification_wording.WEBHOOK` suppresses that record in code,
     and the discriminator is now the PAIR: the webhook policy unless a browser registration on the
     pair contributed this train.
     """
@@ -7010,7 +7010,7 @@ def _real_wording_backend(monkeypatch, prose="Toget er innstilt."):
 
     monkeypatch.setattr(llm_message, "_PROVIDER", "claude")
     monkeypatch.setattr(llm_message, "_ENABLED", True)
-    monkeypatch.setattr(llm_message, "_LOG_PROMPTS", True)  # dev's own setting
+    monkeypatch.setattr(llm_message, "_LOG_PROMPTS", True)  # the debugging switch on
     monkeypatch.setattr(llm_message, "_STATE", llm_message._LatchState())
     # The whole dict, not one entry: this suite's `_MonkeyPatch` is a `setattr`/`undo` shim with no
     # `setitem`, and reaching for pytest's would make the file unrunnable as
@@ -7029,7 +7029,7 @@ def test_a_pair_no_browser_registration_holds_writes_no_prompt_record(monkeypatc
     The wording key names no definition, so "which policy writes for this train?" had to be re-asked
     of the PAIR. Answered wrongly — browser whenever any definition on the corridor wants the train
     — a client-only route's origin, destination and departure time would reach the prompt/reply DEBUG
-    record, which dev writes (`VARSEL_LLM_LOG_PROMPTS=true`). `notification_wording.WEBHOOK`
+    record, written under `VARSEL_LLM_LOG_PROMPTS=true`. `notification_wording.WEBHOOK`
     suppresses that record in code and drops `message` from the INFO record.
 
     Driven through the REAL `write_wording` with only the model call stubbed, because a stubbed

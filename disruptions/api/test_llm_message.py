@@ -1232,7 +1232,7 @@ def test_a_replay_call_is_marked_on_the_existing_event():
 
 
 def test_a_replay_call_never_logs_the_prompt():
-    """dev sets VARSEL_LLM_LOG_PROMPTS today, and the flag was sized for the poller.
+    """VARSEL_LLM_LOG_PROMPTS was sized for the poller.
 
     The prompt carries the traveller's origin, destination and departure time. A public request path
     replaying a day of stored inputs would turn a debugging affordance into bulk publication of it,
@@ -1460,8 +1460,8 @@ def test_a_webhook_call_keeps_prose_and_the_prompt_out_of_the_log():
     Two records, both of which the poller legitimately writes and neither of which may carry a
     client's data. The `event="llm_message"` INFO record logs the finished wording; the
     `llm_message_prompt` DEBUG record logs the whole input, which carries origin, destination and
-    departure time. The suppression is IN CODE, not on `VARSEL_LLM_LOG_PROMPTS` — dev sets that
-    variable true, `/varsel` debugging needs it left on, and dev is where this rollout starts.
+    departure time. The suppression is IN CODE, not on `VARSEL_LLM_LOG_PROMPTS` — that
+    variable is a `/varsel` debugging switch and may be on wherever a client surface runs.
     """
     _reset(provider="claude")
     prose = "Toget er innstilt."
