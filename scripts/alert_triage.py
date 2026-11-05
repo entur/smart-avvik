@@ -49,7 +49,9 @@ CLAUDE_TIMEOUT_S = 900
 MAX_BYTES_BILLED = 10 * 10**9  # 10 GB, about $0.06 at on-demand rates
 STATE = Path.home() / ".local/state/kix-alert-triage"
 LOG = Path.home() / "Library/Logs/kix-alert-triage.log"
-LABEL = "no.entur.smart-avvik-alert-triage"
+# Unchanged from kix-avvik on purpose: with the same label, installing from smart-avvik replaces an
+# agent installed from kix-avvik instead of running beside it and posting every alert twice.
+LABEL = "no.entur.kix-alert-triage"
 PREFIX = (
     "🤖 *Automatisk analyse (Claude Code)* – kan ta feil, sjekk før du handler.\n\n"
 )
