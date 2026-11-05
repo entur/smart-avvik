@@ -50,6 +50,8 @@ Run: uv run python test_personvern_texts.py  (or pytest)
 import re
 from pathlib import Path
 
+import deploy_files
+
 _REPO = Path(__file__).resolve().parents[2]
 
 PERSONVERN_TS = _REPO / "demo" / "avviksvarsel" / "src" / "personvern.ts"
@@ -471,6 +473,7 @@ def _pinned(path: Path, key: str) -> str | None:
 _HONEST_LLM_PROVIDERS = ("gemini", "off")
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_every_environment_pins_gemini_as_the_llm_provider():
     """Protects: «Varselteksten skrives av en språkmodell hos Google i EU» (T5).
 
@@ -491,6 +494,7 @@ def test_every_environment_pins_gemini_as_the_llm_provider():
         )
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_every_environment_explicitly_pins_the_gemini_location_to_eu():
     """Protects: «... hos Google i EU» and «Google Cloud drifter tjenesten ... i EU» (T5).
 
@@ -510,6 +514,7 @@ def test_every_environment_explicitly_pins_the_gemini_location_to_eu():
         )
 
 
+@deploy_files.needs("helm/smart-avvik/env")
 def test_production_pins_posthog_to_the_eu_ingestion_host():
     """Protects: «Tilbakemeldinger du sender behandles i analyseverktøyet PostHog i EU» (T5)."""
     prd = HELM_ENV_DIR / "values-kub-ent-prd.yaml"
