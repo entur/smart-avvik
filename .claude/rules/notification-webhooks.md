@@ -830,8 +830,8 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   **The R16 prompt-record claim has two halves and only one is closed**, published rather than
   asserted away. A **webhook-only** definition — one absent from `by_journey_key`, which stays
   browser-only for exactly this — is written for through `notification_wording.WEBHOOK`, which
-  suppresses the prompt/reply DEBUG record **in code** regardless of `VARSEL_LLM_LOG_PROMPTS` (dev has
-  it on) and drops `message` from the INFO record. A **shared** definition stays on the browser policy
+  suppresses the prompt/reply DEBUG record **in code** regardless of `VARSEL_LLM_LOG_PROMPTS`
+  and drops `message` from the INFO record. A **shared** definition stays on the browser policy
   unavoidably: one wording between the channels means one call and it is the browser's, and that
   record would exist with no webhook channel at all. So R16 is about webhook-only routes plus every
   other client field; it is **not** "no client route ever appears in the prompt log". Accepted as

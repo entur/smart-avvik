@@ -1643,15 +1643,15 @@ def _write_message_detailed_inner(
 
     ``state`` names the holder this call latches against and, if it caches clients, borrows one from
     — the module-global holder when omitted, which is what every push wording uses. ``replay`` marks
-    the audit record and suppresses the ``event="llm_message_prompt"`` DEBUG record: dev sets
-    ``VARSEL_LLM_LOG_PROMPTS`` today, and a replay surface would otherwise write a traveller's
+    the audit record and suppresses the ``event="llm_message_prompt"`` DEBUG record: whenever
+    ``VARSEL_LLM_LOG_PROMPTS`` is on, a replay surface would otherwise write a traveller's
     origin, destination and departure time to Cloud Logging at page-load volume rather than at the
     poller's few-per-cycle rate. Neither changes anything for a caller that passes neither.
 
     ``caller`` names a non-browser surface (``"webhook"``, ``"pull"``) and does three things, all of them
-    required by R16 and none of them left to an environment variable —
-    ``helm/smart-avvik/env/values-kub-ent-dev.yaml`` sets ``VARSEL_LLM_LOG_PROMPTS="true"`` in exactly
-    the environment this rollout starts in, and `/varsel` message debugging needs it left on:
+    required by R16 and none of them left to an environment variable, because
+    ``VARSEL_LLM_LOG_PROMPTS`` is a `/varsel` message debugging switch and may be on wherever a
+    client surface runs:
 
     * the prompt/reply DEBUG record is suppressed **in code**, regardless of that variable;
     * the INFO record drops ``message``, so client prose stays out of routine logs — the provider,
@@ -1813,9 +1813,8 @@ def _write_message_detailed_inner(
         # handful of calls per cycle; a public request path replaying a day of stored inputs would
         # turn it into bulk publication of origin, destination and departure time, and nobody
         # setting it would have that in mind. A client surface is the same shape of problem with a
-        # second party's data in it (R16), and the suppression is in code for the reason that
-        # requirement names: dev, where this rollout starts, sets the variable true and `/varsel`
-        # needs it.
+        # second party's data in it (R16), and the suppression is in code because
+        # the variable is a `/varsel` debugging switch and may be on wherever a client surface runs.
         if _LOG_PROMPTS and not replay and not caller:
             logger.debug(
                 "LLM prompt/reply for %s/%s",

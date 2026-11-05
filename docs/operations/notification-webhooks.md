@@ -1849,7 +1849,7 @@ R16 keeps client records, credentials, callback URLs and generated prose out of 
 - **A route a browser registration also holds** stays on the browser policy, unavoidably and by
   design: AE1 pins **one match and one wording** between the two channels, so there is one call and it
   is the browser's. That call's `llm_message` record carries the traveller's origin, destination and
-  departure time at DEBUG wherever `VARSEL_LLM_LOG_PROMPTS` is on — **which dev is** — and it would
+  departure time at DEBUG wherever `VARSEL_LLM_LOG_PROMPTS` is on, and it would
   exist with no webhook channel at all, because a browser registration holds the same route.
 
 **So R16's claim is about webhook-only routes plus every other client field. It is not "no client
