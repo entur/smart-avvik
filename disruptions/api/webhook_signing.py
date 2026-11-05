@@ -152,11 +152,16 @@ def _env(name: str) -> str:
 #: compares, so the two cannot drift.
 _PUBLISHED_TEST_ROOT = b"smart-avvik-test-signing-root-not-used-in-any-deployment"
 
+#: Example roots published before this one. This repository's public history still carries them,
+#: with every secret they derive, so they are refused exactly like the current one.
+_RETIRED_TEST_ROOTS = (b"kix-test-signing-root-not-used-in-any-deployment",)
+_REFUSED_ROOTS = (_PUBLISHED_TEST_ROOT, *_RETIRED_TEST_ROOTS)
+
 
 def configured() -> bool:
     """Is there a usable root secret? A cheap probe that never raises and never logs the value."""
     value = _env(SIGNING_ROOT_ENV).encode()
-    return len(value) >= MIN_ROOT_BYTES and value != _PUBLISHED_TEST_ROOT
+    return len(value) >= MIN_ROOT_BYTES and value not in _REFUSED_ROOTS
 
 
 def signing_root() -> bytes:
@@ -167,13 +172,14 @@ def signing_root() -> bytes:
     import-time read would also freeze the value against a restart-free secret rotation.
     """
     value = _env(SIGNING_ROOT_ENV).encode()
-    if value == _PUBLISHED_TEST_ROOT:
+    if value in _REFUSED_ROOTS:
         # Named separately from "unset or too short", because the two need different actions and the
         # wrong message sends an operator hunting for a missing secret they have plainly set.
         raise SigningNotConfigured(
-            f"{SIGNING_ROOT_ENV} is set to the example root published in "
-            "contracts/notifications/v1/signing-vectors.json. Every secret it derives is committed "
-            "in that file, so it signs forgeable webhooks; provision a real root in Secret Manager."
+            f"{SIGNING_ROOT_ENV} is set to an example root published in "
+            "contracts/notifications/v1/signing-vectors.json, now or in an earlier version. Every "
+            "secret it derives is public, so it signs forgeable webhooks; provision a real root in "
+            "Secret Manager."
         )
     if len(value) < MIN_ROOT_BYTES:
         raise SigningNotConfigured(
