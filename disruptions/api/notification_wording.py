@@ -1381,8 +1381,7 @@ class WordingPolicy:
     # deliberately NOT the same value as `name`. `llm_message._log_fields` documents it as naming a
     # NON-browser surface, and the gate it feeds is truthiness (`if _LOG_PROMPTS and not replay and
     # not caller`), so passing `name` handed the browser a truthy marker and switched off exactly
-    # the `/varsel` message debugging `helm/.../values-kub-ent-dev.yaml` turns on with
-    # VARSEL_LLM_LOG_PROMPTS="true". `name` stays the human label on this module's own log records;
+    # the `/varsel` message debugging that VARSEL_LLM_LOG_PROMPTS="true" turns on. `name` stays the human label on this module's own log records;
     # this is what crosses into llm_message. None for the browser is the whole point.
     caller: str | None = None
     state_factory: Callable[[], Any] | None = None
