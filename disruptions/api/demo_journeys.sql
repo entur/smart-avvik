@@ -14,9 +14,17 @@
 -- instance pin (sentinel for rail, where operating_date is NULL), and prediction rows -- which
 -- carry the call's own call_date -- are joined per (operator, jkey, call_date, stop_order).
 --
--- When several situations touch a journey the most severe one (highest at-onset impact
--- probability across either end) is chosen, and BOTH ends read from that same situation so
--- the card tells one coherent story -- same convention as /journey.
+-- When several situations touch a journey ONE is chosen, and BOTH ends read from that same
+-- situation so the card tells one coherent story. The choice is made on the BOARDING call:
+-- a situation that names it beats one that does not, then the highest at-onset severity there,
+-- then the highest at either end, then situationNumber. That is varsel's rule
+-- (`varsel.one_alert_per_train` keys a train on its boarding call and keeps the most severe
+-- situation there), and the page's headline is counted on the boarding call too.
+-- Until 2026-11-06 the most severe situation at EITHER end won. Vy often publishes a second
+-- message that names a train only from a later stop, and when that one scored higher at the
+-- alighting call the departure read from a situation with no row for it: a cancelled train that
+-- two other messages had flagged at the boarding stop showed as «Uten prediksjon», and most of
+-- the NSB examples read Presisjon «–» and Dekning 0 %.
 WITH
 f AS (
   SELECT operator, jkey,
@@ -65,18 +73,21 @@ pt AS (
   WHERE stop_place = @to_stop
     AND call_date BETWEEN DATE(@start_ts) AND DATE_ADD(DATE(@end_ts), INTERVAL 1 DAY)
 ),
--- Most severe situation per journey instance, judged at message arrival across either end.
+-- Each situation per journey instance: whether it names the boarding call, its at-onset severity
+-- there, and its at-onset severity at either end (see the header for the order `best` applies).
 cand AS (
   SELECT operator, jkey, from_call_date, situationNumber,
-         MAX(sev) AS sev
+         LOGICAL_OR(on_boarding)          AS on_boarding,
+         MAX(IF(on_boarding, sev, NULL))  AS dep_sev,
+         MAX(sev)                         AS sev
   FROM (
-    SELECT j.operator, j.jkey, j.from_call_date, p.situationNumber,
+    SELECT j.operator, j.jkey, j.from_call_date, p.situationNumber, TRUE AS on_boarding,
            COALESCE(p.onset_p_impact_dep, p.onset_p_impact_arr, p.onset_p_cancel) AS sev
     FROM pf AS p
     JOIN j ON j.operator = p.operator AND j.jkey = p.jkey
           AND p.stop_order = j.from_order AND p.call_date = j.from_call_date
     UNION ALL
-    SELECT j.operator, j.jkey, j.from_call_date, p.situationNumber,
+    SELECT j.operator, j.jkey, j.from_call_date, p.situationNumber, FALSE AS on_boarding,
            COALESCE(p.onset_p_impact_arr, p.onset_p_impact_dep, p.onset_p_cancel) AS sev
     FROM pt AS p
     JOIN j ON j.operator = p.operator AND j.jkey = p.jkey
@@ -86,7 +97,9 @@ cand AS (
 ),
 best AS (
   SELECT operator, jkey, from_call_date,
-         ARRAY_AGG(situationNumber ORDER BY sev DESC LIMIT 1)[OFFSET(0)] AS situationNumber
+         ARRAY_AGG(situationNumber
+                   ORDER BY on_boarding DESC, dep_sev DESC, sev DESC, situationNumber DESC
+                   LIMIT 1)[OFFSET(0)] AS situationNumber
   FROM cand
   GROUP BY operator, jkey, from_call_date
 )
