@@ -1,8 +1,8 @@
 -- Daily prd refresh of the /demo tables.
 --
 -- Registered as the scheduled query "demo-copy-daily" in ent-kixavvik-prd
--- (every day 04:30 UTC, runs as application@ent-kixavvik-prd), one hour after
--- dev's "demo-recent-daily" (03:30 UTC, extend_demo_recent_daily.sql) has
+-- (every day 06:00 UTC, runs as application@ent-kixavvik-prd), one hour after
+-- dev's "demo-recent-daily" (05:00 UTC, extend_demo_recent_daily.sql) has
 -- extended the dev demo tables with yesterday's calls for all operators.
 --
 -- The prd /demo-api serves straight from these copies (30-min in-process meta

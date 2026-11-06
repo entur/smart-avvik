@@ -1,6 +1,9 @@
 -- Extend the /demo dataset with RECENT days for ALL operators (everything after the static
 -- holdout build, which ends 2026-06-20 — see create_demo_predictions.sql). This is the DAILY
--- unattended refresh (bq scheduled query "demo-recent-daily", every day 03:30 UTC).
+-- unattended refresh (bq scheduled query "demo-recent-daily", every day 05:00 UTC).
+-- 05:00 UTC is after last_recorded's daily rewrite in both seasons: that runs ~05:03 Oslo,
+-- i.e. ~03:04 UTC in summer and ~04:03 UTC in winter. The old 03:30 UTC slot read the
+-- table before the rewrite all winter and so stayed a day behind (moved 2026-10-30).
 --
 -- SOURCE: ent-data-sharing-ext-prd.realtime_siri_et.realtime_siri_et_last_recorded — the
 -- all-operator per-call "final state" table (daily-refreshed; yesterday is fully recorded,
