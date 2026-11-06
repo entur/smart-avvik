@@ -1,7 +1,13 @@
 # smart-avvik runbook
 
-**Written:** 2026-11-05, for the team taking over the service. **Retraining:**
-[`RETRAIN.md`](RETRAIN.md).
+**Written:** 2026-11-05 for kix-avvik's handover to team-ror, adapted 2026-11-06 to smart-avvik's
+two repositories. **Retraining:** [`RETRAIN.md`](RETRAIN.md).
+
+smart-avvik is split in two. This repository is public and holds the code: it builds and tests the
+image and deploys nothing. The private
+[`entur/smart-avvik-deployment-config`](https://github.com/entur/smart-avvik-deployment-config)
+holds the Helm chart and the values per environment, Terraform, the orchestrator manifests and the
+deploy workflow. Its `docs/handover.md` records how the service moved from kix-avvik.
 
 This is the short version for people. The long notes are in `CLAUDE.md` and `.claude/rules/*.md`.
 They were written for Claude Code, so they are dense and full of history. Read them when you work on
@@ -29,8 +35,7 @@ SIRI-SX, SIRI-ET, GTFS, stop registry (BigQuery, other teams' projects)
   (120 s) is the cost knob.
 - **prd never trains.** Models and lookup tables are trained in dev and copied to prd. See
   [`RETRAIN.md`](RETRAIN.md).
-- **Firestore holds state** in dev and prd: registrations, the lease, webhook subscriptions,
-  translations. tst has no Firestore.
+- **Firestore holds state**: registrations, the lease, webhook subscriptions, translations.
 
 Public surfaces: `/varsel` (Smarte reisevarsler), `/togmelding` (Rushvarsel),
 `/notification-api/v1` (webhooks), the journey-alerts and journey-status reads. Internal, behind
@@ -39,21 +44,22 @@ snapshots.
 
 ## Environments
 
-| | dev | tst | prd |
-|---|---|---|---|
-| Host | `smart-avvik.dev.entur.io` | `smart-avvik.staging.entur.io` | `smart-avvik.entur.io` |
-| GCP project | `ent-smartavvik-dev` | `ent-smartavvik-tst` | `ent-smartavvik-prd` |
-| Cluster project (logs, kubectl) | `ent-kub-dev` | `ent-kub-tst` | `ent-kub-prd` |
-| kube context | `gke_ent-kub-dev_europe-west1_kub-ent-dev-001` | `..._kub-ent-tst-001` | `gke_ent-kub-prd_europe-west1_kub-ent-prd-001` |
-| Pods | 1-3, rolling | 1, Recreate | 2-3, rolling |
-| Deploys | on every push to `main` | by hand | by hand |
+| | dev | prd |
+|---|---|---|
+| Host | `smart-avvik.dev.entur.io` | `smart-avvik.entur.io` |
+| GCP project | `ent-smartavvik-dev` | `ent-smartavvik-prd` |
+| Cluster project (logs, kubectl) | `ent-kub-dev` | `ent-kub-prd` |
+| kube context | `gke_ent-kub-dev_europe-west1_kub-ent-dev-001` | `gke_ent-kub-prd_europe-west1_kub-ent-prd-001` |
+| Pods | 1-3, rolling | 2-3, rolling |
+| Deploys | on every push to `main` | after approval |
 
-Namespace is `smart-avvik` everywhere. Two Helm releases share the chart and image: `smart-avvik` (API
-and poller) and `smart-avvik-worker` (webhook delivery, one replica, dev and prd only). Values per
-environment are in `helm/smart-avvik/env/`. Feature flags are the `configmap.data` keys there.
+There is no tst: kix-avvik never deployed one either. The project `ent-smartavvik-tst` exists,
+unused.
 
-**tst is not usable.** Its project has no models or runtime tables, no Firestore, no worker and no
-lease, and its host did not resolve when checked on 2026-10-30. Decide whether to fix or delete it.
+Namespace is `smart-avvik` everywhere. Two Helm releases share the chart and image: `smart-avvik`
+(API and poller) and `smart-avvik-worker` (webhook delivery, one replica). The chart and the values
+per environment are in deployment-config's `helm/smart-avvik/`. Feature flags are the
+`configmap.data` keys in `helm/smart-avvik/env/values-kub-ent-<env>.yaml` there.
 
 ## Where to look
 
@@ -71,17 +77,21 @@ lease, and its host did not resolve when checked on 2026-10-30. Decide whether t
   Pick the environment with `prometheus_group="kub-ent-prd-001"`. The label for the namespace
   differs by metric source, and a wrong label returns no data with no error: see the ground rules
   in [`../observability/02-alert-rules-2026-09-11.md`](../observability/02-alert-rules-2026-09-11.md).
-- **Alerts** go to Slack `#alerts-kix` from Grafana rules in the folder `team-ki-eksperimentering`,
-  plus a GCP uptime check on `/health` (`terraform/monitoring.tf`). Nothing pages anyone, at any
-  hour. "critical" means "look at this first".
+- **Alerts:** a GCP uptime check on `/health` per environment (deployment-config's
+  `terraform/monitoring.tf`). prd posts to Slack `#team-ror-prod-alerts` and mails the address in
+  `terraform/env/prd.tfvars`; dev only mails. The Grafana rules below were kix-avvik's (folder
+  `team-ki-eksperimentering`, Slack `#alerts-kix`) and are **not recreated yet** for the
+  `smart_avvik_*` metrics. Nothing pages anyone, at any hour. "critical" means "look at this
+  first".
 - **Traces** go to Cloud Trace in the app project (10 % sampled in prd).
 - **Alert decisions** are logged to BigQuery `disruptions.varsel_decisions`. A nightly scheduled
   query labels them into `varsel_decision_outcomes`, which `/historikk` reads.
 - **Who leads:** `kubectl -n smart-avvik port-forward pod/<pod> 18080:8080`, then
   `curl -s localhost:18080/ready`. The body says `role: leader` or `follower`. The image is
   distroless, so there is no shell inside the pod.
-- **Secrets** are in Secret Manager in each app project, mounted as three ExternalSecret groups
-  (the `secrets:` block in `helm/smart-avvik/env/values-kub-ent-<env>.yaml`): `varsel` (the VAPID
+- **Secrets** are in Secret Manager in each app project, with copies in team-ror's 1Password,
+  mounted as three ExternalSecret groups (the `secrets:` block in deployment-config's
+  `helm/smart-avvik/env/values-kub-ent-<env>.yaml`): `varsel` (the VAPID
   key pair, the PostHog token, the feedback receipt secret), `notifications` (the webhook signing
   root and the API-key pepper) and `sso` (the Auth0 client secret and the session secret). A
   changed secret needs an ExternalSecret re-sync (hourly) and a pod restart. **Rotating the VAPID
@@ -91,19 +101,38 @@ lease, and its host did not resolve when checked on 2026-10-30. Decide whether t
 
 ## Deploy
 
+A push to `main` here starts the chain:
+
+1. `build.yml` runs `ci.yml`: lint, the test suites, the image build and the scan. The image stays
+   as the run's `smart-avvik` artifact.
+2. If CI passed and the repository variable `DEPLOY_ON_MAIN` is `true`, its `trigger-deploy` job
+   dispatches deployment-config's `cd.yml` with the run id.
+3. `cd.yml` takes the image over with `entur/ror-gha-workflows`' `handover-image.yml` (check the run,
+   scan, push to the registry as `smart-avvik:main.<date>-SHA<commit>`), runs its `checks.yml`
+   against that commit, deploys the API and the worker to dev, and smoke-tests dev.
+4. prd waits for approval in the `Approve` environment, then deploys and smoke-tests.
+
 ```sh
-git push origin main                          # CI builds, tests and deploys to dev
-gh workflow run cd.yml -f environment=prd     # builds main again and deploys to prd
+gh run list --repo entur/smart-avvik --workflow build.yml --limit 3
+gh run list --repo entur/smart-avvik-deployment-config --workflow cd.yml --limit 3
 ```
 
-Check after every merge that the dev deploy actually ran: `gh run list --workflow=cd.yml`. The
-deploy jobs depend on the test job, so a flaky test on `main` means the merge never reaches dev, and
-the PR shows nothing wrong.
+Check after every merge that the dev deploy ran: `trigger-deploy` only runs after CI passed, so a
+red test on `main` means the merge never reaches dev, and the PR shows nothing wrong.
+
+To deploy by hand from deployment-config: `-f run_id=<build run id>` hands over and deploys a build
+of `main`, `-f image_tag=main.<date>-SHA<commit>` redeploys an image already in the registry, and no
+input deploys the image of the latest build of `main` (only once it is in the registry).
+
+```sh
+gh workflow run cd.yml --repo entur/smart-avvik-deployment-config -f run_id=<build run id>
+```
 
 `cd.yml` waits up to 6 minutes for a pod that answers `/ready` with `role: leader` and the deployed
 commit as `version`. After a deploy, `/health`, `/varsel/` and `/historikk/` should answer 200.
 
-**Never cancel a running deploy.** Helm rolls itself back if the rollout times out (about 13
+**Never cancel a running Helm deploy job.** Cancelling a run that waits at the `Approve` gate is
+fine. Helm rolls itself back if the rollout times out (about 13
 minutes). A cancelled run leaves the release in `pending-upgrade`, and every later deploy then fails
 with "another operation is in progress". If that has happened:
 
@@ -115,7 +144,7 @@ helm --kube-context <context> -n smart-avvik rollback smart-avvik <last deployed
 **A change to a configmap value alone does not restart the pods** when you run `helm upgrade` by
 hand: the image tag is unchanged, so Kubernetes sees no new pod template, and the app keeps the old
 values it read at startup. Follow with `kubectl -n smart-avvik rollout restart deploy/smart-avvik`.
-Deploys through `cd.yml` always carry a new image tag and are not affected.
+Deploys through `cd.yml` re-render the pod template and are not affected.
 
 **Additive schema changes only, for one release.** During a rolling deploy the new pods load
 tables the old leader built. A column read in the same release that adds it stops the new pod from
@@ -124,25 +153,31 @@ becoming ready. Ship the tolerant read one release before the column. More in
 
 ## Roll back
 
-Deploy an earlier image by dispatching `cd.yml` with its tag:
+Deploy an earlier image by dispatching deployment-config's `cd.yml` with its tag. It goes to dev
+first, then to prd after approval:
 
 ```sh
 gcloud container images list-tags eu.gcr.io/entur-system-1287/smart-avvik --limit=10 --sort-by=~timestamp
-gh workflow run cd.yml -f environment=prd -f image=smart-avvik:main.<date>-SHA<sha>
+gh workflow run cd.yml --repo entur/smart-avvik-deployment-config -f image_tag=main.<date>-SHA<sha>
 ```
 
-The `image` input must be the **short** form above. The workflow adds the registry itself, so a full
-`eu.gcr.io/...` reference becomes a doubled path, the pod cannot pull it, and the deploy times out.
-This took dev down for 5.5 hours on 2026-07-28.
+`image_tag` is the tag alone, never `smart-avvik:...` or a full `eu.gcr.io/...` reference: the
+workflow adds the registry and the name, and refuses anything else. (In kix-avvik a full reference
+became a doubled path that took dev down for 5.5 hours on 2026-07-28.)
 
-**Rolling back past 2026-10-19** (PR 312, the lease) is different: an image without the lease would
-run the poller on every pod. Put `deployment.forceReplicas: 1` back into the environment's values
-file first, then deploy the image. See [`poller-lease.md`](poller-lease.md#rollback). The deploy's
+A rollback runs `checks.yml` against the older commit. Its tests are the older commit's, run against
+today's deployment files, and can fail if those changed since. See deployment-config's
+`docs/handover.md`.
+
+**Rolling back past 2026-10-19** (kix-avvik PR 312, the lease) is different: an image without the
+lease would run the poller on every pod. Put `deployment.forceReplicas: 1` back into the
+environment's values file in deployment-config first, then deploy the image. See [`poller-lease.md`](poller-lease.md#rollback). The deploy's
 smoke step then fails, because an old image's `/ready` has no `version`. The deploy itself has
 already happened at that point.
 
-**If GitHub Actions is down**, deploy from a laptop. Here the image reference must be **fully
-qualified**, the opposite of the dispatch input:
+**If GitHub Actions is down**, deploy from a laptop, in a checkout of deployment-config (the chart
+and the values are there). Here the image reference must be **fully qualified**, the opposite of
+the dispatch input:
 
 ```sh
 helm --kube-context gke_ent-kub-prd_europe-west1_kub-ent-prd-001 \
@@ -177,12 +212,14 @@ deploy can still point at the old bundle.
 
 ## Scheduled queries
 
-The BigQuery scheduled queries in dev and prd run as the service account
+The BigQuery scheduled queries run as the service account
 `application@ent-smartavvik-<env>.iam.gserviceaccount.com`, not as a person:
 
 - `varsel-label-daily` labels alert decisions with what actually happened. Recipe and history:
   `data/queries/label_varsel_decisions.sh`.
-- The demo refresh (`demo-recent-daily` in dev, `demo-copy-daily` in prd, which copies from dev).
+- kix-avvik also ran a demo refresh (`demo-recent-daily` in dev, `demo-copy-daily` in prd). It is
+  not registered for smart-avvik: `/demo` had no requests in the four weeks before the move. The
+  dev `demo_*` tables were copied once; `data/queries/refresh_demo_recent.sh` refreshes them.
 
 A scheduled query holds **a copy** of its SQL. Editing the `.sql` file in git changes nothing until
 the config is updated with `bq update --transfer_config`. Adding a column to
@@ -227,13 +264,18 @@ developer's private notes.
   only caught by running the query.
 - Some files under `disruptions/api/*.sql` have a runnable twin under `data/queries/`. Check for
   one before editing.
-- A `helm-lint` job reported as `fail` can be a cancelled analytics step after a successful lint.
-  Check which step failed, then `gh run rerun <run-id> --failed`.
+- The checks that compare the code with the deployment files (`disruptions/api/deploy_files.py`)
+  skip here and run in deployment-config's `checks.yml`, against this repository's `main`. A change
+  to those tests must merge here first, or deployment-config's next PR fails.
+- The Helm lint and render checks are in deployment-config too. A `helm-lint` job reported as `fail`
+  can be a cancelled analytics step after a successful lint. Check which step failed, then
+  `gh run rerun <run-id> --failed`.
 - A job with no steps and no log ("log not found", `BlobNotFound`) never ran. Rerun it.
 - Test fixtures seeded from the wall clock have caused most of the flaky tests. A date literal next
   to code that prunes by the real clock fails permanently from some date on (seen 2026-10-30).
-- A PR with one commit needs that commit's subject to be a valid conventional commit
-  (`feat`, `fix`, `docs`, `chore` ...). Renaming the PR title is not enough. `ops` is not accepted.
+- A PR title must be a valid conventional commit (`feat`, `fix`, `docs`, `chore` ...), and so must
+  the commit's subject when the PR has one commit. Renaming the PR title is not enough then. `ops` is
+  not accepted.
 
 **BigQuery CLI**
 
@@ -249,7 +291,8 @@ developer's private notes.
 - PR plans run as a read-only identity, applies as a stronger one. A resource the apply can create
   but the plan cannot read breaks every later PR plan. The way out is a `removed { ...
   lifecycle { destroy = false } }` block, which skips the refresh.
-- Grant dataset access to a **group** in `terraform/env/<env>.tfvars`, never a person. Keep the
+- Terraform is in deployment-config. Grant dataset access to a **group** in its
+  `terraform/env/<env>.tfvars`, never a person. Keep the
   resource type `google_bigquery_dataset_iam_member`: the `_binding` and `_policy` forms would
   remove the prd service account's access. Details in `terraform/bigquery_iam.tf`.
 
@@ -278,3 +321,4 @@ developer's private notes.
 - [`notification-webhooks.md`](notification-webhooks.md): the webhook channel's operating contract.
 - [`gemini-tak-og-kostnad.md`](gemini-tak-og-kostnad.md): LLM caps and cost.
 - `CLAUDE.md` and `.claude/rules/<surface>.md`: per-surface detail.
+- deployment-config's `docs/handover.md`: how the service moved from kix-avvik, and what is left.
