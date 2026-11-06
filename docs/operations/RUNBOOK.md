@@ -1,4 +1,4 @@
-# kix-avvik runbook
+# smart-avvik runbook
 
 **Written:** 2026-11-05, for the team taking over the service. **Retraining:**
 [`RETRAIN.md`](RETRAIN.md).
@@ -9,7 +9,7 @@ a surface, not to run the service. This file links into them where the detail ma
 
 ## What the service does
 
-kix-avvik predicts how a public-transport disruption will affect a train or bus, and tells
+smart-avvik predicts how a public-transport disruption will affect a train or bus, and tells
 travellers before it happens. It reads SIRI-SX (operator disruption messages) and SIRI-ET (real-time
 timetable updates) from Anshar's BigQuery tables, scores every rail call with BigQuery ML (BQML)
 models, and pushes alerts.
@@ -41,16 +41,16 @@ snapshots.
 
 | | dev | tst | prd |
 |---|---|---|---|
-| Host | `kix-avvik.dev.entur.io` | `kix-avvik.staging.entur.io` | `kix-avvik.entur.io` |
-| GCP project | `ent-kixavvik-dev` | `ent-kixavvik-tst` | `ent-kixavvik-prd` |
+| Host | `smart-avvik.dev.entur.io` | `smart-avvik.staging.entur.io` | `smart-avvik.entur.io` |
+| GCP project | `ent-smartavvik-dev` | `ent-smartavvik-tst` | `ent-smartavvik-prd` |
 | Cluster project (logs, kubectl) | `ent-kub-dev` | `ent-kub-tst` | `ent-kub-prd` |
 | kube context | `gke_ent-kub-dev_europe-west1_kub-ent-dev-001` | `..._kub-ent-tst-001` | `gke_ent-kub-prd_europe-west1_kub-ent-prd-001` |
 | Pods | 1-3, rolling | 1, Recreate | 2-3, rolling |
 | Deploys | on every push to `main` | by hand | by hand |
 
-Namespace is `kix-avvik` everywhere. Two Helm releases share the chart and image: `kix-avvik` (API
-and poller) and `kix-avvik-worker` (webhook delivery, one replica, dev and prd only). Values per
-environment are in `helm/kix-avvik/env/`. Feature flags are the `configmap.data` keys there.
+Namespace is `smart-avvik` everywhere. Two Helm releases share the chart and image: `smart-avvik` (API
+and poller) and `smart-avvik-worker` (webhook delivery, one replica, dev and prd only). Values per
+environment are in `helm/smart-avvik/env/`. Feature flags are the `configmap.data` keys there.
 
 **tst is not usable.** Its project has no models or runtime tables, no Firestore, no worker and no
 lease, and its host did not resolve when checked on 2026-10-30. Decide whether to fix or delete it.
@@ -58,15 +58,15 @@ lease, and its host did not resolve when checked on 2026-10-30. Decide whether t
 ## Where to look
 
 - **Logs** are in the *cluster* project, not the app project: `ent-kub-prd`, namespace
-  `kix-avvik`. Querying `ent-kixavvik-prd` returns an empty list and no error.
+  `smart-avvik`. Querying `ent-smartavvik-prd` returns an empty list and no error.
   ```sh
   gcloud logging read --project=ent-kub-prd --freshness=1h \
-    'resource.labels.namespace_name="kix-avvik" AND jsonPayload.event="poller_cycle"'
+    'resource.labels.namespace_name="smart-avvik" AND jsonPayload.event="poller_cycle"'
   ```
   Logs are structured. Useful `event` values: `poller_cycle` and `poller_phase` (cycle timings),
   `poller_lease` (who leads), `push`, `notification_*`. The ERROR level is kept almost silent on
   purpose, so any ERROR is worth reading.
-- **Metrics** are `kix_*` Prometheus metrics, read in Grafana (grafana.entur.org) through the
+- **Metrics** are `smart_avvik_*` Prometheus metrics, read in Grafana (grafana.entur.org) through the
   `prometheus-thanos` data source. They are not in Google Managed Prometheus or Cloud Monitoring.
   Pick the environment with `prometheus_group="kub-ent-prd-001"`. The label for the namespace
   differs by metric source, and a wrong label returns no data with no error: see the ground rules
@@ -77,11 +77,11 @@ lease, and its host did not resolve when checked on 2026-10-30. Decide whether t
 - **Traces** go to Cloud Trace in the app project (10 % sampled in prd).
 - **Alert decisions** are logged to BigQuery `disruptions.varsel_decisions`. A nightly scheduled
   query labels them into `varsel_decision_outcomes`, which `/historikk` reads.
-- **Who leads:** `kubectl -n kix-avvik port-forward pod/<pod> 18080:8080`, then
+- **Who leads:** `kubectl -n smart-avvik port-forward pod/<pod> 18080:8080`, then
   `curl -s localhost:18080/ready`. The body says `role: leader` or `follower`. The image is
   distroless, so there is no shell inside the pod.
 - **Secrets** are in Secret Manager in each app project, mounted as three ExternalSecret groups
-  (the `secrets:` block in `helm/kix-avvik/env/values-kub-ent-<env>.yaml`): `varsel` (the VAPID
+  (the `secrets:` block in `helm/smart-avvik/env/values-kub-ent-<env>.yaml`): `varsel` (the VAPID
   key pair, the PostHog token, the feedback receipt secret), `notifications` (the webhook signing
   root and the API-key pepper) and `sso` (the Auth0 client secret and the session secret). A
   changed secret needs an ExternalSecret re-sync (hourly) and a pod restart. **Rotating the VAPID
@@ -108,13 +108,13 @@ minutes). A cancelled run leaves the release in `pending-upgrade`, and every lat
 with "another operation is in progress". If that has happened:
 
 ```sh
-helm --kube-context <context> -n kix-avvik history kix-avvik
-helm --kube-context <context> -n kix-avvik rollback kix-avvik <last deployed revision>
+helm --kube-context <context> -n smart-avvik history smart-avvik
+helm --kube-context <context> -n smart-avvik rollback smart-avvik <last deployed revision>
 ```
 
 **A change to a configmap value alone does not restart the pods** when you run `helm upgrade` by
 hand: the image tag is unchanged, so Kubernetes sees no new pod template, and the app keeps the old
-values it read at startup. Follow with `kubectl -n kix-avvik rollout restart deploy/kix-avvik`.
+values it read at startup. Follow with `kubectl -n smart-avvik rollout restart deploy/smart-avvik`.
 Deploys through `cd.yml` always carry a new image tag and are not affected.
 
 **Additive schema changes only, for one release.** During a rolling deploy the new pods load
@@ -127,8 +127,8 @@ becoming ready. Ship the tolerant read one release before the column. More in
 Deploy an earlier image by dispatching `cd.yml` with its tag:
 
 ```sh
-gcloud container images list-tags eu.gcr.io/entur-system-1287/kix-avvik --limit=10 --sort-by=~timestamp
-gh workflow run cd.yml -f environment=prd -f image=kix-avvik:main.<date>-SHA<sha>
+gcloud container images list-tags eu.gcr.io/entur-system-1287/smart-avvik --limit=10 --sort-by=~timestamp
+gh workflow run cd.yml -f environment=prd -f image=smart-avvik:main.<date>-SHA<sha>
 ```
 
 The `image` input must be the **short** form above. The workflow adds the registry itself, so a full
@@ -146,9 +146,9 @@ qualified**, the opposite of the dispatch input:
 
 ```sh
 helm --kube-context gke_ent-kub-prd_europe-west1_kub-ent-prd-001 \
-  upgrade kix-avvik ./helm/kix-avvik -f helm/kix-avvik/env/values-kub-ent-prd.yaml \
-  --namespace kix-avvik --install --wait --timeout 13m0s \
-  --set common.container.image=eu.gcr.io/entur-system-1287/kix-avvik:<tag>
+  upgrade smart-avvik ./helm/smart-avvik -f helm/smart-avvik/env/values-kub-ent-prd.yaml \
+  --namespace smart-avvik --install --wait --timeout 13m0s \
+  --set common.container.image=eu.gcr.io/entur-system-1287/smart-avvik:<tag>
 ```
 
 Run it with `--dry-run` first. The bare command has no automatic rollback. If `helm dependency
@@ -162,7 +162,7 @@ The common cases:
 
 | Alert | What it means | First response |
 |---|---|---|
-| 1 Poller stopped | No API pod is alive and beating | `kubectl -n kix-avvik get pods`; read the pod's events and last logs. A restart is the usual fix. |
+| 1 Poller stopped | No API pod is alive and beating | `kubectl -n smart-avvik get pods`; read the pod's events and last logs. A restart is the usual fix. |
 | 1a No poller leader | Pods serve, but nobody rebuilds or pushes | Fires once and clears by itself after a crashed leader (~6 min). If it stays: read `poller_lease` logs; `acquire_failed` or `error` means Firestore is failing. Do **not** delete pods then: a pod cannot start without Firestore, and recovery is automatic when it answers. |
 | 1b Two poller leaders | Two pods each believe they lead | Find the stalled pod (gauge 1, `/ready` says follower) and delete it. Never edit or delete the lease document. |
 | 2 Rebuild stale | No cycle finished for an hour | Can be a quiet night. In the daytime, read `poller_phase` logs for the phase that hangs or fails, often BigQuery, and check that new SIRI-SX rows arrive. |
@@ -178,7 +178,7 @@ deploy can still point at the old bundle.
 ## Scheduled queries
 
 The BigQuery scheduled queries in dev and prd run as the service account
-`application@ent-kixavvik-<env>.iam.gserviceaccount.com`, not as a person:
+`application@ent-smartavvik-<env>.iam.gserviceaccount.com`, not as a person:
 
 - `varsel-label-daily` labels alert decisions with what actually happened. Recipe and history:
   `data/queries/label_varsel_decisions.sh`.
@@ -191,7 +191,7 @@ config update are one operation. Creating a config with `bq mk --transfer_config
 `--service_account_name`, and creating one also starts one run immediately.
 
 ```sh
-bq ls --transfer_config --transfer_location=EU --project_id=ent-kixavvik-prd
+bq ls --transfer_config --transfer_location=EU --project_id=ent-smartavvik-prd
 ```
 
 ## Gotchas
@@ -203,13 +203,13 @@ developer's private notes.
 
 - A `bq` "Access Denied" or "missing `bigquery.jobs.create`" on either project is almost always an
   expired local login. Run `gcloud auth login` before suspecting IAM.
-- `gcloud container clusters list --project ent-kixavvik-prd` gives 403. The clusters live in the
+- `gcloud container clusters list --project ent-smartavvik-prd` gives 403. The clusters live in the
   shared `ent-kub-*` projects. That is not a permissions problem.
 - A GCP API being enabled and a role being granted are separate. When an AI function fails in
   BigQuery, check that the Vertex AI API is enabled in the project, not only the IAM role.
 - A "Dataplex" line on the bill is BigQuery Data Lineage, captured for every poller rebuild. On
   2026-08-10 it was enabled in dev only and was about 24 % of the project bill. Check with
-  `gcloud services list --enabled --project=ent-kixavvik-dev | grep datalineage`; nothing in the
+  `gcloud services list --enabled --project=ent-smartavvik-dev | grep datalineage`; nothing in the
   repo uses it, so it can be disabled.
 
 **CI**
