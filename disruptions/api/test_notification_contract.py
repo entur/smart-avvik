@@ -805,11 +805,7 @@ def test_every_worker_values_file_is_linted_and_deployed():
     """
     env_dir = REPO_ROOT / "helm" / "smart-avvik" / "env"
     files = sorted(p.name for p in env_dir.glob("worker-values-kub-ent-*.yaml"))
-    assert files == [
-        "worker-values-kub-ent-dev.yaml",
-        "worker-values-kub-ent-prd.yaml",
-        "worker-values-kub-ent-tst.yaml",
-    ], files
+    assert files == [f"worker-values-kub-ent-{env}.yaml" for env in deploy_files.environments()], files
     checks = (REPO_ROOT / ".github" / "workflows" / "checks.yml").read_text()
     cd = (REPO_ROOT / ".github" / "workflows" / "cd.yml").read_text()
     for name in files:
@@ -857,7 +853,7 @@ def test_the_api_render_check_gates_the_image_and_the_values_match_the_lease_con
     base = (helm / "values.yaml").read_text()
     grace = re.findall(r"^    terminationGracePeriodSeconds: (\d+)$", base, re.MULTILINE)
     assert grace == [str(int(poller_lease.GRACE_S))], grace
-    for env in ("dev", "tst", "prd"):
+    for env in deploy_files.environments():
         text = (helm / "env" / f"values-kub-ent-{env}.yaml").read_text()
         assert "terminationGracePeriodSeconds" not in text, f"{env} overrides the grace"
         sleeps = re.findall(r"time\.sleep\((\d+)\)", text)

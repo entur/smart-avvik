@@ -3691,7 +3691,7 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
     version of BOTH secrets in that project -- dev and prd on 2026-09-10 (version 1 of each).
     """
     live_secret_envs = {"dev", "prd"}
-    for env in ("dev", "tst", "prd"):
+    for env in deploy_files.environments():
         values = (REPO / "helm" / "smart-avvik" / "env" / f"values-kub-ent-{env}.yaml").read_text()
         live = _uncommented(values)
         for name in ("WEBHOOK_SIGNING_ROOT", "NOTIFICATION_KEY_PEPPER"):

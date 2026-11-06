@@ -439,8 +439,8 @@ def test_the_privacy_page_repeats_the_linje_stylesheet_imports_in_the_same_order
 
 def _env_files() -> list[Path]:
     files = sorted(HELM_ENV_DIR.glob("values-kub-ent-*.yaml"))
-    assert len(files) >= 3, (
-        f"expected the dev/tst/prd values files under {HELM_ENV_DIR.relative_to(_REPO)}, found "
+    assert len(files) == len(deploy_files.environments()), (
+        f"expected one values file per environment under {HELM_ENV_DIR.relative_to(_REPO)}, found "
         f"{[f.name for f in files]}"
     )
     return files
