@@ -2,7 +2,7 @@
 
 **Written:** 2026-11-05. **Companion to:** [`RUNBOOK.md`](RUNBOOK.md).
 
-All models are BigQuery ML (BQML) models in `ent-kixavvik-dev:disruptions`. They are trained in dev
+All models are BigQuery ML (BQML) models in `ent-smartavvik-dev:disruptions`. They are trained in dev
 and copied to prd. prd never trains. Retraining is manual: nothing is scheduled, and no test checks
 that a retrain left serving consistent.
 
@@ -26,10 +26,10 @@ The LLM writers (Vertex Gemini) are not trained by us.
 
 ## Before you start
 
-- `gcloud auth login`, and check that `bq ls ent-kixavvik-dev:disruptions` works. An "Access
+- `gcloud auth login`, and check that `bq ls ent-smartavvik-dev:disruptions` works. An "Access
   Denied" here means an expired login, not missing access.
-- Every command below runs against **dev**. Most training files name `ent-kixavvik-dev` in full.
-- Submit SQL from a file, never inline: `bq query --nouse_legacy_sql --project_id=ent-kixavvik-dev <
+- Every command below runs against **dev**. Most training files name `ent-smartavvik-dev` in full.
+- Submit SQL from a file, never inline: `bq query --nouse_legacy_sql --project_id=ent-smartavvik-dev <
   file.sql`.
 - Costs are on-demand BigQuery. The rail heads alone bill about $4 (step 2); the other steps state
   their cost in their file headers where it was measured. Dry-run a step you have no figure for:

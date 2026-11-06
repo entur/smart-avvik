@@ -1342,9 +1342,8 @@ contract either way, so lengthening it later is a contract change rather than a 
 
 | environment | base URL |
 |---|---|
-| dev | `https://kix-avvik.dev.entur.io/notification-api/v1` |
-| tst | `https://kix-avvik.staging.entur.io/notification-api/v1` |
-| prd | `https://kix-avvik.entur.io/notification-api/v1` |
+| dev | `https://smart-avvik.dev.entur.io/notification-api/v1` |
+| prd | `https://smart-avvik.entur.io/notification-api/v1` |
 
 Each is a separate GCP project with its own runtime identity, its own Firestore database, its own
 signing root and its own key pepper. Credentials, destinations, subscriptions and events do not cross
