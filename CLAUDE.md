@@ -35,10 +35,11 @@ deploy live in the private `entur/smart-avvik-deployment-config`, whose `cd.yml`
 artifact to the registry and deploys it:
 
 ```sh
-# A push to main builds the image and dispatches deployment-config's cd.yml for dev.
-# tst and prd are dispatched by hand there, with the image dev runs:
+# A push to main builds the image and, once the repository variable DEPLOY_ON_MAIN is "true",
+# dispatches deployment-config's cd.yml: dev, then tst and prd behind its Approve environment.
+# By hand, to redeploy or roll back an image that is already in the registry:
 gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
-  -f environment=prd -f image=smart-avvik:main.<date>-SHA<commit>
+  -f image_tag=main.<date>-SHA<commit>
 ```
 
 - **One writer per environment, elected by a lease** (2026-10-13): every API pod serves every route

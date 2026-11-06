@@ -1,14 +1,16 @@
 # Build Workflow
 #
 # Runs ci.yml (lint, tests, image build, scan) on every pull request and on push to main. On main
-# it then asks smart-avvik-deployment-config to deploy this run's image to dev. That repository
-# checks that the run is a successful push build of main in entur/smart-avvik, pushes the image
-# artifact to Entur's registry and deploys it. tst and prd are deployed from there, by hand.
+# it then asks smart-avvik-deployment-config to deploy this run's image, the way entur/servicelinker
+# hands over to its deployment config (entur/ror-tasks#45). That repository takes the image
+# artifact from this run with entur/ror-gha-workflows' handover-image.yml, pushes it to Entur's
+# registry and deploys it to dev, then tst and prd behind approvals.
 #
-# The dispatch needs DEPLOYMENT_CONFIG_DISPATCH_TOKEN: a fine-grained PAT that reaches only
-# entur/smart-avvik-deployment-config, with `Actions: write` and nothing else. It stands in until
-# CLOUD-4471 gives a platform mechanism. Pull requests never see it: they get no dispatch job, and
-# pull requests from forks get no secrets at all.
+# The dispatch uses DEPLOY_TRIGGER_TOKEN from the `deploy-trigger` environment: team-ror's shared
+# token with Actions access to the deployment-config repositories (entur/ror-tasks#45 lists the
+# repos that hold it; pat-expiry.yml warns before it expires). It is off until the repository
+# variable DEPLOY_ON_MAIN is "true", so nothing deploys before the platform is ready. Pull requests
+# never reach it, and pull requests from forks get no secrets at all.
 
 name: Build
 
@@ -43,21 +45,23 @@ jobs:
       actions: read
     secrets: inherit
 
-  deploy-dev:
+  trigger-deploy:
     needs: [ci]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: >-
+      github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && github.repository_owner == 'entur' && vars.DEPLOY_ON_MAIN == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: deploy-trigger
     permissions: {}
     steps:
-      - name: Ask smart-avvik-deployment-config to deploy this build to dev
-        env:
-          GH_TOKEN: ${{ secrets.DEPLOYMENT_CONFIG_DISPATCH_TOKEN }}
-          RUN_ID: ${{ github.run_id }}
+      - env:
+          GH_TOKEN: ${{ secrets.DEPLOY_TRIGGER_TOKEN }}
+        # REST dispatch with an explicit ref: the token only has Actions access, which
+        # `gh workflow run`'s default-branch lookup cannot use. A missing run link must not fail
+        # the job once the dispatch went through.
         run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::error::DEPLOYMENT_CONFIG_DISPATCH_TOKEN is not set, so nothing was deployed"
-            exit 1
-          fi
-          gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
-            -f environment=dev -f run_id="$RUN_ID"
-          echo "Dispatched cd.yml in entur/smart-avvik-deployment-config for run $RUN_ID"
+          out=$(gh api -X POST repos/entur/smart-avvik-deployment-config/actions/workflows/cd.yml/dispatches \
+            -f ref=main -f "inputs[run_id]=$GITHUB_RUN_ID" -F return_run_details=true)
+          url=$(jq -r '.html_url // empty' <<<"$out" 2>/dev/null || true)
+          echo "Deploy run: ${url:-https://github.com/entur/smart-avvik-deployment-config/actions/workflows/cd.yml}" | tee -a "$GITHUB_STEP_SUMMARY"
