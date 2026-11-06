@@ -17,6 +17,17 @@ name: Build
 on:
   push:
     branches: [main]
+    # A push that changes only these builds the same image, so there is nothing to deploy. The
+    # image is built from demo/ and disruptions/api/; .dockerignore keeps the rest out. Only the push
+    # trigger is filtered: a filtered pull request run never reports its checks, and a required
+    # check that never reports blocks the merge.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'data/**'
+      - 'notebooks/**'
+      - 'eval/**'
+      - '.claude/**'
   pull_request:
     branches: [main]
   workflow_dispatch:
