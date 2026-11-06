@@ -3,8 +3,13 @@ Agent for proaktiv avvikshåndtering, fra Team KI-eksperimentering
 
 ## Documentation
 
-- [`CLAUDE.md`](CLAUDE.md) — the working guide to this repository: the project, the tooling, the
-  BigQuery tables, deployment, every front-end and API surface, and the conventions.
+- [`docs/operations/RUNBOOK.md`](docs/operations/RUNBOOK.md) — start here to run the service:
+  environments, deploy and rollback, alerts, logs, and the traps that have cost the most time.
+- [`docs/operations/RETRAIN.md`](docs/operations/RETRAIN.md) — retraining the models and promoting
+  them to prd.
+- [`CLAUDE.md`](CLAUDE.md) — the detailed guide to this repository, written for Claude Code: the
+  project, the tooling, the BigQuery tables, deployment, every front-end and API surface, and the
+  conventions.
 - [`docs/`](docs/) — findings, design reviews and plans, one directory per investigation.
 
 ## Integrating with the notification webhooks
