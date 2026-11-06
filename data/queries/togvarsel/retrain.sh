@@ -37,7 +37,9 @@ run() {
 }
 
 run "$DIR/../create_disruptions.sql"
-for f in "$DIR"/0[0-9]_*.sql; do run "$f"; done
+# 0[0-9]*, not 0[0-9]_*: the latter skips 03b_plan.sql, and 04_days.sql then reads every day after
+# the last manual 03b run as zero timetable cuts.
+for f in "$DIR"/0[0-9]*.sql; do run "$f"; done
 
 # Refuse to retrain on a calendar about to expire — extend 00_calendar.sql first (§13).
 bq query --nouse_legacy_sql --format=none --project_id="$PROJECT" '
