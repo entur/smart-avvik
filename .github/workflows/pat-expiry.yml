@@ -1,0 +1,44 @@
+name: Deploy token expiry
+
+# Fails when DEPLOY_TRIGGER_TOKEN is rejected or expires within WARN_DAYS. The token is team-ror's
+# shared one; entur/ror-tasks#45 lists the repos that hold it. Off, like build.yml's trigger, until
+# the repository variable DEPLOY_ON_MAIN is "true". GitHub notifies whoever last changed the cron
+# line.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    if: github.repository_owner == 'entur' && vars.DEPLOY_ON_MAIN == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: deploy-trigger
+    steps:
+      - env:
+          TOKEN: ${{ secrets.DEPLOY_TRIGGER_TOKEN }}
+          WARN_DAYS: 30
+        run: |
+          status=$(curl -sS -o /dev/null -D headers.txt -w '%{http_code}' \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "User-Agent: entur-smart-avvik-token-expiry-check" \
+            https://api.github.com/repos/entur/smart-avvik-deployment-config/actions/workflows)
+          if [ "$status" != 200 ]; then
+            echo "::error::DEPLOY_TRIGGER_TOKEN rejected (HTTP $status): expired, revoked or lacking access"
+            exit 1
+          fi
+          expiry=$(grep -i '^github-authentication-token-expiration:' headers.txt | cut -d' ' -f2- | tr -d '\r')
+          if [ -z "$expiry" ]; then
+            echo "DEPLOY_TRIGGER_TOKEN has no expiry" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          days=$(( ($(date -d "$expiry" +%s) - $(date +%s)) / 86400 ))
+          echo "DEPLOY_TRIGGER_TOKEN expires $expiry ($days days)" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$days" -le "$WARN_DAYS" ]; then
+            echo "::error::DEPLOY_TRIGGER_TOKEN expires in $days days ($expiry). Create a new token and update the secret in environment deploy-trigger, here and in every repo listed in entur/ror-tasks#45."
+            exit 1
+          fi
