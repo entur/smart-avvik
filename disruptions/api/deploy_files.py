@@ -21,6 +21,18 @@ def _absent(paths: tuple[str, ...]) -> list[str]:
     return [p for p in paths if not (REPO / p).exists()]
 
 
+def environments() -> list[str]:
+    """The deployment's environments, one API values file each. Call only from a check guarded by
+    `needs("helm/smart-avvik/env")`. dev and prd are required; any other is optional."""
+    env_dir = REPO / "helm" / "smart-avvik" / "env"
+    envs = sorted(
+        p.name.removeprefix("values-kub-ent-").removesuffix(".yaml")
+        for p in env_dir.glob("values-kub-ent-*.yaml")
+    )
+    assert {"dev", "prd"} <= set(envs), f"expected values files for dev and prd, found {envs}"
+    return envs
+
+
 def read(path: str) -> str:
     """The file's text, or "" when it is absent. Only checks guarded below may rely on it."""
     target = REPO / path
