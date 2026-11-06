@@ -1394,7 +1394,7 @@ def test_rolling_budgets_release_calls_at_each_window_boundary():
 def _api_values_files() -> list[Path]:
     env = Path(__file__).parents[2] / "helm/smart-avvik/env"
     files = [p for p in sorted(env.glob("values-kub-ent-*.yaml"))]
-    assert len(files) >= 3, f"the API values glob matched only {files}; it has stopped matching"
+    assert len(files) == len(deploy_files.environments()), f"the API values glob matched only {files}"
     return files
 
 
