@@ -51,6 +51,8 @@ picks them up on its next forecast, with no deploy.
 - The script refuses to run when `togvarsel_calendar` ends less than 60 days ahead. The calendar
   ends 2027-05-17, so from about 2027-03-18 you must extend `00_calendar.sql` first. Serving fails
   after that date.
+- The next retrain is the first since 2026-09-21 to see fresh timetable cuts: until PR 386,
+  `retrain.sh` skipped `03b_plan.sql`. Its holdout AUCs may move.
 - To reach prd: [Promote to prd](#promote-to-prd).
 
 ## Rail heads
@@ -105,7 +107,7 @@ read the slopes `gen_nosx_platt_weights.py` warns about.
 data/queries/copy_runtime_to_prd.sh
 ```
 
-Copies 118 models and 14 tables from dev to prd with `bq cp -f`. Free (both datasets are in the EU
+Copies 73 models and 14 tables from dev to prd with `bq cp -f`. Free (both datasets are in the EU
 multi-region) and safe to re-run. prd's poller uses the new objects on its next cycle; no deploy.
 
 - **It copies every family at once.** A half-finished retrain of one family in dev goes to prd
@@ -113,6 +115,9 @@ multi-region) and safe to re-run. prd's poller uses the new objects on its next 
 - It copies one object at a time, so prd mixes old and new models for a few minutes.
 - It does **not** copy the poller-built `*_today` tables, the decision log, `svv_baselines` or
   `togvarsel_issued`. Each environment keeps its own.
+- It does not copy the 45 no-SX Platt models (`*_platt_nosx*`). prd reads their coefficients from
+  the `nosx_platt_weights` table, which it does copy, so after a rail retrain step 5 must have run
+  before you promote.
 - It overwrites prd's `categories`, which the app appends to at runtime.
 - The demo tables are also copied every morning by the prd scheduled query `demo-copy-daily`
   (04:30 UTC). dev's `demo-recent-daily` re-scores the last ~25 days with the current models, but
@@ -141,9 +146,6 @@ reproduces the same models.
 
 ## Known problems
 
-- `copy_runtime_to_prd.sh` copies the 45 `*_nosx` Platt models, which prd never reads (serving
-  reads `nosx_platt_weights`). Harmless. Its header still says 45 calibrators; there are 90.
-- `togvarsel/retrain.sh` skipped `03b_plan.sql` from 2026-09-21, so models it retrained saw no
-  timetable cuts after the last manual run of that file. Fixed by PR 386. Until that PR is merged,
-  run `03b_plan.sql` by hand before the script. The first retrain after the merge is the first one
-  with fresh cuts, so its holdout AUCs may move.
+- prd still holds the 45 `*_platt_nosx*` models that `copy_runtime_to_prd.sh` copied until
+  2026-11-06. Nothing reads them and nothing refreshes them any more. Remove them when convenient,
+  one at a time: `bq rm -f -m ent-kixavvik-prd:disruptions.<name>`.

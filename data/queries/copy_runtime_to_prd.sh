@@ -55,9 +55,13 @@ for fam in "" "_pooled_all"; do
     for thr in 5 10 20 40; do MODELS+=("${side}_ge${thr}_clf$fam"); done
   done
 done
-# rail platt calibrators: 9 heads x {base, lead60, lead120, lead240, plan}, x TWO POPULATIONS
-# since 2026-08-20. The _nosx half calibrates calls no SX message named (see the no-SX branch in
-# predict_calls.sql).
+# rail platt calibrators: 9 heads x {base, lead60, lead120, lead240, plan}, the FLAGGED population
+# only. Serving reads these models' ML.WEIGHTS live, so prd needs the models themselves.
+#
+# The no-SX half (`*_platt_nosx*`, 45 more models in dev) is deliberately NOT copied. Serving never
+# reads those models: it reads their coefficients from the `nosx_platt_weights` TABLE in TABLES
+# below, which create_nosx_platt_weights.sql builds from them IN DEV. Copying them only put 45
+# unread objects in prd.
 #
 # PROMOTING THIS TO PRD IS A THREE-STEP SEQUENCE, and both of the obvious two-step orders break it.
 # The dependency runs both ways: the retrained HEADS require `has_situation` in their input, which
@@ -74,14 +78,13 @@ done
 #   2. Deploy the image. has_situation is now supplied (prd's old heads ignore an input column they
 #      do not know), and the query's no-SX branch resolves against the empty table.
 #   3. Run this script. New heads land into a serving path that already feeds them has_situation,
-#      the 45 _nosx models arrive, and the real weights table replaces the empty one -- at which
-#      point no-SX alerting switches on.
+#      and the real weights table replaces the empty one -- at which point no-SX alerting switches
+#      on.
 #
 # Each step is independently safe, which is the property the two-step orders lack.
 for head in cancel arr_ge5 arr_ge10 arr_ge20 arr_ge40 dep_ge5 dep_ge10 dep_ge20 dep_ge40; do
   for variant in "" "_lead60" "_lead120" "_lead240" "_plan"; do
     MODELS+=("${head}_platt${variant}")
-    MODELS+=("${head}_platt_nosx${variant}")
   done
 done
 
