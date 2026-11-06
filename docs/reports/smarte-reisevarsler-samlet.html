@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="nb">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Smarte reisevarsler – samlet dokumentasjon</title>
+<style>
+/* Entur Linje: verdiene speiler @entur/tokens (base, semantic og data).
+   Lavendel 90 for struktur, hvit for innhold, korall bare som detalj.
+   Nationale brukes når den er installert, ellers Arial. To vekter: 500 og 600. */
+:root{
+  --fill-background-standard-light:#ffffff;
+  --fill-background-tint-light:#f6f6f9;
+  --fill-background-contrast-light:#181c56;
+  --fill-background-subdued:#d9dae8;
+  --text-accent:#08091c;
+  --text-subdued:#626493;
+  --text-light:#ffffff;
+  --text-on-contrast-subdued:#aeb7e2;
+  --stroke-neutral:#e3e6e8;
+  --stroke-accent:#181c56;
+  --shape-highlight:#ff5959;
+  --fill-success-tint:#9cd9c2; --text-success:#1a8e60;
+  --fill-warning-tint:#ffeeb3; --text-warning:#6b5200;
+  --fill-negative-tint:#ffd6d6; --text-negative:#d31b1b;
+  --fill-information-tint:#acd7f1; --text-information:#045d84;
+  --data-1:#181c56; --data-2:#ff5959; --data-3:#0ea2a8; --data-4:#2f98fa; --data-5:#8692ca;
+  --font-family:"Nationale", Arial, Helvetica, sans-serif;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --fill-background-standard-light:#141527;
+  --fill-background-tint-light:#08091c;
+  --fill-background-contrast-light:#212233;
+  --fill-background-subdued:#2c2d45;
+  --text-accent:#ffffff; --text-subdued:#aeb7e2; --text-light:#ffffff; --text-on-contrast-subdued:#aeb7e2;
+  --stroke-neutral:#33354f; --stroke-accent:#aeb7e2;
+  --fill-success-tint:#1d3b30; --text-success:#5ac39a;
+  --fill-warning-tint:#3d3315; --text-warning:#ffe082;
+  --fill-negative-tint:#3d1d22; --text-negative:#ff9494;
+  --fill-information-tint:#15324a; --text-information:#64b3e7;
+  --data-1:#6c6eb7; --data-2:#ff5959; --data-3:#0fc2b3; --data-4:#64b2fb; --data-5:#aeb7e2;
+  color-scheme:dark; } }
+:root[data-theme="dark"]{
+  --fill-background-standard-light:#141527;
+  --fill-background-tint-light:#08091c;
+  --fill-background-contrast-light:#212233;
+  --fill-background-subdued:#2c2d45;
+  --text-accent:#ffffff; --text-subdued:#aeb7e2; --text-light:#ffffff; --text-on-contrast-subdued:#aeb7e2;
+  --stroke-neutral:#33354f; --stroke-accent:#aeb7e2;
+  --fill-success-tint:#1d3b30; --text-success:#5ac39a;
+  --fill-warning-tint:#3d3315; --text-warning:#ffe082;
+  --fill-negative-tint:#3d1d22; --text-negative:#ff9494;
+  --fill-information-tint:#15324a; --text-information:#64b3e7;
+  --data-1:#6c6eb7; --data-2:#ff5959; --data-3:#0fc2b3; --data-4:#64b2fb; --data-5:#aeb7e2;
+  color-scheme:dark; }
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto}}
+body{margin:0;background:var(--fill-background-tint-light);color:var(--text-accent);font-family:var(--font-family);font-weight:500;font-size:16px;line-height:1.55}
+strong,b,th{font-weight:600}
+a{color:inherit;text-decoration-thickness:1px;text-underline-offset:2px}
+a:focus-visible{outline:2px solid var(--stroke-accent);outline-offset:2px}
+
+.band{background:var(--fill-background-contrast-light);color:var(--text-light)}
+.band-inner,.page{max-width:1120px;margin:0 auto;padding-left:max(16px, env(safe-area-inset-left, 0px));padding-right:max(16px, env(safe-area-inset-right, 0px))}
+.band-inner{padding-block:44px 40px}
+.band .eyebrow{font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-on-contrast-subdued);margin:0 0 12px}
+.band h1{font-size:clamp(1.9rem,4vw,2.8rem);line-height:1.12;font-weight:600;margin:0 0 14px;text-wrap:balance}
+.band .accent{display:block;width:56px;height:4px;background:var(--shape-highlight);border-radius:2px;margin:0 0 18px}
+.band .lead{font-size:1.15rem;max-width:66ch;margin:0}
+.band .meta{display:flex;flex-wrap:wrap;gap:6px 22px;margin-top:20px;font-size:14px;color:var(--text-on-contrast-subdued)}
+.band .meta strong{color:var(--text-light)}
+.band nav{display:flex;flex-wrap:wrap;gap:8px;margin-top:26px}
+.band nav a{color:var(--text-light);text-decoration:none;border:1px solid rgba(174,183,226,.5);border-radius:999px;padding:5px 14px;font-size:14px}
+.band nav a:hover{border-color:var(--text-light)}
+
+.page{padding-block:44px 72px;display:flex;flex-direction:column;gap:56px}
+section h2{font-size:clamp(1.45rem,2.6vw,1.9rem);font-weight:600;line-height:1.2;margin:0 0 8px;text-wrap:balance}
+section > .intro{max-width:68ch;margin:0 0 20px;color:var(--text-accent)}
+h3{font-size:1.05rem;font-weight:600;margin:28px 0 10px}
+p{max-width:70ch}
+.card{background:var(--fill-background-standard-light);border:1px solid var(--stroke-neutral);border-radius:8px;padding:20px;min-width:0}
+.card h3{margin:0 0 4px}
+.card .sub{margin:0 0 14px;font-size:14px;color:var(--text-subdued)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,22rem),1fr));gap:16px}
+.wide{grid-column:1/-1}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,12rem),1fr));gap:12px;margin-bottom:16px}
+.tile{background:var(--fill-background-standard-light);border:1px solid var(--stroke-neutral);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:4px}
+.tile .l{font-size:14px;color:var(--text-subdued)}
+.tile .n{font-size:2rem;line-height:1.1;font-weight:600;font-variant-numeric:tabular-nums}
+.tile .s{font-size:13px;color:var(--text-subdued)}
+ul.clean,ol.clean{padding-left:1.25em;margin:0;display:flex;flex-direction:column;gap:8px;max-width:70ch}
+.tablebox{overflow-x:auto;border:1px solid var(--stroke-neutral);border-radius:8px;background:var(--fill-background-standard-light)}
+.tablebox.bare{border:0}
+table{width:100%;border-collapse:collapse;font-size:15px}
+th{text-align:left;font-size:13px;color:var(--text-subdued);padding:10px 14px;border-bottom:1px solid var(--stroke-neutral);vertical-align:bottom}
+td{padding:11px 14px;border-bottom:1px solid var(--stroke-neutral);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+td.what{font-weight:600;min-width:11rem}
+.pill{display:inline-block;font-size:13px;font-weight:600;padding:2px 10px;border-radius:999px;white-space:nowrap}
+.ok{background:var(--fill-success-tint);color:var(--text-success)}
+.no{background:var(--fill-negative-tint);color:var(--text-negative)}
+.open{background:var(--fill-background-subdued);color:var(--text-subdued)}
+.res{min-width:14rem}
+.res span.pill{margin-bottom:4px}
+.res div{font-size:14px;color:var(--text-subdued)}
+.src a{font-size:14px;color:var(--text-subdued)}
+.note{border:1px solid var(--stroke-neutral);border-left:4px solid var(--stroke-accent);background:var(--fill-background-standard-light);border-radius:0 8px 8px 0;padding:14px 18px;margin:0 0 20px;max-width:76ch}
+.note strong{display:block;margin-bottom:4px}
+.note p{margin:0}
+/* diagrammer, Linje datafarger i fast rekkefølge */
+.vbars{display:flex;align-items:flex-end;gap:3px;height:180px;padding-top:18px;border-bottom:1px solid var(--stroke-neutral)}
+.vbars .c{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0}
+.vbars .b{width:100%;max-width:26px;background:var(--data-1);border-radius:2px 2px 0 0;opacity:.75}
+.vbars .b.pk{opacity:1}
+.vbars .b2{background:var(--data-2);opacity:1}
+.vbars .v{font-size:11px;color:var(--text-subdued);font-variant-numeric:tabular-nums;margin-bottom:2px}
+.xlabels{display:flex;gap:3px;margin-top:4px}
+.xlabels span{flex:1;text-align:center;font-size:11px;color:var(--text-subdued);min-width:0;overflow:hidden}
+.hbar{margin-bottom:10px;font-size:14px}
+.hbar .row{display:flex;justify-content:space-between;gap:8px;margin-bottom:3px}
+.hbar .row span:last-child{color:var(--text-subdued);font-variant-numeric:tabular-nums;white-space:nowrap}
+.hbar .track{height:16px;background:var(--fill-background-tint-light);border-radius:4px;overflow:hidden}
+.hbar .fill{height:100%;background:var(--data-1);border-radius:4px;min-width:3px}
+.loss{font-size:13px;color:var(--text-subdued);margin:-4px 0 8px 6px}
+.loss.big{color:var(--text-negative);font-weight:600}
+.cols{display:flex;align-items:flex-end;gap:16px;height:180px}
+.cols .c{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:6px}
+.cols .b{width:min(100%,64px);background:var(--data-1);border-radius:4px 4px 0 0}
+.cols .t{font-size:13px;color:var(--text-subdued);text-align:center}
+.cols .v{font-weight:600;font-variant-numeric:tabular-nums}
+.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:var(--text-subdued);margin:0 0 10px}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.trow{display:grid;grid-template-columns:8rem minmax(0,1fr);gap:10px;align-items:center;margin-bottom:10px;font-size:14px}
+.trow .bb div{display:flex;align-items:center;gap:6px;margin:2px 0}
+.trow .bb i{display:block;height:10px;border-radius:2px;min-width:2px}
+.trow .bb em{font-style:normal;color:var(--text-subdued);font-variant-numeric:tabular-nums}
+.matrix{display:grid;grid-template-columns:auto 1fr 1fr;gap:8px;font-size:14px}
+.matrix .h{color:var(--text-subdued);align-self:end;padding:0 4px}
+.matrix .rh{color:var(--text-subdued);align-self:center;padding-right:6px}
+.cell{border:1px solid var(--stroke-neutral);border-left-width:5px;border-radius:8px;padding:10px 12px;background:var(--fill-background-standard-light)}
+.cell .n{font-size:1.5rem;font-weight:600;font-variant-numeric:tabular-nums}
+.cell.c1{border-left-color:var(--data-1)}.cell.c2{border-left-color:var(--data-3)}.cell.c3{border-left-color:var(--data-2)}.cell.c4{border-left-color:var(--data-5)}
+.stack{display:flex;height:26px;border-radius:6px;overflow:hidden;background:var(--fill-background-tint-light)}
+.stack i{display:block;height:100%}
+.stackleg{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,11rem),1fr));gap:6px 16px;margin-top:10px;font-size:14px;color:var(--text-subdued)}
+.stackleg div{display:flex;align-items:center}
+.stackleg b{margin-left:auto;color:var(--text-accent);font-variant-numeric:tabular-nums}
+.learn{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,22rem),1fr));gap:16px}
+.learn .card p{margin:0 0 10px;font-size:15px}
+.learn .card p:last-child{margin:0}
+.learn .who{font-size:14px;color:var(--text-subdued)}
+.quote td.c{min-width:18rem}
+footer{font-size:14px;color:var(--text-subdued);border-top:1px solid var(--stroke-neutral);padding-top:20px}
+</style>
+</head>
+<body>
+<header class="band">
+  <div class="band-inner">
+    <h1>Smarte reisevarsler og proaktive avvik</h1>
+    <span class="accent" aria-hidden="true"></span>
+    <p class="lead">Tjenesten varsler reisende før et avvik rammer toget eller bussen de skal ta. Her står hva som er levert, hvordan det har gått så langt, hva vi har lært, og hva som kan bygges videre.</p>
+    <div class="meta"><span><strong>Klassifisering: Intern</strong></span><span>Team KI-eksperimentering</span><span>Utarbeidet av Anders Erlandsen</span></div>
+    <nav aria-label="Innhold">
+      <a href="#levert">Hva som leveres</a>
+      <a href="#hypoteser">Hypoteser</a>
+      <a href="#entur-app">Entur-appen</a>
+      <a href="#frittstaende">Nettappen</a>
+      <a href="#treff">Treffsikkerhet</a>
+      <a href="#laering">Læringer</a>
+      <a href="#videre">Videre</a>
+    </nav>
+  </div>
+</header>
+
+<main class="page">
+
+<section id="sammendrag">
+  <h2>Hva er Smarte reisevarsler?</h2>
+  <ul class="clean">
+    <li>Smarte reisevarsler sier fra til reisende før et avvik rammer toget eller bussen de skal ta. Tjenesten bak heter smart-avvik og er i drift hos Entur.</li>
+    <li>Den leser avviksmeldingene operatørene publiserer og sanntidsdataene for avgangene, beregner sannsynligheten for innstilling og forsinkelse for hver kommende avgang, og varsler før avviket når den reisende.</li>
+    <li>Reisende møter tjenesten på to måter: i webappen Smarte reisevarsler, og som KI-varsler i Entur-appen, i en prøveversjon fra 17. oktober 2026.</li>
+    <li>Når tjenesten varsler, kommer avviket i 92 % av tilfellene. Den fanger 58 % av avvikene på reisene den følger.</li>
+    <li>Den viktigste vendingen var å bytte spørsmål. Hvor lenge et avvik varer, lot seg ikke forutsi fra avviksmeldingen. Om akkurat din avgang går, blir forsinket eller innstilles, lot seg forutsi.</li>
+  </ul>
+</section>
+
+<section id="levert">
+  <h2>Hva som leveres i dag</h2>
+  <div class="tablebox"><table>
+    <thead><tr><th>Del</th><th>Hva den gjør</th></tr></thead>
+    <tbody>
+      <tr><td class="what">Nettappen Smarte reisevarsler</td><td>Den reisende registrerer en strekning, ukedager og et tidsvindu, og får varsel i nettleseren når et avvik ventes å ramme toget. Dekker tog og bussoperatørene modellene er trent for.</td></tr>
+      <tr><td class="what">Varsler i Entur-appen</td><td>Varsler om mulige forsinkelser og innstillinger på strekninger brukeren har lagret som favoritter.</td></tr>
+      <tr><td class="what">Partnerkanal</td><td>Andre apper kan registrere reiser og få varslene tilsendt med ferdig norsk tekst. Hver partner settes opp manuelt.</td></tr>
+      <tr><td class="what">Oppslag for en reise</td><td>Gir sannsynligheten for innstilling og forsinkelse for avgangene mellom to stopp.</td></tr>
+      <tr><td class="what">Forslag til alternativ reise</td><td>Enturs reiseplanlegger finner en annen avgang når toget er truet. Språkmodellen lager aldri ruter selv.</td></tr>
+      <tr><td class="what">Varseltekst</td><td>En språkmodell skriver teksten, og en fast mal er reserve. Teksten avvises hvis den inneholder tall som ikke finnes i grunnlaget.</td></tr>
+      <tr><td class="what">Bokmål, nynorsk og engelsk</td><td>Operatørens egen engelske tekst brukes der den finnes, ellers maskinoversettes teksten.</td></tr>
+      <tr><td class="what">Intern etterprøving</td><td>Varselhistorikk viser hver beslutning tjenesten har tatt, også når den lot være å varsle, og sammenligner med hva som faktisk skjedde.</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="hypoteser">
+  <h2>Hypoteser og resultat</h2>
+  <p class="intro">Påstandene arbeidet har bygget på, og hva målingene viste.</p>
+  <div class="tablebox"><table>
+    <thead><tr><th>Hypotese</th><th>Resultat</th><th>Kilde</th></tr></thead>
+    <tbody>
+      <tr><td>Hvor lenge et avvik varer, kan forutsies fra avviksmeldingen.</td><td class="res"><span class="pill no">Avkreftet</span><div>Varigheten operatøren oppgir, henger nesten ikke sammen med det som skjer (korrelasjon 0,01).</div></td><td class="src"><a href="https://github.com/entur/smart-avvik/blob/main/docs/LEARNINGS.md">Læringslogg for smart-avvik</a></td></tr>
+      <tr><td>Om en avgang går, blir forsinket eller innstilles, kan læres fra hvordan tidligere avganger faktisk gikk.</td><td class="res"><span class="pill ok">Bekreftet</span><div>Det strengeste varselnivået slår til på 0,62 % av avgangene og er riktig i 91 % av tilfellene.</div></td><td class="src"><a href="https://github.com/entur/smart-avvik/blob/main/docs/LEARNINGS.md">Læringslogg for smart-avvik</a></td></tr>
+      <tr><td>Sted, vær og utviklingen underveis i avviket gjør forutsigelsene bedre.</td><td class="res"><span class="pill no">Avkreftet</span><div>Hver for seg har de et signal, men årsaken til avviket fanger det samme.</div></td><td class="src"><a href="https://github.com/entur/smart-avvik/blob/main/docs/LEARNINGS.md">Læringslogg for smart-avvik</a></td></tr>
+      <tr><td>Varsler om avganger operatøren ikke har meldt noe om, holder samme kvalitet som varsler med melding.</td><td class="res"><span class="pill no">Avkreftet</span><div>Treffsikkerheten faller raskt med tiden til avgang. Kravet for å varsle ble derfor satt høyere for disse.</div></td><td class="src"><a href="https://github.com/entur/smart-avvik/blob/main/CLAUDE.md">Arbeidsguiden for smart-avvik</a></td></tr>
+      <tr><td>Når tjenesten varsler, kommer avviket i minst 90 % av tilfellene.</td><td class="res"><span class="pill ok">Bekreftet</span><div>92 % siste 30 dager.</div></td><td class="src">Varselhistorikk i produksjon, 5. november 2026</td></tr>
+      <tr><td>Tjenesten går glipp av færre enn 5 % av avvikene.</td><td class="res"><span class="pill no">Avkreftet</span><div>Den fanger 58 %. 8 127 avvik gikk uten varsel siste 30 dager.</div></td><td class="src">Varselhistorikk i produksjon, 5. november 2026</td></tr>
+      <tr><td>Varselet kommer minst et kvarter før avgang.</td><td class="res"><span class="pill ok">Bekreftet</span><div>87 % av togene med riktig varsel ble varslet minst 30 minutter før avgang.</div></td><td class="src">Varselhistorikk i produksjon, 5. november 2026</td></tr>
+      <tr><td>Varslene i Entur-appen oppleves ikke som støy. Grensen var at færre enn 10 % slår dem av.</td><td class="res"><span class="pill ok">Bekreftet</span><div>4 av 377 slo dem av, 1,1 %.</div></td><td class="src">Produktanalyse for Entur-appen, 4. november 2026</td></tr>
+      <tr><td>Brukerne av Entur-appen opplever varslene som nyttige.</td><td class="res"><span class="pill open">Ikke avgjort</span><div>2 svar. Vi bestemte på forhånd å vente til det er 50.</div></td><td class="src">Produktanalyse for Entur-appen, 4. november 2026</td></tr>
+      <tr><td>Varslene erstatter de vanlige avviksmeldingene som det brukerne trykker på i Entur-appen.</td><td class="res"><span class="pill ok">Bekreftet</span><div>Andelen gikk fra 49 % den første uken til 95 % den andre.</div></td><td class="src">Produktanalyse for Entur-appen, 4. november 2026</td></tr>
+      <tr><td>Brukerne av webappen synes varselet er nyttig.</td><td class="res"><span class="pill ok">Bekreftet</span><div>37 av 42 svar var tommel opp. Utvalget er lite.</div></td><td class="src">Analyseverktøyet PostHog, 31. august–5. november 2026</td></tr>
+      <tr><td>Reiser med bytte kan vurderes fra start til mål.</td><td class="res"><span class="pill open">Ikke avgjort</span><div>Er bygget og prøves ut i testmiljøet.</div></td><td class="src"><a href="https://github.com/entur/smart-avvik/blob/main/docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md">Plan for reiser med bytte</a></td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section id="entur-app">
+  <h2>Varsler i Entur-appen</h2>
+  <p class="intro">Prøveversjonen kom 17. oktober 2026 i appversjon 21.6.0. Varslene står nå for 95 % av varseltrykkene blant brukerne som har dem, og 1,1 % slår dem av. Bare 20,7 % åpner selve varselet. Tall per 4. november.</p>
+  <div class="tiles">
+    <div class="tile"><span class="l">Så et varsel</span><span class="n">377</span><span class="s">Unike personer siden 17. oktober</span></div>
+    <div class="tile"><span class="l">Slo av varselet</span><span class="n">1,1 %</span><span class="s">Innen 14 dager. Grensen er 10 %</span></div>
+    <div class="tile"><span class="l">Andel av alle varseltrykk</span><span class="n">95 %</span><span class="s">Uken fra 26. oktober</span></div>
+    <div class="tile"><span class="l">Nådde favorittbrukerne</span><span class="n">9,7 %</span><span class="s">Uken fra 26. oktober, opp fra 6,5 %</span></div>
+  </div>
+  <div class="grid2">
+    <div class="card wide">
+      <h3>Personer som så et varsel per dag</h3>
+      <p class="sub">Unike brukere, 17. oktober til 4. november. Flest 23. oktober.</p>
+      <div class="vbars" id="reach" role="img" aria-label="Unike brukere per dag, fra 0 til 81"></div>
+      <div class="xlabels" id="reachx" aria-hidden="true"></div>
+    </div>
+    <div class="card">
+      <h3>Fra varsel til tilbakemelding</h3>
+      <p class="sub">Personer per steg, andel av dem som så varselet.</p>
+      <div class="hbar"><div class="row"><span>Så varselet</span><span>377 · 100 %</span></div><div class="track"><div class="fill" style="width:100%"></div></div></div>
+      <div class="loss big">79,3 % går ikke videre</div>
+      <div class="hbar"><div class="row"><span>Åpnet varselet fra favoritter</span><span>78 · 20,7 %</span></div><div class="track"><div class="fill" style="width:20.7%"></div></div></div>
+      <div class="loss">88,5 % går ikke videre</div>
+      <div class="hbar"><div class="row"><span>Åpnet «Hva betyr dette?»</span><span>9 · 2,4 %</span></div><div class="track"><div class="fill" style="width:2.4%"></div></div></div>
+      <div class="loss">77,8 % går ikke videre</div>
+      <div class="hbar"><div class="row"><span>Svarte på «Var dette nyttig?»</span><span>2 · 0,5 %</span></div><div class="track"><div class="fill" style="width:0.5%"></div></div></div>
+    </div>
+    <div class="card">
+      <h3>Varslenes andel av alle varseltrykk</h3>
+      <p class="sub">Per uke, blant brukere som har varslene.</p>
+      <div class="cols">
+        <div class="c"><span class="v">49 %</span><div class="b" style="height:calc(49% - 3rem);opacity:.7"></div><span class="t">Fra 19. okt.</span></div>
+        <div class="c"><span class="v">95 %</span><div class="b" style="height:calc(95% - 3rem)"></div><span class="t">Fra 26. okt.</span></div>
+        <div class="c"><span class="v">94 %</span><div class="b" style="height:calc(94% - 3rem);opacity:.7"></div><span class="t">Fra 2. nov., delvis</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Når brukerne så varselet</h3>
+      <p class="sub">Hendelser etter tid før planlagt avgang. Ingen kom mer enn en time før. Mange ser varselet etter avgang, fordi det vises når appen åpnes.</p>
+      <div class="legend"><span><i class="sw" style="background:var(--data-1)"></i>Åpnet forklaringen</span><span><i class="sw" style="background:var(--data-2)"></i>Trykket på alternativ avgang</span></div>
+      <div class="trow"><span>30–60 min før</span><div class="bb"><div><i style="width:calc(14/15*80%);background:var(--data-1)"></i><em>14</em></div><div><i style="width:calc(8/15*80%);background:var(--data-2)"></i><em>8</em></div></div></div>
+      <div class="trow"><span>15–30 min før</span><div class="bb"><div><i style="width:calc(6/15*80%);background:var(--data-1)"></i><em>6</em></div><div><i style="width:calc(4/15*80%);background:var(--data-2)"></i><em>4</em></div></div></div>
+      <div class="trow"><span>0–15 min før</span><div class="bb"><div><i style="width:80%;background:var(--data-1)"></i><em>15</em></div><div><i style="width:calc(7/15*80%);background:var(--data-2)"></i><em>7</em></div></div></div>
+      <div class="trow"><span>Etter avgang</span><div class="bb"><div><i style="width:calc(14/15*80%);background:var(--data-1)"></i><em>14</em></div><div><i style="width:2px;background:var(--data-2)"></i><em>0</em></div></div></div>
+    </div>
+    <div class="card">
+      <h3>Reaksjoner per linje</h3>
+      <p class="sub">Brukerne på linje RE30 trykker mest på alternativ avgang, alle ved innstillinger.</p>
+      <div class="tablebox bare"><table>
+        <thead><tr><th>Linje</th><th class="num">Brukere</th><th class="num">Forklaringer</th><th class="num">Alternativ</th></tr></thead>
+        <tbody>
+          <tr><td>RE10</td><td class="num">4</td><td class="num">11</td><td class="num">0</td></tr>
+          <tr><td>RE20</td><td class="num">2</td><td class="num">8</td><td class="num">0</td></tr>
+          <tr><td>R31</td><td class="num">2</td><td class="num">6</td><td class="num">2</td></tr>
+          <tr><td>L1</td><td class="num">2</td><td class="num">4</td><td class="num">0</td></tr>
+          <tr><td><strong>RE30</strong></td><td class="num"><strong>2</strong></td><td class="num"><strong>2</strong></td><td class="num"><strong>14</strong></td></tr>
+          <tr><td>R22</td><td class="num">2</td><td class="num">2</td><td class="num">0</td></tr>
+          <tr><td>L2</td><td class="num">1</td><td class="num">9</td><td class="num">0</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+    <div class="card">
+      <h3>Tilbakemeldinger og alternativ avgang</h3>
+      <p class="sub">Siste 30 dager. For lite til å konkludere.</p>
+      <div class="tiles" style="margin:0">
+        <div class="tile"><span class="l">Bra eller ja</span><span class="n">4</span></div>
+        <div class="tile"><span class="l">Dårlig eller nei</span><span class="n">2</span></div>
+        <div class="tile"><span class="l">Trykket på alternativ</span><span class="n">1,3 %</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="frittstaende">
+  <h2>Tilbakemeldinger i webappen</h2>
+  <div class="note"><strong>Gjelder webappen, ikke Entur-appen</strong><p>Tallene kommer fra den første, frittstående versjonen av Smarte reisevarsler, der reisende registrerer en strekning og får varsel i nettleseren.</p></div>
+  <p class="intro">37 av 42 tilbakemeldinger er tommel opp, altså 88 %. Grunnlaget er lite: 42 svar fra 31. august til 5. november 2026, hentet fra analyseverktøyet PostHog og telt én gang per varsel.</p>
+  <div class="tiles">
+    <div class="tile"><span class="l">Tilbakemeldinger</span><span class="n">42</span></div>
+    <div class="tile"><span class="l">Tommel opp</span><span class="n">37</span></div>
+    <div class="tile"><span class="l">Tommel ned</span><span class="n">5</span></div>
+    <div class="tile"><span class="l">Positiv andel</span><span class="n">88,1 %</span></div>
+  </div>
+  <div class="grid2">
+    <div class="card wide">
+      <h3>Tilbakemeldinger per dag</h3>
+      <p class="sub">Bare dager med minst ett svar vises.</p>
+      <div class="legend"><span><i class="sw" style="background:var(--data-1)"></i>Tommel opp</span><span><i class="sw" style="background:var(--data-2)"></i>Tommel ned</span></div>
+      <div class="vbars" id="fb" role="img" aria-label="Tilbakemeldinger per dag, mellom 1 og 6"></div>
+      <div class="xlabels" id="fbx" aria-hidden="true"></div>
+    </div>
+    <div class="card wide">
+      <h3>Det brukerne skrev</h3>
+      <p class="sub">7 av 42 skrev en kommentar.</p>
+      <div class="tablebox bare"><table class="quote">
+        <thead><tr><th>Dato</th><th>Vurdering</th><th>Kommentar</th></tr></thead>
+        <tbody>
+          <tr><td>8.10.2026</td><td><span class="pill no">Tommel ned</span></td><td class="c">Tar ikke lokaltog</td></tr>
+          <tr><td>8.10.2026</td><td><span class="pill no">Tommel ned</span></td><td class="c">Tar ikke lokaltog</td></tr>
+          <tr><td>14.9.2026</td><td><span class="pill ok">Tommel opp</span></td><td class="c">Nyttig at man får en heads-up. Ser ut til at jeg ikke blir berørt av innstillingen, men det blir spennende å se ;)</td></tr>
+          <tr><td>8.9.2026</td><td><span class="pill no">Tommel ned</span></td><td class="c">Togene på min linje går i rute, det virker som det er tog på andre linjer som er berørt. Ser ikke ut som det er noen forsinkelse på toget jeg sitter på eller andre avganger her. Blir derfor litt «ulv ulv» i dag</td></tr>
+          <tr><td>3.9.2026</td><td><span class="pill ok">Tommel opp</span></td><td class="c">Alt er sent i dag</td></tr>
+          <tr><td>2.9.2026</td><td><span class="pill ok">Tommel opp</span></td><td class="c">Men enda mer nyttig å få forslaget om avgangen før, ikke den etterpå (eller begge).</td></tr>
+          <tr><td>1.9.2026</td><td><span class="pill no">Tommel ned</span></td><td class="c">Jeg fikk allerede push notification fra Entur app med samme info om innstillingen</td></tr>
+        </tbody>
+      </table></div>
+    </div>
+  </div>
+  <h3>Slik leser vi tilbakemeldingene</h3>
+  <ul class="clean">
+    <li>Folk setter pris på å bli varslet i forkant, også når reisen ikke ble rammet.</li>
+    <li>Kritikken handler om treffsikkerhet: varsler om tog brukeren ikke tar. Én kalte det «ulv ulv».</li>
+    <li>Én bruker fikk samme beskjed fra Entur-appen. Dobbel varsling taler for å samle varslene ett sted.</li>
+    <li>En bruker ønsket forslag om avgangen før, ikke bare den etter.</li>
+  </ul>
+</section>
+
+<section id="treff">
+  <h2>Treffsikkerhet</h2>
+  <div class="note"><strong>Varselhistorikk i produksjon</strong><p>Siste 30 dager per 5. november 2026, alle operatører og linjer. Gjelder registrerte reiser i webappen og partnerkanalen. Varsler som bare hentes fra det åpne oppslaget uten registrering, etterprøves ikke.</p></div>
+  <p class="intro">Når tjenesten varsler, kommer avviket i 92 % av tilfellene. Den fanger 58 % av avvikene på reisene den følger. Avvik betyr at avgangen ble innstilt eller var minst 10 minutter forsinket, sjekket mot hva som faktisk skjedde dagen etter.</p>
+  <div class="tiles">
+    <div class="tile"><span class="l">Varsler som traff</span><span class="n">92 %</span><span class="s">11 352 av 12 365 varsler</span></div>
+    <div class="tile"><span class="l">Avvik som ble varslet</span><span class="n">58 %</span><span class="s">8 127 avvik gikk uten varsel</span></div>
+    <div class="tile"><span class="l">Varslet i god tid</span><span class="n">87 %</span><span class="s">3 390 av 3 883 tog fikk minst 30 min</span></div>
+    <div class="tile"><span class="l">Beslutninger</span><span class="n">141 411</span><span class="s">93 % er sjekket mot fasit</span></div>
+  </div>
+  <div class="grid2">
+    <div class="card">
+      <h3>Varslet vi, og kom avviket?</h3>
+      <p class="sub">Én beslutning gjelder én registrert reise, én avviksmelding og én avgang.</p>
+      <div class="matrix">
+        <span></span><span class="h">Avvik kom</span><span class="h">Ingen avvik</span>
+        <span class="rh">Varslet</span>
+        <div class="cell c1"><div>Traff</div><div class="n">11 352</div></div>
+        <div class="cell c2"><div>Falsk alarm</div><div class="n">1 013</div></div>
+        <span class="rh">Tidde</span>
+        <div class="cell c3"><div>Bom</div><div class="n">8 127</div></div>
+        <div class="cell c4"><div>Riktig stille</div><div class="n">111 640</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Slik leser vi tallene</h3>
+      <ul class="clean" style="font-size:15px">
+        <li>Treffandelen er riktige varsler delt på alle varsler. Andelen varslede avvik er riktige varsler delt på alle avvik tjenesten vurderte.</li>
+        <li>Varslingstiden blander to ting. Innstillinger som allerede er kjent og tog som er tatt ut av ruteplanen, varsles lenge før avgang. Forutsigelsene alene gir kortere varsel.</li>
+        <li>En avgang som ikke finnes i fasiten, telles aldri som riktig stille.</li>
+      </ul>
+    </div>
+    <div class="card wide">
+      <h3>Alle beslutninger</h3>
+      <p class="sub">De fleste beslutningene er å tie. De tas med for at det skal gå an å måle hvor mye tjenesten går glipp av.</p>
+      <div class="stack" role="img" aria-label="Traff 8 %, falsk alarm 0,7 %, bom 5,7 %, riktig stille 79 %, ukjent 1,4 %, venter på fasit 5,2 %">
+        <i style="width:8.03%;background:var(--data-1)"></i><i style="width:0.72%;background:var(--data-3)"></i><i style="width:5.75%;background:var(--data-2)"></i><i style="width:78.95%;background:var(--data-5);opacity:.45"></i><i style="width:1.36%;background:var(--stroke-neutral)"></i><i style="width:5.21%;background:var(--fill-background-subdued)"></i>
+      </div>
+      <div class="stackleg">
+        <div><i class="sw" style="background:var(--data-1)"></i>Traff<b>11 352</b></div>
+        <div><i class="sw" style="background:var(--data-3)"></i>Falsk alarm<b>1 013</b></div>
+        <div><i class="sw" style="background:var(--data-2)"></i>Bom<b>8 127</b></div>
+        <div><i class="sw" style="background:var(--data-5);opacity:.45"></i>Riktig stille<b>111 640</b></div>
+        <div><i class="sw" style="background:var(--stroke-neutral)"></i>Ukjent<b>1 917</b></div>
+        <div><i class="sw" style="background:var(--fill-background-subdued)"></i>Venter på fasit<b>7 362</b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="laering">
+  <h2>Læringer andre team kan bruke</h2>
+  <p class="intro">En læring har bare verdi når noen bruker den. Her er de som gjelder utover denne tjenesten, med det som skal til for å bruke dem.</p>
+  <div class="learn">
+    <div class="card">
+      <h3>Mål mot det som faktisk skjedde</h3>
+      <p>Den første modellen skulle forutsi hvor lenge et avvik varer, med varigheten i avviksmeldingen som fasit. Den oppgitte varigheten viste seg å henge nesten ikke sammen med det som skjedde på sporet. Først da fasiten ble hentet fra de faktiske avgangene, ble det noe å lære av.</p>
+      <p class="who">Gjelder alle som bygger på avviksmeldinger, for eksempel kundeservice, refusjon og reiseplanlegging.</p>
+    </div>
+    <div class="card">
+      <h3>Logg også beslutningene om å la være</h3>
+      <p>Tjenesten lagrer hver vurdering, også når den lar være å varsle. Uten dem kan man bare måle hvor ofte et varsel var feil, aldri hvor mange avvik man gikk glipp av. Det var slik vi fant ut at 42 % av avvikene gikk uten varsel.</p>
+      <p class="who">Gjelder alle som sender varsler eller anbefalinger til brukere.</p>
+    </div>
+    <div class="card">
+      <h3>Skill mellom å formidle og å forutsi</h3>
+      <p>Mye av verdien kom fra å videreformidle innstillinger som allerede lå i sanntidsdataene, men som den reisende ikke ser. Måles de sammen med forutsigelsene, flytter totaltallet seg med blandingen, selv om ingenting i tjenesten er endret. Mål dem hver for seg.</p>
+      <p class="who">Gjelder Entur-appen og alle som rapporterer treffsikkerhet på avviksinformasjon.</p>
+    </div>
+    <div class="card">
+      <h3>Å stoppe på et stopp er ikke det samme som å kunne gå av der</h3>
+      <p>En reisende fra Oslo S til Drammen fikk varsel om at Bergenstoget var innstilt. Det toget stopper i Drammen, men slipper ikke av passasjerer der. Varselet gikk til åtte enheter som aldri kunne ha vært om bord. Avgangsdataene sier om man kan gå på og av. Bruk det når reiser matches mot rutetabellen.</p>
+      <p class="who">Gjelder reiseplanlegging, appen og partnere som matcher reiser mot rutedata.</p>
+    </div>
+    <div class="card">
+      <h3>La koden bestemme og språkmodellen formulere</h3>
+      <p>Koden bestemmer om det skal varsles og velger tallene. Språkmodellen formulerer bare teksten, og et svar med tall som ikke finnes i grunnlaget, blir avvist. Faller modellen ut, går den faste malen. Et dårlig svar gir dermed en dårligere tekst, aldri en feil beslutning.</p>
+      <p class="who">Gjelder alle som bruker språkmodeller til tekst som går til kunder.</p>
+    </div>
+    <div class="card">
+      <h3>Vis usikkerhet som et spenn</h3>
+      <p>Anslagene for når togene går igjen er usikre. Et spenn, for eksempel «trolig om 20 minutter, senest om 45», holdt det det lovet over tid. Ett enkelt tall gjorde det ikke.</p>
+      <p class="who">Gjelder alle som viser forutsigelser til reisende, som forventet forsinkelse i appen.</p>
+    </div>
+    <div class="card">
+      <h3>Les store tabeller én gang</h3>
+      <p>Arkivet over sanntidsdata i Googles datavarehus BigQuery er på 26 terabyte og ikke ordnet etter reise. Å filtrere på én reise gir derfor ikke lavere pris. Ved å lese tabellen én gang inn i en liten tabell kostet hver ny analyse under en krone.</p>
+      <p class="who">Gjelder dataanalytikere og team som spør i sanntidsarkivet.</p>
+    </div>
+  </div>
+</section>
+
+<section id="videre">
+  <h2>Mulig videreutvikling</h2>
+  <p class="intro">Ideer som ikke er bygget. Den som tar tjenesten videre, velger hva som er verdt å gå videre med.</p>
+  <ol class="clean">
+    <li>Vise i varselet når togene trolig går som normalt igjen. Varselet sier i dag hvor forsinket avgangen din trolig blir, men ikke hvor lenge avviket varer. Anslagene for det finnes allerede i oversikten over dagens avvik.</li>
+    <li>Foreslå bysykkel og sparkesykkel i nærheten som alternativ.</li>
+    <li>Et «gå nå»-varsel som regner ut når du bør gå hjemmefra, ut fra sanntid, gangtid og vær.</li>
+    <li>Flere alternativer, også avgangen før, som brukere har bedt om.</li>
+    <li>Klarspråk for enhver avviksmelding, tilgjengelig for andre apper uten at reisen må være registrert.</li>
+    <li>Varsler for reiser med bytte, som nå prøves ut i testmiljøet.</li>
+    <li>Ukeoversikt for pendlere, for eksempel «ruten din ble rammet tre av tjue dager».</li>
+    <li>Samle varslene ett sted, slik at ingen får samme beskjed fra både webappen og Entur-appen.</li>
+    <li>Måle effekten i Entur-appen med en kontrollgruppe som ikke forsvinner når brukerne oppdaterer appen.</li>
+  </ol>
+</section>
+
+</main>
+<script>
+(() => {
+  const reach = [["17.10",0],["18.10",0],["19.10",1],["20.10",3],["21.10",3],["22.10",13],["23.10",81],["24.10",37],["25.10",24],["26.10",36],["27.10",60],["28.10",62],["29.10",51],["30.10",61],["31.10",16],["1.11",7],["2.11",69],["3.11",65],["4.11",79]];
+  const max = Math.max(...reach.map(r => r[1]));
+  const box = document.getElementById('reach'), xb = document.getElementById('reachx');
+  reach.forEach(([d, v], i) => {
+    const c = document.createElement('div'); c.className = 'c';
+    const t = document.createElement('span'); t.className = 'v'; t.textContent = v;
+    const b = document.createElement('div'); b.className = 'b' + (v === max ? ' pk' : ''); b.style.height = `calc(${v / max} * (100% - 18px))`;
+    c.append(t, b); box.append(c);
+    const l = document.createElement('span'); l.textContent = i % 2 === 0 ? d : ''; xb.append(l);
+  });
+  const fb = [["31.8",6,0],["1.9",3,1],["2.9",1,0],["3.9",3,0],["7.9",1,0],["8.9",1,1],["13.9",3,0],["14.9",1,0],["17.9",4,0],["20.9",2,0],["25.9",3,0],["29.9",1,0],["8.10",2,2],["13.10",1,0],["15.10",0,1],["28.10",2,0],["30.10",2,0],["4.11",1,0]];
+  const fmax = Math.max(...fb.map(r => r[1] + r[2]));
+  const fbox = document.getElementById('fb'), fx = document.getElementById('fbx');
+  fb.forEach(([d, up, dn], i) => {
+    const c = document.createElement('div'); c.className = 'c';
+    const t = document.createElement('span'); t.className = 'v'; t.textContent = up + dn;
+    const b2 = document.createElement('div'); b2.className = 'b b2'; b2.style.height = `calc(${dn / fmax} * (100% - 18px))`;
+    const b = document.createElement('div'); b.className = 'b pk'; b.style.height = `calc(${up / fmax} * (100% - 18px))`; b.style.borderRadius = dn ? '0' : '2px 2px 0 0';
+    c.append(t, b2, b); fbox.append(c);
+    const l = document.createElement('span'); l.textContent = i % 2 === 0 ? d : ''; fx.append(l);
+  });
+})();
+</script>
+</body>
+</html>
