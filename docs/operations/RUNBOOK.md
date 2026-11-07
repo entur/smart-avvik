@@ -262,6 +262,17 @@ developer's private notes.
 - An unset `prometheus_client` gauge exports `0`, not nothing, and both the API and the worker
   export every metric. That is why the rules wrap gauges in `max()`.
 
+**API paths and usage**
+
+- An installed `/varsel` app keeps running its old code until it reloads `index.html`. When a path
+  it calls is renamed, keep the old path answering for at least a week. After `/togmelding-api`
+  became `/rushvarsel-api` on 2026-10-22, installed apps got 3 394 "404 Not Found" answers until
+  2026-10-26.
+- Usage per endpoint exists only in the prd access log (cluster project `ent-kub-prd`, namespace
+  `kix-avvik`, logger `uvicorn.access`), which keeps 30 days. The metric
+  `kix_http_requests_total` counts by the first path segment only, so it cannot tell one
+  operation from another. Export the log before it ages out if you need a longer history.
+
 **Time zones**
 
 - The product runs on Oslo time (rush hours, `call_date`, push cut-offs). The infrastructure runs

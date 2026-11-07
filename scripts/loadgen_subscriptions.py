@@ -697,7 +697,7 @@ def seed_browser_registrations(
     outcomes: dict[str, int] = {}
     interval = 60.0 / max(1, BROWSER_REGISTRATIONS_PER_MIN)
     for i in range(devices):
-        device_id = f"{DEVICE_PREFIX}{i:06d}"
+        device_id = f"{DEVICE_PREFIX}{i:06d}/data"
         definition = plan.definitions[i % len(plan.definitions)]
         status, _ = _api_call(
             target.base_url,
@@ -787,11 +787,16 @@ def teardown_store(target: Target, *, batch: int = 400) -> dict[str, int]:
 
 
 def teardown_browser(target: Target, *, devices: int) -> dict[str, int]:
-    """«Slett alt» for each synthetic device: the endpoint's own erasure, not a partial delete."""
+    """«Slett alt» for each synthetic device: the endpoint's own erasure, not a partial delete.
+
+    `/data` is the erasure. `DELETE /varsel-api/devices/{id}` is «Skru av», which forgets a push
+    subscription and keeps the journeys, and the seed creates no device record, so that route left
+    every synthetic journey behind.
+    """
     outcomes: dict[str, int] = {}
     for i in range(devices):
         status, _ = _api_call(
-            target.base_url, "DELETE", f"/varsel-api/devices/{DEVICE_PREFIX}{i:06d}"
+            target.base_url, "DELETE", f"/varsel-api/devices/{DEVICE_PREFIX}{i:06d}/data"
         )
         outcomes[str(status)] = outcomes.get(str(status), 0) + 1
     return outcomes

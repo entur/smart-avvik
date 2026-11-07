@@ -432,6 +432,24 @@ def test_the_harness_never_invents_a_push_subscription():
     assert "endpoint" in source, "the reason must be stated where somebody would add the call back"
 
 
+def test_browser_teardown_erases_the_journeys_not_just_the_push_subscription():
+    """The seed registers journeys under device ids with no device record. Only «Slett alt»
+    (`/data`) removes them; the bare device route is «Skru av» and keeps every journey.
+    """
+    calls: list[tuple[str, str]] = []
+    before = gen._api_call
+    gen._api_call = lambda base, method, path, **kw: calls.append((method, path)) or (200, {})  # type: ignore[assignment]
+    try:
+        outcomes = gen.teardown_browser(gen.resolve_target("dev"), devices=2)
+    finally:
+        gen._api_call = before
+    assert calls == [
+        ("DELETE", f"/varsel-api/devices/{gen.DEVICE_PREFIX}000000/data"),
+        ("DELETE", f"/varsel-api/devices/{gen.DEVICE_PREFIX}000001/data"),
+    ], calls
+    assert outcomes == {"200": 2}
+
+
 # ---- The receiver --------------------------------------------------------------------------------
 
 
