@@ -194,6 +194,32 @@ config update are one operation. Creating a config with `bq mk --transfer_config
 bq ls --transfer_config --transfer_location=EU --project_id=ent-kixavvik-prd
 ```
 
+## The obsolete dataset
+
+`disruptions_obsolete`, in dev and in prd, holds the objects moved out of `disruptions` because
+nothing in use reads them: experiments, inputs only an eval notebook reads, and in prd the duration
+models and the no-SX Platt models that serving stopped reading. It has no expiry. Deleting its
+contents is a later, separate decision.
+
+The record is one manifest per project, `docs/operations/bigquery-obsolete/manifest-<env>.csv`: every
+object, its verdict (`keep` or `move`), and why. An object stays in `disruptions` when deployed code,
+a scheduled query, `copy_runtime_to_prd.sh`, the feedback export, a retrain procedure or `/demo`
+uses it. The plan is `docs/plans/2026-11-07-001-refactor-bigquery-obsolete-dataset-plan.md`.
+
+To put an object back (dry run first, then add `--apply`):
+
+```sh
+uv run python scripts/bq_obsolete_move.py --project ent-kixavvik-<env> --restore --only <name>
+```
+
+Restore needs only the name, not the manifest. It refuses to delete the obsolete copy while the name
+already exists in `disruptions`. A restored object stays where it is: on the old manifest the mover
+skips it as `changed-since-manifest`, so moving it again takes a new inventory.
+
+To find what has gone unused since, run `scripts/bq_obsolete_inventory.py` again (its header says
+how). team-ror cleans up their copy of dev with
+[`bigquery-obsolete/team-ror-cleanup.md`](bigquery-obsolete/team-ror-cleanup.md).
+
 ## Gotchas
 
 These are the traps that have cost the most time. Until 2026-11-05 most of them lived only in one

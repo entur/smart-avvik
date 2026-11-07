@@ -28,6 +28,8 @@ simulator = [
 
 [dependency-groups]
 dev = [
+    "google-cloud-bigquery-datatransfer>=3.24.0",
+    "google-cloud-logging>=3.17.0",
     "mypy>=2.3.0",
     "ruff>=0.16.0",
 ]

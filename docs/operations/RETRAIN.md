@@ -34,6 +34,9 @@ The LLM writers (Vertex Gemini) are not trained by us.
 - Costs are on-demand BigQuery. The rail heads alone bill about $4 (step 2); the other steps state
   their cost in their file headers where it was measured. Dry-run a step you have no figure for:
   `bq query --dry_run < file.sql`, and do not chain the dry run and the real run with `&&`.
+- A step that runs a new file needs that file in `RETRAIN` in `scripts/bq_obsolete_inventory.py`.
+  `scripts/test_bq_obsolete_inventory.py` fails until it is listed. An unlisted file's inputs can be
+  moved to `disruptions_obsolete` by the next cleanup.
 
 ## Rushvarsel
 
@@ -143,6 +146,7 @@ reproduces the same models.
 
 ## Known problems
 
-- prd still holds the 45 `*_platt_nosx*` models that `copy_runtime_to_prd.sh` copied until
-  2026-11-06. Nothing reads them and nothing refreshes them any more. Remove them when convenient,
-  one at a time: `bq rm -f -m ent-kixavvik-prd:disruptions.<name>`.
+- prd holds 45 `*_platt_nosx*` models that `copy_runtime_to_prd.sh` copied until 2026-11-06.
+  Nothing reads them and nothing refreshes them any more. The BigQuery cleanup moves them to prd's
+  `disruptions_obsolete`; move them with `scripts/bq_obsolete_move.py` rather than `bq rm` (see
+  `RUNBOOK.md`, "The obsolete dataset").

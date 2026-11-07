@@ -97,6 +97,13 @@ TABLES=(
   togvarsel_calendar        # the togmelding holiday/low-season calendar (00_calendar.sql)
 )
 
+# --list prints what this script copies, one name per line, and exits before any bq call.
+# scripts/bq_obsolete_inventory.py reads it, so the copy list has one owner.
+if [ "${1:-}" = "--list" ]; then
+  printf '%s\n' "${MODELS[@]}" "${TABLES[@]}"
+  exit 0
+fi
+
 # Ensure the destination dataset exists (EU multi-region, same as dev, so
 # copy jobs stay same-region and free).
 if ! bq show --format=none "$DST_PROJECT:$DATASET" 2>/dev/null; then
