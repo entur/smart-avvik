@@ -683,8 +683,7 @@ def _lost_at(query_sql, *, reason="lease_lost"):
 
 def test_a_lease_lost_mid_cycle_stops_before_the_next_phase_with_no_record_for_it():
     client, fields = _lost_at(main._DISRUPTIONS_QUERY)
-    assert main._UPDATE_CATEGORIES_QUERY not in client.queries
-    assert main._PREDICT_QUERY not in client.queries, "no CREATE OR REPLACE after the loss"
+    assert client.queries[-1] == main._DISRUPTIONS_QUERY, "no query after the loss"
     assert _phases(fields)[-1] == "disruptions_sql", _phases(fields)
     assert not [f for f in fields if f.get("event") == "poller_phase" and f["result"] == "error"]
     (record,) = [f for f in fields if f.get("event") == "poller_lease"]
@@ -695,16 +694,16 @@ def test_a_lease_lost_mid_cycle_stops_before_the_next_phase_with_no_record_for_i
     assert "categories" not in cycle["phases"]
 
 
-def test_lost_during_categories_it_stops_before_predict_sql():
+def test_lost_during_categories_it_stops_before_the_next_phase():
     client, fields = _lost_at(main._UPDATE_CATEGORIES_QUERY)
-    assert main._PREDICT_QUERY not in client.queries
+    assert client.queries[-1] == main._UPDATE_CATEGORIES_QUERY, "no query after the loss"
     (record,) = [f for f in fields if f.get("event") == "poller_lease"]
-    assert (record["result"], record["phase"]) == ("lease_lost", "predict_sql"), record
+    assert (record["result"], record["phase"]) == ("lease_lost", "line_modes"), record
 
 
 def test_a_stop_between_phases_ends_the_cycle_the_same_way():
     client, fields = _lost_at(main._DISRUPTIONS_QUERY, reason="stopping")
-    assert main._PREDICT_QUERY not in client.queries
+    assert client.queries[-1] == main._DISRUPTIONS_QUERY, "no query after the stop"
     (record,) = [f for f in fields if f.get("event") == "poller_lease"]
     assert (record["result"], record["phase"]) == ("stopping", "categories"), record
 

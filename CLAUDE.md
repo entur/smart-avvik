@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`kix-avvik` is an experiment from Entur's Team KI-eksperimentering aimed at proactive disruption handling (Norwegian: "proaktiv avvikshåndtering"). It predicts the duration of public-transport disruptions from SIRI-SX situation messages using BigQuery ML.
+`kix-avvik` is an experiment from Entur's Team KI-eksperimentering aimed at proactive disruption handling (Norwegian: "proaktiv avvikshåndtering"). It predicts, per train, whether a public-transport disruption will cancel or delay it, from SIRI-SX situation messages using BigQuery ML.
 
 ## Tooling
 
@@ -22,7 +22,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Deployment
 
-The `/disruptions` API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
+The API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
 path; hosts `kix-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
 node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/rushvarsel` and
@@ -214,15 +214,11 @@ gh workflow run cd.yml -f environment=prd    # promote to prd (tst/prd are dispa
   notification-webhooks, historikk and meldinger rules files above; the Journey Planner budget, the
   two poller phases and the log events are in `docs/operations/notification-webhooks.md`.
 
-- The **Reisevalg** endpoint `GET /reisevalg-api/recommendation` (car vs train for the
-  Lier/Drammen → Oslo S corridor; feasibility prototype — see `docs/bil-avvik/LEARNINGS.md`)
-  lives in `disruptions/api/reisevalg.py`. Road signal: SVV Trafikkdata volumes gated to
-  UNKNOWN (measured precision 0.60 < 0.8 bar) + a DATEX II stub behind optional
-  `SVV_DATEX_USER`/`SVV_DATEX_PASSWORD` (unset = provider unavailable; when provisioning,
-  use Secret Manager like the VAPID keys). Its `disruptions.svv_baselines` lookup loads in
-  the poller/lifespan and is deliberately NOT in `copy_runtime_to_prd.sh` — prd serves the
-  road side as UNKNOWN until a road provider is validated. Rebuild baselines/backtest with
-  `data/queries/reisevalg_*.sql`; raw volume backfill via `data/svv/download_volumes.py`.
+- **Seven endpoints were removed on 2026-11-07** because nothing called them: `/disruptions`,
+  `/situation` and `/alert_profile` (the duration models' feed, with the poller's `predict_sql`
+  phase), `/journey`, `/impact`, `/last_ingestion_time` and `/reisevalg-api/recommendation`. The
+  impact matcher behind `/varsel-api` and the notification API is unchanged. The Reisevalg
+  feasibility study stays in `docs/bil-avvik/LEARNINGS.md` and `data/queries/reisevalg_*.sql`.
 
 ## Conventions
 

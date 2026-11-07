@@ -1,9 +1,8 @@
 -- Build disruptions.disruptions_initial_today: TODAY's NSB and SJN situations in the INITIAL-version
--- per-situation feature/label shape, so predict.sql can score the live incidents.
+-- per-situation feature/label shape, so predict_calls.sql can score the live incidents' calls.
 --
--- SJN (SJ Norge's own messages) since KIX-42, 2026-10-24, for predict_calls.sql's flagged branch
--- only: predict.sql (the duration model and the /disruptions feed) keeps to NSB, and the impact
--- label below reads Vy's rail_calls_today, so it is 0 for SJN and nothing reads it for them.
+-- SJN (SJ Norge's own messages) since KIX-42, 2026-10-24, for predict_calls.sql's flagged branch.
+-- The impact label below reads Vy's rail_calls_today, so it is 0 for SJN.
 --
 -- create_disruptions_initial.sql does the full 2-year build of disruptions.disruptions_initial
 -- (the training population). This script applies the SAME first-version feature snapshot and
@@ -17,8 +16,8 @@
 -- reopen_minutes BETWEEN 1 AND 10080), this uses a LEFT JOIN to end_times and applies NO
 -- reopen-window filter, so situations that have NOT reopened yet are KEPT — with reopen_ts,
 -- reopen_minutes and (therefore) impact_minutes NULL. That is intentional: today's incidents are
--- usually still ongoing when scored, and predict.sql reads only the feature columns, not the
--- labels.
+-- usually still ongoing when scored, and nothing live reads the labels (predict.sql, the duration
+-- model's serving query, was removed on 2026-11-07).
 --
 -- IMPACT LABEL uses rail_calls_today (today's ET slice), NOT the 2-year rail_calls — today's
 -- incidents' calls only live in the recent slice. Refresh rail_calls_today first

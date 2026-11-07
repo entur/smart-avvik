@@ -1935,64 +1935,6 @@ def test_situation_jkey_is_absent_rather_than_wrong_when_unknown():
     assert resp.situations[0].jkey is None
 
 
-def test_real_http_route_satisfies_the_togpuls_contract():
-    """Drive the actual `@app.get("/impact")` route, not just the helpers.
-
-    Review 2026-07-29 pointed out that every other check here calls internals, so query-param
-    parsing, the response envelope and HTTP-level serialization of the new fields were untested — the
-    contract this file claims to pin was never exercised end to end. This sends exactly what
-    togpuls/clients/disruptions.py sends and asserts on exactly what it reads.
-    """
-    from fastapi.testclient import TestClient
-
-    _install_snapshot(_scope(S1=_train("j1", 8, description="Signalfeil")))
-    main._call_pred_refreshed_at = _at(8)
-    original = impact.alternatives.fetch_candidates
-    impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network from the suite
-    try:
-        r = TestClient(main.app).get(
-            "/impact",
-            params={"from_stop": A, "to_stop": B, "at": _at(8).isoformat()},
-        )
-    finally:
-        impact.alternatives.fetch_candidates = original
-
-    assert r.status_code == 200, r.text
-    body = r.json()
-    # The two things togpuls actually depends on.
-    assert isinstance(body["situations"], list) and body["situations"]
-    for sit in body["situations"]:
-        assert isinstance(sit["situation_number"], str) and sit["situation_number"]
-    # And the additive fields, over the wire rather than in-process.
-    assert body["situations"][0]["description"] == "Signalfeil"
-    assert "latest_observation" in body["lines"][0]
-    assert body["lines"][0]["operator"] == "VYG"
-    assert body["alternative_journey"] is None
-    # The alternative-selection verdict is internal working state for varsel's back-fill, not part
-    # of the public contract: `exclude=True` has to hold over the wire, not just in-process.
-    assert "original_is_best" not in body and "alternative_subject" not in body
-
-
-def test_real_http_route_handles_a_trip_with_nothing_affecting_it():
-    from fastapi.testclient import TestClient
-
-    _install_snapshot({})
-    r = TestClient(main.app).get("/impact", params={"from_stop": A, "to_stop": B})
-    assert r.status_code == 200
-    body = r.json()
-    assert body["situations"] == [] and body["lines"] == []
-    assert body["from_stop"] == A and body["to_stop"] == B
-
-
-def test_impact_endpoint_is_not_a_coroutine():
-    """It makes a blocking Journey Planner call, so FastAPI must run it in the threadpool. As
-    `async def` it would block the single-worker event loop and freeze /health (review 2026-07-29;
-    the rule is documented at reisevalg.py:28)."""
-    import inspect
-
-    assert not inspect.iscoroutinefunction(main.impact)
-
-
 def test_an_unanswered_lookup_is_distinguishable_from_an_empty_one_on_the_response():
     """The journey-alert pull read (2026-09-10) serves `unanswered` for a lookup that obtained no
     reply and `none_found` for one that did and had nothing. Until now the two collapsed into one
@@ -2156,7 +2098,7 @@ def test_the_pair_and_window_memos_are_built_once_for_many_definitions():
 def test_an_unaligned_window_is_answered_but_never_filed():
     """The public endpoint must not be able to grow the window memo one dead entry per request.
 
-    `/impact` derives its window as `at ± main._IMPACT_AT_TOLERANCE` off `datetime.now(UTC)`, so no
+    `/impact` derived its window as `at ± 90 min` off `datetime.now(UTC)` (removed 2026-11-07), so no
     two requests ever present the same one and a filed entry could never be hit again — for the life
     of the generation, on a public unauthenticated endpoint. The poller's windows come from
     `varsel.journey_windows` and ARE minute-aligned, which is the sharing the memo exists for, so
@@ -2805,7 +2747,6 @@ def test_sjn_messages_reach_their_trains_and_nothing_else():
     intake, calls = code("disruptions_today.sql"), code("predict_calls.sql")
     assert "participantRef IN ('NSB', 'SJN')" in intake
     assert intake.count(r"r'\{[^}]+\}'") == 2, "first and latest text both screened for placeholders"
-    assert "WHERE d.participantRef = 'NSB'" in code("predict.sql"), "duration model stays NSB"
     aff = calls.split("aff AS (", 1)[1].split("FROM sit AS s", 1)[0]
     assert "SELECT DISTINCT" in aff
     assert r"r'^SJN:DatedServiceJourney:(\d+)_'" in aff
@@ -2960,8 +2901,6 @@ def _characterization_scope():
 
 def _characterize():
     """Every serialized answer the characterization pins, keyed by what produced it."""
-    from fastapi.testclient import TestClient
-
     _install_snapshot(_characterization_scope())
     original_datetime = impact.datetime
     impact.datetime = _FrozenDatetime
@@ -2978,16 +2917,6 @@ def _characterize():
             "no_to_stop": call(to_stop=None),
             "situation": call(situation="S2"),
         }
-        original = impact.alternatives.fetch_candidates
-        impact.alternatives.fetch_candidates = lambda *a, **k: []  # no network from the suite
-        try:
-            r = TestClient(main.app).get(
-                "/impact", params={"from_stop": A, "to_stop": B, "at": _at(8).isoformat()},
-            )
-        finally:
-            impact.alternatives.fetch_candidates = original
-        assert r.status_code == 200, r.text
-        out["http"] = r.text
     finally:
         impact.datetime = original_datetime
     return out
@@ -3003,24 +2932,10 @@ def test_for_trip_without_plans_answers_exactly_what_it_answered_before():
     assert got == _GOLDEN_FOR_TRIP, {name: _characterize()[name] for name in moved}
 
 
-def test_the_impact_response_schema_is_unchanged():
-    """The published `/impact` schema: the OpenAPI component FastAPI serves, by digest."""
-    import hashlib
-    import json
-
+def test_no_trip_subject_reaches_the_published_schema():
+    """`/varsel-api`'s `Alert` carries the trip shape on purpose (KTD13), which puts `Trip*`
+    components in the app's schema; `TripSubject` must never be one of them."""
     schemas = main.app.openapi()["components"]["schemas"]
-    names = sorted(n for n in schemas if n in {
-        "ImpactResponse", "SituationImpact", "LineImpact", "StopPrediction", "LatestObservation",
-        "AlternativeJourney", "AlternativeLeg", "AlternativePrediction",
-    })
-    digest = hashlib.sha256(
-        json.dumps({n: schemas[n] for n in names}, sort_keys=True).encode()
-    ).hexdigest()
-    assert (names, digest) == (_GOLDEN_SCHEMA_NAMES, _GOLDEN_SCHEMA_DIGEST), (names, digest)
-    # And no trip model reaches `/impact`'s components through the excluded carrier. Asked of those
-    # components rather than of the whole document since multi-leg U5: `/varsel-api`'s `Alert`
-    # carries the trip shape on purpose (KTD13), which puts `Trip*` components in the app's schema.
-    assert "#/components/schemas/Trip" not in json.dumps({n: schemas[n] for n in names})
     assert {n for n in schemas if n.startswith("Trip")} <= {
         "TripFacts", "TripLeg", "TripProblem", "TripTransfer",
     }, "the one trip shape, and never `TripSubject`"
@@ -3535,18 +3450,12 @@ def test_a_trip_spends_the_direct_trains_lookup_budget_soonest_first():
 
 # The characterization's golden digests, taken on the code before `for_trip(plans=)` existed.
 _GOLDEN_FOR_TRIP = {
-    "http": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
     "nearest": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
     "no_to_stop": "253875cdcdc24979efd81486a7b3d1fd92099cd437c079d400dc706daae14793",
     "situation": "f5deeb8d676920fd9afe14b238fb5fb75a99770bfebe3c181973914458229387",
     "worst": "42a423594b94c36c34abcef092aae7adcddd20615663ebb8fafdb4f55b8845c1",
     "worst_catchable": "1addfadf1433c68608ea7b175c291059958284c3b6fce592c7bc8031a5436966",
 }
-_GOLDEN_SCHEMA_NAMES = [
-    "AlternativeJourney", "AlternativeLeg", "AlternativePrediction", "ImpactResponse",
-    "LatestObservation", "LineImpact", "SituationImpact", "StopPrediction",
-]
-_GOLDEN_SCHEMA_DIGEST = "4cc727b04b53ed5fb834449d40a1b004fc867b145b913c65249742e4ce5a29a7"
 
 if __name__ == "__main__":
     _run()

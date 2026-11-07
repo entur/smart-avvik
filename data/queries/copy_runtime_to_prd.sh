@@ -9,21 +9,20 @@
 # the EU multi-region, so every copy job below is free (0 bytes billed).
 #
 # Re-run after every retrain / calibration refresh in dev to promote the new
-# models to prd (also re-run after rebuilding the demo_* tables or
-# category_line_hour_impact). Safe to re-run any time: -f overwrites the prd
-# copy in place.
+# models to prd (also re-run after rebuilding the demo_* tables). Safe to
+# re-run any time: -f overwrites the prd copy in place.
 #
 # What is copied (the serving runtime set, derived from disruptions/api/*.sql
 # + main.py — see docs in the repo memory / PR description):
-#   - rail family (NSB+GOA prod models): 2 duration models, 2 delay regressors,
+#   - rail family (NSB+GOA prod models): 2 delay regressors,
 #     9 classifier heads, 45 platt calibrators (9 heads x base/lead60/120/240/plan)
 #   - bus family (pooled_all): 2 delay regressors + 9 classifier heads
 #     (bus platt calibration is the pooled_all_platt_weights TABLE, not models)
-#   - lookup tables: category taxonomy/classification, alert-impact profiles,
-#     duration + delay-p90 calibration, pooled platt weights, /demo-api tables
+#   - lookup tables: category taxonomy/classification, delay-p90 calibration,
+#     pooled platt weights, /demo-api tables
 #
 # NOT copied: the *_today tables (rail_calls_today, *_planned_today,
-# disruptions_*_initial_today, predictions_today, call_predictions_*_today) —
+# disruptions_*_initial_today, call_predictions_*_today) —
 # the poller CREATE OR REPLACEs those in prd within one refresh cycle.
 #
 # ALSO NOT copied, for the opposite reason — varsel_decisions and
@@ -33,7 +32,7 @@
 # replace prd's real alerting history with dev's. The app creates the table and
 # view itself on startup (disruptions/api/create_varsel_decisions.sql), and
 # data/queries/label_varsel_decisions.sh labels each environment separately.
-# Same reasoning as svv_baselines, and as togvarsel_issued (each environment
+# Same reasoning as togvarsel_issued (each environment
 # logs its own issued forecasts; togvarsel.py creates the table on first use).
 set -euo pipefail
 
@@ -42,8 +41,6 @@ DST_PROJECT="ent-kixavvik-prd"
 DATASET="disruptions"
 
 MODELS=(
-  # initial-duration models (predict.sql / disruptions_as_of.sql)
-  dur_init_reopen impact_remaining_noet
   # togmelding forecast models (togvarsel.py / togvarsel_features_today.sql); retrained by
   # data/queries/togvarsel/retrain.sh in dev, promoted here
   togvarsel_m_am0630 togvarsel_m_am0700 togvarsel_m_pm1200 togvarsel_m_pm1400
@@ -91,8 +88,6 @@ done
 TABLES=(
   categories               # AI.CLASSIFY cache; INSERT INTO'd at runtime (seed copy)
   category_taxonomy
-  category_line_hour_impact
-  duration_quantiles
   delay_p90_calib
   delay_p90_calib_pooled_all
   pooled_all_platt_weights

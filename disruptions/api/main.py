@@ -1,12 +1,10 @@
 import functools
 import logging
 import os
-import re
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -20,7 +18,7 @@ import decisions  # sibling module: the append-only Avviksvarsel alert-decision 
 import deployment  # sibling module: which environment is answering (dev/tst/prd), for the UI titles
 import feedback_contexts  # exact display snapshots for isolated /varsel feedback
 import historikk  # sibling module: alert decisions + realized outcomes (/historikk-api)
-import impact as impact_engine  # sibling module: the /impact matcher, shared with /varsel-api
+import impact as impact_engine  # sibling module: the impact matcher behind /varsel-api and the pull read
 import journey_status  # sibling module: every train in a journey's window today, graded (the «I dag» strip)
 import line_modes  # sibling module: each line's Journey Planner transport mode (KIX-23)
 import llm_message  # sibling module: LLM-written /varsel push text (Vertex)
@@ -36,7 +34,6 @@ import notification_store  # sibling module: durable webhook subscriptions, even
 import poller_follow  # sibling module: how a pod loads the tables the lease holder last built
 import poller_handover  # sibling module: the poller tenure's end (lease lost, shutdown) and its holder id
 import poller_lease  # sibling module: which pod runs the poller (the lease state machine, stdlib only)
-import reisevalg  # sibling module: car vs train corridor recommendation (/reisevalg-api)
 import rushhistorikk  # sibling module: did the rush forecasts land? (/rushhistorikk-api)
 import situation_english  # the English and nynorsk beside each situation's Norwegian text
 import sso  # sibling module: the Entur-SSO gate in front of /historikk and /meldinger
@@ -62,10 +59,6 @@ _LAST_INGESTION_TIME_QUERY = (Path(__file__).parent / "last_ingestion_time.sql")
 _RAIL_CALLS_QUERY = (Path(__file__).parent / "rail_calls_today.sql").read_text()
 _DISRUPTIONS_QUERY = (Path(__file__).parent / "disruptions_today.sql").read_text()
 _UPDATE_CATEGORIES_QUERY = (Path(__file__).parent / "update_categories.sql").read_text()
-_PREDICT_QUERY = (Path(__file__).parent / "predict.sql").read_text()
-_ACTIVE_DISRUPTIONS_QUERY = (Path(__file__).parent / "active_disruptions.sql").read_text()
-_DISRUPTIONS_AS_OF_QUERY = (Path(__file__).parent / "disruptions_as_of.sql").read_text()
-_ALERT_PROFILES_QUERY = (Path(__file__).parent / "alert_profiles.sql").read_text()
 # Does any planned trip today run between these two places, and does any run the other way?
 # Asked about many stop pairs at once since U10; its own header carries the argument for the
 # shape. A FILE rather than the inline string it was until then, because nothing in this repo
@@ -227,53 +220,15 @@ _COUNTY_BY_MUNICIPALITY_PREFIX: dict[str, str] = {
     "56": "Finnmark",
 }
 
-# Hour-of-day in the impact lookup is Europe/Oslo local time (matches the table build),
-# so resolve "now" to the Oslo hour when looking up a profile.
 _OSLO = ZoneInfo("Europe/Oslo")
 
-
-@dataclass(frozen=True)
-class _CachedDisruption:
-    """One active disruption as cached from predictions_today.
-
-    Holds the onset and the models' minutes-FROM-ONSET estimates. "Minutes from now"
-    is derived per request (onset + estimate - now), never cached. The impact estimate
-    is re-anchored to elapsed time on each rebuild (it comes from the during-disruption
-    model), so it stays fresh between refreshes rather than drifting overdue.
-    """
-
-    situation_number: str
-    summary: str | None
-    description: str | None
-    category: str
-    onset_ts: datetime
-    reopen_ts: datetime | None  # set once trains run again; impact may still linger after this
-    num_affected_stops: int
-    declared_window_min: int | None
-    # reopen model: "trains running again in ~X min" (minutes from onset)
-    pred_reopen_min: float
-    reopen_p50_min: float
-    reopen_p80_min: float
-    reopen_p90_min: float
-    # impact model: "timetable back to normal in ~Y min" (minutes from onset)
-    pred_impact_min: float
-    impact_p50_min: float
-    impact_p80_min: float
-    impact_p90_min: float
-
-
-# In-process cache of active disruptions, refreshed on every ingestion change. Guarded by a
-# lock because the poller thread writes it while request handlers read it.
-_disruptions_lock = threading.Lock()
-_disruptions_cache: list[_CachedDisruption] = []
-_disruptions_refreshed_at: datetime | None = None
 
 # Ceiling on every BigQuery wait the POLLER makes (get_last_ingestion_time + the query jobs the
 # rebuild issues from this module), via `result(timeout=...)`. It exists for /health's staleness
 # check: kept below HEALTH_STALE_AFTER_S (600 s) so a SLOW upstream surfaces as the existing
 # per-tick logged error — the heartbeat keeps beating, the next tick retries — instead of wedging
 # the loop past the threshold and restart-looping the pod against an outage a restart cannot fix.
-# Request-path queries (disruptions_as_of, /demo-api) deliberately keep unbounded waits.
+# Request-path queries (/demo-api) deliberately keep unbounded waits.
 _POLLER_QUERY_TIMEOUT_S = 240
 # The same ceiling for a table-metadata read (`_tables_built`: every follower tick, the leader's
 # cache loads and `_rush_hydrate`), much shorter because the read is a single cheap GET. Unbounded,
@@ -298,173 +253,20 @@ _MIN_REBUILD_SPACING_S = int(os.environ.get("POLLER_MIN_REBUILD_SPACING_S", "120
 _TRIP_REALTIME_TICK_S = 60
 
 
-def _row_to_cached(r) -> _CachedDisruption:
-    """Map one BigQuery row (active_disruptions.sql / disruptions_as_of.sql share the same
-    column set) to a _CachedDisruption."""
-    return _CachedDisruption(
-        situation_number=r.situationNumber,
-        summary=r.summary,
-        description=r.description,
-        category=r.category,
-        onset_ts=r.onset_ts,
-        reopen_ts=r.reopen_ts,
-        # NULL for journey-only situations (no affected stops -> ARRAY_LENGTH(NULL)); the
-        # response model requires an int, so treat "no stops" as 0. (Kept out of the SQL so the
-        # model still sees the raw feature value it was trained on.)
-        num_affected_stops=r.num_affected_stops or 0,
-        declared_window_min=r.declared_window_min,
-        pred_reopen_min=r.pred_reopen_min,
-        reopen_p50_min=r.reopen_p50_min,
-        reopen_p80_min=r.reopen_p80_min,
-        reopen_p90_min=r.reopen_p90_min,
-        pred_impact_min=r.pred_impact_min,
-        impact_p50_min=r.impact_p50_min,
-        impact_p80_min=r.impact_p80_min,
-        impact_p90_min=r.impact_p90_min,
-    )
-
-
-def refresh_disruptions_cache(built: datetime | None = None) -> None:
-    """Reload the active-disruptions cache from predictions_today (reopen_ts IS NULL).
-
-    `built` is the table's modified time, which every pod's load passes (see
-    :func:`_load_from_last_build`) so two pods holding one build report one stamp; a load of the
-    build the cache already holds is a no-op, as for the spine. Without it (a test, or a metadata
-    read that failed) it stamps the load instant, as every load did before 2026-10-13."""
-    global _disruptions_cache, _disruptions_refreshed_at
-    if built is not None and _disruptions_refreshed_at == built:
-        return
-    rows = bq_client.query(_ACTIVE_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
-    disruptions = [_row_to_cached(r) for r in rows]
-    with _disruptions_lock:
-        _disruptions_cache = disruptions
-        _disruptions_refreshed_at = built or datetime.now(UTC)
-    logger.info("Refreshed disruptions cache: %d active disruptions", len(disruptions))
-
-
-def fetch_disruptions_as_of(as_of: datetime) -> list[_CachedDisruption]:
-    """Reconstruct the disruptions that were active AS OF `as_of` by running the point-in-time
-    query against BigQuery (disruptions_as_of.sql), bypassing the live cache.
-
-    The cache only ever holds today's disruptions scored as-of now, so an arbitrary historical
-    instant has to be rebuilt from SX: onset/features, reopen state and the during-disruption
-    features are all computed using only versions with event_ts <= `as_of`. Returns the same
-    _CachedDisruption shape as the cache, so the endpoint renders it identically (with `as_of`
-    standing in for `now`)."""
-    job_config = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("as_of", "TIMESTAMP", as_of)],
-    )
-    rows = bq_client.query(_DISRUPTIONS_AS_OF_QUERY, job_config=job_config).result()
-    return [_row_to_cached(r) for r in rows]
-
-
-# /situation renders one disruption by its situationNumber. Rather than the live cache (which
-# only holds today's set and is filtered for the feed) we reconstruct it from SX as of now, via
-# the same point-in-time query as GET /disruptions?at=now. The whole "as of now" snapshot is
-# cached for 5 minutes and indexed by situationNumber, so repeated detail lookups share a single
-# BigQuery run instead of one query per id. Guarded by its own lock.
-_SITUATION_CACHE_TTL = timedelta(minutes=5)
-_situation_lock = threading.Lock()
-_situation_snapshot: dict[str, _CachedDisruption] = {}
-_situation_snapshot_at: datetime | None = None
-
-
-def get_situation(situation_id: str) -> _CachedDisruption | None:
-    """Return the disruption with this situationNumber, reconstructed as of now.
-
-    Backed by a 5-minute cache of today's disruptions (rebuilt from SX with the same
-    point-in-time query as GET /disruptions?at=now), so a burst of detail requests costs at
-    most one BigQuery run per 5 minutes. Returns None if no NSB disruption with that
-    situationNumber exists in the lookback window (yesterday and today)."""
-    global _situation_snapshot, _situation_snapshot_at
-    now = datetime.now(UTC)
-    with _situation_lock:
-        if (
-            _situation_snapshot_at is not None
-            and now - _situation_snapshot_at < _SITUATION_CACHE_TTL
-        ):
-            return _situation_snapshot.get(situation_id)
-    # Stale or never loaded: rebuild outside the lock (BigQuery call) and publish. A concurrent
-    # request may rebuild in parallel — a harmless duplicate query, not worth serializing on.
-    snapshot = {d.situation_number: d for d in fetch_disruptions_as_of(now)}
-    with _situation_lock:
-        _situation_snapshot = snapshot
-        _situation_snapshot_at = now
-    return snapshot.get(situation_id)
-
-
-# In-process copy of disruptions.category_line_hour_impact, indexed by (category, line,
-# hour) for the back-off lookup. Tiny table, rarely changes (rebuilt offline), so we load
-# the whole thing. Guarded by its own lock — independent of the disruptions cache.
-_impact_lookup: dict[tuple[str, str, int], dict] = {}
-_impact_lock = threading.Lock()
-
-# Minimum distinct situations behind a cell before we trust it; thinner cells are skipped
-# and the lookup backs off to a coarser grain (the global '*/*/-1' row is always accepted).
-_MIN_SITUATIONS = 30
-
-
-def refresh_impact_lookup() -> bool:
-    """Reload the (category, line, hour) -> impact-profile lookup from BigQuery. True when loaded;
-    a failure raises (the bool is the follower lookups' contract, see `_FOLLOWED_LOOKUPS`)."""
-    rows = bq_client.query(_ALERT_PROFILES_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
-    table = {(r["category"], r["line"], r["hour"]): dict(r.items()) for r in rows}
-    with _impact_lock:
-        global _impact_lookup
-        _impact_lookup = table
-    logger.info("Refreshed impact lookup: %d cells", len(table))
-    return True
-
-
-def _candidate_keys(category: str, line: str, hour: int) -> list[tuple[str, str, int]]:
-    """Lookup keys from most specific to coarsest, dropping hour before line.
-
-    e.g. ('signal','R31',8) -> (signal,R31,8) (signal,R31,-1) (signal,*,8) (signal,*,-1) (*,*,-1).
-    The trailing ('*','*',-1) global row is always the last resort. '*' / -1 inputs mean the
-    caller has no line / no hour, so those back-off steps are skipped.
-    """
-    keys: list[tuple[str, str, int]] = []
-    if category != "*":
-        if line != "*" and hour != -1:
-            keys += [(category, line, hour), (category, line, -1), (category, "*", hour)]
-        elif line != "*":
-            keys += [(category, line, -1)]
-        elif hour != -1:
-            keys += [(category, "*", hour)]
-        keys.append((category, "*", -1))
-    keys.append(("*", "*", -1))
-    seen: set[tuple[str, str, int]] = set()
-    return [k for k in keys if not (k in seen or seen.add(k))]
-
-
-def lookup_alert_profile(category: str, line: str = "*", hour: int = -1) -> dict | None:
-    """Return the most specific impact-profile cell for (category, line, hour) with enough
-    data, backing off to coarser grains and finally the global row. None if nothing loaded."""
-    with _impact_lock:
-        table = _impact_lookup
-    if not table:
-        return None
-    for key in _candidate_keys(category, line, hour):
-        row = table.get(key)
-        if row is not None and (key == ("*", "*", -1) or row["n_situations"] >= _MIN_SITUATIONS):
-            return row
-    return None
-
-
 # ---- Per-call (per-train) predictions cache --------------------------------------------------
 # disruptions.call_predictions_today holds one row per (affected call) of today's situations:
 # a calibrated cancellation probability and typical/p90 delay, at each stop. Cached here indexed
-# by jkey (the dated journey) so /journey is a dict lookup. Guarded by its own lock.
+# by jkey (the dated journey) so a per-train lookup is a dict lookup. Guarded by its own lock.
 
 _call_pred_lock = threading.Lock()
 # Keyed by (operator, jkey): bus ServiceJourney refs are NOT date-scoped, so the bare jkey collides
 # across operators (SKY:ServiceJourney:12345 and ATB:ServiceJourney:12345 both strip to the same
-# jkey). The operator is the ref codespace prefix, which /journey recovers from the id.
+# jkey). The operator is the ref codespace prefix.
 _call_pred_by_key: dict[tuple[str, str], list[impact_engine.CallPred]] = {}
-# jkey -> the set of operators that carry it, so a bare-jkey /journey lookup (no prefix) can still
-# resolve when unambiguous, and 409 when it is not.
+# jkey -> the set of operators that carry it, so a bare-jkey lookup (no prefix) can still resolve
+# when unambiguous.
 _call_pred_by_jkey_index: dict[str, set[str]] = {}
-# Same scored calls, indexed by situationNumber, so /impact can resolve a passenger's train from
+# Same scored calls, indexed by situationNumber, so the matcher can resolve a passenger's train from
 # (situation, from_stop, at) without a journey ref. situationNumber is publisher-namespaced, so the
 # NSB and bus tables merge here without collision.
 _call_pred_by_situation: dict[str, list[impact_engine.CallPred]] = {}
@@ -477,15 +279,6 @@ _call_pred_by_situation: dict[str, list[impact_engine.CallPred]] = {}
 _call_pred_by_stop_ref: dict[str, list[tuple[str, impact_engine.CallPred]]] = {}
 _call_pred_refreshed_at: datetime | None = None
 
-# /impact matches the passenger's intended departure (`at`) to the nearest affected departure at
-# `from_stop`. If the closest affected call is further than this, the train is treated as not
-# affected (omitted) — wide enough to absorb an approximate `at`, tight enough not to grab a
-# different service on the line.
-_IMPACT_AT_TOLERANCE = timedelta(minutes=90)
-
-# Default boarding stop for /impact when the caller omits from_stop: Oslo S, the busiest hub.
-_DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
-
 # `rail_calls_today` is today's ET *actuals* slice, and it was the single most expensive thing the
 # poller did: CREATE OR REPLACE over the whole day-so-far, so one rebuild costs 0.02 GB just after
 # midnight and 3.4 GB by 23:00 (measured 2026-08-08). Ungated it ran on every SX ingestion change
@@ -493,10 +286,10 @@ _DEFAULT_FROM_STOP = "NSR:StopPlace:337"  # Oslo S
 #
 # Two reasons that cadence bought nothing. The poller wakes on the wrong feed: it polls SIRI-SX
 # ingestion (a disruption *text* being published) while this table reads SIRI-ET (a train actually
-# passing a stop) -- the two advance independently. And nothing live reads it: `/journey`,
-# `/impact` and every varsel push score against `rail_calls_planned_today` (predict_calls.sql), not
-# this table. Its consumers were retrospective -- the `actual_*` columns in predict.sql and the
-# impact label in disruptions_today.sql -- both measured over an onset + 12 h window that a quarter
+# passing a stop) -- the two advance independently. And nothing live reads it: every varsel push
+# and journey-alerts read score against `rail_calls_planned_today` (predict_calls.sql), not this
+# table. Its consumers were retrospective -- the `actual_*` columns in predict.sql (removed
+# 2026-11-07) and the impact label in disruptions_today.sql -- both measured over an onset + 12 h window that a quarter
 # of an hour cannot move. Since 2026-09-22 it has ONE live reader, `refresh_rail_actuals` (the
 # /varsel «I dag» strip), which is what the 15 min buys a traveller: a recorded arrival reaches the
 # strip within a quarter of an hour instead of the planned table's hour. It reads the table the
@@ -811,7 +604,8 @@ def refresh_call_predictions_cache(
 
     NSB rows are tagged with the lineRef codespace ('VYG'); bus rows carry an explicit `operator`
     column. The bus load is isolated so a missing/failing bus table (e.g. before the first bus
-    predict runs) never blocks NSB serving. `built` as for `refresh_disruptions_cache` -- the NEWER
+    predict runs) never blocks NSB serving. `built` is the table's modified time (see
+    :func:`_load_from_last_build`) -- the NEWER
     of the two tables' modified times, so a move of either is a new stamp -- set under the same lock
     as the indexes, so they and the stamp still publish as one generation. `translate` is the lease
     holder's alone (KTD12, see `situation_english.update`). So is `fenced` (U2): the leader's cycle
@@ -1111,7 +905,6 @@ def refresh_varsel_stops(*, heal_registrations: bool = True) -> bool:
 # The ET rebuild gates (`_planned_refreshed_at`, `_rail_calls_refreshed_at`,
 # `_bus_planned_refreshed_at`) are never touched here: they say when THIS process last rebuilt a
 # table, and a pod that becomes leader must still rebuild on its own SQL.
-_PREDICTIONS_TABLE = "disruptions.predictions_today"
 _CALL_PREDICTIONS_TABLES = (
     "disruptions.call_predictions_today",
     "disruptions.call_predictions_bus_today",
@@ -1122,11 +915,6 @@ _ACTUALS_TABLE = "disruptions.rail_calls_today"
 # name -> (source tables, the stamp the cache holds, load(built, leader)). Lambdas throughout so a
 # name resolves at call time: the suites swap the globals these read.
 _FOLLOWED_CACHES: dict[str, tuple] = {
-    "disruptions": (
-        (_PREDICTIONS_TABLE,),
-        lambda: _disruptions_refreshed_at,
-        lambda built, leader: refresh_disruptions_cache(built),
-    ),
     "call_predictions": (
         _CALL_PREDICTIONS_TABLES,
         lambda: _call_pred_refreshed_at,
@@ -1148,16 +936,9 @@ _FOLLOWED_CACHES: dict[str, tuple] = {
 # the rush hydrate and the station set are `_rush_hydrate`'s, keyed by Oslo day as well). The leader's cycle keeps calling these directly,
 # every cycle, as it always has. Stamped in `_lookups_built`, since the lookups keep no stamp of
 # their own, and only on SUCCESS: every loader here returns True when it loaded everything, and
-# False (or a raise) leaves it unstamped for the next tick. `refresh_baselines` and
-# `refresh_varsel_stops` swallow their own failures, which is why the bool exists. A table that is
-# missing is never asked at all -- `svv_baselines` in prd, which therefore logs no
-# `reisevalg_baselines_unavailable` WARNING at startup as it did before 2026-10-13.
+# False (or a raise) leaves it unstamped for the next tick. `refresh_varsel_stops` swallows its
+# own failures, which is why the bool exists. A table that is missing is never asked at all.
 _FOLLOWED_LOOKUPS: dict[str, tuple] = {
-    "impact_lookup": (
-        ("disruptions.category_line_hour_impact",),
-        lambda: refresh_impact_lookup(),
-    ),
-    "svv_baselines": (("disruptions.svv_baselines",), lambda: reisevalg.refresh_baselines()),
     # The planned-table cadence: the picker list is which stations exist today. The aliases are
     # published and stored registrations are NOT healed onto them: that write is the leader's,
     # whose cycle calls `refresh_varsel_stops()` itself (so a sole pod heals on its first cycle).
@@ -1566,7 +1347,7 @@ def _varsel_refreshed_at() -> datetime | None:
     (2026-09-10): a cache nobody has loaded yet has no situations in it, and a read that answered
     "no disruptions" off it would be reporting an empty process as a calm day. The read answers 503
     while this is None. The second half of `_impact_snapshot`, under the same lock, so the answer
-    can never describe a different load than the situations /impact matched from.
+    can never describe a different load than the situations the matcher matched from.
     """
     return _impact_snapshot()[1]
 
@@ -1577,16 +1358,15 @@ def _impact_journey_calls(operator: str | None, jkey: str) -> list[impact_engine
     The second reader injected into the impact engine (beside `_impact_snapshot`), over the same
     poller-owned rows indexed the other way. It is how the engine asks what we know about a train
     the Journey Planner offered as an alternative — a question the by-situation snapshot can only
-    answer by scanning it. Mirrors `_reisevalg_call_predictions`' resolution over this same index.
+    answer by scanning it.
 
-    **A codespace that misses is a miss, not an invitation to guess.** `_reisevalg_call_predictions`
-    falls back to the bare-jkey index when the prefixed lookup finds nothing; that is safe there
-    because its input is one journey ref the caller already believes in. Here the ref comes from the
-    Journey Planner and always carries a codespace, so falling back would mean answering "VYG's
+    **A codespace that misses is a miss, not an invitation to guess.** The ref comes from the
+    Journey Planner and always carries a codespace, so falling back to the bare-jkey index would
+    mean answering "VYG's
     ServiceJourney:123 is not in the cache" with ATB's — bus ServiceJourney refs are not
     date-scoped, and that collision is exactly what keying on (operator, jkey) exists to prevent.
     The bare-jkey path is therefore reached only when the ref carries no codespace at all, and even
-    then only when a single operator claims it (the same rule /journey applies before its 409).
+    then only when a single operator claims it.
     """
     with _call_pred_lock:
         if operator is not None:
@@ -1609,7 +1389,8 @@ def _varsel_impact(
     path: alternatives.FetchPath = alternatives._POLLER_PATH,
     plans: trips.DayPlan | None = None,
 ) -> impact_engine.ImpactResponse:
-    """/impact for a registered journey's boarding window, injected into varsel via configure().
+    """The impact matcher for a registered journey's boarding window, injected into varsel via
+    configure().
 
     Structurally typed as `varsel.ImpactProvider` since 2026-07-29 — a signature drift here is now a
     type error rather than a runtime TypeError swallowed by check_and_notify's per-journey guard,
@@ -1619,10 +1400,8 @@ def _varsel_impact(
     `with_alternative` defaults to False so the /varsel-api request path never makes a blocking
     Journey Planner call; the poller passes True.
 
-    `select="worst"` rather than /impact's `nearest`: an alert asks "is any train in this window
-    alert-worthy?", not "which train leaves closest to a given minute". Same matcher, same severity
-    order and same response shaping as the HTTP endpoint — that is the point of routing varsel
-    through here instead of letting it keep its own matcher.
+    `select="worst"` rather than `nearest`: an alert asks "is any train in this window
+    alert-worthy?", not "which train leaves closest to a given minute".
 
     `plans` (multi-leg U5) is the pair's day plan, which `varsel.match_journey` reads through the
     `trip_plans.read_plan` it is configured with and sends on one call per window; forwarded only
@@ -1642,27 +1421,11 @@ def _varsel_impact(
         # "poller", exact while `check_and_notify` was the only caller passing
         # `with_alternative=True`; the journey-alert pull read now names its own path, and a
         # provider that swallowed it would spend the push cycle's share on every read. What the
-        # default still protects: an unauthenticated caller flooding /impact cannot starve the
-        # push cycle it shares this module-global cache with.
+        # default still protects: an unauthenticated caller cannot starve the push cycle it shares
+        # this module-global cache with.
         path=path,
         plans=plans if trips.enabled() else None,
     )
-
-
-def _reisevalg_call_predictions(journey_ref: str) -> list | None:
-    """Per-call prediction rows for a full dated journey ref (e.g.
-    'VYG:DatedServiceJourney:81613_DRM-DAL_26-07-13'), or None when no active disruption
-    touches it. Mirrors /journey's codespace-prefix resolution over the (operator, jkey)
-    cache; injected into reisevalg via configure() as a strictly read-only lookup (its
-    snapshot veto can only demote a recommendation, never promote one)."""
-    m = re.match(r"^([A-Za-z]+):", journey_ref)
-    with _call_pred_lock:
-        rows = _call_pred_by_key.get((m.group(1), journey_ref[m.end():])) if m else None
-        if rows is None:
-            ops = _call_pred_by_jkey_index.get(journey_ref, set())
-            if len(ops) == 1:
-                rows = _call_pred_by_key.get((next(iter(ops)), journey_ref))
-    return list(rows) if rows else None
 
 
 #: Where Linux publishes this process's resident set size, in pages, as the second field of a
@@ -1856,8 +1619,8 @@ def _on_ingestion_change(last_ingestion_time: datetime | None) -> None:
             # `_beat` in poll_for_changes owns the liveness one.
             #
             # On the SUCCESS path only. In the `finally` beside the duration below, a rebuild that
-            # died partway still advanced it: with `predict_sql` raising every cycle — it is one
-            # of the four steps deliberately NOT wrapped in its own try/except, so it propagates —
+            # died partway still advanced it: with `disruptions_sql` raising every cycle — it is one
+            # of the two steps deliberately NOT wrapped in its own try/except, so it propagates —
             # every cache goes hours stale while the runbook's staleness rule stays green forever.
             # What the gauge can still not see is a step that IS isolated (varsel_notify,
             # predict_calls_*, …) failing on every cycle: the rebuild returns normally and this
@@ -1903,7 +1666,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     # The «I dag» strip's recorded calls (journey_status). Its own try: the step above is the one
     # whose failure aborts the rebuild, and a failed LOAD of a table it did build must not.
     #
-    # This and the three loads below go through `_load_from_last_build`, a follower's own path, so
+    # This and the two loads below go through `_load_from_last_build`, a follower's own path, so
     # each cache is stamped with its table's modified time rather than this load's instant (U3,
     # R7). The metadata read sits inside the phase, so the phase's `ms` carries it.
     try:
@@ -1914,12 +1677,11 @@ def _rebuild_all(timings: dict[str, int]) -> None:
     with _phase("disruptions_sql", timings):
         bq_client.query(_DISRUPTIONS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
     # AI.CLASSIFY (Gemini) categorisation of any *new* free text. Isolated so a failure here
-    # never kills the rebuild: predict.sql LEFT JOINs disruptions.categories and falls back to
-    # 'UNKNOWN' (with the global '__ALL__' quantile offsets) for unclassified text, so the feed
-    # still serves — already-classified incidents keep their category; genuinely new text shows
-    # UNKNOWN until classification succeeds. The runtime SA needs roles/aiplatform.user for this
-    # step; until that grant lands the call 403s and we degrade gracefully rather than serving an
-    # empty feed.
+    # never kills the rebuild: predict_calls*.sql LEFT JOIN disruptions.categories and fall back to
+    # 'UNKNOWN' for unclassified text, so the predictions still serve — already-classified
+    # incidents keep their category; genuinely new text shows UNKNOWN until classification succeeds.
+    # The runtime SA needs roles/aiplatform.user for this step; until that grant lands the call 403s
+    # and we degrade gracefully.
     try:
         with _phase("categories", timings):
             bq_client.query(_UPDATE_CATEGORIES_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
@@ -1928,25 +1690,6 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             "Category classification (AI.CLASSIFY) failed; serving with existing categories "
             "(new text -> UNKNOWN). Check the SA has roles/aiplatform.user."
         )
-    with _phase("predict_sql", timings):
-        bq_client.query(_PREDICT_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
-    with _phase("disruptions_cache", timings):
-        _load_from_last_build("disruptions", leader=True)
-    # The impact lookup is a static, offline-built table — reloading it here just keeps it
-    # current if it was rebuilt. Isolated so a missing/erroring lookup never breaks the feed.
-    try:
-        with _phase("impact_lookup", timings):
-            refresh_impact_lookup()
-    except Exception:
-        logger.exception("Impact lookup refresh failed; serving disruptions without alert profiles")
-    # Road-volume baselines for /reisevalg-api — same offline-built-lookup pattern as the impact
-    # lookup above. Isolated so a missing/erroring table (it only exists once the reisevalg
-    # backtest has run) never breaks the feed; the road side just reports unavailable.
-    try:
-        with _phase("svv_baselines", timings):
-            reisevalg.refresh_baselines()
-    except Exception:
-        logger.exception("SVV baselines refresh failed; reisevalg road side may be unavailable")
     # Each line's transport mode for the `mode` field (KIX-23). Above `varsel_stops` for that step's
     # reason below, and before `varsel_notify` so the pass words and mints with today's map.
     try:
@@ -2001,8 +1744,8 @@ def _rebuild_all(timings: dict[str, int]) -> None:
             refresh_varsel_stops()
     except Exception:
         logger.exception("Varsel stops refresh failed; /varsel-api/stops may be stale or empty")
-    # Per-call (per-train) predictions for /journey. Isolated so any failure here never breaks the
-    # main /disruptions feed. The planned call source is rebuilt on a TTL (it scans ET); the
+    # Per-call (per-train) predictions. Isolated so any failure here never breaks the steps above.
+    # The planned call source is rebuilt on a TTL (it scans ET); the
     # scoring + cache reload run every tick (cheap: materialized inputs + ML.PREDICT).
     try:
         with _phase("rail_planned_calls", timings):
@@ -2025,7 +1768,7 @@ def _rebuild_all(timings: dict[str, int]) -> None:
         with _phase("predict_calls_rail", timings):
             bq_client.query(_PREDICT_CALLS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
         # Bus/GOA (pooled_all) per-call predictions. Nested + isolated so any bus failure degrades
-        # bus only — NSB /journey keeps serving from call_predictions_today. Builds today's bus SX
+        # bus only — NSB keeps serving from call_predictions_today. Builds today's bus SX
         # snapshot, refreshes the bus planned source on its own TTL, then scores.
         try:
             with _phase("disruptions_bus_sql", timings):
@@ -2036,14 +1779,14 @@ def _rebuild_all(timings: dict[str, int]) -> None:
                 bq_client.query(_PREDICT_CALLS_BUS_QUERY).result(timeout=_POLLER_QUERY_TIMEOUT_S)
         except Exception:
             logger.exception(
-                "Bus per-call predictions failed; /journey + /varsel serve NSB-only this tick"
+                "Bus per-call predictions failed; serving NSB-only this tick"
             )
         with _phase("call_predictions_cache", timings):
             # Whichever of the two tables are present; the lease holder's load is the one that
             # translates (KTD12).
             _load_from_last_build("call_predictions", leader=True)
     except Exception:
-        logger.exception("Per-call predictions refresh failed; /journey will serve stale or empty")
+        logger.exception("Per-call predictions refresh failed; serving stale or empty")
     # Journeys flagged "no direct service" at registration: ask again, and drop the warning from any
     # that a later timetable does connect (a weekend route registered on a Friday). Costs nothing
     # when nothing is flagged, and its own failure must not touch the alerting below.
@@ -2679,9 +2422,6 @@ async def lifespan(app: FastAPI):
         bq_client=bq_client, deterministic_writer=varsel._deterministic_body
     )
     varsel.load_state()
-    # Reisevalg: inject the read-only per-call snapshot lookup + BigQuery client. Its road-volume
-    # baselines load in `follow_last_build` below.
-    reisevalg.configure(snapshot_lookup=_reisevalg_call_predictions, bq_client=bq_client)
     # Togmeldingen: BigQuery only (live feature rebuild + ML.PREDICT), driven wall-clock from
     # every poll tick (see poll_for_changes). No eager load — the first tick past an issue time
     # computes it, and a restart back-fills the day's earlier issues as `late` (the features are
@@ -2775,42 +2515,31 @@ async def lifespan(app: FastAPI):
 bq_client = bigquery.Client()
 
 _API_DESCRIPTION = """
-Predicts how long ongoing public-transport disruptions will last, from SIRI-SX
-situation messages, using a BigQuery ML model.
+Predicts, per train, whether a public-transport disruption will cancel or delay it, from SIRI-SX
+situation messages and SIRI-ET, using BigQuery ML models.
 
-For each active disruption the API serves two estimates:
+The predictions reach travellers through three surfaces:
 
-* **reopen** — when trains are expected to be running again on the affected line.
-* **impact** — when the timetable is expected to be *fully back to normal*. This
-  usually lags the reopening, so a disruption is kept in the response (flagged
-  `reopened`) for a while after trains start moving again. The impact estimate is
-  re-computed as the disruption runs (it factors in how long it has already lasted),
-  so it tracks long-running disruptions instead of going stale at the onset guess.
+* **/varsel-api**: Smarte reisevarsler, the web app that pushes an alert for a registered journey.
+* **/notification-api/v1**: the same alerts for client apps, as signed webhooks or as the public
+  journey-keyed reads `journey-alerts` and `journey-status`.
+* **/rushvarsel-api**: Rushvarsel, the morning and afternoon rush forecast for the Oslo area.
 
-**Reading the estimates.** Every estimate is expressed as **whole minutes from
-`as_of`** (the response's server time), not as an absolute timestamp. So
-`point_min_from_now: 30` means "expected in about 30 minutes". Values go
-**negative** once the predicted time passes while the disruption is still open —
-the model under-predicted — and `overdue` is then `true`. Alongside the point
-estimate, `p50`/`p80`/`p90` give increasingly conservative (later) bounds.
-
-**Freshness.** Results are served from an in-process cache that is rebuilt
-whenever new SIRI-SX data is ingested (roughly once a minute). `refreshed_at`
-reports when the cache was last rebuilt; the "minutes from now" values are
-recomputed on every request against `as_of`.
+**Freshness.** Predictions are served from an in-process cache that is rebuilt whenever new
+SIRI-SX data is ingested, at most once every two minutes.
 """
 
 app = FastAPI(
     lifespan=lifespan,
     title="Disruptions API",
     version="0.1.0",
-    summary="Live duration predictions for rail disruptions, from SIRI-SX messages.",
+    summary="Per-train disruption predictions for Entur's alerting surfaces.",
     description=_API_DESCRIPTION,
     contact={"name": "Entur — Team KI-eksperimentering"},
 )
 
-# Public API — allow any origin so it can be consumed from browsers. The disruptions feed is
-# read-only (GET); the avviksvarsel endpoints (/varsel-api) additionally accept POST/DELETE to
+# Public API — allow any origin so it can be consumed from browsers. Most routes are read-only
+# (GET); the avviksvarsel endpoints (/varsel-api) additionally accept POST/DELETE to
 # register a device's push subscription and journeys, keyed only by a client-generated device_id
 # (prototype, no auth — see demo/avviksvarsel/README.md).
 app.add_middleware(
@@ -2844,10 +2573,6 @@ tracing_setup.instrument_app(app)
 # Avviksvarsel API (registered-journey push alerts). Registered before the /varsel static mount
 # so /varsel-api/* resolves to these routes.
 app.include_router(varsel.router)
-
-# Reisevalg API (car vs train recommendation for the Lier -> Oslo S corridor). Registered before
-# the static mounts, like /varsel-api.
-app.include_router(reisevalg.router)
 
 # Varselhistorikk API (what Avviksvarsel decided, and whether it turned out right). Registered
 # before the /historikk static mount, like the two above.
@@ -3529,713 +3254,6 @@ def poll_for_changes(
             return
 
 
-class Estimate(BaseModel):
-    """A duration estimate expressed as minutes from now (`as_of`).
-
-    Values are signed: a negative value means the estimate's time has already elapsed
-    while the disruption is still open (running longer than predicted). `overdue` is True
-    when the point estimate has passed.
-    """
-
-    point_min_from_now: int = Field(
-        description=(
-            "Point (mean) estimate, in whole minutes from `as_of`. Negative once the "
-            "predicted time has passed while the disruption is still open."
-        ),
-    )
-    p50_min_from_now: int = Field(
-        description="50th-percentile (median) estimate, in whole minutes from `as_of`.",
-    )
-    p80_min_from_now: int = Field(
-        description=(
-            "80th-percentile estimate, in whole minutes from `as_of` — a more "
-            "conservative (later) bound than p50."
-        ),
-    )
-    p90_min_from_now: int = Field(
-        description=(
-            "90th-percentile estimate, in whole minutes from `as_of` — the most "
-            "conservative (latest) bound exposed."
-        ),
-    )
-    overdue: bool = Field(
-        description=(
-            "True when the point estimate's time has already passed "
-            "(`point_min_from_now` < 0): the disruption is running longer than predicted."
-        ),
-    )
-
-
-class AlertProfile(BaseModel):
-    """Historical impact profile for a disruption category (optionally a line and hour-of-day),
-    for deciding whether a disruption is worth pushing to passengers.
-
-    Derived from 2 years of realized NSB outcomes: for boardings flagged by an SX situation of
-    this category, how often was the trip cancelled or badly delayed, and how bad. `grain` and
-    the `matched_*` fields say exactly which cell was used after back-off (a sparse specific cell
-    falls back to a coarser one), so a category-only match (`matched_line` = `*`,
-    `matched_hour` = -1) is distinguishable from a precise category×line×hour match.
-    """
-
-    grain: str = Field(
-        description=(
-            "Which dimensions the matched cell is specific on: 'C'/'L'/'H' = "
-            "category/line/hour, '-' = aggregated. e.g. 'C-H' = category & hour, line pooled."
-        ),
-    )
-    matched_category: str = Field(description="Category of the matched cell.")
-    matched_line: str = Field(description="Line of the matched cell; '*' if pooled over lines.")
-    matched_hour: int = Field(
-        description="Hour-of-day (Europe/Oslo, 0-23) of the matched cell; -1 if pooled over hours.",
-    )
-    alert_tier: str = Field(
-        description=(
-            "'high' / 'medium' / 'low' / 'suppress'. 'suppress' means the flag is no worse than "
-            "this line+hour's normal traffic, or too little data to trust."
-        ),
-    )
-    alert_score: float = Field(
-        description=(
-            "Rankable priority: confidence-weighted expected lost minutes per flagged boarding "
-            "(a cancellation counted as 60). Higher = more worth alerting."
-        ),
-    )
-    cancel_rate: float = Field(description="P(boarding cancelled) given a flag of this category.")
-    trouble_rate: float = Field(
-        description="P(cancelled OR delayed >= 10 min) given a flag of this category.",
-    )
-    trouble_lift: float | None = Field(
-        description=(
-            "trouble_rate relative to the unconditional baseline at the same line+hour. "
-            ">1 means the flag signals more trouble than normal; ~1 means no added signal."
-        ),
-    )
-    exp_disruption_min: float = Field(
-        description="Expected lost minutes per flagged boarding (cancellation = 60 min equiv).",
-    )
-    delay_p50: int | None = Field(description="Median departure delay (min) among non-cancelled.")
-    delay_p90: int | None = Field(description="90th-pct departure delay (min) among non-cancelled.")
-    n_situations: int = Field(description="Distinct historical situations behind this cell.")
-    n_boardings: int = Field(description="Historical flagged boardings behind this cell.")
-
-
-class Disruption(BaseModel):
-    """A single disruption, with reopen and impact estimates resolved to minutes from `as_of`."""
-
-    situation_number: str = Field(
-        description="SIRI-SX situationNumber — stable identifier for this disruption.",
-    )
-    summary: str | None = Field(
-        description="Short Norwegian summary from the SX message (null if none provided).",
-    )
-    description: str | None = Field(
-        description="Longer Norwegian description from the SX message (null if none provided).",
-    )
-    category: str = Field(description="Disruption category, as classified from the SX message.")
-    onset: datetime = Field(description="When the disruption began (first observed onset), UTC.")
-    minutes_since_onset: int = Field(
-        description="Whole minutes elapsed from `onset` to `as_of` (never negative).",
-    )
-    reopened: bool = Field(
-        description=(
-            "True once trains are running again on the affected line. Impact may still be "
-            "resolving — see `impact`."
-        ),
-    )
-    reopened_at: datetime | None = Field(
-        description="When the reopening was observed (UTC); null while still ongoing.",
-    )
-    minutes_since_reopen: int | None = Field(
-        description="Whole minutes since `reopened_at`; null while still ongoing.",
-    )
-    num_affected_stops: int = Field(description="Number of stops affected by the disruption.")
-    declared_window_min: int | None = Field(
-        description=(
-            "Operator-declared validity window in minutes, if the SX message stated one "
-            "(else null)."
-        ),
-    )
-    reopen: Estimate = Field(
-        description=(
-            "Estimate of when trains will be running again. Once `reopened` is true these "
-            "values are in the past (overdue)."
-        ),
-    )
-    impact: Estimate = Field(
-        description=(
-            "Estimate of when the timetable will be fully back to normal — typically lags "
-            "the reopening."
-        ),
-    )
-    alert: AlertProfile | None = Field(
-        default=None,
-        description=(
-            "How alert-worthy this disruption is right now, from the historical impact of its "
-            "category at the current Oslo hour (line-agnostic — a disruption spans lines; use "
-            "the /alert_profile endpoint for a specific line). Null if no profile is loaded."
-        ),
-    )
-
-    def should_alert(self) -> bool:
-        return (self.alert is not None
-                and self.alert.alert_tier != "suppress"
-                and self.alert.delay_p90 > self.minutes_since_onset)
-
-
-class DisruptionsResponse(BaseModel):
-    """Today's disruptions plus the timing context needed to interpret the estimates."""
-
-    as_of: datetime = Field(
-        description="Server time the \"minutes from now\" values were computed against (UTC).",
-    )
-    refreshed_at: datetime | None = Field(
-        description=(
-            "When the cache was last rebuilt from new SIRI-SX data (UTC); null until the "
-            "first refresh."
-        ),
-    )
-    count: int = Field(description="Total number of disruptions returned (active + reopened).")
-    active_count: int = Field(description="Number not yet reopened.")
-    reopened_count: int = Field(
-        description="Number that have reopened but whose impact may still be resolving.",
-    )
-    disruptions: list[Disruption] = Field(
-        description="The disruptions, each with reopen and impact estimates as minutes from `as_of`.",
-    )
-
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "as_of": "2026-06-15T09:30:00Z",
-                "refreshed_at": "2026-06-15T09:29:12Z",
-                "count": 1,
-                "active_count": 1,
-                "reopened_count": 0,
-                "disruptions": [
-                    {
-                        "situation_number": "ENT:SituationNumber:1234",
-                        "summary": "Signalfeil ved Oslo S",
-                        "description": "Innstilte og forsinkede tog grunnet signalfeil.",
-                        "category": "infrastruktur/signal",
-                        "onset": "2026-06-15T08:45:00Z",
-                        "minutes_since_onset": 45,
-                        "reopened": False,
-                        "reopened_at": None,
-                        "minutes_since_reopen": None,
-                        "num_affected_stops": 6,
-                        "declared_window_min": 120,
-                        "reopen": {
-                            "point_min_from_now": 30,
-                            "p50_min_from_now": 25,
-                            "p80_min_from_now": 55,
-                            "p90_min_from_now": 80,
-                            "overdue": False,
-                        },
-                        "impact": {
-                            "point_min_from_now": 70,
-                            "p50_min_from_now": 60,
-                            "p80_min_from_now": 100,
-                            "p90_min_from_now": 130,
-                            "overdue": False,
-                        },
-                        "alert": {
-                            "grain": "C-H",
-                            "matched_category": "infrastruktur/signal",
-                            "matched_line": "*",
-                            "matched_hour": 8,
-                            "alert_tier": "high",
-                            "alert_score": 13.1,
-                            "cancel_rate": 0.1527,
-                            "trouble_rate": 0.329,
-                            "trouble_lift": 3.96,
-                            "exp_disruption_min": 13.4,
-                            "delay_p50": 2,
-                            "delay_p90": 13,
-                            "n_situations": 1933,
-                            "n_boardings": 40395,
-                        },
-                    }
-                ],
-            }
-        }
-    }
-
-
-class CallPrediction(BaseModel):
-    """Per-stop prediction for one train: chance the stop is cancelled, plus typical/p90 delay.
-
-    Read the BOARDING stop's `cancel_probability` + `dep_delay_*` for "will my train leave, how
-    late?"; read the ALIGHTING stop's `cancel_probability` + `arr_delay_*` for "will I reach my
-    destination, how late?". Delays are whole minutes for a train that runs; `*_p90` is the
-    conservative "bad case". Departure fields are null at a terminal, arrival fields at an origin.
-    """
-
-    stop_place: str = Field(description="NSR StopPlace ref of this stop.")
-    stop_name: str | None = Field(description="Human-readable stop name (null if unresolved).")
-    stop_order: int = Field(description="Position of this stop along the journey (1 = origin).")
-    scheduled_departure: datetime | None = Field(description="Aimed departure (UTC); null at terminal.")
-    scheduled_arrival: datetime | None = Field(description="Aimed arrival (UTC); null at origin.")
-    cancel_probability: float = Field(
-        description="Calibrated P(this stop is cancelled / the train does not serve it), 0-1.",
-    )
-    dep_delay_typ_min: int | None = Field(description="Typical departure delay (min) if it runs.")
-    dep_delay_p90_min: int | None = Field(
-        description="Bad-case (p90) departure delay (min), from the calibrated exceedance stack "
-        "when available (narrower at the same coverage than the legacy per-bucket lookup).",
-    )
-    dep_delay_p50_min: int | None = Field(
-        default=None,
-        description="Median departure delay (min) from the exceedance stack; with "
-        "dep_delay_p90_min this forms the 'expect X-Y min' interval. Null at a terminal.",
-    )
-    dep_ge10_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(departure >= 10 min late | the train runs), 0-1. Null at a terminal.",
-    )
-    dep_impact_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(this stop is cancelled OR the departure is >= 10 min late), 0-1 "
-        "— the boarding-stop alerting score. Null at a terminal.",
-    )
-    arr_delay_typ_min: int | None = Field(description="Typical arrival delay (min) if it runs.")
-    arr_delay_p90_min: int | None = Field(
-        description="Bad-case (p90) arrival delay (min), from the calibrated exceedance stack "
-        "when available (narrower at the same coverage than the legacy per-bucket lookup).",
-    )
-    arr_delay_p50_min: int | None = Field(
-        default=None,
-        description="Median arrival delay (min) from the exceedance stack; with arr_delay_p90_min "
-        "this forms the 'expect X-Y min' interval. Null at an origin.",
-    )
-    arr_ge10_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(arrival >= 10 min late | the train runs), 0-1. Null at an origin.",
-    )
-    impact_probability: float | None = Field(
-        default=None,
-        description="Calibrated P(this stop is cancelled OR the arrival is >= 10 min late), 0-1 — "
-        "the recommended single alerting score. Null at an origin.",
-    )
-
-
-class JourneyResponse(BaseModel):
-    """Per-train predictions for a journey currently affected by a disruption.
-
-    `calls` are the affected stops within 12h of the situation's onset, ordered along the line.
-    When a journey is touched by more than one situation, the most severe (highest peak
-    cancellation probability) is returned and named in `situation_number`.
-    """
-
-    journey_ref: str = Field(description="The journey looked up (echoes the request `id`).")
-    line: str | None = Field(description="Line ref of the train, e.g. 'VYG:Line:R31'.")
-    situation_number: str = Field(description="The SIRI-SX situation these predictions come from.")
-    summary: str | None = Field(description="Short Norwegian summary of that situation.")
-    as_of: datetime = Field(description="Server time of the response (UTC).")
-    refreshed_at: datetime | None = Field(
-        description="When the per-call cache was last rebuilt (UTC); null until first refresh.",
-    )
-    calls: list[CallPrediction] = Field(description="Affected stops, ordered by stop_order.")
-
-
-
-def _minutes_from_now(onset_ts: datetime, est_min_from_onset: float, now: datetime) -> int:
-    """Convert a minutes-from-onset estimate to whole minutes from now.
-
-    May be negative — a negative value means the estimate's time has already passed while
-    the disruption is still open (see Estimate.overdue).
-    """
-    elapsed_min = (now - onset_ts).total_seconds() / 60
-    return round(est_min_from_onset - elapsed_min)
-
-
-def _estimate(
-    onset_ts: datetime, point: float, p50: float, p80: float, p90: float, now: datetime
-) -> Estimate:
-    """Build an Estimate of minutes-from-now; overdue when the point estimate has passed."""
-    point_from_now = _minutes_from_now(onset_ts, point, now)
-    return Estimate(
-        point_min_from_now=point_from_now,
-        p50_min_from_now=_minutes_from_now(onset_ts, p50, now),
-        p80_min_from_now=_minutes_from_now(onset_ts, p80, now),
-        p90_min_from_now=_minutes_from_now(onset_ts, p90, now),
-        overdue=point_from_now < 0,
-    )
-
-
-def _oslo_hour(now: datetime) -> int:
-    """Hour-of-day (0-23) in Europe/Oslo, matching the impact lookup's hour dimension."""
-    return now.astimezone(_OSLO).hour
-
-
-def _alert_profile_model(row: dict | None) -> AlertProfile | None:
-    """Build the AlertProfile response from a lookup row (None passes through)."""
-    if row is None:
-        return None
-    return AlertProfile(
-        grain=row["grain"],
-        matched_category=row["category"],
-        matched_line=row["line"],
-        matched_hour=row["hour"],
-        alert_tier=row["alert_tier"],
-        alert_score=row["alert_score"],
-        cancel_rate=row["cancel_rate"],
-        trouble_rate=row["trouble_rate"],
-        trouble_lift=row["trouble_lift"],
-        exp_disruption_min=row["exp_disruption_min"],
-        delay_p50=row["delay_p50"],
-        delay_p90=row["delay_p90"],
-        n_situations=row["n_situations"],
-        n_boardings=row["n_boardings"],
-    )
-
-
-def _to_disruption(d: _CachedDisruption, now: datetime) -> Disruption:
-    """Render a cached disruption with estimates resolved to minutes from `now`."""
-    reopened_at = d.reopen_ts
-    return Disruption(
-        situation_number=d.situation_number,
-        summary=d.summary,
-        description=d.description,
-        category=d.category,
-        onset=d.onset_ts,
-        minutes_since_onset=max(0, round((now - d.onset_ts).total_seconds() / 60)),
-        reopened=reopened_at is not None,
-        reopened_at=reopened_at,
-        minutes_since_reopen=(
-            max(0, round((now - reopened_at).total_seconds() / 60)) if reopened_at else None
-        ),
-        num_affected_stops=d.num_affected_stops,
-        declared_window_min=d.declared_window_min,
-        reopen=_estimate(
-            d.onset_ts, d.pred_reopen_min, d.reopen_p50_min, d.reopen_p80_min, d.reopen_p90_min, now
-        ),
-        impact=_estimate(
-            d.onset_ts, d.pred_impact_min, d.impact_p50_min, d.impact_p80_min, d.impact_p90_min, now
-        ),
-        alert=_alert_profile_model(lookup_alert_profile(d.category, "*", _oslo_hour(now))),
-    )
-
-
-@app.get(
-    "/disruptions",
-    summary="List today's active and recently-reopened disruptions",
-    response_description="Disruptions with reopen/impact estimates as minutes from `as_of`",
-    tags=["disruptions"],
-    deprecated=True,
-)
-async def disruptions(
-    at: datetime | None = Query(
-        default=None,
-        description=(
-            "Optional point in time (ISO 8601, e.g. `2026-06-15T09:00:00Z`) to reconstruct the "
-            "feed AS OF. When omitted (the default), the live feed is served from the in-process "
-            "cache as of the current time. When given, the disruptions active at that instant are "
-            "rebuilt from BigQuery using only data known by then (no later reopening/updates leak "
-            "in), and every estimate is expressed relative to `at` rather than now. A naive value "
-            "is assumed UTC. Must not be in the future."
-        ),
-    ),
-) -> DisruptionsResponse:
-    """**Deprecated:** use `/impact` (a passenger's trip) or `/journey` (a specific train) for
-    per-train cancellation and delay predictions instead.
-
-    List today's disruptions (still-ongoing and recently reopened), each with reopen and
-    impact estimates as **minutes from now**.
-
-    Reopened disruptions are kept in the response and flagged (`reopened: true`) because impact
-    typically takes a while to resolve after the line reopens. Use `active_count` /
-    `reopened_count` to split the two, and `as_of` as the reference point for every estimate.
-
-    Pass `at` to reconstruct the feed at a past instant instead of now (see the parameter docs);
-    `as_of` then echoes `at`, and `refreshed_at` is null because the result is queried live rather
-    than served from the cache.
-    """
-    if at is None:
-        now = datetime.now(UTC)
-        with _disruptions_lock:
-            cached = _disruptions_cache
-            refreshed_at = _disruptions_refreshed_at
-    else:
-        now = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-        if now > datetime.now(UTC):
-            raise HTTPException(
-                status_code=400,
-                detail="`at` must not be in the future; point-in-time reconstruction only covers past instants.",
-            )
-        cached = fetch_disruptions_as_of(now)
-        refreshed_at = None
-
-    items = [
-        disruption
-        for d in cached
-        for disruption in [_to_disruption(d, now)]
-        if disruption.should_alert()
-    ]
-
-
-    reopened_count = sum(1 for x in items if x.reopened)
-    return DisruptionsResponse(
-        as_of=now,
-        refreshed_at=refreshed_at,
-        count=len(items),
-        active_count=len(items) - reopened_count,
-        reopened_count=reopened_count,
-        disruptions=items,
-    )
-
-
-@app.get(
-    "/situation",
-    summary="Render a single disruption by its SIRI-SX situationNumber",
-    response_description="The disruption with reopen/impact estimates as minutes from `as_of`.",
-    tags=["disruptions"],
-    deprecated=True,
-)
-async def situation(
-    id: str = Query(
-        description="SIRI-SX situationNumber to render, e.g. 'ENT:SituationNumber:1234'.",
-    ),
-) -> Disruption:
-    """**Deprecated:** use `/impact?situation=...` for the per-train impact of a single
-    situation instead.
-
-    Render a single disruption identified by its `situationNumber`.
-
-    Unlike /disruptions — which only surfaces alert-worthy situations — this returns the
-    requested situation regardless of alert tier, reconstructed from SIRI-SX as of now (the
-    same point-in-time build as GET /disruptions?at=now) and cached for 5 minutes. Every
-    estimate is expressed as minutes from the render time. 404 if no NSB disruption with that
-    situationNumber is found in the lookback window (yesterday and today).
-    """
-    d = get_situation(id)
-    if d is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No disruption found for situationNumber {id!r}.",
-        )
-    return _to_disruption(d, datetime.now(UTC))
-
-
-@app.get(
-    "/journey",
-    summary="Per-train cancellation + delay predictions for a journey",
-    response_description="Per-stop predictions for the affected train.",
-    tags=["disruptions"],
-)
-async def journey(
-    id: str = Query(
-        description=(
-            "Journey identifier — a SIRI journey ref: rail 'VYG:DatedServiceJourney:318_LHM-DRM_"
-            "25-09-01' or bus 'RUT:ServiceJourney:<id>'. The codespace prefix disambiguates the "
-            "operator; the bare jkey ('DatedServiceJourney:…' / 'ServiceJourney:…') also works when "
-            "a single operator carries it (else 409 — include the prefix)."
-        ),
-    ),
-    from_stop: str | None = Query(
-        default=None,
-        description="Optional boarding StopPlace ref (NSR:StopPlace:...) to filter the calls to.",
-    ),
-    to_stop: str | None = Query(
-        default=None,
-        description="Optional alighting StopPlace ref (NSR:StopPlace:...) to filter the calls to.",
-    ),
-) -> JourneyResponse:
-    """Per-train predictions for a journey currently affected by a disruption.
-
-    Returns the affected stops, each with a calibrated cancellation probability and typical/p90
-    delay. For a passenger: the boarding stop answers "will my train leave, and how late?"
-    (`cancel_probability` + `dep_delay_*`); the alighting stop answers "will I reach my
-    destination, and how late?" (`cancel_probability` + `arr_delay_*`). Pass `from_stop` /
-    `to_stop` to return just those stops.
-
-    404 if no active disruption affects this journey (the train is not in today's per-call
-    predictions). When several situations touch the journey, the most severe is returned.
-    """
-    # Recover the operator (codespace prefix) so bus ServiceJourney jkeys don't collide across
-    # operators. The cache jkey is the ref minus its leading codespace and itself starts with a
-    # ref-type token ("DatedServiceJourney:"/"ServiceJourney:"), so we try the prefixed reading
-    # first ((operator, jkey) from "<CS>:<jkey>") and, if that misses, fall back to treating the
-    # whole id as a bare jkey — which resolves only when a single operator carries it (else 409).
-    m = re.match(r"^([A-Za-z]+):", id)
-    ambiguous_ops: list[str] | None = None
-    with _call_pred_lock:
-        refreshed_at = _call_pred_refreshed_at
-        rows = _call_pred_by_key.get((m.group(1), id[m.end():])) if m else None
-        if rows is None:
-            ops = _call_pred_by_jkey_index.get(id, set())
-            if len(ops) > 1:
-                ambiguous_ops = sorted(ops)
-            elif ops:
-                rows = _call_pred_by_key.get((next(iter(ops)), id))
-    if ambiguous_ops is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Journey key {id!r} is ambiguous across operators {ambiguous_ops}; "
-                "include the codespace prefix (e.g. 'RUT:ServiceJourney:...')."
-            ),
-        )
-    if not rows:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No active disruption affecting journey {id!r}.",
-        )
-    # A journey can be touched by several situations; surface the most severe (highest peak
-    # cancellation probability across its stops).
-    by_sit: dict[str, list[impact_engine.CallPred]] = {}
-    for r in rows:
-        by_sit.setdefault(r.situation_number, []).append(r)
-    chosen = max(by_sit.values(), key=lambda rs: max(x.p_cancel for x in rs))
-    calls = sorted(chosen, key=lambda x: x.stop_order)
-    if from_stop is not None or to_stop is not None:
-        wanted = {s for s in (from_stop, to_stop) if s is not None}
-        calls = [c for c in calls if c.stop_place in wanted]
-    head = chosen[0]
-    return JourneyResponse(
-        journey_ref=id,
-        line=head.line,
-        situation_number=head.situation_number,
-        summary=head.summary,
-        as_of=datetime.now(UTC),
-        refreshed_at=refreshed_at,
-        calls=[
-            CallPrediction(
-                stop_place=c.stop_place,
-                stop_name=c.stop_name,
-                stop_order=c.stop_order,
-                scheduled_departure=c.aimed_dep,
-                scheduled_arrival=c.aimed_arr,
-                cancel_probability=c.p_cancel,
-                dep_delay_typ_min=c.dep_delay_typ_min,
-                dep_delay_p90_min=(
-                    c.dep_delay_p90_stack_min
-                    if c.dep_delay_p90_stack_min is not None
-                    else c.dep_delay_p90_min
-                ),
-                dep_delay_p50_min=c.dep_delay_p50_stack_min,
-                dep_ge10_probability=c.p_dep_ge10,
-                dep_impact_probability=c.p_impact_dep,
-                arr_delay_typ_min=c.arr_delay_typ_min,
-                arr_delay_p90_min=(
-                    c.arr_delay_p90_stack_min
-                    if c.arr_delay_p90_stack_min is not None
-                    else c.arr_delay_p90_min
-                ),
-                arr_delay_p50_min=c.arr_delay_p50_stack_min,
-                arr_ge10_probability=c.p_arr_ge10,
-                impact_probability=c.p_impact,
-            )
-            for c in calls
-        ],
-    )
-
-
-
-@app.get(
-    "/impact",
-    summary="Per-train cancellation + delay impact on a passenger's trip",
-    response_description="Situations and lines affecting the trip, each with departure/arrival predictions.",
-    tags=["disruptions"],
-)
-def impact(
-    from_stop: str = Query(
-        default=_DEFAULT_FROM_STOP,
-        description=(
-            "Boarding StopPlace ref (NSR:StopPlace:...). Defaults to Oslo S (NSR:StopPlace:337)."
-        ),
-    ),
-    at: datetime | None = Query(
-        default=None,
-        description=(
-            "Intended departure time from `from_stop` (ISO 8601). Used to pick, per line, the "
-            "affected train closest to this time. Defaults to the current time. A naive value is "
-            "assumed UTC."
-        ),
-    ),
-    situation: str | None = Query(
-        default=None,
-        description=(
-            "Optional SIRI-SX situationNumber. When given, only that situation is considered "
-            "(`situations` is length 1, or 0 if it does not affect the trip). When omitted, every "
-            "situation affecting a departure from `from_stop` near `at` is returned."
-        ),
-    ),
-    to_stop: str | None = Query(
-        default=None,
-        description="Optional alighting StopPlace ref (NSR:StopPlace:...) for the arrival prediction.",
-    ),
-) -> impact_engine.ImpactResponse:
-    """Per-train impact of one or more situations on a passenger's intended trip.
-
-    Resolves, for each affected line, the train departing `from_stop` nearest `at`, and scores it
-    at the boarding stop (`departure_prediction`: will it leave, how late?) and — when `to_stop`
-    is given — at the alighting stop (`arrival_prediction`: will I arrive, how late?), using the
-    same per-call model as /journey.
-
-    The result is exposed two ways: `situations` (one entry per situation, worst-case over its
-    lines) and `lines` (one entry per line, worst-case over the situations affecting it). Pass
-    `situation` to scope to a single situation. Both lists are empty when nothing affects the trip.
-
-    Plain ``def`` (NOT ``async def``) on purpose, matching ``reisevalg.recommendation``: this may
-    make a blocking Journey Planner call, which must run in the anyio threadpool. On the
-    single-worker event loop it would freeze ``/journey``, ``/varsel-api`` and the ``/health``
-    liveness probe (found in review 2026-07-29 -- it was ``async def`` with a blocking urlopen).
-    """
-    if at is None:
-        at_utc = datetime.now(UTC)
-    else:
-        at_utc = at if at.tzinfo is not None else at.replace(tzinfo=UTC)
-    return impact_engine.for_trip(
-        from_stop=from_stop,
-        to_stop=to_stop,
-        window_start=at_utc - _IMPACT_AT_TOLERANCE,
-        window_end=at_utc + _IMPACT_AT_TOLERANCE,
-        select="nearest",
-        at=at_utc,
-        situation=situation,
-    )
-
-
-@app.get(
-    "/alert_profile",
-    summary="Historical impact profile for a category (optionally a line and hour)",
-    response_description="The most specific impact profile with enough data, after back-off.",
-    tags=["disruptions"],
-    deprecated=True,
-)
-async def alert_profile(
-    category: str = Query(description="Disruption category, e.g. 'infrastruktur/signal'."),
-    line: str = Query(
-        default="*",
-        description="Line code without the 'VYG:Line:' prefix, e.g. 'R31'. Omit (or '*') to pool over lines.",
-    ),
-    hour: int | None = Query(
-        default=None,
-        ge=-1,
-        le=23,
-        description=(
-            "Hour-of-day in Europe/Oslo (0-23). Omit to use the current Oslo hour; pass -1 to "
-            "pool over all hours."
-        ),
-    ),
-) -> AlertProfile:
-    """**Deprecated:** use the calibrated per-train `impact_probability` served by `/impact`
-    and `/journey` to decide whether to alert, instead of these historical category profiles.
-
-    Look up the historical impact profile for a (category, line, hour) cell.
-
-    Backs off to coarser cells when the specific one is too sparse — drop the hour, then the
-    line, finally the global row — so a result is (almost) always returned. Check `grain` /
-    `matched_*` to see how specific the match actually is, and `alert_tier` / `alert_score`
-    to rank it. 404 only if the lookup table has not loaded yet.
-    """
-    h = _oslo_hour(datetime.now(UTC)) if hour is None else hour
-    row = lookup_alert_profile(category, line, h)
-    if row is None:
-        raise HTTPException(status_code=404, detail="No impact profile available (lookup not loaded).")
-    return _alert_profile_model(row)
-
-
 # ---- /demo-api: retrospective "how good were the predictions?" journey demo -------------------
 # Serves the static demo dataset (temporal holdout 2026-04 -> 2026-06, NSB rail on the prod
 # model family + GOA/bus on the pooled_all family) built by
@@ -4381,7 +3399,7 @@ class DemoJourney(BaseModel):
 
     journey_ref: str = Field(
         description="Operator-prefixed journey key, e.g. 'NSB:DatedServiceJourney:...' or "
-        "'RUT:ServiceJourney:...' — same format /journey accepts.",
+        "'RUT:ServiceJourney:...'.",
     )
     operator: str = Field(description="Codespace the journey runs in, e.g. 'NSB', 'GOA', 'RUT'.")
     mode: str = Field(description="Vehicle noun for the operator: 'Tog' or 'Buss'.")
@@ -4704,17 +3722,3 @@ async def ready(response: Response) -> dict:
         return {"status": "ready", **pod}
     response.status_code = 503
     return {"status": "not_ready", "reason": reason, **pod}
-
-
-@app.get(
-    "/last_ingestion_time",
-    summary="Most recent SIRI-SX ingestion time",
-    response_description='`{"last_ingestion_time": "<timestamp>"}` (the string `"None"` if no data yet).',
-    tags=["diagnostics"],
-)
-async def last_ingestion_time() -> dict[str, str]:
-    """Return the latest SIRI-SX ingestion time the service has observed for today.
-
-    This is the upstream-freshness signal that drives the cache refresh, exposed for debugging.
-    """
-    return {"last_ingestion_time": str(get_last_ingestion_time())}

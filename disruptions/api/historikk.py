@@ -28,7 +28,7 @@ environment (see ``sso.py``). The redaction rules below are kept as they are, de
 is one env var from off, and none of them costs the page anything.
 
 Reads only. No import of main (the package rule): main injects the BigQuery client via
-:func:`configure`, the same pattern reisevalg/varsel/llm_message/decisions already use. The stop
+:func:`configure`, the same pattern varsel/llm_message/decisions already use. The stop
 names and the place grouping behind the filters come from the National Stop Register directly
 (:func:`_place_registry`), NOT from main's picker cache — that cache holds only today's timetable and
 deliberately drops co-located refs, which is exactly how a station's rail side ended up offered as a

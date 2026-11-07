@@ -612,10 +612,6 @@ def test_the_webhook_channel_adds_exactly_three_rebuild_phases_around_the_alerti
         "rail_actuals_cache",
         "disruptions_sql",
         "categories",
-        "predict_sql",
-        "disruptions_cache",
-        "impact_lookup",
-        "svv_baselines",
         # Each line's JP transport mode (KIX-23), above `varsel_stops` for the orphan window's reason.
         "line_modes",
         # The leader's Journey Planner day plans (multi-leg U2), behind TRIP_PLANS_ENABLED, above
@@ -1474,7 +1470,7 @@ def _warm_client(ages, rows=None, *, raises=(), not_found=(), lookups=None):
             return _Job()
 
     names = (
-        "bq_client", "_disruptions_cache", "_disruptions_refreshed_at", "_call_pred_by_key",
+        "bq_client", "_call_pred_by_key",
         "_call_pred_by_jkey_index", "_call_pred_by_situation", "_call_pred_by_stop_ref",
         "_call_pred_refreshed_at", "_planned_refreshed_at", "_rail_calls_refreshed_at",
         "_FOLLOWED_LOOKUPS", "_lookups_built",
@@ -1482,7 +1478,7 @@ def _warm_client(ages, rows=None, *, raises=(), not_found=(), lookups=None):
     saved = {name: getattr(main, name) for name in names}
     saved_modes = line_modes._fetched_at
     main.bq_client = client = _Client()
-    main._disruptions_refreshed_at = main._call_pred_refreshed_at = None
+    main._call_pred_refreshed_at = None
     main._planned_refreshed_at = main._rail_calls_refreshed_at = None
     main._FOLLOWED_LOOKUPS = lookups or {}
     main._lookups_built = {}
@@ -1499,14 +1495,12 @@ def _warm_client(ages, rows=None, *, raises=(), not_found=(), lookups=None):
 
 _TWO_MIN = timedelta(minutes=2)
 _ALL_FRESH = {
-    "disruptions.predictions_today": _TWO_MIN,
     "disruptions.call_predictions_today": _TWO_MIN,
     "disruptions.rail_calls_planned_today": _TWO_MIN,
     "disruptions.rail_calls_today": _TWO_MIN,
 }
 # Every table a follower tick asks the modified time of, once per tick and nothing more.
 _FOLLOWED_TABLES = {
-    "disruptions.predictions_today",
     "disruptions.call_predictions_today",
     "disruptions.call_predictions_bus_today",
     "disruptions.rail_calls_planned_today",
@@ -1534,7 +1528,6 @@ def test_a_new_process_serves_the_tables_the_last_one_built_stamped_with_their_a
         built = now - _TWO_MIN
         assert main._varsel_refreshed_at() == built, "the pull read answers, stamped with the table"
         assert set(main._impact_snapshot()[0]) == {"S1"}
-        assert main._disruptions_refreshed_at == built
         assert journey_status.spine_refreshed_at() == built
         assert journey_status.actuals_refreshed_at() == built
         # The ET rebuild gates stay unarmed: the first cycle must still rebuild both tables, since
@@ -1552,27 +1545,21 @@ def test_a_missing_or_unreadable_table_leaves_only_its_own_cache_cold_and_age_is
     import journey_status
 
     ages = {
-        # predictions_today absent: a first deploy.
+        # The spine's tables absent: a first deploy.
         "disruptions.call_predictions_today": timedelta(minutes=11),
-        "disruptions.rail_calls_planned_today": timedelta(minutes=50),
         "disruptions.rail_calls_today": _TWO_MIN,
     }
-    with _warm_client(
-        ages, {main._JOURNEY_STATUS_SPINE_QUERY: [_planned_row()]},
-        raises={main._JOURNEY_STATUS_ACTUALS_QUERY},
-    ) as (client, now):
+    with _warm_client(ages, raises={main._JOURNEY_STATUS_ACTUALS_QUERY}) as (client, now):
         result = main.follow_last_build()
-        assert main._disruptions_refreshed_at is None
         assert main._varsel_refreshed_at() == now - timedelta(minutes=11), "loaded, and says how old"
-        assert journey_status.spine_refreshed_at() == now - timedelta(minutes=50)
+        assert journey_status.spine_refreshed_at() is None
         assert journey_status.actuals_refreshed_at() is None
         assert client.queries == [
             main._CALL_PREDICTIONS_QUERY, main._CALL_PREDICTIONS_BUS_QUERY,
-            main._JOURNEY_STATUS_SPINE_QUERY, main._JOURNEY_STATUS_ACTUALS_QUERY,
+            main._JOURNEY_STATUS_ACTUALS_QUERY,
         ]
         assert result == {
-            "disruptions": "missing", "call_predictions": "loaded", "spine": "loaded",
-            "actuals": "error",
+            "call_predictions": "loaded", "spine": "missing", "actuals": "error",
         }, result
 
 
@@ -1706,9 +1693,9 @@ def test_the_leader_stamps_with_the_newer_tables_modified_time_and_translates():
     finally:
         situation_english.update = real
     source = inspect.getsource(main._rebuild_all)
-    for name in ("disruptions", "call_predictions", "spine", "actuals"):
+    for name in ("call_predictions", "spine", "actuals"):
         assert f'_load_from_last_build("{name}", leader=True)' in source, name
-    for bare in ("refresh_disruptions_cache()", "refresh_call_predictions_cache()",
+    for bare in ("refresh_call_predictions_cache()",
                  "refresh_planned_spine()", "refresh_rail_actuals()"):
         assert bare not in source, f"the leader still stamps {bare} with the load instant"
 
@@ -1753,7 +1740,7 @@ def test_the_follower_lookups_are_the_per_pod_load_set():
     table and keep their own 24 h TTL, so they are asked on every tick and not listed here."""
     import inspect
 
-    assert set(main._FOLLOWED_LOOKUPS) == {"impact_lookup", "svv_baselines", "varsel_stops"}
+    assert set(main._FOLLOWED_LOOKUPS) == {"varsel_stops"}
     # Every call, un-gated by any table: main hands the hook over and the mechanism calls it.
     import poller_follow
 
@@ -1806,8 +1793,7 @@ def test_the_lifespan_runs_the_follower_load_set_before_the_poller_starts():
     source = inspect.getsource(main.lifespan)
     assert source.index("follow_last_build()") < source.index("thread.start()")
     assert source.index("varsel.load_state()") < source.index("follow_last_build()")
-    assert source.index("reisevalg.configure(") < source.index("follow_last_build()")
-    for direct in ("refresh_impact_lookup()", "refresh_varsel_stops()", "refresh_baselines()"):
+    for direct in ("refresh_varsel_stops()",):
         assert direct not in source, direct
 
 
@@ -2158,12 +2144,6 @@ _CALL_PRED_COLUMNS_2026_10_13 = (
     "arr_delay_p90_stack_min", "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
     "dep_delay_p90_stack_min", "p_impact_dep",
 )
-_DISRUPTION_COLUMNS_2026_10_13 = (
-    "situationNumber", "summary", "description", "category", "onset_ts", "reopen_ts",
-    "num_affected_stops", "declared_window_min", "pred_reopen_min", "reopen_p50_min",
-    "reopen_p80_min", "reopen_p90_min", "pred_impact_min", "impact_p50_min", "impact_p80_min",
-    "impact_p90_min",
-)
 
 
 def test_a_prediction_row_from_an_older_leader_loads_with_defaults():
@@ -2171,8 +2151,6 @@ def test_a_prediction_row_from_an_older_leader_loads_with_defaults():
     since 2026-10-13, so this passes today and fails the day a reader adds `r.new_column`."""
     pred = main._call_pred_from_row(_StrictRow(_CALL_PRED_COLUMNS_2026_10_13), "VYG")
     assert pred.has_situation is True and pred.report_type is None and pred.boarding_allowed is True
-    cached = main._row_to_cached(_StrictRow(_DISRUPTION_COLUMNS_2026_10_13))
-    assert cached.num_affected_stops == 0
 
 
 

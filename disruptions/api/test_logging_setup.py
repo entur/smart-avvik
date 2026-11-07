@@ -1,11 +1,9 @@
 """Checks for the structured-logging contract (logging_setup.py) and the channels it must keep
 trustworthy (U5): the JSON line format every Cloud Logging query depends on, the /health
-access-log mute, the LOG_LEVEL env with its privacy interlock, the reisevalg chronic-warning
-latch, and the symmetric push audit record (one `event="push"` line carrying the failure detail,
+access-log mute, the LOG_LEVEL env with its privacy interlock, and the symmetric push audit record (one `event="push"` line carrying the failure detail,
 with no prose lines beside it).
 
-Hermetic: no network, no BigQuery — reisevalg's client is a local stub and `pywebpush.webpush`
-is patched on the real module (varsel._send_push imports it at call time), the
+Hermetic: no network, no BigQuery — `pywebpush.webpush` is patched on the real module (varsel._send_push imports it at call time), the
 test_domain_metrics idiom. Tests that re-run `logging_setup.setup()` always restore it under
 ambient env in `finally` — and re-attach the metrics counting handler the wipe removes (main's
 own order: setup, then configure) — so later suites in the same process see INFO and keep
@@ -29,7 +27,6 @@ from types import SimpleNamespace
 
 import logging_setup
 import metrics
-import reisevalg
 import varsel
 
 # ---- Helpers -----------------------------------------------------------------------------------
@@ -284,69 +281,6 @@ def test_setup_rerun_keeps_one_handler_one_filter_each_and_rederives_the_level()
     finally:
         with _env(LOG_LEVEL=None, VARSEL_LLM_LOG_PROMPTS=None):
             _restore_logging()
-
-
-# ---- 5. The reisevalg chronic-warning latch (R10) ------------------------------------------------
-
-
-class _FailingClient:
-    def query(self, sql):
-        raise RuntimeError("svv_baselines not found")
-
-
-class _EmptyClient:
-    def query(self, sql):
-        # `timeout=` is passed by refresh_baselines (the poller-path bound), so a bare `list`
-        # here raises TypeError and the refresh reads as a failed one.
-        return SimpleNamespace(result=lambda timeout=None: [])
-
-
-@contextmanager
-def _reisevalg_state(client):
-    before = (
-        reisevalg._bq_client,
-        reisevalg._baselines,
-        reisevalg._baselines_built_at,
-        reisevalg._baselines_refreshed_at,
-        reisevalg._baselines_unavailable_warned,
-    )
-    reisevalg._bq_client = client
-    reisevalg._baselines_unavailable_warned = False
-    try:
-        yield
-    finally:
-        (
-            reisevalg._bq_client,
-            reisevalg._baselines,
-            reisevalg._baselines_built_at,
-            reisevalg._baselines_refreshed_at,
-            reisevalg._baselines_unavailable_warned,
-        ) = before
-
-
-def test_the_chronic_baselines_warning_latches_to_info_and_a_success_rearms_it():
-    """First unavailable refresh warns; the chronic repeat (prd deliberately has no
-    svv_baselines) drops to INFO under the SAME event name; a successful refresh re-arms the
-    WARNING so a NEW outage is loud again."""
-    with _reisevalg_state(_FailingClient()), _capture(reisevalg.logger.name) as records:
-        reisevalg.refresh_baselines()
-        reisevalg.refresh_baselines()
-        assert [(r.levelno, r.fields["event"]) for r in records] == [
-            (logging.WARNING, "reisevalg_baselines_unavailable"),
-            (logging.INFO, "reisevalg_baselines_unavailable"),
-        ]
-        records.clear()
-        reisevalg._bq_client = _EmptyClient()
-        reisevalg.refresh_baselines()
-        assert [r.fields["event"] for r in records] == ["reisevalg_baselines_refreshed"]
-        records.clear()
-        reisevalg._bq_client = _FailingClient()
-        reisevalg.refresh_baselines()
-        reisevalg.refresh_baselines()
-        assert [(r.levelno, r.fields["event"]) for r in records] == [
-            (logging.WARNING, "reisevalg_baselines_unavailable"),
-            (logging.INFO, "reisevalg_baselines_unavailable"),
-        ], "a success between outages must re-arm the first-warning latch"
 
 
 # ---- 6. The symmetric push audit (R11) ----------------------------------------------------------

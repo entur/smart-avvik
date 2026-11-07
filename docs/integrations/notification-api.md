@@ -151,8 +151,8 @@ subscription on your next `POST` of it — the idempotent re-registration is eno
 
 The two limiter tiers exist because *verifying a credential is itself store work*: a repeated bad
 credential is refused by the global tier and a short-TTL negative cache before any Firestore read, so
-it cannot spend a real client's budget. An anonymous flood can still exhaust the global tier — the
-same accepted trade `/impact`'s limiter makes.
+it cannot spend a real client's budget. An anonymous flood can still exhaust the global tier, an
+accepted trade.
 
 **3 000 a minute is a CEILING, not a throughput promise.** It was 300 until 2026-09-13. What the
 process can actually serve depends on how many of your reads hit its per-cycle cache: a read for a

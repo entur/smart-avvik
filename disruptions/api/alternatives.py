@@ -41,16 +41,14 @@ Design notes
 * **Fail open, always.** Every failure path — timeout, GraphQL ``errors``, an empty
   ``tripPatterns``, a malformed payload — yields ``None``. This sits on the poller thread behind a
   push notification; it must never be the reason an alert does not go out.
-* **Keyed TTL cache with single-flight and a failure cooldown**, mirroring
-  ``reisevalg._TTLCache``'s semantics (fetch outside the lock, swap under it, a failed fetch serves
+* **Keyed TTL cache with single-flight and a failure cooldown** (fetch outside the lock, swap under it, a failed fetch serves
   the previous value rather than caching a miss as fresh) but keyed per
   ``(from, to, arrive_by, quantized date_time)`` rather than holding one value. Air legs are
   excluded by restricting ``transportModes``; ``directMode: foot`` keeps JP from proposing a
   two-hour walk.
 * **The key is cycle-stable, and that is what makes the TTL worth anything.** This is a blocking
   3 s HTTPS call on the ingestion thread that also rebuilds every BigQuery cache, in a service
-  pinned to one replica, so a cold fetch per cycle delays ``/disruptions``, ``/journey``, ``/demo``
-  and ``/reisevalg`` alike. The caller anchors one of its two queries on a moving ``now``; with the
+  pinned to one replica, so a cold fetch per cycle delays every cache the poller rebuilds. The caller anchors one of its two queries on a moving ``now``; with the
   old five-minute bucket two cycles ~4.8 min apart shared a key about 4 % of the time, so **every**
   poller lookup was a cold fetch no matter how long the TTL was. See :data:`_DATE_TIME_QUANTUM` —
   the quantum comes first, the TTL second.
@@ -126,9 +124,8 @@ _DATE_TIME_QUANTUM = timedelta(minutes=30)
 # unauthenticated, has no rate limit of its own, runs `plain def` in the ~40-slot anyio threadpool,
 # and turns one inbound request into a blocking 3 s outbound call — and the cache cannot bound the
 # cost of a caller that keeps inventing `at` values, because every one of them is a new key. Past
-# the ceiling `fetch_candidates` yields no candidates, so /impact degrades to
-# `alternative_journey: null` instead of the pod degrading and taking /journey, /demo-api and
-# /reisevalg-api down with it.
+# the ceiling `fetch_candidates` yields no candidates, so an alert degrades to
+# `alternative_journey: null` instead of the pod degrading and taking the other routes down with it.
 _FETCH_MAX_PER_MIN = 30
 # ...and the poller gets its own, larger ceiling, because the paragraph above is an argument about
 # the REQUEST path only — a public unauthenticated endpoint turning one inbound call into a blocking
@@ -234,9 +231,9 @@ def within_lookahead(date_time: datetime, now: datetime) -> bool:
 _NUM_TRIP_PATTERNS = 10
 
 # Verified live with curl 2026-08-06 (Oslo S -> Rosenholm, Oslo S -> Drammen, Oslo S -> Drøbak
-# torg, both `arriveBy` values), following the same in-file convention as reisevalg.py's two JP
-# queries -- a brace slip in one of those cost a fix commit (PR #22), so the document is checked
-# against the real endpoint before the parser is written, and the date says when. The parser is
+# torg, both `arriveBy` values). A brace slip in an earlier hand-built JP query (in reisevalg.py,
+# removed 2026-11-07) cost a fix commit (PR #22), so the document is checked against the real
+# endpoint before the parser is written, and the date says when. The parser is
 # additionally pinned in test_alternatives.py against a payload recorded from that same curl.
 #
 # Reach is governed by `searchWindow` and OTP2's dynamic default, NOT by the pattern count.
@@ -744,7 +741,7 @@ class AlternativeCandidate(BaseModel):
 class _KeyedTTLCache:
     """Per-key TTL cache with single-flight refresh and a post-failure cooldown.
 
-    Same contract as ``reisevalg._TTLCache`` — the fetch runs outside the lock, the swap happens
+    The contract: the fetch runs outside the lock, the swap happens
     under it, and a failing fetch serves the previous value (with its old timestamp) instead of
     caching the miss as a fresh success — but keyed, because there is one answer per stop pair
     rather than one global value.
@@ -1105,7 +1102,7 @@ def _post_json(url: str, payload: dict, headers: dict[str, str]) -> dict:
 
     JP answers HTTP 200 with an ``errors`` array on a bad query, so raising here routes those
     responses through the cache's failure path instead of parsing them into "no alternative" and
-    caching that as a fresh success. Same guard as ``reisevalg._post_json``.
+    caching that as a fresh success.
 
     Raises before opening a socket when :func:`_network_allowed` says no — see the note above it.
     """
@@ -1480,7 +1477,7 @@ def fetch_candidates(
         # unauthenticated input (/impact's query params, JourneyIn's fields) validated only as short
         # strings. Nothing reaches here today with a quote in it -- the refs have matched real
         # stop_places in the prediction cache first -- but that containment is an accident of an
-        # unrelated code path, and the sibling reisevalg module was already bitten once by
+        # unrelated code path, and the reisevalg module (removed 2026-11-07) was bitten once by
         # hand-built GraphQL (PR #22). Refuse the shape here, where the assumption lives, and
         # BEFORE any fetch.
         logger.warning(

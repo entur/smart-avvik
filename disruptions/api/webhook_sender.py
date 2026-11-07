@@ -1,9 +1,9 @@
 """The hardened outbound client for webhook delivery (KTD9, R18).
 
-Built on :mod:`urllib.request`, this repo's outbound client (`alternatives._post_json`,
-`reisevalg._post_json`) -- no new dependency, and none is needed. What is different here is the
-destination: the Journey Planner is an Entur host in a constant, while a client callback URL is a
-value somebody typed into a record. Everything below follows from that one difference.
+Built on :mod:`urllib.request`, this repo's outbound client (`alternatives._post_json`) -- no new
+dependency, and none is needed. What is different here is the destination: the Journey Planner
+is an Entur host in a constant, while a client callback URL is a value somebody typed into a
+record. Everything below follows from that one difference.
 
 **The address test is POSITIVE, and that is the whole point.** An address is accepted only when it
 is globally routable and not multicast; then the IPv4-embedding prefixes are decoded and the same

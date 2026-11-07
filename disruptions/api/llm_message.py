@@ -221,7 +221,7 @@ _VERTEX_HEADER_OVERHEAD_S = 2.9
 # Hard wall clock for ONE HTTP attempt -- not for one call, since 2026-09-20; `_RETRY_OPTIONS`
 # below buys a second attempt and each gets its own fresh deadline and `X-Server-Timeout` header.
 # This runs on the poller thread that also rebuilds every BigQuery cache, so an unbounded call
-# stalls ingestion for /disruptions, /journey, /demo and /reisevalg too. The Anthropic SDK defaults
+# stalls ingestion for every surface too. The Anthropic SDK defaults
 # to 600 s with two retries; google-genai is likewise unbounded. At _MAX_LLM_CALLS_PER_CYCLE=8
 # sequential calls that is over an hour of stalled ingestion, so the budget stays bounded.
 #

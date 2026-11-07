@@ -252,7 +252,7 @@ def test_a_dying_rebuild_observes_its_duration_but_does_not_advance_the_freshnes
     The DURATION stays in `finally`, same contract as the poller_cycle log line: a rebuild that
     died partway through is when that reading matters most. The freshness GAUGE must not move —
     it was in the `finally` too, which made the runbook's staleness rule unfirable by
-    construction: with `predict_sql` raising every cycle (one of the four steps deliberately not
+    construction: with `disruptions_sql` raising every cycle (one of the two steps deliberately not
     wrapped in its own try/except, so it propagates), every cache goes hours stale while the
     gauge keeps advancing and the rule stays green forever.
     """

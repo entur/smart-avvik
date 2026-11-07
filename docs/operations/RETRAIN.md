@@ -20,7 +20,6 @@ prd serves new models with old calibration. Nothing errors.
 | Rushvarsel (`togvarsel_m_*`, 4 models) | `/togmelding` | Monthly | [Rushvarsel](#rushvarsel), one script |
 | Rail call heads (11 models) + Platt calibration (90 models, 1 table) | `/varsel`, webhooks, journey-alerts | No fixed cadence; when the base rate drifts | [Rail heads](#rail-heads) |
 | Bus and Go-Ahead (`*_pooled_all`) | Same, for buses | Frozen at June 2026 | Not routine, see [Frozen families](#frozen-families) |
-| Duration (`dur_init_reopen`, `impact_remaining_noet`) | `/disruptions` | Frozen | Not routine |
 | Trip miss constants (`trips._MISS_*`) | Multi-leg journeys | After an arrival-head retrain | Only matters once multi-leg is on in prd |
 
 The LLM writers (Vertex Gemini) are not trained by us.
@@ -113,8 +112,8 @@ multi-region) and safe to re-run. prd's poller uses the new objects on its next 
 - **It copies every family at once.** A half-finished retrain of one family in dev goes to prd
   with it. Promote only when dev is in a consistent state.
 - It copies one object at a time, so prd mixes old and new models for a few minutes.
-- It does **not** copy the poller-built `*_today` tables, the decision log, `svv_baselines` or
-  `togvarsel_issued`. Each environment keeps its own.
+- It does **not** copy the poller-built `*_today` tables, the decision log or `togvarsel_issued`.
+  Each environment keeps its own.
 - It does not copy the 45 no-SX Platt models (`*_platt_nosx*`). prd reads their coefficients from
   the `nosx_platt_weights` table, which it does copy, so after a rail retrain step 5 must have run
   before you promote.
@@ -136,8 +135,6 @@ reproduces the same models.
   `create_pooled_all_platt_weights.sql`, `create_delay_p90_calib_pooled_all.sql`. The table
   `pooled_all_platt_weights` is what serving reads, so the second-to-last step is not optional.
   Evaluate with `eval_pooled_all_models.sql`.
-- **Duration.** `train_dual_models.sql` and `train_impact_remaining.sql`, with
-  `create_quantiles.sql` for `duration_quantiles`.
 - **`trips._MISS_*`** (`disruptions/api/trips.py`). Refit after the arrival heads change, with
   `data/queries/transfer_miss_backtest.py` (command in its header), then copy the printed constants
   into `trips.py` and move the pins in `test_trips.py`. Its input table `exp_etcmp6_fair_scored`

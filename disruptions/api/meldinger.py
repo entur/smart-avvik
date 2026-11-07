@@ -285,8 +285,8 @@ def configure(
     """Wire in the BigQuery client and the template writer. Called once from main.lifespan.
 
     ``deterministic_writer`` is ``varsel._deterministic_body`` — a pure function of the stored
-    ``message_input`` — passed in the way :mod:`historikk`, :mod:`impact` and :mod:`reisevalg` all
-    take their dependencies. Importing :mod:`varsel` directly would pull a 147 KB module carrying the
+    ``message_input`` — passed in the way :mod:`historikk` and :mod:`impact` take their
+    dependencies. Importing :mod:`varsel` directly would pull a 147 KB module carrying the
     poller's mutable state onto a public request path for the sake of one pure function.
 
     Optional and fail-soft: without it every card simply has no template arm to compare the

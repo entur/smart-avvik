@@ -385,7 +385,7 @@ _LLM_WORKERS = 16
 # It exists because the deadline used to be checked but not RESERVED: `monotonic() >= llm_deadline`
 # is a pre-check, so a call could start with a millisecond left and still run its full worst case.
 # The reachable overshoot was ~46 s against a documented 30 s ceiling -- 53 % over, on the single
-# poller thread that also feeds /disruptions, /journey, /demo and /reisevalg, and ahead of the
+# poller thread that also feeds every other surface, and ahead of the
 # delivery loop that pushes to travellers.
 _WORST_CASE_CALL_S = 20.0
 # Web Push sends are independent, I/O-bound, and each can block for _PUSH_TIMEOUT_S against a
@@ -5737,8 +5737,8 @@ def check_and_notify(
     # the cycle: unlike `_messages` it describes this tick's numbers and must not outlive them.
     message_inputs: dict[tuple[str, str, str], dict | None] = {}
     # Wall-clock budget, not just a call count -- see _WriteBudget for why the deadline is reserved
-    # rather than checked. This is the ingestion thread: every second here is a second /disruptions,
-    # /journey, /demo and /reisevalg serve staler data, and loop 2's pushes wait for loop 1.
+    # rather than checked. This is the ingestion thread: every second here is a second every other
+    # surface serves staler data, and loop 2's pushes wait for loop 1.
     budget = _WriteBudget(_MAX_LLM_CALLS_PER_CYCLE, monotonic() + _MAX_LLM_SECONDS_PER_CYCLE)
     # The WEBHOOK surface's own call allowance, spent inside this same pass and therefore under the
     # same wall clock -- `notification_wording.PassBudget`'s docstring states that contract and this
@@ -7221,7 +7221,7 @@ def list_journeys(
     """Every journey registered by this device, each annotated with the situations currently
     affecting it (the same matcher used for push, but with no dedup — this is the live picture).
 
-    Plain ``def`` (NOT ``async def``), as in ``reisevalg.recommendation``: the impact provider can
+    Plain ``def`` (NOT ``async def``): the impact provider can
     make a blocking Journey Planner call, which must run in the anyio threadpool rather than on the
     single-worker event loop. The alternative lookup is additionally skipped on this request path —
     see :func:`match_journey`."""

@@ -3390,7 +3390,7 @@ def test_ensure_table_backs_off_after_a_failure(monkeypatch):
 def test_journey_handlers_are_not_coroutines():
     """They reach the impact provider, which can make a blocking Journey Planner call, so FastAPI
     must run them in the anyio threadpool. As `async def` they would block the single-worker event
-    loop and freeze /health (review 2026-07-29; rule documented at reisevalg.py:28)."""
+    loop and freeze /health (review 2026-07-29)."""
     import inspect
 
     assert not inspect.iscoroutinefunction(varsel.list_journeys)

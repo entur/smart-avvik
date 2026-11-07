@@ -1,7 +1,7 @@
 -- Incrementally classify each disruption's free text (summary + description) into a category and
--- append it to disruptions.categories — the category lookup predict.sql joins on (a miss there
+-- append it to disruptions.categories — the category lookup predict_calls*.sql join on (a miss there
 -- falls back to 'UNKNOWN'). In the main.py pipeline this runs after disruptions_initial_today is
--- rebuilt and before predict.sql, so new incidents get a real category before scoring.
+-- rebuilt and before predict_calls*.sql, so new incidents get a real category before scoring.
 --
 -- cat_array: the candidate categories, built from disruptions.category_taxonomy as a list of
 -- (category, description) tuples ordered by sort_order. AI.CLASSIFY needs its category set as a

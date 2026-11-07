@@ -7,8 +7,8 @@ tests pin the parser, the selection rules and the fail-open behaviour around the
 The parser is checked against `RECORDED_JP_REPLY` at the bottom of this file — a payload captured
 from that 2026-08-06 curl, not a hand-written fixture. The distinction is the point: a fixture
 written from the parser's own assumptions would agree with the parser no matter what either of
-them did, and the JP document is hand-built GraphQL whose sibling in reisevalg.py already cost a
-fix commit to a brace slip (PR #22).
+them did, and the JP document is hand-built GraphQL whose sibling in reisevalg.py (removed
+2026-11-07) cost a fix commit to a brace slip (PR #22).
 
 Run: uv run --with pydantic python test_alternatives.py  (or under pytest)
 """

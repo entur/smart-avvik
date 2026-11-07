@@ -58,7 +58,7 @@ Seven things here are decisions rather than mechanics.
 
 No import of ``main`` and no import of ``varsel`` (the package rule): ``main`` injects the store,
 the credential plane, the canonicaliser and the connectivity seam through :func:`configure`, the
-way it already does for ``historikk``, ``meldinger``, ``reisevalg`` and ``togvarsel_notify``.
+way it already does for ``historikk``, ``meldinger`` and ``togvarsel_notify``.
 """
 
 from __future__ import annotations

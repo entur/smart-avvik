@@ -352,7 +352,7 @@ def test_no_poller_path_bigquery_wait_is_unbounded():
     import pathlib
     import re
 
-    modules = ("togvarsel.py", "togvarsel_notify.py", "togvarsel_outcomes.py", "reisevalg.py")
+    modules = ("togvarsel.py", "togvarsel_notify.py", "togvarsel_outcomes.py")
     offenders = []
     for name in (*modules, "decisions.py"):
         text = (pathlib.Path(__file__).parent / name).read_text()

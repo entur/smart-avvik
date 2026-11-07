@@ -12,7 +12,7 @@ Extracted from main.py on 2026-07-29. Two things drove it, both review findings:
    type error instead of a runtime TypeError swallowed by a per-journey guard.
 
 This module owns no state. The per-call prediction snapshot lives in main (the poller writes it);
-main injects a reader via `configure()`, the same pattern reisevalg/varsel/llm_message already use.
+main injects a reader via `configure()`, the same pattern varsel/llm_message already use.
 """
 
 from __future__ import annotations
@@ -781,8 +781,8 @@ def _trip_cells(
     Situations with no qualifying departure are skipped.
 
     The window is the primitive because the two callers ask different questions of the same data:
-    ``/impact`` asks about one intended departure (window = ``at`` ± :data:`_IMPACT_AT_TOLERANCE`),
-    while a registered /varsel journey is a recurring ``[begin, end]`` window. `select` is how they
+    the public ``/impact`` endpoint (removed 2026-11-07) asked about one intended departure (window =
+    ``at`` ± 90 min), while a registered /varsel journey is a recurring ``[begin, end]`` window. `select` is how they
     differ on which train to keep per line:
 
     * ``"nearest"`` — the boarding call closest to `at` (which is then required). What a passenger
@@ -2249,7 +2249,7 @@ class _Generation:
         **Only a minute-ALIGNED window is filed.** The poller's windows come from
         `varsel.journey_windows` and are minute-aligned by construction, so registrations sharing a
         window share an entry — which is the clustering this memo exists for. The public `/impact`
-        endpoint's are `at ± main._IMPACT_AT_TOLERANCE` off `datetime.now(UTC)`, so they are never
+        endpoint's (removed 2026-11-07) were `at ± 90 min` off `datetime.now(UTC)`, so they were never
         aligned and no two requests ever agree: filed, each one would deposit an entry nothing can
         hit again for the life of the generation — a leak proportional to public request volume, in
         a structure whose whole point is being sized by the timetable. Declining to file it costs
