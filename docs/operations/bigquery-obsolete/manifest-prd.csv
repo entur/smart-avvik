@@ -1,0 +1,152 @@
+name,type,size_gb,modified,verdict,reason,evidence
+arr_delay_reg,MODEL,0.000,2026-09-22T07:56:51Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_delay_reg_pooled_all,MODEL,0.000,2026-09-22T07:57:26Z,keep,deployed,app:2026-11-09
+arr_ge10_clf,MODEL,0.000,2026-09-22T07:57:04Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge10_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:38Z,keep,deployed,app:2026-11-09
+arr_ge10_platt,MODEL,0.000,2026-09-22T07:59:02Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge10_platt_lead120,MODEL,0.000,2026-09-22T07:59:14Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge10_platt_lead240,MODEL,0.000,2026-09-22T07:59:21Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge10_platt_lead60,MODEL,0.000,2026-09-22T07:59:08Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge10_platt_plan,MODEL,0.000,2026-09-22T07:59:27Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_clf,MODEL,0.000,2026-09-22T07:57:07Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:41Z,keep,deployed,app:2026-11-09
+arr_ge20_platt,MODEL,0.000,2026-09-22T07:59:33Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_platt_lead120,MODEL,0.000,2026-09-22T07:59:45Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_platt_lead240,MODEL,0.000,2026-09-22T07:59:51Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_platt_lead60,MODEL,0.000,2026-09-22T07:59:39Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge20_platt_plan,MODEL,0.000,2026-09-22T07:59:58Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_clf,MODEL,0.000,2026-09-22T07:57:10Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:44Z,keep,deployed,app:2026-11-09
+arr_ge40_platt,MODEL,0.000,2026-09-22T08:00:04Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_platt_lead120,MODEL,0.000,2026-09-22T08:00:17Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_platt_lead240,MODEL,0.000,2026-09-22T08:00:23Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_platt_lead60,MODEL,0.000,2026-09-22T08:00:11Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge40_platt_plan,MODEL,0.000,2026-09-22T08:00:30Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_clf,MODEL,0.000,2026-09-22T07:57:00Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:35Z,keep,deployed,app:2026-11-09
+arr_ge5_platt,MODEL,0.000,2026-09-22T07:58:31Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_platt_lead120,MODEL,0.000,2026-09-22T07:58:44Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_platt_lead240,MODEL,0.000,2026-09-22T07:58:50Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_platt_lead60,MODEL,0.000,2026-09-22T07:58:37Z,keep,deployed,app:2026-11-09 team:2026-10-15
+arr_ge5_platt_plan,MODEL,0.000,2026-09-22T07:58:56Z,keep,deployed,app:2026-11-09 team:2026-10-15
+bus_calls_planned_today,TABLE,0.148,2026-11-09T11:30:00Z,keep,deployed,app:2026-11-09 team:2026-10-26
+call_cancel_clf,MODEL,0.000,2026-09-22T07:56:57Z,keep,deployed,app:2026-11-09 team:2026-10-15
+call_cancel_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:32Z,keep,deployed,app:2026-11-09
+call_predictions_bus_today,TABLE,0.002,2026-11-09T13:16:24Z,keep,deployed,app:2026-11-09
+call_predictions_today,TABLE,0.009,2026-11-09T13:16:10Z,keep,deployed,app:2026-11-09 team:2026-10-23
+cancel_platt,MODEL,0.000,2026-09-22T07:58:00Z,keep,deployed,app:2026-11-09 team:2026-10-15
+cancel_platt_lead120,MODEL,0.000,2026-09-22T07:58:12Z,keep,deployed,app:2026-11-09 team:2026-10-15
+cancel_platt_lead240,MODEL,0.000,2026-09-22T07:58:18Z,keep,deployed,app:2026-11-09 team:2026-10-15
+cancel_platt_lead60,MODEL,0.000,2026-09-22T07:58:06Z,keep,deployed,app:2026-11-09 team:2026-10-15
+cancel_platt_plan,MODEL,0.000,2026-09-22T07:58:25Z,keep,deployed,app:2026-11-09 team:2026-10-15
+categories,TABLE,0.024,2026-11-09T13:15:41Z,keep,deployed,app:2026-11-09 team:2026-10-15
+category_taxonomy,TABLE,0.000,2026-09-22T08:02:50Z,keep,deployed,
+delay_p90_calib,TABLE,0.000,2026-09-22T08:03:00Z,keep,deployed,app:2026-11-09 team:2026-10-15
+delay_p90_calib_pooled_all,TABLE,0.000,2026-09-22T08:03:03Z,keep,deployed,app:2026-11-09
+demo_calls,TABLE,34.399,2026-11-09T06:00:31Z,keep,deployed,team:2026-11-06
+demo_highlights,TABLE,0.000,2026-11-09T06:00:44Z,keep,deployed,team:2026-11-06
+demo_predictions,TABLE,0.745,2026-11-09T06:00:41Z,keep,deployed,team:2026-11-06
+demo_stops,TABLE,0.001,2026-11-09T06:00:43Z,keep,deployed,
+dep_delay_reg,MODEL,0.000,2026-09-22T07:56:54Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_delay_reg_pooled_all,MODEL,0.000,2026-09-22T07:57:29Z,keep,deployed,app:2026-11-09
+dep_ge10_clf,MODEL,0.000,2026-09-22T07:57:17Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge10_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:51Z,keep,deployed,app:2026-11-09
+dep_ge10_platt,MODEL,0.000,2026-09-22T08:01:09Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge10_platt_lead120,MODEL,0.000,2026-09-22T08:01:22Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge10_platt_lead240,MODEL,0.000,2026-09-22T08:01:28Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge10_platt_lead60,MODEL,0.000,2026-09-22T08:01:15Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge10_platt_plan,MODEL,0.000,2026-09-22T08:01:36Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_clf,MODEL,0.000,2026-09-22T07:57:20Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:54Z,keep,deployed,app:2026-11-09
+dep_ge20_platt,MODEL,0.000,2026-09-22T08:01:42Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_platt_lead120,MODEL,0.000,2026-09-22T08:01:55Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_platt_lead240,MODEL,0.000,2026-09-22T08:02:01Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_platt_lead60,MODEL,0.000,2026-09-22T08:01:49Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge20_platt_plan,MODEL,0.000,2026-09-22T08:02:08Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_clf,MODEL,0.000,2026-09-22T07:57:23Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:57Z,keep,deployed,app:2026-11-09
+dep_ge40_platt,MODEL,0.000,2026-09-22T08:02:14Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_platt_lead120,MODEL,0.000,2026-09-22T08:02:27Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_platt_lead240,MODEL,0.000,2026-09-22T08:02:34Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_platt_lead60,MODEL,0.000,2026-09-22T08:02:21Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge40_platt_plan,MODEL,0.000,2026-09-22T08:02:41Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_clf,MODEL,0.000,2026-09-22T07:57:13Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_clf_pooled_all,MODEL,0.000,2026-09-22T07:57:47Z,keep,deployed,app:2026-11-09
+dep_ge5_platt,MODEL,0.000,2026-09-22T08:00:37Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_platt_lead120,MODEL,0.000,2026-09-22T08:00:50Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_platt_lead240,MODEL,0.000,2026-09-22T08:00:56Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_platt_lead60,MODEL,0.000,2026-09-22T08:00:43Z,keep,deployed,app:2026-11-09 team:2026-10-15
+dep_ge5_platt_plan,MODEL,0.000,2026-09-22T08:01:03Z,keep,deployed,app:2026-11-09 team:2026-10-15
+disruptions_bus_initial_today,TABLE,0.000,2026-11-09T13:16:13Z,keep,deployed,app:2026-11-09
+disruptions_initial_today,TABLE,0.000,2026-11-09T13:15:39Z,keep,deployed,app:2026-11-09 team:2026-10-22
+nosx_platt_weights,TABLE,0.000,2026-09-22T08:03:09Z,keep,deployed,app:2026-11-09 team:2026-10-15
+pooled_all_platt_weights,TABLE,0.000,2026-09-22T08:03:06Z,keep,deployed,app:2026-11-09
+rail_calls_planned_today,TABLE,0.004,2026-11-09T12:55:59Z,keep,deployed,app:2026-11-09 team:2026-10-30
+rail_calls_removed_today,TABLE,0.000,2026-11-09T12:56:06Z,keep,deployed,app:2026-11-09 team:2026-10-30
+rail_calls_today,TABLE,0.001,2026-11-09T13:04:12Z,keep,deployed,app:2026-11-09 team:2026-10-30
+togvarsel_calendar,TABLE,0.000,2026-09-22T08:03:36Z,keep,deployed,app:2026-11-09
+togvarsel_features_today,TABLE,0.000,2026-11-09T13:02:57Z,keep,deployed,app:2026-11-09
+togvarsel_issued,TABLE,0.000,2026-11-09T13:03:04Z,keep,deployed,app:2026-11-09 team:2026-10-29
+togvarsel_m_am0630,MODEL,0.000,2026-09-22T07:56:38Z,keep,deployed,app:2026-11-09
+togvarsel_m_am0700,MODEL,0.000,2026-09-22T07:56:41Z,keep,deployed,app:2026-11-09
+togvarsel_m_pm1200,MODEL,0.000,2026-09-22T07:56:44Z,keep,deployed,app:2026-11-09
+togvarsel_m_pm1400,MODEL,0.000,2026-09-22T07:56:47Z,keep,deployed,app:2026-11-09
+togvarsel_oslo_stations,TABLE,0.000,2026-09-22T08:03:33Z,keep,deployed,app:2026-11-09 team:2026-10-29
+togvarsel_outcomes,TABLE,0.000,2026-11-09T08:20:38Z,keep,deployed,app:2026-11-09 team:2026-10-29
+togvarsel_rounds,TABLE,0.000,2026-11-09T13:03:08Z,keep,deployed,app:2026-11-09
+togvarsel_sx_today,TABLE,0.000,2026-11-09T13:02:59Z,keep,deployed,app:2026-11-09
+varsel_decision_groups,VIEW,0.000,2026-11-07T12:52:46Z,keep,deployed,
+varsel_decision_groups_between,ROUTINE,0.000,2026-11-07T12:52:45Z,keep,deployed,
+varsel_decision_outcomes,TABLE,0.154,2026-11-09T04:30:18Z,keep,deployed,app:2026-11-09 team:2026-11-02
+varsel_decisions,TABLE,7.571,2026-11-09T13:13:46Z,keep,deployed,app:2026-11-09 team:2026-11-03
+varsel_feedback_contexts,TABLE,0.000,2026-11-04T12:50:40Z,keep,deployed,team:2026-10-13
+arr_ge10_platt_nosx,MODEL,0.000,2026-09-22T07:59:05Z,move,eval-only,
+arr_ge10_platt_nosx_lead120,MODEL,0.000,2026-09-22T07:59:17Z,move,eval-only,
+arr_ge10_platt_nosx_lead240,MODEL,0.000,2026-09-22T07:59:24Z,move,eval-only,
+arr_ge10_platt_nosx_lead60,MODEL,0.000,2026-09-22T07:59:11Z,move,eval-only,
+arr_ge10_platt_nosx_plan,MODEL,0.000,2026-09-22T07:59:30Z,move,eval-only,
+arr_ge20_platt_nosx,MODEL,0.000,2026-09-22T07:59:36Z,move,eval-only,
+arr_ge20_platt_nosx_lead120,MODEL,0.000,2026-09-22T07:59:48Z,move,eval-only,
+arr_ge20_platt_nosx_lead240,MODEL,0.000,2026-09-22T07:59:54Z,move,eval-only,
+arr_ge20_platt_nosx_lead60,MODEL,0.000,2026-09-22T07:59:42Z,move,eval-only,
+arr_ge20_platt_nosx_plan,MODEL,0.000,2026-09-22T08:00:01Z,move,eval-only,
+arr_ge40_platt_nosx,MODEL,0.000,2026-09-22T08:00:07Z,move,eval-only,
+arr_ge40_platt_nosx_lead120,MODEL,0.000,2026-09-22T08:00:20Z,move,eval-only,
+arr_ge40_platt_nosx_lead240,MODEL,0.000,2026-09-22T08:00:27Z,move,eval-only,
+arr_ge40_platt_nosx_lead60,MODEL,0.000,2026-09-22T08:00:14Z,move,eval-only,
+arr_ge40_platt_nosx_plan,MODEL,0.000,2026-09-22T08:00:34Z,move,eval-only,
+arr_ge5_platt_nosx,MODEL,0.000,2026-09-22T07:58:34Z,move,eval-only,
+arr_ge5_platt_nosx_lead120,MODEL,0.000,2026-09-22T07:58:47Z,move,eval-only,
+arr_ge5_platt_nosx_lead240,MODEL,0.000,2026-09-22T07:58:53Z,move,eval-only,
+arr_ge5_platt_nosx_lead60,MODEL,0.000,2026-09-22T07:58:41Z,move,eval-only,
+arr_ge5_platt_nosx_plan,MODEL,0.000,2026-09-22T07:58:59Z,move,eval-only,
+cancel_platt_nosx,MODEL,0.000,2026-09-22T07:58:03Z,move,unreferenced,
+cancel_platt_nosx_lead120,MODEL,0.000,2026-09-22T07:58:15Z,move,unreferenced,
+cancel_platt_nosx_lead240,MODEL,0.000,2026-09-22T07:58:22Z,move,unreferenced,
+cancel_platt_nosx_lead60,MODEL,0.000,2026-09-22T07:58:09Z,move,unreferenced,
+cancel_platt_nosx_plan,MODEL,0.000,2026-09-22T07:58:28Z,move,unreferenced,
+category_line_hour_impact,TABLE,0.001,2026-09-22T08:02:53Z,move,unreferenced,
+dep_ge10_platt_nosx,MODEL,0.000,2026-09-22T08:01:12Z,move,unreferenced,
+dep_ge10_platt_nosx_lead120,MODEL,0.000,2026-09-22T08:01:25Z,move,unreferenced,
+dep_ge10_platt_nosx_lead240,MODEL,0.000,2026-09-22T08:01:32Z,move,unreferenced,
+dep_ge10_platt_nosx_lead60,MODEL,0.000,2026-09-22T08:01:19Z,move,unreferenced,
+dep_ge10_platt_nosx_plan,MODEL,0.000,2026-09-22T08:01:39Z,move,unreferenced,
+dep_ge20_platt_nosx,MODEL,0.000,2026-09-22T08:01:46Z,move,unreferenced,
+dep_ge20_platt_nosx_lead120,MODEL,0.000,2026-09-22T08:01:58Z,move,unreferenced,
+dep_ge20_platt_nosx_lead240,MODEL,0.000,2026-09-22T08:02:04Z,move,unreferenced,
+dep_ge20_platt_nosx_lead60,MODEL,0.000,2026-09-22T08:01:52Z,move,unreferenced,
+dep_ge20_platt_nosx_plan,MODEL,0.000,2026-09-22T08:02:11Z,move,unreferenced,
+dep_ge40_platt_nosx,MODEL,0.000,2026-09-22T08:02:17Z,move,unreferenced,
+dep_ge40_platt_nosx_lead120,MODEL,0.000,2026-09-22T08:02:31Z,move,unreferenced,
+dep_ge40_platt_nosx_lead240,MODEL,0.000,2026-09-22T08:02:37Z,move,unreferenced,
+dep_ge40_platt_nosx_lead60,MODEL,0.000,2026-09-22T08:02:24Z,move,unreferenced,
+dep_ge40_platt_nosx_plan,MODEL,0.000,2026-09-22T08:02:44Z,move,unreferenced,
+dep_ge5_platt_nosx,MODEL,0.000,2026-09-22T08:00:40Z,move,unreferenced,
+dep_ge5_platt_nosx_lead120,MODEL,0.000,2026-09-22T08:00:53Z,move,unreferenced,
+dep_ge5_platt_nosx_lead240,MODEL,0.000,2026-09-22T08:00:59Z,move,unreferenced,
+dep_ge5_platt_nosx_lead60,MODEL,0.000,2026-09-22T08:00:47Z,move,unreferenced,
+dep_ge5_platt_nosx_plan,MODEL,0.000,2026-09-22T08:01:06Z,move,unreferenced,
+dur_init_reopen,MODEL,0.000,2026-09-22T07:56:31Z,move,unreferenced,
+duration_quantiles,TABLE,0.000,2026-09-22T08:02:56Z,move,unreferenced,
+impact_remaining_noet,MODEL,0.000,2026-09-22T07:56:34Z,move,unreferenced,
+predictions_today,TABLE,0.000,2026-11-07T12:53:14Z,move,unreferenced,
