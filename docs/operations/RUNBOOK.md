@@ -233,10 +233,18 @@ bq ls --transfer_config --transfer_location=EU --project_id=ent-smartavvik-prd
 
 ## The obsolete dataset
 
-`disruptions_obsolete`, in dev and in prd, holds the objects moved out of `disruptions` because
-nothing in use reads them: experiments, inputs only an eval notebook reads, and in prd the duration
-models and the no-SX Platt models that serving stopped reading. It has no expiry. Deleting its
-contents is a later, separate decision.
+This section describes kix-avvik's projects (`ent-kixavvik-dev`, `ent-kixavvik-prd`), where the
+move was made on 2026-11-07. smart-avvik has no `disruptions_obsolete`: dev holds a full copy of
+kix-avvik's dev dataset taken the day before, which
+[`bigquery-obsolete/team-ror-cleanup.md`](bigquery-obsolete/team-ror-cleanup.md) cleans up, and prd
+holds what `copy_runtime_to_prd.sh` copies plus the tables the app builds. The scripts below are
+kix-avvik's tools for its own projects: they treat a read from `ent-smartavvik-*` as the handover
+copy and refuse any other project.
+
+In kix-avvik, `disruptions_obsolete`, in dev and in prd, holds the objects moved out of
+`disruptions` because nothing in use reads them: experiments, inputs only an eval notebook reads,
+and in prd the duration models and the no-SX Platt models that serving stopped reading. It has no
+expiry. Deleting its contents is a later, separate decision.
 
 The record is one manifest per project, `docs/operations/bigquery-obsolete/manifest-<env>.csv`: every
 object, its verdict (`keep` or `move`), and why. An object stays in `disruptions` when deployed code,
@@ -254,8 +262,7 @@ already exists in `disruptions`. A restored object stays where it is: on the old
 skips it as `changed-since-manifest`, so moving it again takes a new inventory.
 
 To find what has gone unused since, run `scripts/bq_obsolete_inventory.py` again (its header says
-how). team-ror cleans up their copy of dev with
-[`bigquery-obsolete/team-ror-cleanup.md`](bigquery-obsolete/team-ror-cleanup.md).
+how).
 
 ## Gotchas
 
@@ -338,8 +345,8 @@ developer's private notes.
   became `/rushvarsel-api` on 2026-10-22, installed apps got 3 394 "404 Not Found" answers until
   2026-10-26.
 - Usage per endpoint exists only in the prd access log (cluster project `ent-kub-prd`, namespace
-  `kix-avvik`, logger `uvicorn.access`), which keeps 30 days. The metric
-  `kix_http_requests_total` counts by the first path segment only, so it cannot tell one
+  `smart-avvik`, logger `uvicorn.access`), which keeps 30 days. The metric
+  `smart_avvik_http_requests_total` counts by the first path segment only, so it cannot tell one
   operation from another. Export the log before it ages out if you need a longer history.
 
 **Time zones**
