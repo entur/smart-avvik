@@ -1389,7 +1389,7 @@ def test_rolling_budgets_release_calls_at_each_window_boundary():
 #: releases' files since the delivery worker got its own — the chart renders one Deployment per
 #: release, so a second workload is a second release — and the worker asks no model and serves no
 #: replay, so demanding these two values of it would be demanding configuration for surfaces that
-#: are not in that process at all. A prefix filter rather than a name list: a fourth environment
+#: are not in that process at all. A prefix filter rather than a name list: a third environment
 #: must still be caught by both tests below, which is the whole point of globbing.
 def _api_values_files() -> list[Path]:
     env = Path(__file__).parents[2] / "helm/smart-avvik/env"

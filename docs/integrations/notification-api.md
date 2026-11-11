@@ -185,10 +185,10 @@ gating onboarding on the flag that needs onboarding is circular. Two consequence
 - A deployment whose store or key pepper is not configured answers **503
   `{"detail": "channel_not_configured"}`** with `Retry-After: 60` on every **credentialed** route —
   never 401. The public read is the exception: it never touches the store or the pepper, so it is
-  never `channel_not_configured` — it serves in every environment, tst included, with the one 503
+  never `channel_not_configured` — it serves in every environment, with the one 503
   of its own below.
-  **tst answers this today; dev and prd have had the pepper since 2026-09-10**: the database name ships in the base chart and is
-  inherited everywhere, so the pepper is the only discriminator and it exists in dev and prd. Any other store fault answers **503 `store_unavailable`**.
+  **Neither environment answers this today: dev and prd have had the pepper since 2026-09-10.** The database name ships in the base chart and is
+  inherited everywhere, so the pepper is the only discriminator. Any other store fault answers **503 `store_unavailable`**.
 - **The public read has a 503 of its own**: **503 `{"detail": "predictions_not_loaded"}`** with
   `Retry-After: 60` while the process has no predictions loaded. It is deliberately never an empty
   list — an empty list off an empty cache would report an empty process as a calm day. Since
@@ -385,7 +385,7 @@ not one uniform shape bought at that price.
 
 `servable` and `servable_checked_at` answer "can the service alert on any planned trip between these
 two places today?", from `/varsel`'s own connectivity check. Where the deployment evaluates trips
-with a change (`TRIP_PLANS_ENABLED`, on in dev since 2026-10-28 and off in tst and prd), that is a
+with a change (`TRIP_PLANS_ENABLED`, on in dev since 2026-10-28 and off in prd), that is a
 direct trip **or** a trip with a change that rides a Vy or SJ Norge train, read off the timetable of
 trips with a change the service holds for the pair, today's and tomorrow's. Elsewhere it is a direct
 trip only, as before.
@@ -804,7 +804,7 @@ definition is registered**.
 - **Treat 429, 503 `predictions_not_loaded` and a `rate_limited` status as ordinary states** and
   serve your cached answer. They are the read's bounds binding, not a fault to alarm on.
 - **Whether an entry's wording is the model's follows a deployment switch**
-  (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev and prd, off in tst today), so
+  (`NOTIFICATION_WEBHOOK_LLM_ENABLED`, the webhook event's own; on in dev and prd), so
   in an environment where it is off every entry reads `disabled` with the template — correct, and
   complete.
 
@@ -1357,7 +1357,7 @@ Listed here from 2026-10-28; earlier additions are dated where they are describe
 
 **2026-10-28 — departures with a change**
 (`docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`), where the deployment evaluates them
-(`TRIP_PLANS_ENABLED`: dev on, tst and prd off):
+(`TRIP_PLANS_ENABLED`: dev on, prd off):
 
 - **Two strict-schema additions**, present in every environment including those where the flag is
   off. `coverage.transfers` on journey-alerts and journey-status (`not_evaluated` with the flag

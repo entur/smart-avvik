@@ -70,16 +70,14 @@ def imports():
     _spec.loader.exec_module(exporter)
 
     # Which PostHog project serves which environment. The ids come from the environment and are
-    # listed in smart-avvik-deployment-config's docs/feedback/README.md. tst deliberately shares
-    # DEV's project and is separated from it by the `environment` event property alone, so the pair
-    # is encoded here rather than left to whoever is typing --posthog-project-id at 16:55.
+    # listed in smart-avvik-deployment-config's docs/feedback/README.md. Encoded
+    # here rather than left to whoever is typing --posthog-project-id at 16:55.
     def _posthog_project(name):
         value = os.environ.get(f"POSTHOG_PROJECT_ID_{name}", "").strip()
         return int(value) if value.isdigit() else None
 
     TARGETS = {
         "dev": ("ent-smartavvik-dev", _posthog_project("DEV")),
-        "tst": ("ent-smartavvik-tst", _posthog_project("DEV")),
         "prd": ("ent-smartavvik-prd", _posthog_project("PRD")),
     }
     return (

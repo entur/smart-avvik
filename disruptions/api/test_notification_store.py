@@ -3714,7 +3714,7 @@ def test_the_notification_secrets_are_their_own_group_and_carry_no_dash():
             values,
             re.MULTILINE,
         ), f"{env} has no `notifications:` secrets group naming both secrets, live or commented"
-        assert "VAPID_PRIVATE_KEY" in values or env == "tst", "tst alone has no keypair"
+        assert "VAPID_PRIVATE_KEY" in values, f"{env} has no keypair"
 
 
 @deploy_files.needs("helm/smart-avvik/values.yaml")

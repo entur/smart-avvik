@@ -23,7 +23,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Deployment
 
 The API (`disruptions/api/main.py`) runs on **Kubernetes** (Entur GKE golden
-path; hosts `smart-avvik.dev.entur.io` / `.staging.entur.io` (tst) / `.entur.io` (prd); see the
+path; hosts `smart-avvik.dev.entur.io` (dev) and `smart-avvik.entur.io` (prd), no tst; see the
 Kubernetes memory note). It is built from the multi-stage `Dockerfile` at the **repo root** — its
 node stage builds the `/demo`, `/varsel`, `/historikk`, `/meldinger`, `/rushvarsel` and
 `/rushhistorikk` front-ends (from `demo/reisedemo` + `demo/avviksvarsel` +
@@ -36,7 +36,7 @@ artifact to the registry and deploys it:
 
 ```sh
 # A push to main builds the image and, once the repository variable DEPLOY_ON_MAIN is "true",
-# dispatches deployment-config's cd.yml: dev, then tst and prd behind its Approve environment.
+# dispatches deployment-config's cd.yml: dev, then prd behind its Approve environment.
 # By hand, to redeploy or roll back an image that is already in the registry:
 gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
   -f image_tag=main.<date>-SHA<commit>
@@ -50,8 +50,7 @@ gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
   leaves the env file only after the lease-aware binary is live there — dev's whole `deployment:`
   block went on 2026-10-20 for 1..3 pods, PDB 0%; prd keeps its block for a 2..3 floor with a 50 %
   PDB, Entur's production hardening, because one pod loses ~45-50 s to every node eviction;
-  rollback puts the line back before the image); tst has no store, no lease, and keeps one Recreate pod
-  for good. Per-process allowances are per pod (×3 at most). **Read
+  rollback puts the line back before the image). Per-process allowances are per pod (×3 at most). **Read
   `docs/operations/poller-lease.md` before touching the lease, a deploy's strategy, or anything a
   follower loads** — it carries the holder-reading, handoff, outage and rollout steps.
 - **What the poller cycle costs is now logged, not inferred** (2026-08-21). Every step of
@@ -114,13 +113,13 @@ gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
   last-built tables (and on every follower tick), each stamped with its tables' modified time, with
   **no age bound** (a live leader on a quiet night leaves tables hours old). The ET rebuild gates are
   left unarmed, so the first cycle still rebuilds on the deployed SQL. The remaining ~40 s is
-  Recreate itself, which is what tst and a step-A environment still pay; after step B a deploy is
+  Recreate itself, which is what a step-A environment still pays; after step B a deploy is
   rolling, readiness is `/ready`, and the gap should be zero (U9 measures it).
 - Public, read-only service; the SA needs SIRI read access (granted via the team group).
 - **Who may read the `disruptions` dataset is Terraform, not a console click** (`terraform/`, added
   2026-08-13 — the app had no Terraform before that, only the platform-provisioned state bucket
   `ent-gcs-tfa-smartavvik`). Add the group to `disruptions_readers` in `terraform/env/<env>.tfvars`;
-  `.github/workflows/terraform.yml` plans on the PR and applies to dev on merge (tst/prd are
+  `.github/workflows/terraform.yml` plans on the PR and applies to dev on merge (prd is
   dispatch-only, as in `cd.yml`). Grant to a **group**, never a person — reading a group's
   membership needs permissions an ordinary developer does not have, so a per-person list rots
   silently. Two traps, both spelled out in `terraform/bigquery_iam.tf`: the resource must stay
@@ -213,7 +212,7 @@ gh workflow run cd.yml --repo entur/smart-avvik-deployment-config \
   - `.claude/rules/rushvarsel.md` — Rushvarsel (`/rushvarsel`), its push rounds, the
     `SHOW_RUSHVARSEL` gate, and `/rushhistorikk`.
 - **Departures with a change are behind `TRIP_PLANS_ENABLED`** (2026-10-28, plan
-  `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`): on in dev, off in tst and prd until
+  `docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`): on in dev, off in prd until
   the owner turns prd on after the dev review meets the plan's pass marks. Read per call; off is
   today's behaviour everywhere but two strict-schema fields (`coverage.transfers: not_evaluated`,
   `trip: null`). The leader fetches Journey Planner day plans (`trip_plans.py`) into Firestore

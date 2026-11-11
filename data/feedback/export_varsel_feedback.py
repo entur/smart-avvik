@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 QUERY_HOST = "https://eu.posthog.com"
 TOKEN_ENV = "POSTHOG_PERSONAL_API_KEY"
 MAX_EVENTS = 10_000
-ENVIRONMENTS = ("dev", "tst", "prd")
+ENVIRONMENTS = ("dev", "prd")
 _HEX_ID = re.compile(r"^[0-9a-f]{32}$")
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.IGNORECASE)
 _PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")

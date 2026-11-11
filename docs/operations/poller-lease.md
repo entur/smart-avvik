@@ -7,7 +7,7 @@
 Every API pod in dev and prd serves every route, and exactly one of them — the pod holding the
 **poller lease** — runs the poller cycle and every tick-time writer. This file is how to read who
 leads, what to do when nobody does or two do, and how an environment moves from one Recreate pod to
-a rolling, autoscaled Deployment and back. tst has no lease and never will (see the last section).
+a rolling, autoscaled Deployment and back. A local run has no lease (see the last section).
 
 ## What the lease is
 
@@ -172,8 +172,8 @@ Three sources, and they should agree.
    A healthy rolling deploy reads, in order: the old pod's `released`, then the new pod's
    `acquired` within one tick. A Recreate deploy from a lease-unaware binary shows `acquired` with no
    `released` before it, since the old binary had no lease.
-3. **`smart_avvik_poller_leader`**, 1 on the leader and 0 everywhere else — followers, the worker pod and
-   every tst pod export it as 0 (an unset `prometheus_client` gauge is 0, not absent; the metric's
+3. **`smart_avvik_poller_leader`**, 1 on the leader and 0 everywhere else — followers and the worker pod
+   export it as 0 (an unset `prometheus_client` gauge is 0, not absent; the metric's
    HELP text says "absent" and is wrong in the same way `WORKER_LAST_TICK`'s was).
    `sum(smart_avvik_poller_leader{kubernetes_namespace="smart-avvik", prometheus_group="kub-ent-<env>-001"})`
    is the number of leaders; the dashboard draws `count()` beside it, the number of pods exporting.
@@ -397,14 +397,11 @@ would leave route-bearing documents with no expiry. Under Recreate the 270 s gra
 deploy's no-pod gap by up to one phase when the old pod is mid-query; that applies to step A and to
 every rollback, and is accepted.
 
-## tst has no lease
+## A local run has no lease
 
-tst has no Firestore database and no store backend (`VARSEL_STATE_BACKEND` is not `store`), so the
-process uses `poller_lease.SoleLeader`: always the leader, never touches a lease, starts no timer,
-and keeps the old 5 s shutdown join. `/ready` answers exactly as `/health`, and tst's file states
-`/health` as its readiness path anyway. tst keeps `deployment.forceReplicas: 1` **permanently** —
-there is nothing to share and no leader to elect — and neither alert rule exists there (its gauge
-is 0 forever). Local runs and every hermetic suite take the same path.
+A process with no store backend (`VARSEL_STATE_BACKEND` is not `store`), which is every local run
+and every hermetic suite, uses `poller_lease.SoleLeader`: always the leader, never touches a lease,
+starts no timer, and keeps the old 5 s shutdown join. `/ready` answers exactly as `/health`.
 
 ## Measurements
 
