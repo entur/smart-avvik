@@ -32,17 +32,17 @@
           {
             "text": "kub-ent-dev-001",
             "value": "kub-ent-dev-001",
-            "selected": true
+            "selected": false
           },
           {
             "text": "kub-ent-prd-001",
             "value": "kub-ent-prd-001",
-            "selected": false
+            "selected": true
           }
         ],
         "current": {
-          "text": "kub-ent-dev-001",
-          "value": "kub-ent-dev-001"
+          "text": "kub-ent-prd-001",
+          "value": "kub-ent-prd-001"
         }
       }
     ]

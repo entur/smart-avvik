@@ -1,5 +1,5 @@
-# Minor and patch updates are grouped. Nothing merges them automatically until this repository
-# has CI and required checks.
+# Minor and patch updates are grouped. Freyja (the repo's freyja-mode property) merges the PRs it
+# rates low risk once the checks in the "main: required checks" ruleset pass.
 # The chore(deps) prefix makes the PR titles pass verify-pr in pr.yml.
 version: 2
 updates:

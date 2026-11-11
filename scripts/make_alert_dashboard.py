@@ -140,11 +140,12 @@ def dashboard(text):
                     "type": "custom",
                     "label": "Environment",
                     "query": "kub-ent-dev-001,kub-ent-prd-001",
+                    # Defaults to prd, whose alerts are the ones that page someone.
                     "options": [
-                        {"text": e, "value": e, "selected": i == 0}
-                        for i, e in enumerate(("kub-ent-dev-001", "kub-ent-prd-001"))
+                        {"text": e, "value": e, "selected": e == "kub-ent-prd-001"}
+                        for e in ("kub-ent-dev-001", "kub-ent-prd-001")
                     ],
-                    "current": {"text": "kub-ent-dev-001", "value": "kub-ent-dev-001"},
+                    "current": {"text": "kub-ent-prd-001", "value": "kub-ent-prd-001"},
                 },
             ]
         },
