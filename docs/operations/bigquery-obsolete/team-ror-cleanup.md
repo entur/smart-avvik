@@ -18,8 +18,9 @@ rows. The `reason` column says why each object moved: mostly `unreferenced` (not
 `eval-only` (only an evaluation notebook reads it). A row we decided by hand keeps the reason it
 was flagged for, such as `external-read`.
 
-Nothing to do in prd or tst. Your prd copy holds only `varsel_decisions` and
-`varsel_decision_outcomes`, and both stay. tst has no objects.
+Nothing to do for what you copy from our prd. The 50 objects we moved there left `disruptions` on
+2026-11-09, and our audit log shows no read by your jobs before 2026-11-11, so a copy from prd
+holds only objects we keep. tst has no objects.
 
 ## Before you start
 
