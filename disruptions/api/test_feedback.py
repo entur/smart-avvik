@@ -67,6 +67,16 @@ def test_capture_is_allowlisted_and_personless(monkeypatch):
     # caller's real address in a store with no per-event deletion, and the project's "discard client
     # IP data" setting did not suppress it.
     assert captured["properties"]["$ip"] == "0.0.0.0"
+    # The text stays out of PostHog, which keeps events for 7 years with no per-event deletion.
+    assert "comment" not in captured["properties"]
+    assert "Uklart" not in json.dumps(captured)
+    assert captured["properties"]["has_comment"] is True
+    for empty in (None, "", "   "):
+        feedback._capture(
+            _body(comment=empty), environment="dev", context_date="2026-08-26", submitted_at="now",
+            event=feedback.EVENT,
+        )
+        assert captured["properties"]["has_comment"] is False
 
 
 def test_receipt_binds_response_to_context(monkeypatch):
@@ -188,13 +198,46 @@ def test_submit_persists_context_before_capture_and_returns_receipt(monkeypatch)
     monkeypatch.setattr(feedback, "enabled", lambda: True)
     monkeypatch.setattr(feedback.feedback_contexts, "resolve", lambda context_id: {"displayed_text": "Hei"})
     monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (order.append("bq") or True, None))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: order.append("comment") or True)
     monkeypatch.setattr(feedback, "_capture", lambda *args, **kwargs: order.append("posthog"))
     monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
     monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
     result = feedback.submit(_body(), environment="dev")
     assert result["status"] == "saved"
     assert result["receipt"]
-    assert order == ["bq", "posthog"]
+    assert order == ["bq", "comment", "posthog"]
+
+
+def test_a_comment_goes_to_bigquery_keyed_by_event_and_a_blank_one_goes_nowhere(monkeypatch):
+    written = []
+    monkeypatch.setattr(feedback, "enabled", lambda: True)
+    monkeypatch.setattr(feedback.feedback_contexts, "resolve", lambda context_id: {"displayed_text": "Hei"})
+    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (True, None))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: written.append(kwargs) or True)
+    monkeypatch.setattr(feedback, "_capture", lambda *args, **kwargs: None)
+    monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
+    monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
+    body = _body()
+    assert feedback.submit(body, environment="dev")["status"] == "saved"
+    assert written[0]["event_id"] == str(body.event_id)
+    assert written[0]["comment"] == "Uklart"
+    assert written[0]["revision"] == 1
+    for empty in (None, "   "):
+        assert feedback.submit(_body(comment=empty), environment="dev")["status"] == "saved"
+    assert len(written) == 1
+
+
+def test_submit_stops_before_posthog_when_the_comment_cannot_be_stored(monkeypatch):
+    released = []
+    monkeypatch.setattr(feedback, "enabled", lambda: True)
+    monkeypatch.setattr(feedback.feedback_contexts, "resolve", lambda context_id: {"displayed_text": "Hei"})
+    monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (True, None))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: False)
+    monkeypatch.setattr(feedback.feedback_contexts, "release", lambda *args: released.append(args))
+    monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
+    monkeypatch.setattr(feedback, "_capture", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("called")))
+    assert feedback.submit(_body(), environment="dev") == {"status": "downstream"}
+    assert len(released) == 1
 
 
 def test_submit_stops_before_posthog_when_context_persistence_fails(monkeypatch):
@@ -235,12 +278,17 @@ def test_signed_revision_survives_display_lease_and_reuses_context_date(monkeypa
         lambda context_id: (_ for _ in ()).throw(AssertionError("resolved")),
     )
     monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.update(kwargs))
+    stored = []
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: stored.append(kwargs) or True)
     revised = _body(
         response_id=str(first.response_id), revision=2, receipt=receipt, comment="Bedre"
     )
     assert feedback.submit(revised, environment="dev")["status"] == "saved"
     assert captured["context_date"] == "2026-08-26"
     assert captured["event"] == "rush_alert_feedback"
+    # The comment row takes the receipt's date too, so it expires with the context it is about.
+    assert stored[0]["context_date"] == "2026-08-26"
+    assert stored[0]["revision"] == 2
 
 
 def test_the_review_export_reads_both_events():
@@ -257,6 +305,7 @@ def test_rushvarsel_feedback_is_its_own_event_and_rides_the_receipt_into_a_revis
     monkeypatch.setattr(feedback, "enabled", lambda: True)
     monkeypatch.setattr(feedback, "_claim", lambda context_id: True)
     monkeypatch.setattr(feedback.feedback_contexts, "persist", lambda context_id, **kwargs: (True, None))
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: True)
     monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.append(kwargs["event"]))
     monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
     for source, event in (
@@ -291,6 +340,7 @@ def _store_backed(monkeypatch, store, persisted, captured):
         "persist",
         lambda context_id, **kwargs: (persisted.append(context_id) or True, None),
     )
+    monkeypatch.setattr(feedback.feedback_contexts, "persist_comment", lambda **kwargs: True)
     monkeypatch.setattr(feedback, "_capture", lambda body, **kwargs: captured.append(body.response_id))
     monkeypatch.setenv("VARSEL_FEEDBACK_RECEIPT_SECRET", "s" * 32)
 

@@ -223,7 +223,10 @@ def _capture(
         "event_id": str(body.event_id),
         "revision": body.revision,
         "rating": body.rating,
-        "comment": body.comment,
+        # Never the text: PostHog keeps events for 7 years with no per-event deletion, and a comment
+        # can hold anything a traveller types. The text goes to BigQuery (persist_comment), which
+        # expires it with its context after 45 days.
+        "has_comment": _comment(body) is not None,
         "context_date": context_date,
         "environment": environment,
         "submitted_at": submitted_at,
@@ -240,7 +243,7 @@ def _capture(
         # Nothing here wants an IP. Capture is server-side, so the address would be this pod's
         # egress — Entur infrastructure, not the traveller, whose browser never contacts PostHog —
         # and a developer running data/feedback's synthetic round-trip from a laptop would otherwise
-        # write their own residential address into a store with 30-day retention and no per-event
+        # write their own residential address into a store with 7-year retention and no per-event
         # deletion path.
         "$ip": "0.0.0.0",
     }
@@ -256,6 +259,10 @@ def _capture(
     with urlopen(request, timeout=3) as response:
         if response.status >= 300:
             raise RuntimeError(f"PostHog returned {response.status}")
+
+
+def _comment(body: FeedbackIn) -> str | None:
+    return body.comment if body.comment and body.comment.strip() else None
 
 
 def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
@@ -300,11 +307,25 @@ def submit(body: FeedbackIn, *, environment: str) -> dict[str, str | int]:
             if not persisted:
                 feedback_contexts.release(body.context_id, str(body.response_id))
                 return {"status": reason or "downstream"}
+        context_date = context_date or submitted.date().isoformat()
+        comment = _comment(body)
+        if comment is not None and not feedback_contexts.persist_comment(
+            event_id=str(body.event_id),
+            context_id=body.context_id,
+            response_id=str(body.response_id),
+            revision=body.revision,
+            context_date=context_date,
+            submitted_at=submitted.isoformat(),
+            comment=comment,
+        ):
+            if body.revision == 1:
+                feedback_contexts.release(body.context_id, str(body.response_id))
+            return {"status": "downstream"}
         try:
             _capture(
                 body,
                 environment=environment,
-                context_date=context_date or submitted.date().isoformat(),
+                context_date=context_date,
                 submitted_at=submitted.isoformat(),
                 event=event,
             )

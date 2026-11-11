@@ -34,8 +34,8 @@ import {
 // storage-limitation rule), leaving the version alone would have dated the new text to the day the
 // old text was written. REGISTRATION_TEXTS itself did not change.
 const PINNED_CONSENT = {
-  version: '2026-09-13.1',
-  hash: 'af1b2f62',
+  version: '2026-11-11.1',
+  hash: 'fe281fbe',
 };
 
 /** sha256[:8] of the exact corpus a registering user consents to, version included. */

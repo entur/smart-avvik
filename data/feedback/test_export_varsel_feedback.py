@@ -132,6 +132,41 @@ def test_hogql_is_bounded_to_event_environment_and_dates():
     assert f"LIMIT {export.MAX_EVENTS + 1}" in query
 
 
+def test_hogql_never_reads_comment_text_from_posthog():
+    query = export._hogql("prd", date(2026, 8, 1), date(2026, 8, 3))
+    assert "properties.comment" not in query
+    assert "properties.has_comment" in query
+    assert "comment" not in export.EVENT_COLUMNS
+
+
+def test_comments_come_from_bigquery_by_event_id_and_a_lost_one_is_reported():
+    with_text, without, lost, old = event(), event(), event(), event()
+    for e, flag in ((with_text, True), (without, False), (lost, "true"), (old, True)):
+        e["has_comment"] = flag
+    old["context_date"] = "2026-06-01"
+    errors = []
+    export.attach_comments(
+        [with_text, without, lost, old], {with_text["event_id"]: "Uklart"}, errors,
+        retained_since=date(2026, 7, 1),
+    )
+    assert with_text["comment"] == "Uklart"
+    assert without["comment"] is None and lost["comment"] is None and old["comment"] is None
+    assert [e["kind"] for e in errors] == ["missing_comment", "expired_comment"]
+    assert errors[0]["response_id"] == lost["response_id"]
+
+
+def test_comment_query_validates_the_project_and_skips_an_empty_window():
+    try:
+        export.fetch_comments(project="bad`project", event_ids=["e"], start=date(2026, 8, 26),
+                              end=date(2026, 8, 27), client=object())
+    except ValueError as exc:
+        assert "project ID" in str(exc)
+    else:
+        raise AssertionError("unsafe project identifier accepted")
+    assert export.fetch_comments(project="ent-smartavvik-dev", event_ids=[], start=date(2026, 8, 26),
+                                 end=date(2026, 8, 27), client=object()) == {}
+
+
 def test_hogql_uses_hogql_functions_and_not_clickhouse_ones():
     # Nothing offline can validate HogQL, so this pins the constructs a real query already refused
     # rather than pretending to check the dialect. toInt64 is ClickHouse's; HogQL rejects the whole

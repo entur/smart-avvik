@@ -37,7 +37,7 @@
 /** Version of the registration-visible texts, persisted on each journey record
  * as `consent_text_version`. Format: YYYY-MM-DD.n — bump the date (or the
  * counter for a same-day change) whenever a text in REGISTRATION_TEXTS changes. */
-export const CONSENT_TEXT_VERSION = '2026-09-13.1';
+export const CONSENT_TEXT_VERSION = '2026-11-11.1';
 
 /** The version's date as a Norwegian date, for «Sist oppdatert» on the privacy page (design
  * review 2026-09-01, finding 44): the same value every registration is stamped with, so the page
@@ -183,7 +183,7 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'vurdere om varslene treffer. Google Cloud drifter tjenesten på Enturs vegne, i EU. ' +
       'Varselteksten skrives av en språkmodell hos Google i EU, som får vite hvilken strekning og ' +
       'avgang varselet gjelder. Tilbakemeldinger du sender behandles i analyseverktøyet PostHog i ' +
-      'EU, på Enturs vegne. Tjenesten som leverer varselet til telefonen din ser ikke innholdet — ' +
+      'EU, på Enturs vegne, men en kommentar du skriver blir hos Google Cloud. Tjenesten som leverer varselet til telefonen din ser ikke innholdet — ' +
       'det er kryptert.',
   },
   // Its own section, not a clause (finding 46): this is the most far-reaching sentence on the
@@ -224,8 +224,9 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
       'på nytt. Varselabonnementet slettes når du skrur av varsler, når du bruker «Slett alt», og ' +
       'sammen med reisene dine. Loggen over varsler vi har vurdert å sende lagres så lenge ' +
       'eksperimentet pågår; den identifiserer ikke enheten din. Driftslogger slettes automatisk ' +
-      'etter 30 dager og omfattes ikke av «Slett alt». Tilbakemeldinger du sender lagres i inntil ' +
-      '45 dager.',
+      'etter 30 dager og omfattes ikke av «Slett alt». En kommentar du skriver i en tilbakemelding ' +
+      'slettes etter 45 dager. Selve vurderingen, nyttig eller ikke nyttig, beholdes lenger, men ' +
+      'kan etter 45 dager ikke knyttes til varselet eller reisen.',
   },
   {
     title: 'Rettighetene dine',

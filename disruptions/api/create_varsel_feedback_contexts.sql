@@ -1,8 +1,8 @@
 -- Exact traveller-visible alert snapshots used to enrich isolated PostHog feedback.
 -- Append-only and environment-local. Never add this table to runtime copy scripts.
--- 45 days: PostHog keeps the responses that reference a context for 30 days (the project's data-retention
--- setting), and the exporter reaches back one day before its window; a context that outlives every
--- response is unreviewable but still holds route-bearing wording, so it should not sit for 90.
+-- 45 days: the in-app privacy text promises feedback is kept for at most 45 days. The PostHog event that
+-- references a context is anonymous once its context has expired; the comment lives in
+-- varsel_feedback_comments, which expires on the same partition date.
 CREATE TABLE IF NOT EXISTS `disruptions.varsel_feedback_contexts`
 (
   context_id STRING NOT NULL,

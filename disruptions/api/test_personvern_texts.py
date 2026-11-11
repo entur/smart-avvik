@@ -528,6 +528,22 @@ def test_production_pins_posthog_to_the_eu_ingestion_host():
 NOTIFICATION_STORE_PY = _REPO / "disruptions" / "api" / "notification_store.py"
 
 
+def test_the_published_feedback_retention_matches_both_tables():
+    """Protects: «En kommentar du skriver i en tilbakemelding slettes etter 45 dager» (T5).
+
+    The comment and the context it was written about expire by BigQuery partition expiry. PostHog
+    keeps the rating for 7 years, which is why the text lives in BigQuery and not there.
+    """
+    body = PERSONVERN_TS.read_text().split("title: 'Hvor lenge',", 1)[1].split("\n  },", 1)[0]
+    assert "slettes etter 45 dager" in body, "the retention section no longer states 45 days for comments"
+    for name in ("create_varsel_feedback_comments.sql", "create_varsel_feedback_contexts.sql"):
+        ddl = (_REPO / "disruptions" / "api" / name).read_text()
+        assert "partition_expiration_days=45" in ddl, (
+            f"{name} no longer expires after 45 days, so the published «slettes etter 45 dager» "
+            "is false. Change the text and bump CONSENT_TEXT_VERSION before changing the table."
+        )
+
+
 def test_the_published_retention_text_matches_the_horizon_the_store_enforces():
     """The one published sentence that a code constant can falsify without anybody noticing.
 

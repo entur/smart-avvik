@@ -180,7 +180,7 @@ def fetch(
         ),
     )
 
-    # The same four calls main() makes, in the same order, minus write_json. Skipping the
+    # The same calls main() makes, in the same order, minus write_json. Skipping the
     # write is not a shortcut: write_json refuses to overwrite an existing file, so a
     # notebook that wrote on every run would fail on its second one. Saving is opt-in at the
     # bottom instead, through that same guarded function.
@@ -195,6 +195,17 @@ def fetch(
         environment=environment.value,
         start=from_date.value,
         end=to_date.value,
+    )
+    _events = exporter.attach_comments(
+        _events,
+        exporter.fetch_comments(
+            project=project,
+            event_ids=sorted(event["event_id"] for event in _events),
+            start=from_date.value - timedelta(days=1),
+            end=to_date.value,
+        ),
+        _errors,
+        retained_since=datetime.now(UTC).date() - timedelta(days=45),
     )
     _context_ids = sorted({event["context_id"] for event in _events})
     _contexts = exporter.fetch_contexts(

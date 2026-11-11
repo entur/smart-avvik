@@ -16,6 +16,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 TABLE = "disruptions.varsel_feedback_contexts"
+COMMENTS_TABLE = "disruptions.varsel_feedback_comments"
 # The JSON-typed columns of TABLE. insert_rows_json streams through the legacy insertAll API, which
 # reads a native dict against a JSON column as a record and rejects the row ("This field: policy is
 # not a record") — every context write failed this way until 2026-08-27, invisibly, because the
@@ -24,6 +25,7 @@ TABLE = "disruptions.varsel_feedback_contexts"
 # that `IS NOT NULL` matches and /meldinger-style "has input" tests would read as present.
 _JSON_COLUMNS = ("journey_context", "message_input", "prediction", "policy", "delivery")
 _DDL = (Path(__file__).parent / "create_varsel_feedback_contexts.sql").read_text()
+_COMMENTS_DDL = (Path(__file__).parent / "create_varsel_feedback_comments.sql").read_text()
 _LEASE_S = 15 * 60
 _MAX_CONTEXTS = 10_000
 #: After a failed store write, how long this pod mints memory-only without asking. A card render
@@ -67,7 +69,8 @@ def ensure_table() -> bool:
     if _table_ready:
         return True
     try:
-        _bq_client.query(_DDL).result(timeout=60)
+        for ddl in (_DDL, _COMMENTS_DDL):
+            _bq_client.query(ddl).result(timeout=60)
         _table_ready = True
         return True
     except Exception:
@@ -260,6 +263,40 @@ def persist(context_id: str, *, context_date: str | None = None) -> tuple[bool, 
     with _lock:
         _persisted.add(context_id)
     return True, None
+
+
+def persist_comment(
+    *,
+    event_id: str,
+    context_id: str,
+    response_id: str,
+    revision: int,
+    context_date: str,
+    submitted_at: str,
+    comment: str,
+) -> bool:
+    """Store a free-text comment in BigQuery before its PostHog event, which carries only
+    `has_comment`. One row per event id, so a retried submission dedupes on insertAll's row id."""
+    if not ensure_table():
+        return False
+    row = {
+        "event_id": event_id,
+        "context_id": context_id,
+        "response_id": response_id,
+        "revision": revision,
+        "context_date": context_date,
+        "submitted_at": submitted_at,
+        "comment": comment,
+    }
+    try:
+        errors = _bq_client.insert_rows_json(COMMENTS_TABLE, [row], row_ids=[event_id], timeout=5)
+    except Exception:
+        logger.warning("Could not persist feedback comment", exc_info=True)
+        return False
+    if errors:
+        logger.warning("Feedback comment rejected by BigQuery")
+        return False
+    return True
 
 
 def _reset_for_tests() -> None:

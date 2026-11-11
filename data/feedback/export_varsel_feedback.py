@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export personless varsel feedback enriched with its exact BigQuery context."""
+"""Export personless varsel feedback enriched with its comment and exact context from BigQuery."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 _PROJECT_ID = re.compile(r"^[a-z][a-z0-9-]{4,28}[a-z0-9]$")
 EVENT_COLUMNS = (
     "event_timestamp", "environment", "context_id", "context_date", "response_id",
-    "revision", "event_id", "rating", "comment", "submitted_at",
+    "revision", "event_id", "rating", "has_comment", "submitted_at",
 )
 
 
@@ -58,7 +58,7 @@ def _hogql(environment: str, start: date, end: date) -> str:
 toString(toTimeZone(timestamp, 'UTC')), properties.environment, properties.context_id,
 toString(toDate(properties.context_date)),
 properties.response_id, toInt(properties.revision), properties.event_id,
-properties.rating, properties.comment,
+properties.rating, properties.has_comment,
 toString(toTimeZone(properties.submitted_at, 'UTC'))
 FROM events
 WHERE event IN ('varsel_alert_feedback', 'rush_alert_feedback')
@@ -171,6 +171,45 @@ AND context_id IN UNNEST(@context_ids)"""
     return [dict(row.items()) for row in client.query(query, job_config=config).result()]
 
 
+def fetch_comments(
+    *, project: str, event_ids: list[str], start: date, end: date, client: Any | None = None,
+) -> dict[str, str]:
+    """The free text per event id. PostHog carries only `has_comment`: it keeps events for 7 years
+    with no per-event deletion, so the text lives in BigQuery and expires with its context."""
+    if not _PROJECT_ID.fullmatch(project):
+        raise ValueError("invalid Google Cloud project ID")
+    if not event_ids:
+        return {}
+    if client is None:
+        from google.cloud import bigquery
+        client = bigquery.Client(project=project)
+    else:
+        bigquery = __import__("google.cloud.bigquery", fromlist=["bigquery"])
+    query = f"""SELECT event_id, comment FROM `{project}.disruptions.varsel_feedback_comments`
+WHERE context_date >= @from_date AND context_date < @to_date
+AND event_id IN UNNEST(@event_ids)"""
+    config = bigquery.QueryJobConfig(query_parameters=[
+        bigquery.ScalarQueryParameter("from_date", "DATE", start),
+        bigquery.ScalarQueryParameter("to_date", "DATE", end),
+        bigquery.ArrayQueryParameter("event_ids", "STRING", event_ids),
+    ])
+    # Rows are keyed by event id, so a retried insert can only repeat the same text.
+    return {row["event_id"]: row["comment"] for row in client.query(query, job_config=config).result()}
+
+
+def attach_comments(
+    events: list[dict[str, Any]], comments: dict[str, str], errors: list[dict[str, Any]],
+    *, retained_since: date | None = None,
+) -> list[dict[str, Any]]:
+    for event in events:
+        event["comment"] = comments.get(event["event_id"])
+        if event["comment"] is None and event.get("has_comment") in (True, "true"):
+            expired = retained_since and date.fromisoformat(event["context_date"]) < retained_since
+            errors.append({"kind": "expired_comment" if expired else "missing_comment",
+                           "context_id": event["context_id"], "response_id": event["response_id"]})
+    return events
+
+
 def enrich(
     events: list[dict[str, Any]], contexts: Iterable[dict[str, Any]], errors: list[dict[str, Any]],
     *, retained_since: date | None = None,
@@ -251,10 +290,17 @@ def main(argv: list[str] | None = None) -> int:
                       start=args.from_date, end=args.to_date, token=token),
         environment=args.environment, start=args.from_date, end=args.to_date,
     )
+    retained_since = datetime.now(UTC).date() - timedelta(days=45)
+    events = attach_comments(
+        events,
+        fetch_comments(project=args.project, event_ids=sorted(event["event_id"] for event in events),
+                       start=args.from_date - timedelta(days=1), end=args.to_date),
+        errors, retained_since=retained_since,
+    )
     context_ids = sorted({event["context_id"] for event in events})
     contexts = fetch_contexts(project=args.project, context_ids=context_ids,
                               start=args.from_date - timedelta(days=1), end=args.to_date)
-    rows, errors = enrich(events, contexts, errors, retained_since=datetime.now(UTC).date() - timedelta(days=45))
+    rows, errors = enrich(events, contexts, errors, retained_since=retained_since)
     write_json(args.output, {
         "metadata": {"environment": args.environment, "from_date": args.from_date,
                      "to_date_exclusive": args.to_date, "response_count": len(rows),

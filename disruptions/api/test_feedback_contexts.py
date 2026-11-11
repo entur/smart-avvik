@@ -140,6 +140,28 @@ def test_persist_is_self_contained_and_uses_stable_insert_id():
     assert len(fake.rows) == 1
 
 
+def test_comment_rows_go_to_their_own_table_keyed_by_event_id():
+    fake = FakeBQ()
+    feedback_contexts.configure(bq_client=fake)
+    assert feedback_contexts.persist_comment(
+        event_id="e-1", context_id="a" * 32, response_id="r-1", revision=2,
+        context_date="2026-08-26", submitted_at="2026-08-26T10:00:00+00:00", comment="Uklart",
+    )
+    table, rows, ids = fake.rows[0]
+    assert table == feedback_contexts.COMMENTS_TABLE
+    assert ids == ["e-1"]
+    assert rows[0]["comment"] == "Uklart" and rows[0]["context_date"] == "2026-08-26"
+
+
+def test_comment_write_fails_closed_without_bigquery():
+    feedback_contexts._reset_for_tests()
+    feedback_contexts.configure(bq_client=None)
+    assert not feedback_contexts.persist_comment(
+        event_id="e-1", context_id="a" * 32, response_id="r-1", revision=1,
+        context_date="2026-08-26", submitted_at="2026-08-26T10:00:00+00:00", comment="Uklart",
+    )
+
+
 def test_unknown_context_never_infers_a_row():
     assert feedback_contexts.persist("0" * 32) == (False, "expired")
 
