@@ -1,8 +1,8 @@
 {
-  "title": "kix-avvik — alert rules",
-  "uid": "kix-avvik-alerts",
+  "title": "smart-avvik — alert rules",
+  "uid": "smart-avvik-alerts",
   "tags": [
-    "kix-avvik",
+    "smart-avvik",
     "alerts"
   ],
   "timezone": "browser",
@@ -64,7 +64,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(smart_avvik_poller_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_poller_last_tick_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -96,7 +96,7 @@
     {
       "type": "timeseries",
       "title": "1a — No poller leader",
-      "description": "critical · fires below 1 for 5m\n\nNo API pod has led for 5 minutes: no rebuild cycle, no push, no webhook emit, no labelling check. The pods still serve the last-built tables, so reads look healthy while refreshed_at ages. Expected and self-clearing after a SIGKILLed or crashed leader: the successor waits out the 300 s lease TTL plus one 60 s tick, which is longer than this rule's pending window, so a forced kill fires it once. Otherwise look at event=\"poller_lease\" records in ent-kub-<env> namespace kix-avvik (acquire_failed and error mean the Firestore notifications database is failing; refused means some holder's held_until is still in the future) and at /ready's role on each pod. Never delete the lease document. Runbook: docs/operations/poller-lease.md.",
+      "description": "critical · fires below 1 for 5m\n\nNo API pod has led for 5 minutes: no rebuild cycle, no push, no webhook emit, no labelling check. The pods still serve the last-built tables, so reads look healthy while refreshed_at ages. Expected and self-clearing after a SIGKILLed or crashed leader: the successor waits out the 300 s lease TTL plus one 60 s tick, which is longer than this rule's pending window, so a forced kill fires it once. Otherwise look at event=\"poller_lease\" records in ent-kub-<env> namespace smart-avvik (acquire_failed and error mean the Firestore notifications database is failing; refused means some holder's held_until is still in the future) and at /ready's role on each pod. Never delete the lease document. Runbook: docs/operations/poller-lease.md.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -109,12 +109,12 @@
       },
       "targets": [
         {
-          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "leaders (sum)",
           "refId": "A"
         },
         {
-          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "pods exporting (count)",
           "refId": "B"
         }
@@ -159,12 +159,12 @@
       },
       "targets": [
         {
-          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "sum(smart_avvik_poller_leader{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "leaders (sum)",
           "refId": "A"
         },
         {
-          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "count(smart_avvik_poller_leader{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "pods exporting (count)",
           "refId": "B"
         }
@@ -209,7 +209,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -254,7 +254,7 @@
       },
       "targets": [
         {
-          "expr": "(max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) - max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})) and on() (max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}) > 0)",
+          "expr": "(max(smart_avvik_poller_last_cycle_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}) - max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})) and on() (max(smart_avvik_mirror_last_sync_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}) > 0)",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -286,7 +286,7 @@
     {
       "type": "timeseries",
       "title": "2b — Worker stopped",
-      "description": "critical · fires above 900 for 5m\n\nNo delivery round for 15 minutes; the tick moves on every round, including the ones that find nothing. Check the kix-avvik-worker Deployment — scaled to zero, rolled back, or crash-looping. Pending webhook events expire after an hour.",
+      "description": "critical · fires above 900 for 5m\n\nNo delivery round for 15 minutes; the tick moves on every round, including the ones that find nothing. Check the smart-avvik-worker Deployment — scaled to zero, rolled back, or crash-looping. Pending webhook events expire after an hour.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -299,7 +299,7 @@
       },
       "targets": [
         {
-          "expr": "time() - max(smart_avvik_worker_last_tick_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "time() - max(smart_avvik_worker_last_tick_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -331,7 +331,7 @@
     {
       "type": "timeseries",
       "title": "2c — Delivery backlog",
-      "description": "warning · fires above 1800 for 15m\n\nThe oldest deliverable pending delivery was minted over 30 min ago, and an event is valid for 60. Response: raise deployment.forceReplicas in helm/kix-avvik/env/worker-values-kub-ent-<env>.yaml — the drain formula is in docs/operations/notification-webhooks.md.",
+      "description": "warning · fires above 1800 for 15m\n\nThe oldest deliverable pending delivery was minted over 30 min ago, and an event is valid for 60. Response: raise deployment.forceReplicas in smart-avvik-deployment-config's helm/smart-avvik/env/worker-values-kub-ent-<env>.yaml — the drain formula is in docs/operations/notification-webhooks.md.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -344,7 +344,7 @@
       },
       "targets": [
         {
-          "expr": "max(smart_avvik_delivery_backlog_age_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"})",
+          "expr": "max(smart_avvik_delivery_backlog_age_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -389,12 +389,12 @@
       },
       "targets": [
         {
-          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[15m])",
+          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[15m])",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[15m]) or vector(0)",
+          "expr": "increase(kube_pod_container_status_restarts_total{exported_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[15m]) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -439,7 +439,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"kix-avvik\", container!=\"\", prometheus_group=\"$env\"})\n/\nsum by (pod) (kube_pod_container_resource_limits{exported_namespace=\"kix-avvik\", resource=\"memory\", prometheus_group=\"$env\"})",
+          "expr": "sum by (pod) (container_memory_working_set_bytes{namespace=\"smart-avvik\", container!=\"\", prometheus_group=\"$env\"})\n/\nsum by (pod) (kube_pod_container_resource_limits{exported_namespace=\"smart-avvik\", resource=\"memory\", prometheus_group=\"$env\"})",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -484,7 +484,7 @@
       },
       "targets": [
         {
-          "expr": "kube_pod_status_ready{exported_namespace=\"kix-avvik\", condition=\"true\", prometheus_group=\"$env\"}",
+          "expr": "kube_pod_status_ready{exported_namespace=\"smart-avvik\", condition=\"true\", prometheus_group=\"$env\"}",
           "legendFormat": "alert expression",
           "refId": "A"
         }
@@ -516,7 +516,7 @@
     {
       "type": "timeseries",
       "title": "6 — ERROR logged",
-      "description": "warning · fires above 0 for 0m\n\nThe ERROR channel is deliberately near-silent, so any ERROR is worth a look. labelling_stale, thread_died and health_degraded all arrive here. Read the record in Cloud Logging — cluster project ent-kub-dev, namespace kix-avvik, not the app project.",
+      "description": "warning · fires above 0 for 0m\n\nThe ERROR channel is deliberately near-silent, so any ERROR is worth a look. labelling_stale, thread_died and health_degraded all arrive here. Read the record in Cloud Logging — cluster project ent-kub-dev, namespace smart-avvik, not the app project.",
       "datasource": {
         "type": "prometheus",
         "uid": "$datasource"
@@ -529,12 +529,12 @@
       },
       "targets": [
         {
-          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m])",
+          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[10m])",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[10m]) or vector(0)",
+          "expr": "increase(smart_avvik_log_records_total{level=\"ERROR\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[10m]) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -579,12 +579,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_push_total{result=\"error\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_push_total{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -629,12 +629,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\nand on()\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m])) > 5",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=~\"error|unavailable|truncated|rejected\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m]))\n/\nsum(increase(smart_avvik_llm_message_total{surface=\"live\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[30m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -679,12 +679,12 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h]))",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[1h]))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[1h])) or vector(0)",
+          "expr": "sum(increase(smart_avvik_llm_message_total{surface=\"live\", result=\"rejected\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[1h])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -729,12 +729,12 @@
       },
       "targets": [
         {
-          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))\nand on()\n(sum(increase(smart_avvik_decision_write_total{result=\"ok\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[48h])) > 0)",
+          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}))\nand on()\n(sum(increase(smart_avvik_decision_write_total{result=\"ok\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[48h])) > 0)",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}))",
+          "expr": "(time() - max(smart_avvik_labelling_last_success_timestamp_seconds{kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}))",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -779,12 +779,12 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))",
+          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m]))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])) or vector(0)",
+          "expr": "sum(rate(smart_avvik_http_requests_total{status=\"5xx\", path!=\"health\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m]))\n/\nsum(rate(smart_avvik_http_requests_total{path!=\"health\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m])) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
@@ -829,12 +829,12 @@
       },
       "targets": [
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m])))",
           "legendFormat": "alert expression",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"kix-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(smart_avvik_http_request_duration_seconds_bucket{path!=\"health\", long_poll!=\"true\", kubernetes_namespace=\"smart-avvik\", prometheus_group=\"$env\"}[5m]))) or vector(0)",
           "legendFormat": "readable",
           "refId": "B"
         }
