@@ -169,7 +169,7 @@ test('T6 dialog stays enumerative: it names the three things «Slett alt» delet
   // kept honest at BOTH ends: «Slett alt» reaches the journeys, the varselabonnement and the
   // technical key, and nothing else. The operational logs, the BigQuery decision log and any
   // feedback already sent all SURVIVE it — see the survival table in
-  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §3 — so a dialog
+  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §3 in smart-avvik-deployment-config — so a dialog
   // that grew a reassuring extra noun would promise an erasure the endpoint does not perform.
   const survives = {
     logg: 'the operational logs (push sends, the deletion receipt) and the BigQuery decision log',

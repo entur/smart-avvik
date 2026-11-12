@@ -190,7 +190,8 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
   // page, and it had the least room. What the pages show is the strekning, avgangstid and verdict
   // of every alert — without anything that identifies you or your device. Whether that is
   // sufficiently anonymous on a thin route is an open question for the data protection officer
-  // (see docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §5); the text
+  // (see docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md §5 in
+  // smart-avvik-deployment-config); the text
   // states what is shown rather than promising anonymity. Since 2026-09-10 the two pages are
   // behind Entur SSO (disruptions/api/sso.py) and the text says so — §5 of that document requires
   // the published audience and the gate's state to move in the same change, in both directions.
@@ -265,7 +266,7 @@ export const T5_SECTIONS: readonly PersonvernSection[] = [
   // supplies (Google, Mozilla, Apple), routinely outside the EØS. The original
   // assessment weighed Google Cloud, Vertex and PostHog only — everything Entur picks —
   // and missed the one processor the *browser* picks. See
-  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md.
+  // docs/personvern/2026-08-31-avviksvarsel-personvern-tekster-beslutninger.md in smart-avvik-deployment-config.
   {
     title: 'Overføring ut av EØS',
     body:

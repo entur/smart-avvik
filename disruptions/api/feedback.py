@@ -112,7 +112,7 @@ def _token() -> str | None:
     # False, so no context is persisted either and /varsel-api/config reports capture off, which is
     # a one-request diagnosis. What it cannot catch is a well-formed token for the WRONG project;
     # the only detector for that is an export returning zero responses beside a growing
-    # varsel_feedback_contexts, which is why data/feedback/README.md names that check.
+    # varsel_feedback_contexts, which is why docs/feedback/README.md in smart-avvik-deployment-config names that check.
     value = _env("POSTHOG_PROJECT_TOKEN")
     return value if value.startswith("phc_") and len(value) >= 32 else None
 

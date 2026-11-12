@@ -193,9 +193,9 @@ least 32 bytes. `POSTHOG_HOST` is pinned to `https://eu.i.posthog.com`. Missing 
 configuration hides the control without affecting alerts. The token's shape is checked because its
 value cannot be: PostHog's capture endpoint answers HTTP 200 to any non-empty key, so a wrong one
 would otherwise discard feedback in silence (measured 2026-08-28 — see
-[`data/feedback/README.md`](../../data/feedback/README.md)). Do not enable it merely because the secrets exist: setup, raw-payload audit, access,
+`docs/feedback/README.md` in smart-avvik-deployment-config). Do not enable it merely because the secrets exist: setup, raw-payload audit, access,
 retention, deletion/subject-rights, staged rollout, reviewer usage, and rollback are documented in
-[`data/feedback/README.md`](../../data/feedback/README.md).
+`docs/feedback/README.md` in smart-avvik-deployment-config.
 
 Regenerate the PWA icons — the navy KI-lab tile for the default brand, a white bell on petrol
 for `?brand=none` — after changing the design (needs `npm ci` first, for the Nationale fonts):

@@ -243,7 +243,7 @@ three pods are three times each.
 - the Journey Planner fetch caps (`alternatives`), the request limiters (journey-alerts'
   `MAX_PER_MIN` and `PER_PAIR_PER_MIN`, the other public limiters), the `/meldinger` replay budget;
 - the feedback capture limits (60 per minute, 12 per context per minute, 2 000 per day — an
-  effective **6 000 a day** at three pods; `data/feedback/README.md`).
+  effective **6 000 a day** at three pods; `docs/feedback/README.md` in smart-avvik-deployment-config).
 
 Gemini translation of operator text is leader-only, so followers do not translate the same
 situations; they read the leader's from `situation_translations` instead (the shared translation

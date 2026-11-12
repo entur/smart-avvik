@@ -33,8 +33,11 @@ def _(mo):
     for the same reason (argv is readable by every user on the machine via `ps`):
 
     ```sh
-    POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" uv run marimo edit data/feedback/review_feedback.py
+    POSTHOG_PERSONAL_API_KEY="$(approved-secret-manager-or-cli-command)" POSTHOG_PROJECT_ID_DEV=<id> POSTHOG_PROJECT_ID_PRD=<id> uv run marimo edit data/feedback/review_feedback.py
     ```
+
+    The PostHog project ids are listed in smart-avvik-deployment-config's
+    `docs/feedback/README.md`, not in this repository.
 
     BigQuery uses your developer ADC. Everything you read here is subject to the same rules
     as the export file: don't paste it into tickets, and don't keep it past 30 days.
@@ -66,13 +69,18 @@ def imports():
     exporter = importlib.util.module_from_spec(_spec)
     _spec.loader.exec_module(exporter)
 
-    # Which PostHog project serves which environment. tst deliberately shares DEV's project
-    # and is separated from it by the `environment` event property alone, so the pair
+    # Which PostHog project serves which environment. The ids come from the environment and are
+    # listed in smart-avvik-deployment-config's docs/feedback/README.md. tst deliberately shares
+    # DEV's project and is separated from it by the `environment` event property alone, so the pair
     # is encoded here rather than left to whoever is typing --posthog-project-id at 16:55.
+    def _posthog_project(name):
+        value = os.environ.get(f"POSTHOG_PROJECT_ID_{name}", "").strip()
+        return int(value) if value.isdigit() else None
+
     TARGETS = {
-        "dev": ("ent-smartavvik-dev", None),
-        "tst": ("ent-smartavvik-tst", None),
-        "prd": ("ent-smartavvik-prd", None),
+        "dev": ("ent-smartavvik-dev", _posthog_project("DEV")),
+        "tst": ("ent-smartavvik-tst", _posthog_project("DEV")),
+        "prd": ("ent-smartavvik-prd", _posthog_project("PRD")),
     }
     return (
         Path,
@@ -135,7 +143,9 @@ def target(TARGETS, environment, from_date, mo, to_date):
     # through editing (To moved before From, or dragged past 31 days) reaches the fetch on the
     # keystroke. A message read by a human was enough while a button separated the two.
     window_problem = (
-        "`To` must be after `From` (it is exclusive)." if _days <= 0
+        "Set `POSTHOG_PROJECT_ID_DEV` and `POSTHOG_PROJECT_ID_PRD` when you launch (see the notes"
+        " at the top)." if posthog_project_id is None
+        else "`To` must be after `From` (it is exclusive)." if _days <= 0
         else "The window is limited to 31 days." if _days > 31
         else None
     )
