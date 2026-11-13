@@ -157,6 +157,9 @@ class CallPred:
     alighting_allowed: bool = True
     # SIRI-SX `reportType` (INCIDENT / GENERAL) as published; None on a synthetic `KIX:` row.
     report_type: str | None = None
+    # The stops the situation's message names (SX `affects`), empty when it names none or the row is
+    # not a situation's. Only `_other_stretch` reads it.
+    affected_stops: frozenset[str] = frozenset()
     # The stacks' 5-minute points, which only a trip's connection reads (KTD7: P(miss) off the
     # arriving call's survival, a slack shift off the connecting call's). Defaulted, like the fields
     # above, so a table built before them, and every hand-written call in the suites, still loads.
@@ -336,6 +339,13 @@ class SituationImpact(BaseModel):
         "`AlternativeOutcome.answered`. False is a transient absence (throttled, outage, a raising "
         "lookup), never to be cached as 'no alternative exists'; a lookup that was not issued at "
         "all stays True, because that absence is terminal.",
+    )
+    other_stretch: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+        description="The operator's message is about a stretch of the worst train the traveller "
+        "does not ride — see `_other_stretch`.",
     )
 
 
@@ -546,6 +556,28 @@ class TripCell:
     # but never reaches `to_stop`. `departure` then carries the certainty (see
     # `_unreachable_departure_prediction`) while its own `cancelled` stays False.
     destination_cancelled: bool = False
+    other_stretch: bool = False
+
+
+def _other_stretch(bcall: CallPred, acall: CallPred | None, calls: Iterable[CallPred]) -> bool:
+    """Whether the situation's message is about a stretch of this train the traveller does not ride.
+
+    A message names whole trains, so it reaches every call of each (`predict_calls.sql`'s `base`),
+    and Vy publishes one per stretch: on 2026-11-12 an Oslo S -> Hamar traveller's RE10 card read
+    «Ta Ruters buss … Bryn–Skøyen» and «alternativ transport … Oslo S og Skøyen», both behind
+    Oslo S on a train from Drammen. The stops the message names, placed on this train, span
+    a stretch; it is another stretch when it shares at most one stop with the ride, where the two
+    meet. Spans rather than stop sets because Vy names a stretch by its two ends («Oslo S–Skøyen»
+    is Oslo S and Skøyen, not Nationaltheatret between them), and a stretch around the whole ride
+    names no stop on it. Anything it cannot place counts as the ride: one stop is a point, not a
+    stretch, a stop the train does not call at says nothing, and no `to_stop` means no ride's end.
+    """
+    if acall is None or not bcall.affected_stops:
+        return False
+    named = [c.stop_order for c in calls if c.stop_place in bcall.affected_stops]
+    if len(set(named)) < 2:
+        return False
+    return min(max(named), acall.stop_order) - max(min(named), bcall.stop_order) <= 0
 
 
 def _certainly_cancelled(c: CallPred) -> bool:
@@ -932,6 +964,7 @@ def _trip_cells(
                     # arrival can come from the other population when the train's calls are split.
                     has_situation=bcall.has_situation,
                     report_type=bcall.report_type,
+                    other_stretch=_other_stretch(bcall, acall, by_journey[(bcall.operator, bcall.jkey)]),
                 )
             )
     return cells
@@ -1099,6 +1132,7 @@ def _impact_response(
                 original_is_best=outcome.original_is_best,
                 alternative_subject=outcome.subject,
                 answered=outcome.answered,
+                other_stretch=worst_cell.other_stretch,
             )
         )
     situations.sort(key=lambda s: severity_key(s.departure_prediction), reverse=True)

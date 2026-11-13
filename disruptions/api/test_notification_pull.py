@@ -272,6 +272,34 @@ def test_two_situations_about_one_train_collapse_to_one_entry_naming_both():
     assert entry["situations"] == [s["situation_number"] for s in entry["payload"]["situations"]]
 
 
+def test_the_read_leaves_a_message_about_a_stretch_behind_the_boarding_stop_out_of_the_text():
+    """The Entur app's card renders `situations_text` off this read (2026-11-12, RE10 Oslo S ->
+    Hamar), so the matcher's `other_stretch` has to survive into the payload the read assembles."""
+    now = datetime(2026, 9, 10, 6, 0, tzinfo=_OSLO)
+    _reset(now=now)
+    dep = now + timedelta(hours=1)
+
+    def train(situation, text, named, p):
+        return [
+            FakeCall(jkey="t1", stop_place=place, stop_order=order, aimed_dep=at, aimed_arr=arr,
+                     situation_number=situation, summary=text, description=text, p_impact_dep=p,
+                     affected_stops=frozenset(named))
+            for place, order, at, arr in [
+                ("NSR:StopPlace:152", 1, dep - timedelta(minutes=10), None),
+                (NSR_A, 2, dep, dep),
+                (NSR_B, 5, None, dep + timedelta(minutes=40)),
+            ]
+        ]
+
+    _use_snapshot({
+        "S_far": train("S_far", "Alternativ transport Oslo S–Skøyen.", {"NSR:StopPlace:152", NSR_A}, 0.90),
+        "S_ride": train("S_ride", "Alternativ transport Asker–Oslo S.", {NSR_A, NSR_B}, 0.85),
+    })
+    [entry] = _get().json()["alerts"]
+    assert entry["payload"]["situations_text"] == "Alternativ transport Asker–Oslo S.", entry["payload"]
+    assert sorted(s["situation_number"] for s in entry["payload"]["situations"]) == ["S_far", "S_ride"]
+
+
 def test_a_declared_cancellation_is_confirmed_certain_and_says_innstilt():
     """R3: `phase: confirmed` iff `alert.cancelled`; probabilities 1.0 and delay null are
     `impact._cancelled_prediction`'s rule carried by `varsel._webhook_payload`, and the title is the

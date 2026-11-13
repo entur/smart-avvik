@@ -32,7 +32,29 @@ WITH all_versions AS (
   SELECT
     participantRef, situationNumber, version, creationTime,
     COALESCE(SAFE.TIMESTAMP(versionedAtTime), ingestionTime) AS event_ts,
-    severity, planned, reportType, priority, validityPeriods, summaries, descriptions, affects
+    severity, planned, reportType, priority, validityPeriods, summaries, descriptions, affects,
+    -- The stops a version names, every way SX can name one: once here, so the first version's
+    -- (`affected_stops`, a feature) and the latest's (`latest_affected_stops`, served) cannot drift.
+    (
+      SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
+      FROM (
+        SELECT stops.stopPointRef AS stop_ref
+        FROM UNNEST(affects.stopPoints) AS stops WHERE stops.stopPointRef IS NOT NULL
+        UNION DISTINCT
+        SELECT sp.stopPlaceRef
+        FROM UNNEST(affects.stopPlaces) AS sp WHERE sp.stopPlaceRef IS NOT NULL
+        UNION DISTINCT
+        SELECT sp.stopPointRef
+        FROM UNNEST(affects.networks) AS n, UNNEST(n.affectedLines) AS al,
+             UNNEST(al.routes) AS r, UNNEST(r.stopPoints.stopPoints) AS sp
+        WHERE sp.stopPointRef IS NOT NULL
+        UNION DISTINCT
+        SELECT sp.stopPointRef
+        FROM UNNEST(affects.vehicleJourneys) AS vj, UNNEST(vj.routes) AS r,
+             UNNEST(r.stopPoints.stopPoints) AS sp
+        WHERE sp.stopPointRef IS NOT NULL
+      )
+    ) AS named_stops
   FROM `ent-anshar-prd.realtime.siri_realtime_sx_production`
   -- `OR _PARTITIONTIME IS NULL` reads the streaming buffer too (see last_ingestion_time.sql).
   WHERE (DATE(_PARTITIONTIME) = CURRENT_DATE() OR _PARTITIONTIME IS NULL)
@@ -55,6 +77,9 @@ latest_version AS (
   SELECT
     participantRef, situationNumber,
     reportType AS latest_report_type,
+    -- Served only, like the text: Vy moves a stretch between versions («Innstilt Drammen–Lillestrøm»
+    -- became «… Drammen–Oslo S»; 103 of 3 327 NSB situations over the 14 days to 2026-11-13).
+    named_stops AS latest_affected_stops,
     (SELECT x.value FROM UNNEST(summaries) AS x
      WHERE x.value IS NOT NULL AND (x.language IS NULL OR UPPER(x.language) = 'NO')
      LIMIT 1) AS latest_summary,
@@ -117,7 +142,7 @@ base AS (
      WHERE x.value IS NOT NULL AND UPPER(x.language) = 'EN'
      LIMIT 1) AS description_en,
     lv.latest_summary, lv.latest_description, lv.latest_summary_en, lv.latest_description_en,
-    lv.latest_report_type,
+    lv.latest_report_type, lv.latest_affected_stops,
     -- Vy's all-clear: an INCIDENT whose latest version is GENERAL («Åpnet», «Normal hastighet»,
     -- «Toget kjører igjen»). Measured 2026-09-20..10-06: 377 of 383 such NSB situations say exactly
     -- that, and the other 6 («Planlegger buss for tog» and the like) were CLOSED by Vy. Serving drops
@@ -125,26 +150,7 @@ base AS (
     -- It is inert for SJN, which never republishes as GENERAL and never closes (267 situations
     -- 2025-10..2026-10): each SJN message only reaches its own train's 12 h window anyway.
     (fv.reportType = 'INCIDENT' AND lv.latest_report_type = 'GENERAL') AS all_clear,
-    (
-      SELECT ARRAY_AGG(stop_ref ORDER BY stop_ref)
-      FROM (
-        SELECT stops.stopPointRef AS stop_ref
-        FROM UNNEST(fv.affects.stopPoints) AS stops WHERE stops.stopPointRef IS NOT NULL
-        UNION DISTINCT
-        SELECT sp.stopPlaceRef
-        FROM UNNEST(fv.affects.stopPlaces) AS sp WHERE sp.stopPlaceRef IS NOT NULL
-        UNION DISTINCT
-        SELECT sp.stopPointRef
-        FROM UNNEST(fv.affects.networks) AS n, UNNEST(n.affectedLines) AS al,
-             UNNEST(al.routes) AS r, UNNEST(r.stopPoints.stopPoints) AS sp
-        WHERE sp.stopPointRef IS NOT NULL
-        UNION DISTINCT
-        SELECT sp.stopPointRef
-        FROM UNNEST(fv.affects.vehicleJourneys) AS vj, UNNEST(vj.routes) AS r,
-             UNNEST(r.stopPoints.stopPoints) AS sp
-        WHERE sp.stopPointRef IS NOT NULL
-      )
-    ) AS affected_stops,
+    fv.named_stops AS affected_stops,
     (
       SELECT ARRAY_AGG(journey_ref ORDER BY journey_ref)
       FROM (

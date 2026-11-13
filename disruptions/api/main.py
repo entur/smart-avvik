@@ -584,6 +584,9 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         has_situation=getattr(r, "has_situation", True),
         # Same getattr rule: a table built before 2026-10-05 has no report_type column.
         report_type=getattr(r, "report_type", None),
+        # Same getattr rule: a table built before 2026-11-13, and the bus table, name no stops, which
+        # `impact._other_stretch` reads as "about the ride".
+        affected_stops=frozenset(getattr(r, "affected_stops", None) or ()),
         # Same getattr rule, same rollout window: a prediction table built before 2026-09-01 has
         # neither column, and "not stated" is permission. The matcher reads these to keep a
         # boarding-only long-distance call from being offered as somebody's trip.

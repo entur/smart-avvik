@@ -25,6 +25,7 @@ import alternatives
 import impact
 import llm_message
 import main
+import notification_wording
 import varsel
 from varsel import (
     _OSLO,
@@ -84,6 +85,8 @@ class FakeCall:
     p_arr_ge20: float | None = None
     p_dep_ge5: float | None = None
     p_dep_ge20: float | None = None
+    # The stops the situation's message names. Empty, like CallPred's default, reads as "about the ride".
+    affected_stops: frozenset[str] = frozenset()
 
 
 def _journey(begin="07:00", end="09:00", days=(0, 1, 2, 3, 4)):
@@ -1988,10 +1991,60 @@ def test_the_freshness_provider_reads_none_before_the_first_load_and_the_timesta
             main._call_pred_refreshed_at = previous
 
 
-def _payload(alert):
+def _payload(alert, contributing=None):
     return varsel._webhook_payload(
-        alert, [alert], message_input={"i_morgen": False}, title="t", body="b", summary=(None, None, None)
+        alert, contributing or [alert], message_input={"i_morgen": False}, title="t", body="b",
+        summary=(None, None, None),
     )
+
+
+def test_operator_text_leaves_out_messages_about_a_stretch_the_traveller_does_not_ride():
+    """2026-11-12, RE10 22:34 Drammen-Lillehammer, a traveller Oslo S -> Hamar (A -> B here): Vy
+    named the train in one message per stretch, and the app's card read two about stretches behind
+    Oslo S. A message that meets the ride only where the two touch leaves the text; one along the
+    ride, a point, and a stretch around the whole ride stay; `situations` keeps every one."""
+    route = [("SKO", 5), ("NTH", 6), ("A", 7), ("LLS", 8), ("OSL", 9), ("B", 13), ("LHM", 16)]
+
+    def train(sit, text, named):
+        return [
+            FakeCall(
+                jkey="re10", stop_place=place, stop_order=order,
+                aimed_dep=None if place == "LHM" else MON_0800 + timedelta(minutes=10 * (order - 7)),
+                aimed_arr=MON_0800 + timedelta(minutes=10 * (order - 7)),
+                situation_number=sit, summary=text, description=text, affected_stops=frozenset(named),
+            )
+            for place, order in route
+        ]
+
+    messages = {
+        "S1": ("Ta Ruters buss på strekningen Bryn–Skøyen.", {"BRY", "SKO", "NTH", "A"}),
+        "S2": ("Alternativ transport Oslo S–Skøyen.", {"A", "SKO"}),
+        "S3": ("Alternativ transport Oslo S–Oslo lufthavn.", {"A", "OSL"}),
+        "S4": ("Toget står på Nationaltheatret.", {"NTH"}),
+        "S5": ("Stengt Skøyen–Lillehammer.", {"SKO", "LHM"}),
+    }
+    alerts = match(_journey(), {sit: train(sit, *m) for sit, m in messages.items()})
+    assert {a.situation_number for a in alerts if a.other_stretch} == {"S1", "S2"}, alerts
+
+    payload = _payload(alerts[0], alerts)
+    text = payload["situations_text"]
+    assert "Bryn" not in text and "Oslo S–Skøyen" not in text, text
+    assert all(m[0] in text for sit, m in messages.items() if sit in {"S3", "S4", "S5"}), text
+    assert {s["situation_number"] for s in payload["situations"]} == set(messages)
+
+    # The definition summary chooses its cause from the same messages.
+    seen = []
+    original = notification_wording.alerts_summary
+    notification_wording.alerts_summary = lambda trains: seen.extend(trains) or (None, None, None)
+    try:
+        varsel.definition_summary([({}, alerts[0], alerts)])
+    finally:
+        notification_wording.alerts_summary = original
+    assert {s["situation_number"] for _, situations in seen for s in situations} == {"S3", "S4", "S5"}
+
+    # Nothing about the ride left: the train's own messages beat none.
+    elsewhere = [a for a in alerts if a.other_stretch]
+    assert "Bryn" in _payload(elsewhere[0], elsewhere)["situations_text"]
 
 
 def test_a_train_that_leaves_but_never_reaches_the_destination_is_a_confirmed_cancellation():

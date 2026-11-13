@@ -73,6 +73,11 @@ sit AS (
     COALESCE(d.latest_description_en, d.description_en) AS description_en,
     -- SIRI-SX `reportType` as the operator published it NOW (INCIDENT / GENERAL), served only.
     COALESCE(d.latest_report_type, d.reportType) AS report_type,
+    -- The stops the message names, served only and from the version whose text is served (the first
+    -- when the latest names none): a message names every call of each train it lists, so
+    -- `impact._other_stretch` reads these to tell a stretch the traveller rides from one elsewhere on
+    -- the same train. `num_stops` below stays the first version's, a feature.
+    IF(ARRAY_LENGTH(d.latest_affected_stops) > 0, d.latest_affected_stops, d.affected_stops) AS affected_stops,
     CASE
       WHEN REGEXP_CONTAINS(LOWER(CONCAT(IFNULL(d.summary,''),' ',IFNULL(d.description,''))),
                            r'innstil|kansel')                        THEN 'innstilt'
@@ -931,7 +936,9 @@ SELECT
      'Ingen situasjonsmelding er publisert for denne avgangen. Vurderinga byggjer på '
      || 'sanntidsdata: forseinkinga toget sjølv har lenger bak, og tilstanden på linja.') AS description_nn,
   -- NULL on a no-SX row: no `sit` row carries its synthetic number, so `sd` is unmatched.
-  sd.report_type
+  sd.report_type,
+  -- Empty on a no-SX row, for the same reason (BigQuery stores a NULL array as empty).
+  sd.affected_stops
 FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
@@ -939,7 +946,7 @@ LEFT JOIN (
   SELECT situationNumber, ANY_VALUE(served_summary) AS served_summary,
          ANY_VALUE(description) AS description,
          ANY_VALUE(summary_en) AS summary_en, ANY_VALUE(description_en) AS description_en,
-         ANY_VALUE(report_type) AS report_type
+         ANY_VALUE(report_type) AS report_type, ANY_VALUE(affected_stops) AS affected_stops
   FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
 JOIN wch  ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
@@ -1051,6 +1058,7 @@ SELECT
       || IF(e.bus_for_train, ' Vy har sett opp buss for tog.', '')
     ELSE 'Avgangen er markert som innstilt i sanntidsdata frå operatøren.'
   END AS description_nn,
-  -- No operator message, so no report type.
-  CAST(NULL AS STRING)  AS report_type
+  -- No operator message, so no report type and no stops it names.
+  CAST(NULL AS STRING)  AS report_type,
+  ARRAY<STRING>[]       AS affected_stops
 FROM et_only AS e;

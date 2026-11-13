@@ -77,7 +77,18 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   `varsel._webhook_payload`, so the event, the journey-alerts read and (as null) the test event
   carry it. Deterministic and operator words only: it drops a Vy forecast once «Forsinket» is out
   (`_SUPERSEDED_BY`, 15 of 15 prd pairs named the same origin), drops exact repeated sentences and
-  puts «Ta …» advice last. Measured on prd's 14 days to 2026-10-18: 112 of 216 alert-worthy trains
+  drops «Ta neste tog»/«Ta andre tog» advice whenever a fact is left (2026-10-27). **Since
+  2026-11-13 it also leaves out a message about a stretch of the train the traveller does not ride**
+  (`impact._other_stretch`, `varsel._about_the_ride`): a message names whole trains, and on
+  2026-11-12 an Oslo S -> Hamar card on the RE10 from Drammen read Vy's «Bryn–Skøyen» and «Oslo S og
+  Skøyen» advice. The stops the message names (`affected_stops` on `call_predictions_today`, a
+  serving-only column: the latest SX version's, like the text, or the first's when the latest names
+  none -- 103 of 3 327 NSB situations moved their stops over the 14 days to 2026-11-13) are placed on the train as a span, and the message is
+  elsewhere when that span shares at most one stop with the ride. One stop, no stops on the train,
+  or no `to_stop` count as the ride; if nothing is left, every message stays. The same filter feeds
+  the definition `summary`'s cause; `situations[]` keeps every message. Bus rows carry no stops, so
+  bus is unchanged. The cost: an upstream closure that explains a delay drops out when a message
+  about the ride exists. Measured on prd's 14 days to 2026-10-18: 112 of 216 alert-worthy trains
   carried 2+ situations, none with identical descriptions, and this shortens the text by only ~11 %.
   The rest of the overlap is in meaning (bus ordered both directions, 3-5 message incidents), and an
   LLM summary is the next step only if an integrator asks for it. Never fuzzy matching: messages

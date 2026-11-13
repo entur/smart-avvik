@@ -2257,6 +2257,13 @@ class Alert(BaseModel):
         description="SIRI-SX `reportType` as published, `INCIDENT` or `GENERAL`; null on a "
         "synthetic `KIX:` alert.",
     )
+    other_stretch: bool = Field(
+        default=False,
+        exclude=True,
+        repr=False,
+        description="The operator's message is about a stretch of this train the traveller does not "
+        "ride (`impact._other_stretch`), so the operator text a traveller reads leaves it out.",
+    )
     line: str | None = Field(description="Line ref of the worst affected vehicle, e.g. 'VYG:Line:R31'.")
     destination: str | None = Field(
         default=None,
@@ -2767,6 +2774,7 @@ def _collect_alerts(
             operator=sit.operator,
             has_situation=sit.has_situation,
             report_type=sit.report_type,
+            other_stretch=bool(getattr(sit, "other_stretch", False)),
             mode=mode_label(sit.operator, sit.line),
             line=sit.line,
             destination=journey_status.destination(sit.operator, sit.jkey),
@@ -4676,6 +4684,14 @@ def _webhook_withdrawal_wording(
     return _tag_environment(title), f"{from_name} → {to_name}\n{_WEBHOOK_WITHDRAWAL_DETAIL}"
 
 
+def _about_the_ride(alerts: list[Alert]) -> list[Alert]:
+    """`alerts` without the ones whose message is about a stretch the traveller does not ride
+    (`impact._other_stretch`), for the text a traveller reads -- unless that leaves none, since a
+    message about the train beats no message. `payload.situations` keeps them all: the figures were
+    scored under them, and a client joins on their numbers."""
+    return [a for a in alerts if not a.other_stretch] or alerts
+
+
 def _webhook_situations(alerts: list[Alert]) -> list[dict]:
     """The contributing situations for one train, operator text included.
 
@@ -4784,7 +4800,7 @@ def _webhook_payload(
         except Exception:
             logger.debug("Could not serialize an alternative journey for a notification event", exc_info=True)
     situations = _webhook_situations(contributing)
-    situations_text = notification_wording.situations_text(situations)
+    situations_text = notification_wording.situations_text(_webhook_situations(_about_the_ride(contributing)))
     payload = {
         "notification": {"title": title, "body": body, "action": None},
         "call": {
@@ -4869,7 +4885,7 @@ def definition_summary(
     in the payload's own order, which is the order a cause is chosen in."""
     ranked = sorted(trains, key=lambda t: _alert_rank(t[1]), reverse=True)
     return notification_wording.alerts_summary(
-        [(message_input, _webhook_situations(contributing)) for message_input, _, contributing in ranked]
+        [(message_input, _webhook_situations(_about_the_ride(contributing))) for message_input, _, contributing in ranked]
     )
 
 
