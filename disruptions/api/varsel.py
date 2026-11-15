@@ -6520,9 +6520,8 @@ def check_and_notify(
                                 decision_key = _decision_key(item.key, alert)
                                 pushed_keys.add(decision_key)
                                 digest_messages[decision_key] = wording
-                    elif result == "gone":
-                        if handle_gone_device(item.journey["device_id"]):
-                            changed = True
+                    elif result == "gone" and handle_gone_device(item.journey["device_id"]):
+                        changed = True
                     continue
                 jid, _device, journey, alert, _key, _brand, replaces = item
                 _log_push(
@@ -6554,9 +6553,8 @@ def check_and_notify(
                                 charge_cap=not replaces,
                             )
                     pushed_keys.add(_decision_key(journey_key(journey), alert))
-                elif result == "gone":
-                    if handle_gone_device(journey["device_id"]):
-                        changed = True
+                elif result == "gone" and handle_gone_device(journey["device_id"]):
+                    changed = True
             if presend_failed:
                 logger.warning(
                     "Pre-send store read failed for %d push(es); withheld this cycle",

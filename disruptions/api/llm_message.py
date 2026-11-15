@@ -62,6 +62,7 @@ Design notes
 
 import contextvars
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -265,7 +266,7 @@ _TIMEOUT_S = 9.5
 # `retry_args` reads every field as `options.x or <default>`, so a falsy value silently becomes the
 # SDK default: `jitter=0` is NOT available, and `initial_delay == max_delay` is how the wait is
 # pinned at exactly 1 s instead of drifting to 1-2 s. The retriable set is the SDK's own (408, 429,
-# 5xx, plus httpx timeouts and connect errors).
+# 5xx, plus httpx2/httpx timeouts and connect errors).
 #
 # Since 2026-10-23 the WORDING's attempts are made by `_gemini_write` itself, not by the SDK,
 # because the second one goes to `_GEMINI_FALLBACK_MODEL` -- same count, same 1 s wait
@@ -970,12 +971,30 @@ def _attempt_models(input_json: str) -> tuple[str, ...]:
 def _retriable(exc: Exception) -> bool:
     """google-genai's own retry predicate (`_api_client.retry_args`), for the attempts
     `_gemini_write` now makes itself."""
-    import httpx
     from google.genai import errors as genai_errors
 
     if isinstance(exc, genai_errors.APIError):
         return exc.code in _RETRIABLE_CODES
-    return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+    return isinstance(exc, _transport_errors())
+
+
+def _transport_errors() -> tuple[type[Exception], ...]:
+    """The timeout and connect errors of whichever HTTP client google-genai may be running on.
+
+    google-genai 3 talks httpx2 by default and httpx only when asked (`GOOGLE_GENAI_HTTP_CLIENT`);
+    2.x talked httpx. The two packages share no exception classes, so a check naming one of them
+    reads the other's timeout as permanent and `_gemini_write` gives up instead of trying the
+    fallback model. The image installs `google-genai>=1.0.0` unpinned, so every image built since
+    3.0.0 (2026-11-06) runs httpx2 -- which is how the check went stale in prd before uv.lock moved.
+    """
+    errors: list[type[Exception]] = []
+    for name in ("httpx2", "httpx"):
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        errors += [module.TimeoutException, module.ConnectError]
+    return tuple(errors)
 
 
 _BACKENDS = {"claude": _claude_write, "gemini": _gemini_write}
