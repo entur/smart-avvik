@@ -1254,7 +1254,7 @@
               "predicted",
               "confirmed"
             ],
-            "description": "`confirmed` when the real-time feed has declared the train cancelled, when a departure with a change cannot get there for a declared cancellation of one of its legs (`payload.trip`), or when a Vy train that runs on this weekday is missing from today's timetable altogether (situation `KIX:PlanRemoved:<journey_ref>`) -- a fact, with probabilities of 1.0 and null delay figures in the payload -- else `predicted`. There is no `withdrawn` entry: a train no longer over the gate is simply absent."
+            "description": "`confirmed` when the operator has declared the train cancelled (in SIRI-ET, or since 2026-11-16 in a Vy SIRI-SX «Innstilt A–B» message whose stretch covers the call), when a departure with a change cannot get there for a declared cancellation of one of its legs (`payload.trip`), or when a Vy train that runs on this weekday is missing from today's timetable altogether (situation `KIX:PlanRemoved:<journey_ref>`) -- a fact, with probabilities of 1.0 and null delay figures in the payload -- else `predicted`. There is no `withdrawn` entry: a train no longer over the gate is simply absent."
           },
           "train": {
             "title": "Train",

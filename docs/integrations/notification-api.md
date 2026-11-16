@@ -1355,6 +1355,21 @@ between them — that isolation is what the project boundary enforces, not an ap
 
 Listed here from 2026-10-28; earlier additions are dated where they are described ("since …").
 
+**2026-11-16 — a Vy «Innstilt A–B» message is a declared cancellation.** Vy publishes a
+cancellation as a SIRI-SX message «Innstilt A–B» naming each train, often an hour or more before its
+real-time timetable (SIRI-ET) marks the calls. A call that message covers is now treated exactly as
+one ET has declared cancelled: `phase: confirmed`, `effect: "cancelled"`, probabilities at 1.0 and
+delay figures null, on journey-alerts and on events alike. "Covers" means strictly between A and B
+on that train, or A where the train starts there, or B where it ends there; a call ET has recorded as
+served is never covered. Of the calls this confirms before ET has cancelled them (measured on
+9–16 November 2026), 95 % were in the end cancelled on ordinary days, and 72 % on a disrupted day
+(2026-11-13), when trains still named in an «Innstilt» message ran. No field changed; expect `confirmed` earlier and more often for Vy
+trains, and a `predicted` → `confirmed` transition on trains that already had a warning. If Vy then
+narrows or closes the message, or the train runs after all, journey-alerts goes back to the forecast
+(`predicted`, or no entry below the alert threshold), while an event already sent as `confirmed` is
+never revised to `predicted`; it is
+`withdrawn` only if the forecast then falls below the alert threshold.
+
 **2026-10-28 — departures with a change**
 (`docs/plans/2026-10-24-001-feat-multi-leg-journeys-plan.md`), where the deployment evaluates them
 (`TRIP_PLANS_ENABLED`: dev on, prd off):

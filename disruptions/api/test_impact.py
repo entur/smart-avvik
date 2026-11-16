@@ -14,6 +14,7 @@ import contextlib
 import logging
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 # --- Stub the BigQuery client BEFORE importing main (it builds one at module scope). ---
 from google.cloud import bigquery as _bq
@@ -247,6 +248,52 @@ def test_a_prediction_row_without_the_columns_still_permits():
         Row(**fields, boarding_allowed=True, alighting_allowed=False), "VYG"
     )
     assert after.boarding_allowed and not after.alighting_allowed
+
+
+def test_a_vy_innstilt_covering_the_call_is_read_as_a_declared_cancellation():
+    """predict_calls.sql's `sx_declared_cancelled` (a Vy «Innstilt A–B» whose stretch covers the
+    call) folds into `et_declared_cancelled`, so the matcher serves it exactly as an ET declaration:
+    certainty, no delay figures, `cancelled`. Without the fold the 2026-11-13 L2 Ski–Lysaker cards
+    read «Mulig innstilling 68 %» under Vy's own «Toget er innstilt». A table without the column
+    (the bus table, or one built before it existed) reads as not declared."""
+
+    class Row:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    numbers = dict.fromkeys(
+        [
+            "summary", "description", "stop_name", "aimed_arr", "et_dep_delay_min",
+            "dep_delay_typ_min", "dep_delay_p90_min", "arr_delay_typ_min", "arr_delay_p90_min",
+            "p_arr_ge10", "p_arr_ge20", "arr_delay_p50_stack_min", "arr_delay_p90_stack_min",
+            "p_impact", "p_dep_ge10", "p_dep_ge20", "dep_delay_p50_stack_min",
+            "dep_delay_p90_stack_min",
+        ]
+    )
+    fields = {
+        "situationNumber": "NSB:SituationNumber:x", "jkey": "j1", "lineRef": "VYG:Line:L2",
+        "stop_place": A, "stop_order": 1, "aimed_dep": _at(8), "et_declared_cancelled": False,
+        "call_source": "estimated", "p_cancel": 0.68, "p_impact_dep": 0.7, **numbers,
+    }
+    declared = main._call_pred_from_row(Row(**fields, sx_declared_cancelled=True), "VYG")
+    served = impact._departure_prediction(declared)
+    assert served.cancelled and served.cancel_probability == 1.0 and served.impact_probability == 1.0
+    assert served.delay_p50_min is None and served.delay_typ_min is None
+    assert not main._call_pred_from_row(Row(**fields, sx_declared_cancelled=False), "VYG").et_declared_cancelled
+    assert not main._call_pred_from_row(Row(**fields), "VYG").et_declared_cancelled
+    assert main._call_pred_from_row(
+        Row(**{**fields, "et_declared_cancelled": True}, sx_declared_cancelled=False), "VYG"
+    ).et_declared_cancelled
+
+
+def test_the_sx_declaration_reaches_the_cache_loader():
+    """`_call_pred_from_row` reads `sx_declared_cancelled` with getattr, so that a table built before
+    the column existed reads as "not declared". The same fallback would hide a SELECT that stopped
+    carrying the column: every Vy-declared call served as a forecast again, and nothing failing."""
+    sql = (Path(main.__file__).parent / "predict_calls.sql").read_text()
+    assert sql.count("AS sx_declared_cancelled") == 2  # both branches of the final UNION ALL
+    loader = main._CALL_PREDICTIONS_QUERY
+    assert loader.startswith("SELECT * ") or "sx_declared_cancelled" in loader
 
 
 def test_a_severe_train_that_skips_to_stop_does_not_hide_a_less_severe_one_that_serves_it():

@@ -118,7 +118,9 @@ class CallPred:
     # predict). `call_source` is 'recorded' once the vehicle has actually served the stop and
     # 'estimated' while it is still upcoming, so it is the flag that says whether the two observed
     # fields mean anything. Freshness is bounded by the planned-source TTL, not by "now" -- see
-    # maybe_refresh_planned_calls.
+    # maybe_refresh_planned_calls. Since 2026-11-16 `et_declared_cancelled` also holds a Vy SX
+    # «Innstilt A–B» that covers the call (`main._call_pred_from_row`): declared by the operator,
+    # in either feed.
     et_declared_cancelled: bool | None
     et_dep_delay_min: int | None
     call_source: str | None

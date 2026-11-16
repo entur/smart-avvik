@@ -403,7 +403,8 @@ class JourneyAlertOut(BaseModel):
         "truncated answer lists the soonest trains and may therefore lack some ranks."
     )
     phase: str = Field(
-        description="`confirmed` when ET has declared the train cancelled, when a departure with a "
+        description="`confirmed` when the operator has declared the train cancelled (in ET, or since "
+        "2026-11-16 in a Vy SX «Innstilt A–B» whose stretch covers the call), when a departure with a "
         "change cannot get there for a declared cancellation of one of its legs (`payload.trip`), or "
         "when a Vy train that runs on this weekday is missing from today's timetable "
         "(`KIX:PlanRemoved:`), else `predicted`."

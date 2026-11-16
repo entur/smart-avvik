@@ -310,9 +310,12 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
     `message_wording_comparison.sql` (the rates, and the per-train lead time). All six copies must
     move together. `test_a_removed_train_is_resolved_before_the_et_cancelled_flag` in both suites
     pins the order. The blended figures still count these rows, since they are real decisions. On
-    the card, a removed row gets the «Tatt ut av rutetabellen» tag, and the «Allerede meldt i
-    SIRI-ET» tag is **withheld** although its flag is true, because that tag's claim is the one
-    thing a removed train is not. The strip shows the fourth row only once it has rows, like
+    the card, a removed row gets the «Tatt ut av rutetabellen» tag, and the «Allerede meldt
+    innstilt» tag is **withheld** although its flag is true, because that tag's claim is the one
+    thing a removed train is not. (The tag read «Allerede meldt i SIRI-ET» until 2026-11-16, when a
+    Vy «Innstilt A–B» covering the call started setting the same `et_cancelled` flag; see
+    `.claude/rules/varsel.md`. That moved such rows from `predicted` to `relayed`, so neither
+    segment's rate is comparable across that date.) The strip shows the fourth row only once it has rows, like
     `no_sx`. Two things this does not do. It leaves `historikk_decisions.sql` alone apart from a
     comment: `sx_only` already cuts on the whole `KIX:` namespace. And it does not collapse the
     removed summary into its own `/meldinger` SIRI-SX option, because it is one fixed text («Tatt ut

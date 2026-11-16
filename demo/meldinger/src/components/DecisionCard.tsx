@@ -339,8 +339,8 @@ export default function DecisionCard({
             </span>
           ) : null}
           {/* The removed tag, and the ET tag withheld on the same rows: their flag is true, but the
-              ET tag's claim — «already declared in SIRI-ET» — is the one thing a removed train is
-              not. */}
+              ET tag's claim — «already declared cancelled by the operator» — is the one thing a removed
+              train is not. */}
           {planRemoved ? (
             <span
               className="tb-tag"
@@ -352,9 +352,9 @@ export default function DecisionCard({
           {decision.et_cancelled && !planRemoved ? (
             <span
               className="tb-tag"
-              title="Avgangen var allerede meldt innstilt i sanntidsdata (SIRI-ET) da vi bestemte oss. Sannsynlighetene er 1,0 per definisjon — vi videreformidlet et faktum."
+              title="Avgangen var allerede meldt innstilt av operatøren da vi bestemte oss: i sanntidsdata (SIRI-ET), eller i en Vy-melding «Innstilt A–B» som dekker stoppet (SIRI-SX, fra 2026-11-16). Sannsynlighetene er 1,0 per definisjon — vi videreformidlet et faktum."
             >
-              Allerede meldt i SIRI-ET
+              Allerede meldt innstilt
             </span>
           ) : null}
           <SendStateBadge decision={decision} />

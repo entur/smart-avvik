@@ -526,7 +526,8 @@ def _end_cancelled(planned: PlannedCall, recorded: PlannedCall | None, preds: li
     """Whether one end of the trip is cancelled. A recorded row for the stop is the latest fact and
     wins either way — a train the spine and the prediction cache (built from the same hourly table)
     still call cancelled has RUN if its call is recorded as served, which is how a reinstatement
-    shows. Without one, the spine's flag or ET's declaration on any scored call at that stop."""
+    shows. Without one, the spine's flag or a declaration on any scored call at that stop (ET's,
+    or a Vy «Innstilt A–B» covering it, `main._call_pred_from_row`)."""
     if recorded is not None:
         return recorded.call_cancelled
     return planned.call_cancelled or any(

@@ -158,6 +158,33 @@ means the root `CLAUDE.md` or a sibling file in `.claude/rules/`.
   job scores it correctly, but if reinstatements turn out to be common the certainty should go back
   to hedging for departures still some way off. Note `/journey` still serves the model's probability
   for a known-cancelled call — same defect, separate contract, not yet fixed.
+  **A Vy «Innstilt A–B» is a declaration too** (2026-11-16): Vy publishes the SX naming each train
+  often an hour or more before ET marks the calls, and the models score every call of a named train
+  alike, with no input saying which calls the stretch covers — so the L2 Ski–Lysaker trains that day,
+  cancelled end to end, read «Mulig innstilling 68 %» in the Entur app under Vy's own «Toget er
+  innstilt». `predict_calls.sql`'s `sx_cancelled` finds A and B on the WHOLE train by name (latest
+  text, « stasjon» dropped, each matching exactly one call) and flags the calls strictly between,
+  plus A where the train starts and B where it ends; `sx_declared_cancelled` carries it and
+  `main._call_pred_from_row` folds it into `et_declared_cancelled`, so everything in this paragraph
+  follows (certainty, «Innstilt», `confirmed`, destination cancelled, the strip, `relayed` on
+  /historikk). Measured Jun 1 - Oct 12 2026: 98.6 % of the strict interior, 98.9 % of an origin A and
+  99.0 % of a terminus B were cancelled in ET, against 53 % over all calls of those trains — but that
+  counts calls ET had already cancelled, where the flag changes nothing. On the calls it does change
+  (flagged before ET, replayed hourly on prd 2026-11-09..16): **95 % on ordinary days, 72 % on
+  2026-11-13**, a derailment day on which trains still named in an «Innstilt» message ran — calls ET
+  never cancelled (R21 1114: ET cancelled calls 8–11 and took that back; flagged call 6 it never
+  touched). The owner
+  chose certainty anyway over a raised probability (2026-11-16). Two guards were replayed and
+  rejected: "ET reinstated the call" fixed nothing (73 %), because the message is flagged before ET
+  takes anything back; "ET already cancelled another call of this train" reached 85 % but left 24 true
+  cancellations to the models. Each leader cycle logs the trains it declares ahead of ET
+  (`event="sx_declared_cancelled"`), which is how to measure it live after the 7 days of time travel
+  on `call_predictions_today` have passed. What it
+  deliberately leaves to the models: a mid-route A or B (the train still CALLS there, so ET's
+  call-level flag could not measure the departure from A or the arrival at B), SJ Norge (77 %), a
+  call ET recorded as served, and a ride that boards before A and alights after B (neither end is
+  covered; ET's interior cancellations have the same gap). The table's own `et_declared_cancelled`
+  stays ET's alone. No kill switch: rollback is a revert.
   **A cancellation ET has declared needs no SX message** (2026-08-19): `predict_calls.sql` and
   `predict_calls_bus.sql` now UNION in one row per declared-cancelled call that **no situation
   named**, consulting no model — `impact._cancelled_prediction` was going to replace every score

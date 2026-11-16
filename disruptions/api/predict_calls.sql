@@ -47,7 +47,8 @@
 -- concern (it exists so varsel and /impact see a train ET already knows is gone), and its
 -- rows carry a flat 1.0 rather than a model output. In an evaluation query they would be
 -- free correct answers nobody predicted -- the same reason /historikk segments them out of
--- model skill.
+-- model skill. `sx_cancelled` (Vy's «Innstilt A–B» read as a declaration, 2026-11-16) is outside
+-- the sync for the same reason.
 CREATE OR REPLACE TABLE `disruptions.call_predictions_today` AS
 WITH
 cat AS (
@@ -58,6 +59,8 @@ cat AS (
 sit AS (
   SELECT
     d.situationNumber,
+    -- Served only: `sx_cancelled` reads Vy's «Innstilt A–B» and nobody else's.
+    d.participantRef,
     SAFE.TIMESTAMP(d.creationTime) AS onset_ts,
     d.summary,
     -- Served text is the situation's LATEST version (disruptions_today.sql), the first version
@@ -807,6 +810,68 @@ et_cancelled AS (
 covered AS (
   SELECT DISTINCT jkey, stop_order FROM base
 ),
+-- ---- CALLS A VY «INNSTILT A–B» MESSAGE DECLARES CANCELLED (2026-11-16) -----------------------
+-- Vy publishes a cancellation as SX «Innstilt A–B» naming each train, often an hour or more before
+-- ET marks the calls (L2 2842 Ski–Lysaker on 2026-11-13: SX at ~12:10Z, ET at 13:37Z, 13 min after
+-- the train should have left). The models score EVERY call of a named train alike and have no
+-- input saying which calls lie inside the stretch, so a train cancelled end to end scored 0.68 at
+-- its origin under Vy's own «Toget er innstilt». Measured over Jun 1 - Oct 12 2026 (4 335 named
+-- trains): 98.6 % of calls strictly inside A–B were cancelled in ET (99.3 % by the message's own
+-- stops), 98.9 % of A when A is the train's first call and 99.0 % of B when B is its last -- against
+-- 53 % over all calls of the same trains. Those figures count calls ET had ALREADY cancelled, where
+-- this flag changes nothing. Replayed live on the calls it does change (flagged hourly before ET had
+-- cancelled them, prd 2026-11-09..16), 95 % were cancelled on ordinary days and 72 % on 2026-11-13,
+-- a derailment day on which trains still named in an «Innstilt» message ran, those calls never
+-- cancelled in ET (R21 1114: ET cancelled calls 8-11 and took that back; the flagged call 6 it never
+-- touched). So a guard on ET having reinstated the call, or any call of the train, did not help
+-- (73 % that day). The owner chose to read those calls as a DECLARATION anyway, like ET's (2026-11-16),
+-- and `main._call_pred_from_row` folds this flag into `et_declared_cancelled`.
+--   * A mid-route A (the train runs to A and terminates) and a mid-route B (it starts again from B)
+--     are left to the models: the train still CALLS there, so ET's call-level flag cannot say
+--     whether the departure from A or the arrival at B went (6.8 % / 25.7 % call-level).
+--   * The LATEST text (`served_summary`), since Vy narrows a message after publishing it, and the
+--     ends are found on the WHOLE train in the planned table, not in `base`, which is windowed on
+--     the onset and so can lack A. A name must match exactly one call after « stasjon» is dropped
+--     («Ski» = «Ski stasjon»); an unmatched or repeated name leaves the train to the models.
+--   * Vy only: SJ Norge's «innstilt» was right 77 % of the time (eval_sjn_flagged.sql).
+--   * A call ET has RECORDED as served ran, whatever the message says.
+--   * Per CALL, not per situation: every situation row about a flagged call carries it (the «Ta
+--     neste tog» beside the «Innstilt» too), or that row would stay a forecast in the decision log
+--     and could win `impact`'s cross-situation alighting fallback. Not the no-SX row of a call
+--     outside the message's window (see the column at the final SELECT).
+-- Never written into rail_calls_planned_today: the line and network state features average its
+-- `call_cancelled`, and a flag training never saw would move every other train's forecast.
+sx_cancelled AS (
+  SELECT DISTINCT r.jkey, r.stop_order
+  FROM (
+    SELECT jkey, LEAST(oa, ob) AS lo, GREATEST(oa, ob) AS hi
+    FROM (
+      SELECT a.jkey, x.situationNumber,
+        IF(COUNTIF(p.norm = x.a_name) = 1, MIN(IF(p.norm = x.a_name, p.stop_order, NULL)), NULL) AS oa,
+        IF(COUNTIF(p.norm = x.b_name) = 1, MIN(IF(p.norm = x.b_name, p.stop_order, NULL)), NULL) AS ob
+      FROM (
+        SELECT situationNumber,
+          LOWER(TRIM(REGEXP_EXTRACT(ANY_VALUE(served_summary), r'^Innstilt ([^–]+)–[^–]+$'))) AS a_name,
+          LOWER(TRIM(REGEXP_EXTRACT(ANY_VALUE(served_summary), r'^Innstilt [^–]+–([^–]+)$'))) AS b_name
+        FROM sit WHERE participantRef = 'NSB' GROUP BY situationNumber
+      ) AS x
+      JOIN (SELECT DISTINCT situationNumber, jkey FROM aff) AS a USING (situationNumber)
+      JOIN (
+        SELECT jkey, stop_order, LOWER(TRIM(REGEXP_REPLACE(stop_name, r'(?i)\s+stasjon$', ''))) AS norm
+        FROM `disruptions.rail_calls_planned_today`
+      ) AS p ON p.jkey = a.jkey
+      WHERE x.a_name IS NOT NULL AND x.b_name IS NOT NULL
+      GROUP BY a.jkey, x.situationNumber
+    )
+    WHERE oa IS NOT NULL AND ob IS NOT NULL AND oa != ob
+  ) AS st
+  JOIN `disruptions.rail_calls_planned_today` AS r
+    ON r.jkey = st.jkey
+   AND (   (r.stop_order > st.lo AND r.stop_order < st.hi)
+        OR (r.stop_order = st.lo AND r.aimed_arr IS NULL)    -- A is where the train starts
+        OR (r.stop_order = st.hi AND r.aimed_dep IS NULL))   -- B is where it ends
+  WHERE NOT (r.call_source = 'recorded' AND NOT IFNULL(r.call_cancelled, FALSE))
+),
 et_only AS (
   SELECT e.*
   FROM et_cancelled AS e
@@ -938,7 +1003,12 @@ SELECT
   -- NULL on a no-SX row: no `sit` row carries its synthetic number, so `sd` is unmatched.
   sd.report_type,
   -- Empty on a no-SX row, for the same reason (BigQuery stores a NULL array as empty).
-  sd.affected_stops
+  sd.affected_stops,
+  -- A Vy «Innstilt A–B» declares this call cancelled (`sx_cancelled`). Served only, and kept apart
+  -- from `et_declared_cancelled` so this table still says which feed said what. Situation rows only:
+  -- a call of the stretch outside the message's 12 h window has just its no-SX row, and a certainty
+  -- under «Mulig avvik» / «Ingen situasjonsmelding er publisert» would contradict itself.
+  (s.has_situation AND sxc.jkey IS NOT NULL) AS sx_declared_cancelled
 FROM scored AS s
 -- Situation description for serving. GROUP BY guarantees one row per situationNumber, so this
 -- join can never fan out the scored calls even if the source ever carries a duplicate.
@@ -949,7 +1019,9 @@ LEFT JOIN (
          ANY_VALUE(report_type) AS report_type, ANY_VALUE(affected_stops) AS affected_stops
   FROM sit GROUP BY situationNumber
 ) AS sd ON sd.situationNumber = s.situationNumber
-JOIN wch  ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
+-- DISTINCT per (jkey, stop_order), so this cannot fan out a call either.
+LEFT JOIN sx_cancelled AS sxc ON sxc.jkey = s.jkey AND sxc.stop_order = s.stop_order
+JOIN wch ON wch.lead_bucket  = s.lead_bucket AND wch.has_situation = s.has_situation
 JOIN wdh  ON wdh.lead_bucket  = s.lead_bucket AND wdh.has_situation = s.has_situation
 JOIN w10h ON w10h.lead_bucket = s.lead_bucket AND w10h.has_situation = s.has_situation
 LEFT JOIN bounds AS bd ON bd.side = 'dep'
@@ -1060,5 +1132,7 @@ SELECT
   END AS description_nn,
   -- No operator message, so no report type and no stops it names.
   CAST(NULL AS STRING)  AS report_type,
-  ARRAY<STRING>[]       AS affected_stops
+  ARRAY<STRING>[]       AS affected_stops,
+  -- ET's own declaration already carries these rows; no message is behind them.
+  FALSE                 AS sx_declared_cancelled
 FROM et_only AS e;

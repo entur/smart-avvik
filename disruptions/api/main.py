@@ -558,7 +558,12 @@ def _call_pred_from_row(r, operator: str) -> impact_engine.CallPred:
         stop_order=r.stop_order,
         aimed_dep=r.aimed_dep,
         aimed_arr=r.aimed_arr,
-        et_declared_cancelled=r.et_declared_cancelled,
+        # A Vy «Innstilt A–B» covering this call is a declaration too (predict_calls.sql
+        # `sx_cancelled`): of the calls it flags before ET has cancelled them, 95 % were cancelled
+        # on ordinary days and 72 % on a disrupted one (2026-11-13), often an hour before ET said
+        # so. Folded here so every reader of the flag follows; absent on the bus table and on a
+        # table built before the column existed, which reads as "not declared".
+        et_declared_cancelled=r.et_declared_cancelled or getattr(r, "sx_declared_cancelled", False),
         et_dep_delay_min=r.et_dep_delay_min,
         call_source=r.call_source,
         p_cancel=r.p_cancel,
@@ -630,11 +635,15 @@ def refresh_call_predictions_cache(
     # rollout rule `_call_pred_from_row` states: a table built before the English or the nynorsk
     # columns has none.
     texts: dict[str, tuple] = {}
+    # Trains a Vy «Innstilt A–B» declares cancelled before ET has (see `_call_pred_from_row`).
+    sx_declared: set[str] = set()
 
     def _ingest(rows, operator_of: Callable[..., str]) -> None:
         for r in rows:
             op = operator_of(r)
             pred = _call_pred_from_row(r, op)
+            if getattr(r, "sx_declared_cancelled", False) and not r.et_declared_cancelled:
+                sx_declared.add(r.jkey)
             texts.setdefault(
                 r.situationNumber,
                 (
@@ -704,6 +713,15 @@ def refresh_call_predictions_cache(
     except Exception:
         # A translation is an addition to the payload, never a reason to keep last cycle's predictions.
         logger.exception("Could not update the situations' English and nynorsk text")
+    if fenced and sx_declared:
+        # The decision log records these as ET cancellations (`et_cancelled`), and the table that
+        # tells the two apart is replaced every cycle, so this line is what measures the rule live
+        # beyond time travel's 7 days. The leader's load only, so each cycle logs it once.
+        logger.info(
+            "Vy «Innstilt» declares %d trains cancelled ahead of ET",
+            len(sx_declared),
+            extra={"fields": {"event": "sx_declared_cancelled", "trains": sorted(sx_declared)}},
+        )
     logger.info(
         "Refreshed per-call predictions cache: %d (operator, journey) keys, %d situations, "
         "%d stop refs",
