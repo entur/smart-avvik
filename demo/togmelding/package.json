@@ -13,7 +13,7 @@
     "@entur/alert": "^0.22.1",
     "@entur/button": "^5.1.1",
     "@entur/expand": "^4.0.7",
-    "@entur/form": "^10.3.1",
+    "@entur/form": "^10.3.2",
     "@entur/icons": "^10.0.6",
     "@entur/layout": "^5.0.1",
     "@entur/loader": "^0.9.0",
