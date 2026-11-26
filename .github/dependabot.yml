@@ -1,22 +1,55 @@
-# Minor and patch updates are grouped. Freyja (the repo's freyja-mode property) merges the PRs it
-# rates low risk once the checks in the "main: required checks" ruleset pass.
-# The chore(deps) prefix makes the PR titles pass verify-pr in pr.yml.
+# One PR per dependency so Freyja can assess and merge it (no groups).
+# 4 day cooldown, except for the Entur packages listed under exclude.
+# Same file in every repo: comment out the ecosystems the repo does not use.
+# Additions to the standard file: the uv block, and the two ignore rules below.
 version: 2
 updates:
-  - package-ecosystem: uv
-    directory: "/"
+  - package-ecosystem: "github-actions"
+    directories: ["/", "/.github/actions/*"]
     schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Oslo"
+    open-pull-requests-limit: 100
     cooldown:
-      default-days: 7
+      default-days: 4
+      exclude: ["entur/*"]
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore"
+      include: "scope"
 
-  - package-ecosystem: npm
+  #   - package-ecosystem: "gradle"
+  #     directories: ["/"]
+  #     schedule:
+  #       interval: "weekly"
+  #       day: "monday"
+  #       time: "06:00"
+  #       timezone: "Europe/Oslo"
+  #     open-pull-requests-limit: 100
+  #     cooldown:
+  #       default-days: 4
+  #       exclude: ["org.entur*", "org.rutebanken*"]
+  #     commit-message:
+  #       prefix: "chore"
+  #       include: "scope"
+
+  #   - package-ecosystem: "maven"
+  #     directories: ["/"]
+  #     schedule:
+  #       interval: "weekly"
+  #       day: "monday"
+  #       time: "06:00"
+  #       timezone: "Europe/Oslo"
+  #     open-pull-requests-limit: 100
+  #     cooldown:
+  #       default-days: 4
+  #       exclude: ["org.entur*", "org.rutebanken*"]
+  #     commit-message:
+  #       prefix: "chore"
+  #       include: "scope"
+
+  - package-ecosystem: "npm"
     directories:
       - "/demo/avviksvarsel"
       - "/demo/meldinger"
@@ -27,62 +60,94 @@ updates:
       - "/integrations/firebase-notifications"
       - "/integrations/notifications-client"
     schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
-      # The @entur packages depend on each other's tokens. A major taken one package
-      # at a time leaves two generations in the lockfile, so they come in one PR.
-      entur:
-        applies-to: version-updates
-        patterns: ["@entur/*"]
-        update-types: [major]
-      # firebase and @firebase/rules-unit-testing peer on each other's major, so neither
-      # installs alone.
-      firebase:
-        applies-to: version-updates
-        patterns: ["firebase", "@firebase/*"]
-        update-types: [major]
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Oslo"
+    open-pull-requests-limit: 100
     cooldown:
-      default-days: 7
+      default-days: 4
+      exclude: ["@entur/*"]
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore"
+      include: "scope"
+    # The packages declare node >=24 and the image builds them on node:24-slim.
     ignore:
-      # @types/node follows the Node major in engines and CI (24). Bump them together by hand,
-      # or it types APIs the runtime does not have.
       - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
 
-  - package-ecosystem: github-actions
-    directory: "/"
-    schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
-    cooldown:
-      default-days: 7
-    commit-message:
-      prefix: "chore(deps)"
+  #   - package-ecosystem: "bun"
+  #     directories: ["/"]
+  #     schedule:
+  #       interval: "weekly"
+  #       day: "monday"
+  #       time: "06:00"
+  #       timezone: "Europe/Oslo"
+  #     open-pull-requests-limit: 100
+  #     cooldown:
+  #       default-days: 4
+  #       exclude: ["@entur/*"]
+  #     commit-message:
+  #       prefix: "chore"
+  #       include: "scope"
 
-  - package-ecosystem: docker
-    directory: "/"
+  - package-ecosystem: "uv"
+    directories: ["/"]
     schedule:
-      interval: weekly
-    groups:
-      minor-and-patch:
-        applies-to: version-updates
-        update-types: [minor, patch]
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Oslo"
+    open-pull-requests-limit: 100
     cooldown:
-      default-days: 7
+      default-days: 4
     commit-message:
-      prefix: "chore(deps)"
+      prefix: "chore"
+      include: "scope"
+
+  - package-ecosystem: "docker"
+    directories: ["/", "/[!.]*"]
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Oslo"
+    open-pull-requests-limit: 100
+    cooldown:
+      default-days: 4
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # The build stage must match the CPython 3.13 in the distroless runtime image.
     ignore:
-      # python:3.X-slim builds the venv that runs on the CPython in
-      # gcr.io/distroless/python3-debian13 (3.13). Dependabot calls 3.13 -> 3.14 a minor,
-      # so without this it auto-merges a venv the runtime cannot load (#331). Move both together.
       - dependency-name: "python"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
 
+  #   - package-ecosystem: "helm"
+  #     directories: ["/helm/*"]
+  #     schedule:
+  #       interval: "weekly"
+  #       day: "monday"
+  #       time: "06:00"
+  #       timezone: "Europe/Oslo"
+  #     open-pull-requests-limit: 100
+  #     cooldown:
+  #       default-days: 4
+  #       exclude: ["common"]
+  #     commit-message:
+  #       prefix: "chore"
+  #       include: "scope"
+
+  #   - package-ecosystem: "terraform"
+  #     directories: ["/terraform"]
+  #     schedule:
+  #       interval: "weekly"
+  #       day: "monday"
+  #       time: "06:00"
+  #       timezone: "Europe/Oslo"
+  #     open-pull-requests-limit: 100
+  #     cooldown:
+  #       default-days: 4
+  #     commit-message:
+  #       prefix: "chore"
+  #       include: "scope"

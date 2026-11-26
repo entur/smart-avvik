@@ -92,7 +92,7 @@ RUN uv venv /opt/venv \
 # ---- Stage 3: the distroless runtime image --------------------------------
 # main.py loads its sibling *.sql files (and eval_static/) via Path(__file__).parent,
 # so they must sit next to main.py in the image (WORKDIR /app below).
-FROM gcr.io/distroless/python3-debian13:nonroot
+FROM gcr.io/distroless/python3-debian13:nonroot@sha256:72de1dda9d4c52c370e2ef2d93c28e3e1a8193c92058b7dfa42bace38a83d114
 
 # Run the copied venv's packages on the image's own CPython 3.13. /app is on the
 # path too so `uvicorn main:app` can import main.py.
