@@ -24,7 +24,7 @@
     "@entur/menu": "^7.4.1",
     "@entur/modal": "^2.1.1",
     "@entur/tokens": "^4.2.0",
-    "@entur/typography": "^3.0.7",
+    "@entur/typography": "^3.2.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },
