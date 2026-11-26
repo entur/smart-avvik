@@ -1245,7 +1245,7 @@ wheels = [
 
 [[package]]
 name = "google-cloud-logging"
-version = "3.17.0"
+version = "3.17.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "google-api-core", extra = ["grpc"] },
@@ -1259,9 +1259,9 @@ dependencies = [
     { name = "proto-plus" },
     { name = "protobuf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e1/5b/fbb367f8bb05b3e968048686f440181765a8681c3a07cfa901814f9280e1/google_cloud_logging-3.17.0.tar.gz", hash = "sha256:d7343f2b82b4f9e9244bfc8aba7ad034c415f9bbb405ed28d1125aa37d270b72", size = 292071, upload-time = "2026-10-01T18:17:01.302Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/1d/e4/d3e9a809fc57ec1aa1aaf98e5da740e5b02d97070856c9d70f3f9cfb1c35/google_cloud_logging-3.17.1.tar.gz", hash = "sha256:24af44573642b4c3f0154d34511ddac89589824ee802ee743464022845322327", size = 293812, upload-time = "2026-11-22T01:00:10.067Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/35/53/911cbf97517123350292ac6edba7d130ee44acccfd3e2a36f6807f32da14/google_cloud_logging-3.17.0-py3-none-any.whl", hash = "sha256:da2819da683a5135e21c2853ff2c86040786cd5521c3f71424755c110cf36fe2", size = 234020, upload-time = "2026-10-01T18:10:50.73Z" },
+    { url = "https://files.pythonhosted.org/packages/42/26/ed9840af0b2e8da5ed8a7cd0f2b422314827df3fbdce3b0c6177f1f13eec/google_cloud_logging-3.17.1-py3-none-any.whl", hash = "sha256:c347426cc8aea05ad5f6fc12ebd013329c3387c378f4669a8e53e1b44f998981", size = 234217, upload-time = "2026-11-22T01:00:08.38Z" },
 ]
 
 [[package]]
